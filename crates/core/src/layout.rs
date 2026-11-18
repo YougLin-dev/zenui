@@ -44,10 +44,6 @@ impl LayoutMap {
         self.entries.len()
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-
     /// Reserve a node id for a view the frame is about to mount.
     pub(crate) fn plan(&mut self, view: ViewId) {
         if self.get(view).is_some() {

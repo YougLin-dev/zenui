@@ -89,7 +89,7 @@ mod arena;
 
 pub mod graph;
 pub mod handle;
-pub mod layout;
+mod layout;
 pub mod metrics;
 pub mod owner;
 pub mod query;
@@ -103,7 +103,6 @@ pub use handle::{
     Generation, Handle, HandleError, InvalidHandle, LayoutNodeId, MemoId, OwnerId, QueryId, RowKey,
     RuntimeId, SignalId, SlotIndex, ViewId,
 };
-pub use layout::LayoutMap;
 pub use metrics::Counters;
 pub use owner::{OwnerError, OwnerTree};
 pub use query::{Filter, QueryCache, RowSet};
