@@ -198,7 +198,11 @@ impl TodoApp {
                 .find(|(_, existing_key)| existing_key == key)
             {
                 Some((view, _)) => order.push(*view),
-                None => order.push(self.mount_row(*key)),
+                None => {
+                    if let Some(view) = self.mount_row(*key) {
+                        order.push(view);
+                    }
+                }
             }
         }
         self.views.reorder(&order);
@@ -277,20 +281,27 @@ impl TodoApp {
         }
     }
 
-    fn mount_row(&mut self, key: RowKey) -> ViewId {
-        let mut title_len = 0;
-        match self.store.handle_for(key) {
-            Some(row) => match self.store.read_owned_title(row) {
-                // `SPEC-RT-045`: one owned read per UI mount.
-                Ok(title) => title_len = title.chars().count() as u32,
-                Err(error) => self
-                    .sink
-                    .push(format!("mount read failed for row {}: {error}", key.raw())),
-            },
-            None => self
-                .sink
-                .push(format!("mount failed: unknown row key {}", key.raw())),
-        }
+    /// Mount one row view, or nothing at all.
+    ///
+    /// `SPEC-RT-045`: one owned read per UI mount. `SPEC-RT-013`: a failed read
+    /// cancels the mount — no node, no owner, no zero-length ghost row. The
+    /// error goes to the sink and the caller simply omits the row for this
+    /// frame.
+    fn mount_row(&mut self, key: RowKey) -> Option<ViewId> {
+        let Some(row) = self.store.handle_for(key) else {
+            self.sink
+                .push(format!("mount skipped: row key {} is gone", key.raw()));
+            return None;
+        };
+        let title = match self.store.read_owned_title(row) {
+            Ok(title) => title,
+            Err(error) => {
+                self.sink
+                    .push(format!("mount skipped: title read failed: {error}"));
+                return None;
+            }
+        };
+        let title_len = title.chars().count() as u32;
 
         let owner = match self.owners.child_of(self.root_owner) {
             Ok(owner) => owner,
@@ -308,7 +319,7 @@ impl TodoApp {
                 let _ = (key, view);
             }),
         );
-        view
+        Some(view)
     }
 
     fn unmount_row(&mut self, view: ViewId) {
@@ -617,4 +628,41 @@ pub fn todolist_trace() -> String {
 fn row_named(app: &TodoApp, title: &str) -> (RowKey, RowId) {
     app.row_by_title(title)
         .unwrap_or_else(|| panic!("scenario invariant: row {title} exists"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_failed_title_read_does_not_mount_a_row() {
+        let mut app = TodoApp::new();
+        let row = app.insert("A");
+        app.frame(|app| app.render());
+
+        let (view, _) = app.views.row_views()[0];
+        // Remove the row and the view behind the query cache's back, so the
+        // cached RowSet still lists the key while nothing can resolve it.
+        app.store.remove(row).expect("live row");
+        app.views.unmount(view);
+
+        app.render();
+
+        assert_eq!(
+            app.views.row_views().len(),
+            0,
+            "a failed read must not mount a zero-length ghost row"
+        );
+        assert_eq!(
+            app.views.counters().mounts,
+            1,
+            "only the first mount counts"
+        );
+        assert_eq!(app.sink.len(), 1, "the failure must reach the sink");
+        assert!(
+            app.sink[0].contains("mount skipped"),
+            "unexpected sink message: {}",
+            app.sink[0]
+        );
+    }
 }
