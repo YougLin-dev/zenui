@@ -273,10 +273,11 @@ impl Store {
 
     /// Remove every completed row in one write.
     ///
-    /// Focus is not this helper's business: `Tx::clear_completed` records
-    /// exactly one `FocusRemovalIntent` before the rows go, and the commit
-    /// settles it once (`SPEC-GATE-A0-10`). This is the slot-table half, used
-    /// by the store's own tests.
+    /// Focus is not this helper's business: `Tx::clear_completed` records a
+    /// single `FocusRemovalIntent` before the rows go — one for the whole clear,
+    /// and only when the focused row is among them — and the commit settles it
+    /// once (`SPEC-GATE-A0-10`). This is the slot-table half, used by the
+    /// store's own tests.
     #[cfg(test)]
     pub(crate) fn clear_completed(&mut self) -> Vec<RowKey> {
         let doomed: Vec<SlotIndex> = self
@@ -338,10 +339,11 @@ impl Store {
     /// Owned title read over the committed store (`SPEC-RT-045`).
     ///
     /// The runtime entry point is `Tx::read_once`, returning
-    /// `Result<String, InvalidHandle>`, and the mount executor cancels the
-    /// mount when it fails (`zenui-app::mount_row`, pinned in
-    /// `crates/app/tests/mount_path.rs`). This helper is the store-level
-    /// equivalent the unit tests use, accounting the same I/O and clone.
+    /// `Result<String, InvalidHandle>`; the mount executor cancels the mount
+    /// when it fails (`zenui-app::mount_row`). The one-owned-read-per-mount
+    /// half is pinned in `crates/app/tests/mount_path.rs`; the cancellation
+    /// branch has no fixture. This helper is the store-level equivalent the
+    /// unit tests use, accounting the same I/O and clone.
     #[cfg(test)]
     pub(crate) fn read_owned_title(&mut self, row: RowId) -> Result<String, InvalidHandle> {
         let title = self.entry(row)?.title.clone();
