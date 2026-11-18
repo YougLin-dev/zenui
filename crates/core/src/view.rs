@@ -146,9 +146,9 @@ impl ViewTree {
         let node = self.nodes.remove(&view)?;
         self.order.retain(|candidate| *candidate != view);
         self.carets.remove(&view);
-        if self.focused == Some(view) {
-            self.focused = None;
-        }
+        // Focus is not cleared here: the transaction settles the recorded
+        // intent after the swap, so a removal and its focus fallback count as
+        // one observable move (`SPEC-GATE-A0-10`).
         self.unmounts += 1;
         self.geometry_epoch += 1;
         Some(node)
@@ -345,12 +345,15 @@ mod tests {
     }
 
     #[test]
-    fn unmount_clears_focus_and_caret() {
+    fn unmount_clears_caret_and_leaves_focus_for_the_transaction() {
         let mut tree = tree();
         let a = tree.mount_row(key(1), owner(), 1);
         tree.focus(a);
         assert!(tree.unmount(a).is_some());
-        assert_eq!(tree.focused(), None);
+        // The pointer stays until the transaction settles the recorded intent,
+        // so the removal and its fallback are one observable move.
+        assert_eq!(tree.focused(), Some(a));
+        assert!(!tree.is_live(a));
         assert_eq!(tree.caret(a), None);
     }
 }

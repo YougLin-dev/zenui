@@ -4,7 +4,7 @@ scenario=todolist-headless
 [step 01 empty]
   detail=no rows
   state store_rows=0 visible_rows=0 remaining=0 has_completed=false filter=all store_titles=- visible_titles=- focus=- caret=-
-  delta query_evals=1 id_materializations=1 mounts=0 unmounts=0 memo_recomputes=3 commits=1 focus_moves=0 caret_ops=0 io_reads=0 io_writes=0 string_clones=0
+  delta query_evals=1 id_materializations=0 mounts=0 unmounts=0 memo_recomputes=3 commits=1 focus_moves=0 caret_ops=0 io_reads=0 io_writes=0 string_clones=0
   graph edges=3 active_sources=1 geometry_epoch=1 live_owners=1 cleanup_runs=0 sink=0
 
 [step 02 insert-abc]
@@ -58,6 +58,6 @@ scenario=todolist-headless
 [summary]
   steps=9
   state store_rows=2 visible_rows=2 remaining=2 has_completed=false filter=active store_titles=C,D visible_titles=C,D focus=view#3 caret=view#3:1
-  total query_evals=8 id_materializations=8 mounts=4 unmounts=2 memo_recomputes=22 commits=9 focus_moves=2 caret_ops=2 io_reads=4 io_writes=8 string_clones=4
+  total query_evals=8 id_materializations=7 mounts=4 unmounts=2 memo_recomputes=22 commits=9 focus_moves=2 caret_ops=2 io_reads=4 io_writes=8 string_clones=4
   graph edges=4 active_sources=1 geometry_epoch=10 live_owners=3 cleanup_runs=2 sink=0
 [status] outcome=ok

@@ -113,6 +113,11 @@ pub enum Fatal {
     LayoutMapInconsistent,
     /// The staged view order is not a permutation of the views live at commit.
     ViewOrderNotAPermutation,
+    /// Two views claim the same row key: `For` must be keyed
+    /// (`SPEC-GATE-A0-09`).
+    DuplicateViewKey {
+        key: RowKey,
+    },
     /// A mount targets a row the same transaction removed.
     MountForMissingRow {
         view: ViewId,
@@ -150,6 +155,7 @@ impl fmt::Display for Fatal {
             Fatal::ViewOrderNotAPermutation => {
                 f.write_str("staged view order is not a permutation")
             }
+            Fatal::DuplicateViewKey { .. } => f.write_str("two views claim the same row key"),
             Fatal::MountForMissingRow { .. } => f.write_str("mount targets a removed row"),
             Fatal::FocusTargetNotLive { .. } => f.write_str("focus target will not be live"),
             Fatal::GraphCycle { node } => write!(f, "memo cycle at node {node}"),
@@ -302,6 +308,11 @@ pub struct Txn {
     staged_rev: u64,
     publishes: Vec<Publication>,
     commits: u64,
+    /// Focus intents recorded before a structural change, settled once at the
+    /// end of the commit (`SPEC-RT-026`, `SPEC-GATE-A0-10`).
+    focus_intents: Vec<FocusIntent>,
+    /// Set when the frame moves focus explicitly; cancels pending intents.
+    user_focused: bool,
     /// Test-only: what the Cleanup stage observed when it released an owner.
     #[cfg(test)]
     cleanup_log: Vec<(crate::handle::OwnerId, Phase, usize)>,
@@ -324,6 +335,8 @@ impl Txn {
             publishes: Vec::new(),
             commits: 0,
             poison: None,
+            focus_intents: Vec::new(),
+            user_focused: false,
             #[cfg(test)]
             cleanup_log: Vec::new(),
         }
@@ -367,6 +380,8 @@ impl Txn {
         self.depth = 0;
         self.phase = Phase::Outside;
         self.outcome = Outcome::Committed;
+        self.focus_intents.clear();
+        self.user_focused = false;
         self.model = ModelJournal::new(self.model.next_key);
         self.graph = GraphScratch::new();
         self.view = ViewDraft::default();
@@ -596,6 +611,18 @@ impl<'a> Tx<'a> {
             }
         }
         if !removed.is_empty() {
+            // A bulk clear settles one intent, not one per removed row.
+            if self.txn.focus_intents.is_empty()
+                && let Some(focused) = self.views.focused()
+                && self
+                    .views
+                    .node(focused)
+                    .and_then(|node| node.row)
+                    .is_some_and(|row| removed.contains(&row))
+                && let Some(intent) = self.views.focus_intent_for(focused)
+            {
+                self.txn.focus_intents.push(intent);
+            }
             self.txn.model.writes += 1;
             self.bump();
         }
@@ -743,7 +770,9 @@ impl<'a> Tx<'a> {
         match outcome {
             Ok((Value::Rows(rows), recomputed)) => {
                 if recomputed {
-                    self.query.note_eval();
+                    // An empty result costs no build and no materialization
+                    // (`SPEC-GATE-A0-08`).
+                    self.query.note_eval(!rows.is_empty());
                 }
                 rows
             }
@@ -886,6 +915,17 @@ impl<'a> Tx<'a> {
 
     pub fn mount_row(&mut self, row: RowKey, title_len: u32) -> Result<ViewId, Fatal> {
         self.require(WriteKind::OwnerMount)?;
+        // `For` is keyed: two live views for one row would alias its identity,
+        // so the duplicate is refused before any patch is staged
+        // (`SPEC-GATE-A0-09`).
+        let already_mounted = self
+            .views
+            .row_views()
+            .into_iter()
+            .any(|(view, key)| key == row && !self.txn.view.unmounts.contains(&view));
+        if already_mounted || self.txn.view.mounts.iter().any(|mount| mount.row == row) {
+            return Err(Fatal::DuplicateViewKey { key: row });
+        }
         let view_id = ViewId::from_index(self.txn.view.next_view);
         let owner_id = OwnerId::from_index(self.txn.view.next_owner);
         let parent = self.owners.root();
@@ -904,10 +944,19 @@ impl<'a> Tx<'a> {
         Ok(view_id)
     }
 
+    /// Stage an unmount. The focus intent is recorded here — *before* the
+    /// structure changes — and settled once at the end of the commit
+    /// (`SPEC-GATE-A0-10`).
     pub fn unmount(&mut self, view: ViewId) -> Result<(), Fatal> {
         self.require(WriteKind::ViewPatch)?;
         if !self.txn.view.unmounts.contains(&view) {
             self.txn.view.unmounts.push(view);
+            if self.views.focused() == Some(view)
+                && self.txn.focus_intents.is_empty()
+                && let Some(intent) = self.views.focus_intent_for(view)
+            {
+                self.txn.focus_intents.push(intent);
+            }
         }
         Ok(())
     }
@@ -920,6 +969,8 @@ impl<'a> Tx<'a> {
 
     pub fn focus(&mut self, view: ViewId) -> Result<(), Fatal> {
         self.require(WriteKind::FocusChange)?;
+        // A user focus move mid-frame cancels any recorded removal intent.
+        self.txn.user_focused = true;
         let caret = self
             .views
             .node(view)
@@ -940,6 +991,7 @@ impl<'a> Tx<'a> {
 
     pub fn clear_focus(&mut self) -> Result<(), Fatal> {
         self.require(WriteKind::FocusChange)?;
+        self.txn.user_focused = true;
         self.txn.view.focus = Some(None);
         Ok(())
     }
@@ -1046,9 +1098,13 @@ impl<'a> Tx<'a> {
             .into_iter()
             .map(|(key, _)| key)
             .collect();
+        let mut seen_keys: BTreeSet<RowKey> = BTreeSet::new();
         for mount in &self.txn.view.mounts {
             if !live_rows.contains(&mount.row) {
                 return Err(Fatal::MountForMissingRow { view: mount.id });
+            }
+            if !seen_keys.insert(mount.row) {
+                return Err(Fatal::DuplicateViewKey { key: mount.row });
             }
         }
 
@@ -1112,6 +1168,10 @@ impl<'a> Tx<'a> {
                     draft.release(reservation.slot);
                     continue;
                 }
+                // A new row joins every membership set.
+                for filter in [Filter::All, Filter::Active, Filter::Completed] {
+                    draft.touch_filter(filter);
+                }
                 draft.fill(
                     reservation.slot,
                     *key,
@@ -1129,13 +1189,25 @@ impl<'a> Tx<'a> {
                 continue;
             }
             if let Some((slot, _)) = self.store.slot_for(*key) {
+                let was_completed = self.store.completed_at(slot);
                 draft.update(slot, staged.title.clone(), staged.completed);
+                // Only a real completed change moves `Active`/`Completed`;
+                // `All` membership never depends on the flag.
+                if let Some(value) = staged.completed
+                    && was_completed.is_some_and(|previous| previous != value)
+                {
+                    draft.touch_filter(Filter::Active);
+                    draft.touch_filter(Filter::Completed);
+                }
             }
         }
 
         for key in &journal.removals {
             if let Some((slot, _)) = self.store.slot_for(*key) {
                 draft.remove(slot);
+                for filter in [Filter::All, Filter::Active, Filter::Completed] {
+                    draft.touch_filter(filter);
+                }
             }
         }
 
@@ -1203,6 +1275,34 @@ impl<'a> Tx<'a> {
         self.views.set_next(draft.next_view);
         self.owners.set_next(draft.next_owner);
         self.layout.commit(&draft.unmounts);
+
+        // Two-phase focus settlement (`SPEC-GATE-A0-10`): the intent was
+        // recorded before the tree changed, and it is settled here — after the
+        // swap, once — only when the frame did not move focus explicitly.
+        // Fallback order is next -> previous; a focusable input and the
+        // toolbar do not exist in A0 (they are A1 nodes).
+        if !self.txn.user_focused
+            && focused.is_none()
+            && let Some(intent) = self.txn.focus_intents.last().copied()
+        {
+            let target = intent
+                .next
+                .filter(|view| self.views.is_live(*view))
+                .or_else(|| intent.previous.filter(|view| self.views.is_live(*view)));
+            match target {
+                Some(view) => self.views.focus(view),
+                None => self.views.clear_focus(),
+            };
+        }
+        // A focus pointer left on an unmounted view is resolved once, after
+        // the settlement, and counts as a move.
+        if self
+            .views
+            .focused()
+            .is_some_and(|view| !self.views.is_live(view))
+        {
+            self.views.clear_focus();
+        }
 
         // Cleanup: release the owners the unmounts orphaned. No mount, no
         // flush, no user write — the transaction is already published

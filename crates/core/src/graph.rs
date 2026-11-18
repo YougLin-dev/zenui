@@ -164,6 +164,13 @@ impl GraphScratch {
         Self::default()
     }
 
+    /// Test-only: put a node on the compute stack, as a scheduler would while
+    /// its body runs, so a two-node cycle can be exercised.
+    #[cfg(test)]
+    pub(crate) fn begin_computing(&mut self, node: NodeId) {
+        self.computing.push(node);
+    }
+
     /// Test-only: force a node to recompute on the next staged compute.
     #[cfg(test)]
     pub(crate) fn mark_dirty(&mut self, node: NodeId) {
@@ -752,6 +759,30 @@ mod tests {
     /// `SPEC-RT-038`: a memo body reading a node that is still computing is a
     /// cycle, reported as a domain error instead of converging on a stale
     /// value. Removing the `computing` check makes this fail.
+    /// `SPEC-GATE-A0-05`: a two-node cycle is detected too, not just a memo
+    /// reading itself. Removing the compute-stack check makes this fail.
+    #[test]
+    fn a_two_node_cycle_is_detected() {
+        let mut graph = MemoGraph::new();
+        let first = graph.memo("first");
+        let second = graph.memo("second");
+        let mut scratch = GraphScratch::new();
+
+        // `first` is mid-compute; `second` reads it.
+        scratch.begin_computing(first);
+        let error = graph
+            .compute_staged(second, &mut scratch, 1, |reader| {
+                let _ = reader.read(first);
+                Value::Count(1)
+            })
+            .expect_err("reading a computing node is a cycle");
+
+        assert!(
+            matches!(error, GraphError::Cycle { node } if node == first),
+            "expected Cycle({first}), got {error:?}"
+        );
+    }
+
     #[test]
     fn a_self_reading_memo_is_a_cycle() {
         let mut graph = MemoGraph::new();

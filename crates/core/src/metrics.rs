@@ -14,6 +14,14 @@ pub struct Counters {
     pub query_evals: u64,
     /// `RowSet` materializations (stable-id collections).
     pub id_materializations: u64,
+    /// Row-set constructions from a store scan (`SPEC-GATE-A0-07`). A cache
+    /// hit costs nothing; an empty result costs nothing either, because it is
+    /// answered from the membership counters.
+    pub cache_builds: u64,
+    /// Rows scanned while building a row set (`SPEC-GATE-A0-08`). This is the
+    /// counter that must stay at zero for an empty result: a `collect()`-based
+    /// `is_empty` would move it.
+    pub row_visits: u64,
     /// Retained views mounted.
     pub mounts: u64,
     /// Retained views unmounted.
@@ -45,6 +53,8 @@ impl Counters {
             id_materializations: self
                 .id_materializations
                 .saturating_sub(earlier.id_materializations),
+            cache_builds: self.cache_builds.saturating_sub(earlier.cache_builds),
+            row_visits: self.row_visits.saturating_sub(earlier.row_visits),
             mounts: self.mounts.saturating_sub(earlier.mounts),
             unmounts: self.unmounts.saturating_sub(earlier.unmounts),
             memo_recomputes: self.memo_recomputes.saturating_sub(earlier.memo_recomputes),
@@ -61,6 +71,8 @@ impl Counters {
     pub fn total(self) -> u64 {
         self.query_evals
             + self.id_materializations
+            + self.cache_builds
+            + self.row_visits
             + self.mounts
             + self.unmounts
             + self.memo_recomputes
@@ -77,6 +89,8 @@ impl AddAssign for Counters {
     fn add_assign(&mut self, other: Counters) {
         self.query_evals += other.query_evals;
         self.id_materializations += other.id_materializations;
+        self.cache_builds += other.cache_builds;
+        self.row_visits += other.row_visits;
         self.mounts += other.mounts;
         self.unmounts += other.unmounts;
         self.memo_recomputes += other.memo_recomputes;
@@ -116,6 +130,8 @@ mod tests {
         let one = Counters {
             query_evals: 1,
             id_materializations: 2,
+            cache_builds: 12,
+            row_visits: 13,
             mounts: 3,
             unmounts: 4,
             memo_recomputes: 5,
@@ -129,6 +145,8 @@ mod tests {
         let two = Counters {
             query_evals: 10,
             id_materializations: 20,
+            cache_builds: 120,
+            row_visits: 130,
             mounts: 30,
             unmounts: 40,
             memo_recomputes: 50,

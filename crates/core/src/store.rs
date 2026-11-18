@@ -81,6 +81,9 @@ pub struct Store {
     order: Vec<SlotIndex>,
     next_key: u64,
     epoch: u64,
+    /// Per-filter membership epochs (`SPEC-GATE-A0-07`). A write that cannot
+    /// change a filter's membership must not invalidate its cache.
+    filter_epoch: [u64; 3],
     completed: usize,
     io_reads: u64,
     io_writes: u64,
@@ -104,6 +107,8 @@ pub(crate) struct StoreDraft {
     next_key: u64,
     epoch: u64,
     io_writes: u64,
+    /// Which filter memberships this commit changed.
+    filter_mask: [bool; 3],
 }
 
 impl StoreDraft {
@@ -141,8 +146,21 @@ impl StoreDraft {
         self.order = order;
     }
 
+    /// Mark a filter's membership as changed by this commit.
+    pub(crate) fn touch_filter(&mut self, filter: crate::query::Filter) {
+        self.filter_mask[filter_index(filter)] = true;
+    }
+
     pub(crate) fn set_completed_count(&mut self, completed: usize) {
         self.completed = completed;
+    }
+}
+
+const fn filter_index(filter: crate::query::Filter) -> usize {
+    match filter {
+        crate::query::Filter::All => 0,
+        crate::query::Filter::Active => 1,
+        crate::query::Filter::Completed => 2,
     }
 }
 
@@ -159,6 +177,7 @@ impl Store {
             order: Vec::new(),
             next_key: 1,
             epoch: 0,
+            filter_epoch: [0; 3],
             completed: 0,
             io_reads: 0,
             io_writes: 0,
@@ -180,6 +199,7 @@ impl Store {
         assert!(self.rows.fill(slot, row), "fresh reservation must be empty");
         self.order.push(slot);
         self.record_write();
+        self.touch_filters([true, true, true]);
         Handle::new(self.runtime, slot, generation)
     }
 
@@ -197,6 +217,7 @@ impl Store {
             self.completed -= 1;
         }
         self.record_write();
+        self.touch_filters([false, true, true]);
         Ok(completed)
     }
 
@@ -220,6 +241,7 @@ impl Store {
             self.completed -= 1;
         }
         self.record_write();
+        self.touch_filters([false, true, true]);
         Ok(())
     }
 
@@ -234,6 +256,7 @@ impl Store {
             self.completed -= 1;
         }
         self.record_write();
+        self.touch_filters([true, true, true]);
         Ok(removed)
     }
 
@@ -262,6 +285,7 @@ impl Store {
             // One `clear_completed` call is one write, however many rows it
             // removed (`metrics::Counters::io_writes`).
             self.record_write();
+            self.touch_filters([true, true, true]);
         }
         removed
     }
@@ -370,6 +394,40 @@ impl Store {
         self.next_key = draft.next_key;
         self.epoch = draft.epoch;
         self.io_writes = draft.io_writes;
+        self.touch_filters(draft.filter_mask);
+    }
+
+    /// The membership epoch of one filter (`SPEC-GATE-A0-07`).
+    pub const fn epoch_for(&self, filter: crate::query::Filter) -> u64 {
+        self.filter_epoch[filter_index(filter)]
+    }
+
+    /// True when the filter matches no row, answered from the membership
+    /// counters without scanning (`SPEC-GATE-A0-08`).
+    pub const fn is_empty_for(&self, filter: crate::query::Filter) -> bool {
+        match filter {
+            crate::query::Filter::All => self.order.is_empty(),
+            crate::query::Filter::Active => self.completed == self.order.len(),
+            crate::query::Filter::Completed => self.completed == 0,
+        }
+    }
+
+    /// Rows a filter scan would visit.
+    pub const fn scan_cost(&self) -> usize {
+        self.order.len()
+    }
+
+    pub(crate) fn touch_filters(&mut self, mask: [bool; 3]) {
+        for (index, dirty) in mask.iter().enumerate() {
+            if *dirty {
+                self.filter_epoch[index] += 1;
+            }
+        }
+    }
+
+    /// Committed `completed` flag at a slot, without going through a handle.
+    pub(crate) fn completed_at(&self, slot: SlotIndex) -> Option<bool> {
+        self.rows.get_ref(slot).map(Row::completed)
     }
 
     pub(crate) fn key_of(&self, row: Handle<Row>) -> Option<RowKey> {

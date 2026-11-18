@@ -21,6 +21,27 @@
 //!
 //! Identity domains do not convert into each other (`SPEC-RT-002`):
 //!
+//! `SPEC-GATE-A0-02`: a handle stays `Copy`, so it cannot carry the title.
+//! These two failures are the contract, not decoration — the first is the
+//! language rule that forces `read_once` to return an owned `String`, and the
+//! second is the absence of an owned `get` on the authority.
+//!
+//! ```compile_fail
+//! // E0204: `Copy` cannot be implemented for a type that owns a `String`.
+//! #[derive(Clone, Copy)]
+//! struct CopyRow {
+//!     title: String,
+//! }
+//! ```
+//!
+//! ```compile_fail
+//! use zenui_core::{RowId, Runtime};
+//!
+//! fn owned_get(runtime: &Runtime, row: RowId) {
+//!     let _ = runtime.get(row); // E0599: no owned `get`; use `read_once`
+//! }
+//! ```
+//!
 //! ```compile_fail
 //! use zenui_core::{RowKey, ViewId};
 //!
