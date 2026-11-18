@@ -55,6 +55,7 @@ replaces: []
 | [ADR-0012](adr-0012-evidence-status-and-prefixes.md) | evidence 层允许 `SPEC`/`WITHDRAWN` 作为断言状态；接受 `SRC path:line` 为第三种证据前缀 | `SPEC-SCOPE-021`；`CLAIM-*` 台账规则 | normative |
 | [ADR-0013](adr-0013-archive-read-only.md) | 归档只读、不重写；版本 pin / Gate / 完成度描述一律失效；已知过期物单列 | `SPEC-ROUTE-001`、`-002`；`SPEC-STYLE-011`、`-012` | normative |
 | [ADR-0014](adr-0014-baseline-defects-are-gate-criteria.md) | baseline / intrinsic / synthesis 缺陷写成 Gate 硬判据，不以"探针绿"关闭 | `SPEC-GATE-B-01`…`-03`；`SPEC-TEXT-001`…`-003`、`-006` | normative |
+| [ADR-0015](adr-0015-render-ownership-splits.md) | 渲染线三处归属切分：生命周期归 `SPEC-RT`、声明形态归 `SPEC-STYLE`、坐标单位归 `SPEC-TEXT` | `SPEC-RENDER-011`、`-016`；`SPEC-TEXT-015`；`SPEC-RT-024`、`-026`；`SPEC-STYLE-002`、`-004`、`-052`、`-055` | normative |
 
 ## 3. 每条的固定结构
 
@@ -73,6 +74,7 @@ replaces: []
 | `archive/review/FINAL.md` §0、§8 主控裁决 | 0001–0008、0010 | 只作为历史来源；现行约束以 `spec/` 为准 |
 | `archive/research/stack-decisions.md`、`CONCLUSION.md` | 0004、0005、0006、0009 | 版本与生态取舍的论证过程 |
 | 2026-11-18 队长裁决 D-01…D-06 | 0012、0013、0014（0010 同步） | 证据状态词、归档只读、Gate 唯一化、baseline 硬判据 |
+| 渲染线三处归属切分（队长裁决） | 0015 | 生命周期 / 声明形态 / caret 单位的唯一 owner |
 | `docs/README.md` 四层治理契约 | 0011 | 文档层的唯一入口与状态词表 |
 
 ## 5. 维护规则

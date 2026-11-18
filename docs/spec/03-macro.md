@@ -219,16 +219,16 @@ replaces: []
 
 以下条目只描述“已存在的小宏能做什么”，**不构成产品能力**。每项都只以 `EVID-VAL-*` 引用，明细与命令见 [../evidence/validation.md](../evidence/validation.md)。
 
-| 能力 | 状态 | 边界 |
-|---|---|---|
-| rstml 能解析目标 RSX 的 node/component/attribute 形状 | PROBE | parse-only，不产生任何运行时结构 |
-| `view!` 接受 `view`/`text`/`button`，`class` 字面量编译为 StyleRule，`on:click`/`change`/`input` 保留为 Rust 闭包 | PROBE | 无组件、无 props、无 `aria:`/`style:*` |
-| 3 个 compile-fail：DOM 标签、脚本字符串事件、未知 class | PROBE | 错误文案已固定为 stderr 快照；unknown_class 目前高亮整段字面量 |
-| 绑定不在 mount 求值、事件不在 mount 执行、显式求值一次、事件不重定向 | PROBE | 仅 text content 与单一事件 |
-| 组件/PascalCase、props、children、slot、`Show`/`For`/`Index` | SPEC | 探针明确未实现 |
-| 宏产出生产 `MountPlan` | SPEC | 现 `Node` 是 inspection record，**不得**改名冒充生产 plan |
-| 精确 class 子 span | OPEN | 现为整串 + byte offset |
-| 依赖重命名（renamed facade） | OPEN | 现硬编码 `::zenui_macro_runtime` |
+| 能力 | 状态 | 证据 | 边界 |
+|---|---|---|---|
+| rstml 能解析目标 RSX 的 node/component/attribute 形状 | PROBE | `EVID-VAL-08`（H1 夹具，不可复跑） | parse-only，不产生任何运行时结构 |
+| `view!` 接受 `view`/`text`/`button`，`class` 字面量编译为 StyleRule，`on:click`/`change`/`input` 保留为 Rust 闭包 | PROBE | `EVID-VAL-02`（H1）、`EVID-VAL-13`（H2 本轮复跑） | 无组件、无 props、无 `aria:`/`style:*` |
+| 3 个 compile-fail：DOM 标签、脚本字符串事件、未知 class | PROBE | `EVID-VAL-02`、`EVID-VAL-13` | 错误文案已固定为 stderr 快照；unknown_class 目前高亮整段字面量 |
+| 绑定不在 mount 求值、事件不在 mount 执行、显式求值一次、事件不重定向 | PROBE | `EVID-VAL-01`（H1）、`EVID-VAL-12`（H2） | 仅 text content 与单一事件 |
+| 组件/PascalCase、props、children、slot、`Show`/`For`/`Index` | SPEC | 无（探针未覆盖） | 探针明确未实现 |
+| 宏产出生产 `MountPlan` | SPEC | 无（`EVID-VAL-17` 只证明 0 tests） | 现 `Node` 是 inspection record，**不得**改名冒充生产 plan |
+| 精确 class 子 span | OPEN | 无 | 现为整串 + byte offset |
+| 依赖重命名（renamed facade） | OPEN | 无 | 现硬编码 `::zenui_macro_runtime` |
 
 `archive/review/README.md` 与 `VALIDATION.md` 都记录了探针的 0-test target；任何“宏已完成”的表述都 MUST 以上表为准，0 tests 不算完成。
 
