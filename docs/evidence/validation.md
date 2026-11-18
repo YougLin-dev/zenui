@@ -37,7 +37,7 @@ replaces: []
 | 主机 | OS | Rust | GPU / adapter | commit | 证据性质 |
 |---|---|---|---|---|---|
 | **H1** | Windows 11，MSVC 工具链 | `1.99.1 x86_64-pc-windows-msvc` | NVIDIA GeForce RTX 4060 Laptop GPU / Vulkan | 未记录 | 上一轮记录（转述） |
-| **H2** | macOS 27.0.1 (26A434)，Apple M4（10 核 GPU，Metal 4） | `1.99.1 (58cf8f9c3 2026-10-13) aarch64-apple-darwin` | Apple M4 / `metal` | `ab5339b`（EVID-VAL-12…19）/ `83b21a4`（EVID-VAL-20/-21）/ `%COMMIT%`（EVID-VAL-23…26） | **本轮实测**（commit 逐条见各条目） |
+| **H2** | macOS 27.0.1 (26A434)，Apple M4（10 核 GPU，Metal 4） | `1.99.1 (58cf8f9c3 2026-10-13) aarch64-apple-darwin` | Apple M4 / `metal` | `ab5339b`（EVID-VAL-12…19）/ `83b21a4`（EVID-VAL-20/-21）/ bb16522b03abd7fb0102fb092c49284615416fbc（EVID-VAL-23…26） | **本轮实测**（commit 逐条见各条目） |
 | **CI** | GitHub Actions 矩阵：`ubuntu-26.04` / `macos-26-arm64` / `windows-2025-vs2026` | `rustc 1.99.1 (58cf8f9c3 2026-10-13)`，三个 runner 一致（取自 `rust-toolchain.toml` 的 pin） | 无（headless；A0 不需要 GPU） | `213f772`（main 上的 PR #5 merge commit） | **本轮 CI 实测**，run [`44284925421`](https://github.com/YougLin-dev/zenui/actions/runs/44284925421) |
 
 > H1 的 commit 在原始记录中未写下，这是本轮无法补的缺口；引用 H1 结果时应同时声明"commit 未知"。
@@ -68,10 +68,11 @@ replaces: []
 | EVID-VAL-20 | A | `cargo run -p zenui-app --example todolist_headless --locked` | **H2** | 9 步 trace，两次运行逐字节一致 | VERIFIED（仅 A0-01 的命令与 trace；A0-02…11 仍 OPEN） |
 | EVID-VAL-21 | A | `cargo test --workspace --locked` | **H2** | 40 passed（34 + 6） | VERIFIED |
 | EVID-VAL-22 | D | `cargo test --workspace --locked` | **CI** | 40 passed × 3 平台 | VERIFIED（CI 日志） |
-| EVID-VAL-23 | A | `cargo test -p zenui-core --test gates --locked` | **H2** | 4 passed（A0-03/04/06 夹具） | VERIFIED（四条 mutation 逐一判红，见条目） |
-| EVID-VAL-24 | A | `cargo test -p zenui-core --locked` | **H2** | 50 passed（44 + 4 + 2 doctest） | VERIFIED |
+| EVID-VAL-23 | A | `cargo test -p zenui-core --test gates --locked` | **H2** | 6 passed（A0-03/04/06 夹具） | VERIFIED（四条 mutation 逐一判红，见条目） |
+| EVID-VAL-24 | A | `cargo test -p zenui-core --locked` | **H2** | 65 passed（45 + 6 + 8 + 6 doctest） | VERIFIED |
 | EVID-VAL-25 | A | `cargo run -p zenui-app --example todolist_headless --locked` | **H2** | 9 步 trace，sha256 与 EVID-VAL-20 相同 | VERIFIED（语义未变，不是重新录制） |
 | EVID-VAL-26 | A | `cargo clippy --workspace --all-targets --locked -- -D warnings` | **H2** | exit 0 | VERIFIED（仅本机，C-04 仍 OPEN） |
+| EVID-VAL-27 | A | `cargo test -p zenui-core --test regressions --locked` | **H2** | 8 passed（审计回归夹具） | VERIFIED（三条 mutation 判红，见条目） |
 
 ## 3. 仓库内测试：H1 原始记录（转述）
 
@@ -402,23 +403,23 @@ $ cargo test --workspace --locked        # ubuntu-26.04 / macos-26-arm64 / windo
 ## 9. 数字台账（仅汇总本文件已定义的事实，供 CLAIM 引用）
 
 - H2 实际通过测试：**53** 条（7 + 2 + 4 + 40），来源 EVID-VAL-12/13/14/21；其中 40 条来自新的 headless workspace。这是 commit `83b21a4` 的计数。
-- H2 在 P2 之后的通过**执行数**：**107**（53 加上 EVID-VAL-23 的 4 与 EVID-VAL-24 的 50）。它是同一批用例在新 commit 上的复跑，**不是** 107 条互不相同的测试；`EVID-VAL-21` 的 40 与 `EVID-VAL-24` 的 50 有重叠（core lib 由 34 增至 44），不得相加当作"新增覆盖"。
-- H2 compile-fail fixture：**5** 条 = EVID-VAL-13 的 3 条 trybuild + EVID-VAL-24 的 2 条 `compile_fail` doctest。
+- H2 在 P2 之后的通过**执行数**：**132**（53 加上 EVID-VAL-23 的 6、EVID-VAL-24 的 65 与 EVID-VAL-27 的 8）。它是同一批用例在新 commit 上的复跑，**不是** 107 条互不相同的测试；`EVID-VAL-21` 的 40 与 `EVID-VAL-24` 的 50 有重叠（core lib 由 34 增至 44），不得相加当作"新增覆盖"。
+- H2 compile-fail fixture：**9** 条 = EVID-VAL-13 的 3 条 trybuild + EVID-VAL-24 的 6 条 `compile_fail` doctest。
 - 0-test target：根 package，来源 EVID-VAL-17。
 - 跨图形后端 GPU 观测：**2** 个数据点（Vulkan/NVIDIA 来自 H1 转述，Metal/Apple M4 来自 EVID-VAL-15），**不是** "GPU 矩阵已通过"。
 - CI 实际通过测试：**120** 次执行 = 40 条 × 3 个 runner（`EVID-VAL-22`）。它是**执行次数**，不是 120 条不同的测试，也不得与 H2 的 53 相加；同一批 40 条测试在 H2 与 CI 上各跑过。
-- 可复跑性分布：26 条中 **14 条**（A 类）可在本机原样复跑；**11 条**（B/C 类）依赖上一轮记录或仓库外夹具；**1 条**（D 类，`EVID-VAL-22`）在 CI runner 上，重跑 workflow 可复现，本机不能代替。
+- 可复跑性分布：27 条中 **15 条**（A 类）可在本机原样复跑；**11 条**（B/C 类）依赖上一轮记录或仓库外夹具；**1 条**（D 类，`EVID-VAL-22`）在 CI runner 上，重跑 workflow 可复现，本机不能代替。
 
 不得使用"基本完成""大部分支持""应该可以"描述以上任何数字。
 
 ## 11. P2 轮（MORT-5）在 H2 的复跑
 
 本节四条记录的是 `feat/MORT-5-transaction-journal` 上的运行，被测代码 commit
-`%COMMIT%`。与 §6 一样，**一条记录只对应一条命令**；分支与 commit 相同不构成合并记录的许可。
+bb16522b03abd7fb0102fb092c49284615416fbc。与 §6 一样，**一条记录只对应一条命令**；分支与 commit 相同不构成合并记录的许可。
 
 ### EVID-VAL-23 A0 gate 夹具（H2）
 
-- 分支：`feat/MORT-5-transaction-journal`；被测代码 commit `%COMMIT%`。
+- 分支：`feat/MORT-5-transaction-journal`；被测代码 commit bb16522b03abd7fb0102fb092c49284615416fbc。
 - 主机：H2（macOS 27.0.1 / Apple M4）；`rustc 1.99.1 (58cf8f9c3 2026-10-13) aarch64-apple-darwin`。
 
 ```text
@@ -427,7 +428,9 @@ test a0_03_cross_runtime_access_is_rejected ... ok
 test a0_03_stale_handle_does_not_alias_the_reused_slot ... ok
 test a0_04_nested_batch_publishes_once_with_the_outer_value ... ok
 test a0_06_rejected_commit_restores_the_previous_commit ... ok
-test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test a0_03_a_failed_read_does_not_advance_io_reads ... ok
+test a0_06_a_duplicate_key_is_a_value_error_that_keeps_the_frame_alive ... ok
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 ```
 
 每条夹具比对的权威快照只含**会回滚的状态**（`titles`、`order`、`epoch`、`remaining`、
@@ -456,17 +459,18 @@ test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 
 ```text
 $ cargo test -p zenui-core --locked
-     Running unittests src/lib.rs (zenui_core)    44 passed; 0 failed
-     Running tests/gates.rs (zenui_core)           4 passed; 0 failed
-   Doc-tests zenui_core                            2 passed; 0 failed
-（合计 50 passed / 0 failed）
+     Running unittests src/lib.rs (zenui_core)    45 passed; 0 failed
+     Running tests/gates.rs (zenui_core)           6 passed; 0 failed
+     Running tests/regressions.rs (zenui_core)     8 passed; 0 failed
+   Doc-tests zenui_core                            6 passed; 0 failed
+（合计 65 passed / 0 failed）
 ```
 
-- 44 条单测里与本次 gate 直接相关的：
+- 45 条单测里与本次 gate 直接相关的：
   - A0-05 的图侧夹具：`a_diamond_never_observes_two_epochs`（同一 epoch 的两个分支在 join 处必须相等）、`a_long_chain_keeps_the_final_value_consistent`（7 级链逐级 `+1`）；事务侧夹具：`runtime::tests::a_write_during_compute_is_a_domain_error`（`Phase::Topo` 下 `insert` 返回 `Fatal::PhaseViolation`，下一帧正常提交）。
   - A0-06 的映射单测：`layout::tests` 3 条（plan 只读可见、`discard` 遗忘计划、mount+unmount 同 view 与缺失 plan 均被 preflight 拒绝）。
   - A0-03 的槽位单测：`arena` 与 `store` 下 4 条（见 EVID-VAL-20 的「不证明什么」）。
-- 2 条 doctest 是 `compile_fail` 夹具，锁 `SPEC-RT-002` 的身份域不互通：`ViewId → RowKey` 与 `LayoutNodeId → RowKey` 都必须 **E0308**。这两条是 EVID-VAL-13 三个 compile-fail fixture 之外的**新增**数量，统计见 §9。
+- 6 条 doctest 是 `compile_fail` 夹具，锁 `SPEC-RT-002` / `SPEC-GATE-A0-03` 的身份域**双向**不互通：`ViewId`/`RowKey`/`LayoutNodeId` 两两互传都必须 **E0308**。这是 EVID-VAL-13 三个 compile-fail fixture 之外的新增数量，统计见 §9。
 - **不证明什么**：`zenui-app` 的 6 条 golden 测试不在本命令内（见 EVID-VAL-25 与 EVID-VAL-21）；单测数量不等于 gate 覆盖数。
 
 ### EVID-VAL-25 重构后的 trace 复跑（H2）
@@ -495,3 +499,51 @@ $ cargo clippy --workspace --all-targets --locked -- -D warnings
 
 - 同轮 `cargo fmt --all -- --check` 通过。
 - **不证明什么**：这**不是** CI 日志。`SPEC-GATE-C-04` 的判据是仓库 CI 上的 `cargo clippy` 与 `cargo package` 记录，两者仍然缺失，因此 **C-04 保持 OPEN**。本机通过只说明本机通过。
+
+## 12. ADR-0017 一致性审计的回归（H2）
+
+被测代码 commit `bb16522b03abd7fb0102fb092c49284615416fbc`。审计由 5 个独立审查视角并发执行（每个只看一组 ADR 决策或 spec 条款），
+候选缺陷再经过一轮对抗验证；下面的 8 条是修完后固化的回归夹具。
+
+### EVID-VAL-27 审计回归夹具（H2）
+
+```text
+$ cargo test -p zenui-core --test regressions --locked
+test a_swallowed_nested_failure_poisons_the_frame ... ok
+test a_discarded_frame_does_not_rewind_row_keys ... ok
+test a_removal_wins_over_a_staged_value ... ok
+test an_insert_removed_in_the_same_frame_leaves_no_row ... ok
+test a_partial_view_order_is_rejected ... ok
+test a_mount_for_a_removed_row_is_rejected ... ok
+test a_focus_on_an_unmounted_view_is_rejected ... ok
+test a_discarded_frame_does_not_burn_layout_ids ... ok
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
+**审计发现的真实缺陷（修前全部可复现）**
+
+| 夹具 | 修前行为 | 条款 |
+|---|---|---|
+| `a_swallowed_nested_failure_poisons_the_frame` | 内层 `batch` 返回 `Err` 被外层吞掉后，内层 staged 写仍然提交 | ADR-0017 决定 8 |
+| `a_discarded_frame_does_not_rewind_row_keys` | `discard` 后 key 分配器回退，第三次 insert 会铸出重复 `RowKey` | `SPEC-RT-002` |
+| `a_removal_wins_over_a_staged_value` | 同帧删除后 `with_title`/`completed`/`read_once` 仍返回旧值 | ADR-0017 决定 4 |
+| `an_insert_removed_in_the_same_frame_leaves_no_row` | 同帧 insert+remove 仍然填槽，槽位永久泄漏 | `SPEC-RT-051` |
+| `a_partial_view_order_is_rejected` | 局部 view order 在 apply 时被静默过滤，view 失联 | `SPEC-RT-052` |
+| `a_mount_for_a_removed_row_is_rejected` | 为已删行挂载的 view 可以提交 | `SPEC-RT-052` |
+| `a_focus_on_an_unmounted_view_is_rejected` | focus 指针可与 journal 不一致地提交 | `SPEC-RT-052` |
+| `a_discarded_frame_does_not_burn_layout_ids` | 失败帧推进 `LayoutNodeId` 分配器 | `SPEC-RT-051` |
+
+**判红复核**（每条 mutation 跑完立即还原）：
+
+| 夹具 | mutation | 结果 |
+|---|---|---|
+| `a_discarded_frame_does_not_rewind_row_keys` | `discard` 不再以高水位重种 journal | **FAILED** |
+| `a_swallowed_nested_failure_poisons_the_frame` | `batch` 不再设置 poison | **FAILED** |
+| `a_partial_view_order_is_rejected` | 删除 preflight 的 view order 置换检查 | **FAILED** |
+| `a_removal_wins_over_a_staged_value` | `effective_completed` 忽略暂存删除 | **FAILED** |
+
+- **不证明什么**：
+  - **memo cycle 没有检测**。`GraphError` 没有 cycle 变体，环仍表现为 compute 重入并用陈旧值算出结果；A0-05 中「cycle 是领域错误」这一半没有实现，也没有夹具。
+  - **Cleanup 阶段本身没有被任何帧进入过**：cleanup 回调现在在换入之后、`Phase::Cleanup` 下执行，但「cleanup 中 unmount 的意图只入 journal」没有独立夹具。
+  - 审计指出 `LayoutMap` 原本是公开类型（`pub use layout::LayoutMap`），与 ADR 决定 12 的「core 私有」不一致；本轮已改为 `mod layout;`（不再导出），但**尚无夹具**断言它不可被下游命名。
+  - `SPEC-RT-053` 把 duplicate key 列为必须丢弃事务的 preflight 失败，而 ADR-0017 决定 7 把它归为值错误并使帧继续提交。代码按 ADR 执行；这是 spec 与 ADR 的冲突，需要裁决，不由实现者就地解释。

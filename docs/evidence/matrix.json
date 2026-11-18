@@ -330,7 +330,7 @@
       "command": "cargo test -p zenui-core --test gates --locked",
       "exit": 0,
       "commit": "867a7b3d9b4ba08ad17b208619b1e8f926080a21",
-      "tests": { "passed": 4, "failed": 0, "ignored": 0 },
+      "tests": { "passed": 6, "failed": 0, "ignored": 0 },
       "proves": "A0-03 stale 复用、A0-03 跨 runtime 写拒绝、A0-04 内层 batch 只发布一次且发布外层值、A0-06 预检失败回滚到上一已提交状态；四条均做过去掉实现即判红的 mutation 复核",
       "doesNotProve": "A0-02 的 trybuild fixture；A0-05 的环检测；A0-06 与真实 Taffy 的对接；任何窗口/GPU/性能结论"
     },
@@ -342,8 +342,8 @@
       "command": "cargo test -p zenui-core --locked",
       "exit": 0,
       "commit": "867a7b3d9b4ba08ad17b208619b1e8f926080a21",
-      "tests": { "passed": 50, "failed": 0, "ignored": 0 },
-      "compileFailFixtures": 2,
+      "tests": { "passed": 65, "failed": 0, "ignored": 0 },
+      "compileFailFixtures": 6,
       "proves": "zenui-core lib 44 + gate 夹具 4 + 2 条 compile_fail doctest；含 A0-05 的 diamond/长链无 glitch 与 WriteDuringCompute 领域错误、A0-06 的 LayoutMap preflight 单测",
       "doesNotProve": "zenui-app 的 golden 测试不在本命令内；单测数量不等于 gate 覆盖数"
     },
@@ -369,6 +369,18 @@
       "commit": "867a7b3d9b4ba08ad17b208619b1e8f926080a21",
       "proves": "本机全 workspace（含 all-targets）零 clippy 警告；同轮 cargo fmt --all -- --check 通过",
       "doesNotProve": "不是 CI 日志；SPEC-GATE-C-04 要求的 CI 记录仍缺失，C-04 保持 OPEN"
+    },
+    {
+      "id": "EVID-VAL-27",
+      "class": "A",
+      "host": "H2",
+      "kind": "test",
+      "command": "cargo test -p zenui-core --test regressions --locked",
+      "exit": 0,
+      "commit": "bb16522bbdb5c861afebe5c7d6cf0864f3d37f17b03abd7fb0102fb092c49284615416fbc",
+      "tests": { "passed": 8, "failed": 0, "ignored": 0 },
+      "proves": "ADR-0017 一致性审计发现的 8 个缺陷各有回归夹具：嵌套失败中毒、discard 不回退 row key、removal 压过 staged 值、同帧 insert+remove 归还槽位、局部 view order 被拒、mount 指向已删行被拒、focus 指向将被卸载的 view 被拒、失败帧不烧 LayoutNodeId",
+      "doesNotProve": "审计仍有未修项：memo cycle 无检测、Cleanup 阶段的 unmount 意图未单独验证、A0-05 的 per-epoch 计数只在单测层"
     }
   ],
 
@@ -504,13 +516,13 @@
   },
 
   "counts": {
-    "testsPassedH2": 107,
+    "testsPassedH2": 132,
     "testsPassedCi": 120,
-    "compileFailFixturesH2": 5,
+    "compileFailFixturesH2": 9,
     "zeroTestTargetsH2": ["root package zenui"],
     "gpuBackendsObserved": 2,
-    "runsTotal": 26,
-    "runsReproducibleHere": 14,
+    "runsTotal": 27,
+    "runsReproducibleHere": 15,
     "runsTranscribedOrExternal": 11,
     "runsOnCi": 1
   },

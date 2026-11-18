@@ -84,6 +84,7 @@ replaces: []
 | EVID-VAL-24 | A | `cargo test -p zenui-core --locked`（H2，commit `%COMMIT%`） | 50 passed（44 lib + 4 gates + 2 doctest） |
 | EVID-VAL-25 | A | `cargo run -p zenui-app --example todolist_headless --locked`（H2，commit `%COMMIT%`） | 9 步 trace，sha256 与 EVID-VAL-20 相同 |
 | EVID-VAL-26 | A | `cargo clippy --workspace --all-targets --locked -- -D warnings`（H2，commit `%COMMIT%`） | exit 0（本机，不是 CI 日志） |
+| EVID-VAL-27 | A | `cargo test -p zenui-core --test regressions --locked`（H2，commit `bb16522b03abd7fb0102fb092c49284615416fbc`） | 8 passed（ADR-0017 审计回归夹具） |
 | SRC | — | 仓库源码/清单，`path:line` | 本轮静态核对，可直接复查 |
 
 > **已裁决（C-18/D-02，ADR-0012）**：`docs/README.md` §6 现已承认第三种证据前缀 `SRC path:line`，
@@ -242,6 +243,12 @@ replaces: []
 | CLAIM-102 | A0-03 有 gate 级夹具：跨 runtime 写被拒绝、remount 后旧 handle 不 alias 复用槽位；去掉 generation 推进即判红 | VERIFIED | EVID-VAL-23（含 mutation 表）；SRC `crates/core/tests/gates.rs` | A0 | **不覆盖**跨 runtime 读与 A0-02 的 trybuild fixture |
 | CLAIM-103 | A0-05 有夹具：diamond 与 7 级长链在同一 epoch 内不产生 glitch；`Phase::Topo` 下的写返回 `Fatal::PhaseViolation` 且下一帧可提交 | VERIFIED | EVID-VAL-24；SRC `crates/core/src/graph.rs`、`crates/core/src/runtime.rs` | A0 | **无环检测**：环仍表现为 compute 重入，没有对应错误变体 |
 | CLAIM-104 | A0-06 的映射子句由 core 内零依赖 `LayoutMap` 承担：`plan` 只对帧内可见，`preflight` 拒绝 mount+unmount 同 view、缺失 plan 与重复 id，`discard` 清空计划 | VERIFIED | EVID-VAL-23、EVID-VAL-24；SRC `crates/core/src/layout.rs` | A0 | **不是** Taffy 适配器；与真实布局引擎对接仍 OPEN |
+| CLAIM-105 | 帧事务的失败语义已被回归夹具钉住：嵌套失败中毒、discard 不回退 row key、暂存删除压过暂存值、同帧 insert+remove 归还预留槽位 | VERIFIED | EVID-VAL-27；SRC `crates/core/src/txn.rs`、`crates/core/tests/regressions.rs` | A0 | 不含 memo cycle 检测 |
+| CLAIM-106 | preflight 会拒绝局部 view order、指向已删行的 mount 与指向本帧将卸载 view 的 focus，因而换入的 view 树必然与 journal 一致 | VERIFIED | EVID-VAL-27；SRC `crates/core/src/txn.rs` | A0 | 只能在单线程 headless 下验证 |
+| CLAIM-107 | 越阶段写返回 typed `ValueError::Phase` 并毒化事务，帧不会提交；debug 构建不再靠 `debug_assert!` 中止 | VERIFIED | EVID-VAL-24；SRC `crates/core/src/runtime.rs` | A0 | 仅在强制相位下测过 |
+| CLAIM-108 | `LayoutMap` 是 core 私有类型（`mod layout;`，不导出），只经 `Runtime` 的 preflight 与只读访问器对外可见，与 ADR-0017 决定 12 一致 | VERIFIED | SRC `crates/core/src/lib.rs`、`crates/core/src/layout.rs` | A0 | 无夹具断言下游无法命名该类型 |
+| CLAIM-109 | memo 环没有检测：`GraphError` 无 cycle 变体，环表现为 compute 重入并以陈旧值收敛 | OPEN | SRC `crates/core/src/graph.rs`；`docs/spec/08-gates.md` A0-05 | A0 | 「cycle 是领域错误」未实现 |
+| CLAIM-110 | `SPEC-RT-053` 把 duplicate key 列为必须丢弃事务的失败，ADR-0017 决定 7 把它归为值错误；代码按 ADR 执行 | OPEN | SRC `crates/core/src/txn.rs`；`docs/spec/02-runtime.md` -053；ADR-0017 决定 7 | A0 | 需队长裁决，不由实现者就地解释 |
 
 ---
 
@@ -249,12 +256,12 @@ replaces: []
 
 | 状态 | 条数 | 主要领域 |
 |---|---|---|
-| VERIFIED | 64 | 执行记录、源码事实、两条官方 CSS/Tailwind 事实 |
+| VERIFIED | 68 | 执行记录、源码事实、两条官方 CSS/Tailwind 事实 |
 | SPEC | 9 | Store/Query/For/焦点契约中尚未实现的部分 |
-| OPEN | 12 | MSRV、bidi/emoji、capabilities、surface/DPI、Mac/Linux、mask/filter、3D depth、IME、AT、平台矩阵、版本组合 |
+| OPEN | 14 | MSRV、bidi/emoji、capabilities、surface/DPI、Mac/Linux、mask/filter、3D depth、IME、AT、平台矩阵、版本组合 |
 | WITHDRAWN | 13 | 旧 mount 形状、条件语法、优先级、Copy+String、retained-visibility 等 |
 | PROBE | 6 | rstml parse-only、3 条 C 类夹具记录、tailwind crate 研究探针、A0 query 缓存共享 |
-| **合计** | **104** | — |
+| **合计** | **110** | — |
 
 > 注意：`VERIFIED` 只表示"该断言在其限定范围内有记录"，不表示整个子系统完成。例如
 > CLAIM-064 只证明 H1/H2 两个 headless 数据点，不证明窗口、surface 或其他 Linux 后端。
