@@ -313,6 +313,48 @@ mod tests {
         assert!(tree.geometry_epoch() > epoch);
     }
 
+    /// `SPEC-GATE-A0-09`: a same-owner reorder preserves `ViewId` **and**
+    /// generation. The identity half is pinned end-to-end in
+    /// `crates/core/tests/lifecycle.rs`; this fixture isolates the generation
+    /// field so the clause has an executable object.
+    ///
+    /// Boundary: A0 never recycles a view slot (`mount_row` skips generation
+    /// reuse), so this pins "a reorder does not touch generation", not
+    /// "generation still separates occupants after reuse" — reuse has no
+    /// executable object in A0.
+    ///
+    /// Red-ability: assign `node.generation.next()` to each reordered node in
+    /// `ViewTree::reorder` and the equality assertion fails.
+    #[test]
+    fn a_reorder_preserves_every_generation() {
+        let mut tree = tree();
+        let a = tree.mount_row(key(1), owner(), 1);
+        let b = tree.mount_row(key(2), owner(), 1);
+        let c = tree.mount_row(key(3), owner(), 1);
+        let generations = |tree: &ViewTree, ids: [ViewId; 3]| -> BTreeMap<ViewId, u32> {
+            ids.into_iter()
+                .map(|id| {
+                    let node = tree.node(id).expect("mounted");
+                    (id, node.generation.raw())
+                })
+                .collect()
+        };
+        let before = generations(&tree, [a, b, c]);
+
+        tree.reorder(&[c, a, b]);
+
+        assert_eq!(
+            tree.order(),
+            &[c, a, b],
+            "the fixture must reorder for real"
+        );
+        assert_eq!(
+            generations(&tree, [a, b, c]),
+            before,
+            "a reorder must not change any view generation"
+        );
+    }
+
     #[test]
     fn reorder_without_change_does_not_advance_geometry() {
         let mut tree = tree();
