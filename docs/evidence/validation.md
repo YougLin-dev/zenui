@@ -63,6 +63,7 @@ replaces: []
 | EVID-VAL-17 | A | 根 `cargo test` | **H2** | 0 tests | VERIFIED（0 = 无测试） |
 | EVID-VAL-18 | A | `#[derive(Copy)] struct{String}` | **H2** | **E0204** | VERIFIED |
 | EVID-VAL-19 | A | 目标示例 `todolist/main.rs` 单独编译 | **H2** | **40 errors** | VERIFIED（不可编译=预期） |
+| EVID-VAL-20 | A | `cargo run -p zenui-app --example todolist_headless --locked` | **H2** | 9 步 trace，两次运行逐字节一致；32 tests passed | VERIFIED（仅 A0-01 的命令与 trace；A0-02…11 仍 OPEN） |
 
 ## 3. 仓库内测试：H1 原始记录（转述）
 
@@ -247,6 +248,68 @@ error[E0425]: cannot find type `CompletedField` in this scope
 
 - 用途：把"`examples/todolist/main.rs` 是 design-only、不是可运行程序"从叙述变成可复跑的观测。任何把该文件当 A1 证据的说法都可以据此驳回。
 
+### EVID-VAL-20 Headless core 与 `todolist_headless` trace（H2，A0-01 闭环）
+
+- 分支：`feat/MORT-4-a0-headless-core`；commit `2277302bf386d1cf3609e4e97edea11d8c5fdfc0`。
+- 主机：H2（macOS 27.0.1 / Apple M4）；`rustc 1.99.1 (58cf8f9c3 2026-10-13) aarch64-apple-darwin`；`cargo 1.99.1 (5f94df478 2026-08-27)`。
+
+```text
+$ cargo run -p zenui-app --example todolist_headless --locked
+zenui headless trace v1
+scenario=todolist-headless
+
+[step 01 empty]
+  detail=no rows
+  state rows=0 remaining=0 has_completed=false filter=all keys=- focus=- caret=-
+  delta query_evals=1 id_materializations=1 mounts=0 unmounts=0 memo_recomputes=3 commits=1 focus_moves=0 caret_ops=0 io_reads=0 io_writes=0 string_clones=0
+  graph edges=3 active_sources=1 geometry_epoch=1 live_owners=1 cleanup_runs=0 sink=0
+
+... 共 9 步，完整输出逐字保存在 crates/app/tests/golden/todolist_headless.trace
+
+[step 08 invalid-rollback]
+  detail=result=InvalidHandle(vacant)
+  state rows=1 remaining=1 has_completed=false filter=active keys=C focus=view#3 caret=view#3:1
+  delta query_evals=0 id_materializations=0 mounts=0 unmounts=0 memo_recomputes=0 commits=1 focus_moves=0 caret_ops=0 io_reads=0 io_writes=0 string_clones=0
+  graph edges=4 active_sources=1 geometry_epoch=8 live_owners=2 cleanup_runs=2 sink=0
+
+[summary]
+  steps=9
+  state rows=2 remaining=2 has_completed=false filter=active keys=C,D focus=view#3 caret=view#3:1
+  total query_evals=8 id_materializations=8 mounts=4 unmounts=2 memo_recomputes=22 commits=9 focus_moves=2 caret_ops=2 io_reads=4 io_writes=7 string_clones=4
+  graph edges=4 active_sources=1 geometry_epoch=10 live_owners=3 cleanup_runs=2 sink=0
+[status] outcome=ok
+```
+
+```text
+$ cargo run -p zenui-app --example todolist_headless --locked > run1.txt
+$ cargo run -p zenui-app --example todolist_headless --locked > run2.txt
+$ diff -u run1.txt run2.txt
+（无输出）
+
+$ sha256sum run1.txt crates/app/tests/golden/todolist_headless.trace
+df124418df5407c79584e79d969d03f36a8c602570b4445184540e8bad680706  run1.txt
+df124418df5407c79584e79d969d03f36a8c602570b4445184540e8bad680706  crates/app/tests/golden/todolist_headless.trace
+```
+
+```text
+$ cargo test --workspace --locked
+     Running unittests src/lib.rs (zenui_core)         27 passed; 0 failed
+     Running tests/golden_trace.rs (zenui_app)          5 passed; 0 failed
+     其余 target（根 package 与 zenui-app lib）          0 tests
+（合计 32 passed / 0 failed）
+```
+
+- 依赖边界：`crates/core/Cargo.toml` 的 `[dependencies]` 为空（纯 `std`）；`crates/app` 只依赖 `crates/core`；两个 crate 均 `publish = false`。`Cargo.lock` 只新增 `zenui-core` 与 `zenui-app` 两个 package。
+- 本机附加检查（不在 CI 里）：`cargo clippy --workspace --all-targets --locked -- -D warnings` 与 `cargo fmt --all -- --check` 均通过。
+- 确定性构造：全 crate 不使用 `HashMap`/`HashSet`（`BTreeMap`/`BTreeSet` 与 `Vec` 顺序）；trace 不含地址、耗时、线程 id；`RowSet` 只含稳定 `RowKey`，不含 `String`。
+- **不证明什么**：这条只说明 `SPEC-GATE-A0-01` 规定的命令可跑、trace 确定、测试数非零。它不证明 A0-02…A0-11 的任何一条：
+  - `step 01` 的空 Store 上 `id_materializations=1`——空态仍靠物化集合判定，`SPEC-GATE-A0-08` 未满足；
+  - 每次 store 写都按整 epoch 重算，`step 03/05/07` 的 `id_materializations=1`——`SPEC-GATE-A0-07` 的 membership 索引与反向边未接线；
+  - `step 07` 的批量 Clear 只在 view 层结算一次焦点，`FocusRemovalIntent` 的完整顺序与取消语义未实现（`SPEC-GATE-A0-10`）；
+  - 无 staging journal 与阶段守卫，`SPEC-GATE-A0-04`/`A0-06` 未验证；`graph` 无 cycle / `WriteDuringCompute` 领域错误（`A0-05`）；
+  - `SPEC-GATE-A0-02` 无 trybuild fixture；`A0-03` 只有 slot 复用与跨 runtime 拒绝的单元测试；`A0-09` 的 unmount/setup 计数与 `A0-11` 的 churn 基线未采集。
+- Gate 状态：`docs/spec/08-gates.md` 中 `SPEC-GATE-A0-01` 仍写作 `OPEN`。该列属于 spec 层，本次未改动；翻转需由文档负责人在归档本条目后单独提交。
+
 ## 7. 本轮源码核对（不是测试，但可复核）
 
 以下四条是**读源码得到的事实**，用于防止"测试绿了所以没问题"的误判。逐条给出可对照的位置。
@@ -285,10 +348,10 @@ error[E0425]: cannot find type `CompletedField` in this scope
 
 ## 9. 数字台账（仅汇总本文件已定义的事实，供 CLAIM 引用）
 
-- H2 实际通过测试：**13** 条（7 + 2 + 4），来源 EVID-VAL-12/13/14。
+- H2 实际通过测试：**45** 条（7 + 2 + 4 + 32），来源 EVID-VAL-12/13/14/20；其中 32 条来自新的 headless workspace。
 - H2 compile-fail fixture：**3** 条，来源 EVID-VAL-13。
 - 0-test target：根 package，来源 EVID-VAL-17。
 - 跨图形后端 GPU 观测：**2** 个数据点（Vulkan/NVIDIA 来自 H1 转述，Metal/Apple M4 来自 EVID-VAL-15），**不是** "GPU 矩阵已通过"。
-- 可复跑性分布：19 条中 **8 条**（A 类）可在本机原样复跑；**11 条**（B/C 类）依赖上一轮记录或仓库外夹具。
+- 可复跑性分布：20 条中 **9 条**（A 类）可在本机原样复跑；**11 条**（B/C 类）依赖上一轮记录或仓库外夹具。
 
 不得使用"基本完成""大部分支持""应该可以"描述以上任何数字。

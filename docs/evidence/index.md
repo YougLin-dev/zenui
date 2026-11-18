@@ -19,7 +19,7 @@ replaces: []
 | 文件 | 定义什么 | 状态 |
 |---|---|---|
 | `index.md`（本文件） | 复跑入口、主机约定、引用规则、陷阱 | normative |
-| `validation.md` | `EVID-VAL-01…19`：每条命令 + 主机 + 结果 + 边界 | normative |
+| `validation.md` | `EVID-VAL-01…20`：每条命令 + 主机 + 结果 + 边界 | normative |
 | `matrix.json` | `EVID-MATRIX`：上述运行与 11 组合同的机器投影 | normative |
 | `claim-register.md` | `CLAIM-*`：可判真假的单句断言（唯一事实来源） | normative（研究员交付，436 行） |
 | `probes.md` | `EVID-PROBE-01…05`：探针能力与证伪边界 | normative（本文件负责人，见 §1.1） |
@@ -43,7 +43,8 @@ replaces: []
 ### 2.1 前置
 
 - Rust `1.99.1`（`rust-toolchain.toml` 尚未建立；在此之前以本文件记录的工具链为准）。
-- **三个示例各自是独立 workspace**（各自有 `Cargo.toml` 的 `[workspace]`），根 package 不是统一 workspace。所以命令必须带 `--manifest-path`，缓存也按 workspace 分开。
+- 根 `Cargo.toml` 自 M0 P1 起是 workspace（members `crates/core`、`crates/app`，`resolver = "3"`）；根 package `zenui` 仍是 workspace 成员。
+- **三个 PoC 示例各自是独立 workspace**（各自有 `Cargo.toml` 的 `[workspace]`），因此对 PoC 的命令必须带 `--manifest-path`，缓存也按 workspace 分开；workspace 内的 crate 用 `-p` 选择。
 - 根 `Cargo.toml` 设 `autoexamples = false`：`examples/todolist/main.rs` 是 design-only，**不应该**被当成可构建目标。
 - 首次构建约 2–3 分钟编译依赖，三个 workspace 各自 `target/` 合计约 2.5 GB（`**/target/` 已被 gitignore）。
 
@@ -59,8 +60,9 @@ replaces: []
 | 6 | `cargo test --manifest-path Cargo.toml` | **0 tests** —— 不是通过 | `EVID-VAL-17` |
 | 7 | `rustc --edition 2024 --crate-type lib <tmp>/copy_string.rs`（源码见 `validation.md` `EVID-VAL-18`） | 必须 **E0204**（预期失败） | `EVID-VAL-18` |
 | 8 | `rustc --edition 2024 --crate-type lib --emit=metadata --out-dir <tmp> examples/todolist/main.rs` | 必须 **40 个 error**（预期失败，证明 design-only） | `EVID-VAL-19` |
+| 9 | `cargo run -p zenui-app --example todolist_headless --locked` | 9 步 trace；两次运行逐字节一致 | `EVID-VAL-20` |
 
-1–6 与 `EVID-VAL-12…17` 一一对应（顺序按 ID 排）；7–8 是两处**预期失败**的独立检查，对应 `EVID-VAL-18…19`。
+1–6 与 `EVID-VAL-12…17` 一一对应（顺序按 ID 排）；7–8 是两处**预期失败**的独立检查，对应 `EVID-VAL-18…19`；9 是 M0 的 headless 闭环，对应 `EVID-VAL-20`。
 
 一键脚本（只读仓库；只往 `mktemp -d` 里写）：
 
@@ -75,6 +77,7 @@ run cargo test --manifest-path examples/native_poc/Cargo.toml  --lib
 run cargo run  --manifest-path examples/native_poc/Cargo.toml
 run cargo run  --manifest-path examples/desktop_poc/Cargo.toml
 run cargo test --manifest-path Cargo.toml
+run cargo run -p zenui-app --example todolist_headless --locked
 
 tmp=$(mktemp -d)
 cat > "$tmp/copy_string.rs" <<'EOF'
@@ -109,7 +112,7 @@ run_fail rustc --edition 2024 --crate-type lib --emit=metadata --out-dir "$tmp" 
 
 ## 5. 新增一条 EVID-VAL 的流程
 
-1. **只增不改**：已有 ID 的结论变了，新开一条（`EVID-VAL-20`）并在旧条目写明 `supersededBy`；不要原地改写历史输出。
+1. **只增不改**：已有 ID 的结论变了，新开一条（顺延一个 ID）并在旧条目写明 `supersededBy`；不要原地改写历史输出。
 2. **失败也记**：编译失败、断言红、跑不起来都是证据（`EVID-VAL-09/-11/-18/-19` 都是失败记录），比"没跑"有用得多。
 3. **写清边界**：每条必须有一行"不证明什么"。没有这一行的条目视为不合格。
 4. **同步 `matrix.json`**：加 run 对象；若影响 Gate 判据，改 `08-gates.md` 的状态列并更新 `coverage` 计数。
@@ -124,7 +127,7 @@ run_fail rustc --edition 2024 --crate-type lib --emit=metadata --out-dir "$tmp" 
 | 程序自报主机错误 | 两个 GPU 探针都硬编码打印 `SCOPE: ... Windows ...` | 主机以 H 表为准；该字符串待实现负责人修 |
 | 测试名误导 | `hover_only_supersedes_the_matching_property` 沿用已撤销措辞 | 它只断言 class 内部的 hover 变体覆盖，不涉及 inline vs class 的 origin 顺序 |
 | 文档未记录 commit | H1 的所有结论没有 commit | 引用时声明"commit 未知"，不得当作可精确复现的基线 |
-| 探针通过 ⇒ 产品能力 | 13 条测试全绿 | 它们分别只覆盖平坦 sink、rstml 形状、Taffy/Parley 测量；见各自条目的"不证明" |
+| 探针通过 ⇒ 产品能力 | 45 条测试全绿（含 M0 的 32 条） | 它们分别只覆盖平坦 sink、rstml 形状、Taffy/Parley 测量、headless 身份/事务骨架；见各自条目的"不证明" |
 
 ## 7. 与 Gate 的对应
 
@@ -139,6 +142,6 @@ Gate 判据（`SPEC-GATE-*`）在 `docs/spec/08-gates.md`。当前映射：42 �
 
 本轮新增：`index.md`、`validation.md`、`matrix.json`、`probes.md`（commit `ab5339b` 之后、队长统一提交前）。`claim-register.md` 由研究员交付，本层只引用不改写。原始记录 `archive/review/VALIDATION.md`、`archive/review/validation-matrix-raw.json` 保持原文不动，归档后由本层接管引用。
 
-编号一致性：`claim-register.md` 的证据键表已与本层 `EVID-VAL-01…19` 的 19 条逐一对应（含 H1/H2 与服务端编号），无需再收敛。
+编号一致性：`claim-register.md` 的证据键表与本层 `EVID-VAL-01…19` 的 19 条逐一对应（含 H1/H2 与服务端编号）；`EVID-VAL-20` 由 M0 P1 新增，尚未进入该键表。`matrix.json` 的 `runs`/`counts` 仍是 19 条的投影，需由本层负责人补齐到 20 条。
 
 源码事实的引用形式（回应 `claim-register.md` 的 C-18）：不新增 `EVID-SRC`，统一写成 `EVID-PROBE-0N`（`probes.md` 条目内附 `SRC path:line`）。这样源码事实仍落在 evidence 层、仍是 `EVID-*` 形态，且附带"能/不能证明什么"的边界，比裸 `path:line` 更难被断章取义。
