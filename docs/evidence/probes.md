@@ -31,6 +31,7 @@ replaces: []
 | `EVID-PROBE-03` | typed utility 编译 | `examples/desktop_poc` → `lib/style.rs` | 是（`--lib`） | class 字面量 → 8 个属性枚举 + 单激活状态 `resolve` | 只到 B-05 的"unknown token 可诊断" |
 | `EVID-PROBE-04` | 文字 / 布局 / GPU | `examples/native_poc` | 是（`--lib` + 二进制） | Parley shaping、Taffy 测量、sparse-strips readback | 只到 B-01/-02 的**缺陷证明**与 D-01 的"不是模型" |
 | `EVID-PROBE-05` | 目标语法 | `examples/todolist` | **否**（40 个编译错误） | 无 | 无；它是 negative evidence |
+| `EVID-PROBE-06` | A0 行集投影的边界 | `crates/core/src/{query,txn}.rs` | 是（`--test queries`） | 共享行集快照与单接线 | 只到 A0-07 的计数判据；`Memo<RowSet>` 归 A1 |
 
 ---
 
@@ -193,13 +194,37 @@ baseline/intrinsic/synthesis 三项是**修代码**，不是加测试；修完�
 
 ---
 
-## 6. 交叉提醒
+## 6. `EVID-PROBE-06` — A0 的行集投影边界（ADR-0023）
+
+**入口**：`crates/core/src/query.rs` 的 `QueryCache::rows_at`、`crates/core/src/txn.rs` 的 `Tx::rows`。
+可运行：`cargo test -p zenui-core --test queries`（`EVID-VAL-42`）。
+
+### 它能证明的一件事
+
+A0 的共享行集投影由缓存快照承担：`Tx::rows` 返回的就是该快照，两个消费者共享同一份分配
+（`RowSet::shares_with`），不克隆 `String`。`SPEC-MACRO-011` 括号里「或 runtime 声明的同构投影」
+在 A0 指的就是这一形态（[ADR-0023](../decisions/adr-0023-row-set-projection-scope.md) 决定 1）。
+
+### 它不能证明的（引用 A0-07 时必须一起引用这一节）
+
+- **`Memo<RowSet>` 未在 A0 验证，归 A1。** A0 没有 `For`、没有订阅者，代码里也没有任何 memo 节点
+  承载行集。把 A0-07 的 `PROBE` 读成「行集 memo 已验证」是误读。
+- 可订阅的 `Memo<RowSet>` 随 `For` 在 A1 落地，届时**只能**从 `(membership revision, order revision)`
+  派生，不得读整表或 store 节点。
+- A0-07 的 `PROBE` 只覆盖计数判据与单接线，不覆盖任何节点订阅语义。
+
+### 证伪边界（不可引用）
+
+- 本条的"能证明"只对 `zenui-core` 的三个 filter 成立；不含真实布局、渲染与窗口。
+- 若将来有人把一个 memo 节点当作 A0-07 的证据，同时违反本条与 ADR-0023。
+
+## 7. 交叉提醒
 
 1. **两个探针对"绑定何时求值"给出相反观测**：宏探针 mount 时 `binding_reads == 0`（`EVID-PROBE-01`），响应式探针 `bind()` 立即 flush 并求值（`EVID-PROBE-02`）。引用时按探针分别标注，不要合成一条结论。
 2. **两套样式类型互不相通**：宏侧 `Property/Condition` 与桌面侧 `Property/Modifier` 是两份独立枚举，任何"宏与 builder 产出一致 IR"的说法都还没有证据。
 3. **所有探针的 `Patch`/`Node` 都不带 generation**：这是三个探针共同的天花板，也是 A0 必须新写 core 而不是改造探针的原因。
 
-## 7. 维护
+## 8. 维护
 
 - 新增探针先在本文件登记 `EVID-PROBE-0N`，写明入口、可运行性、覆盖、**不覆盖**，再写测试。
 - 探针的能力一旦升级（例如 baseline 修好、宏支持 PascalCase），更新对应条目并注明 commit；不要删掉旧的"不覆盖"行，改为写明从哪个 commit 起不再成立。

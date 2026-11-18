@@ -110,7 +110,7 @@ replaces: []
 
 > **已裁决（C-18/D-02，ADR-0012）**：`docs/README.md` §6 现已承认第三种证据前缀 `SRC path:line`，
 > 优先级为 `EVID-VAL-*` ＞ `EVID-PROBE-*` ＞ `SRC`。`SRC` 只证明"代码此刻是这样"，不能证明运行行为；
-> 探针的能力边界另见 `evidence/probes.md`（`EVID-PROBE-01…05`）。本表原有 `CODE` 前缀已全部改为 `SRC`。
+> 探针的能力边界另见 `evidence/probes.md`（`EVID-PROBE-01…06`）。本表原有 `CODE` 前缀已全部改为 `SRC`。
 
 ---
 

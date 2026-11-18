@@ -569,7 +569,7 @@
         "ignored": 0
       },
       "proves": "A0-07/A0-08 在重写后的夹具上成立：计数只由缓存内部路径推进；空结果 0 build / 0 materialize / 0 visit（含帧内暂存态）；reorder 通过 order revision 使旧顺序失效；帧内的暂存插入与删除被查询路径看到。四条 mutation 逐一判红：删掉空态短路 3 条红，live_counts 忽略 journal 2 条红，缓存键去掉 order revision 1 条红，Tx::rows 绕过缓存 6 条红",
-      "doesNotProve": "不证明 Graph 侧另有一个 Memo<RowSet>（本轮按设计移除：行集 memo 就是缓存槽）；不含真实布局/渲染；计数是执行期观测，不是复杂度证明"
+      "doesNotProve": "`Memo<RowSet>` 未在 A0 验证，行集投影是缓存快照（ADR-0023，EVID-PROBE-06）；不含真实布局/渲染；计数是执行期观测，不是复杂度证明"
     },
     {
       "id": "EVID-VAL-34",
@@ -960,9 +960,9 @@
   "coverage": {
     "criteriaTotal": 42,
     "criteriaVerified": 0,
-    "criteriaProbe": 6,
-    "criteriaOpen": 36,
-    "note": "PROBE 项为 SPEC-GATE-B-05（3 条 style 探针，无 manifest/provenance）与 SPEC-GATE-A0-01/-03/-04/-05/-06（EVID-VAL-20…-24、-27 的 gate 夹具与 trace）。total 为 42 是巧合，不代表任何覆盖率百分比。"
+    "criteriaProbe": 12,
+    "criteriaOpen": 30,
+    "note": "PROBE 项为 SPEC-GATE-A0 的 -01…-11（EVID-VAL-33/-34/-36/-41/-42 的夹具、变异表与 trace；A0-05 的多节点环、A0-11 的 subscriber bucket 子句仍在条目里标注为未覆盖）与 SPEC-GATE-B-05（3 条 style 探针，无 manifest/provenance）。A0 汇总行仍 OPEN。total 为 42 是巧合，不代表任何覆盖率百分比。"
   },
   "counts": {
     "testsPassedH2": 694,
