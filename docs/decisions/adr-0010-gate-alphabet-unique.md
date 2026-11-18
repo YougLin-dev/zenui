@@ -46,7 +46,7 @@ replaces: []
 - `SPEC-GATE-A0-01`…`A0-11`、`A1-01`…`A1-09`、`B-01`…`B-10`、`C-01`…`C-07`、`D-01`…`D-05`：
   现行判据全集。
 - `docs/archive/README.md` §3：旧 Gate 字母表的权威替代关系；§4：旧 A/B/C/D 已列过期。
-- `CLAIM-003`：13 条测试是探针，不是 Gate 通过；`CLAIM-040`：A0 trace 尚不存在。
+- `CLAIM-003`：探针测试计数不构成 Gate 通过；`CLAIM-040`：A0 headless trace 的状态以台账为准。
 - `EVID-MATRIX.coverage`：当前 42 条判据中 0 条 `VERIFIED`、1 条 `PROBE`、41 条 `OPEN`——这是
   "Gate 未完成"的机器可读事实，不是能力宣称。
 - `SPEC-GATE-A0-04` 已有反例 `EVID-VAL-08`；`SPEC-GATE-B-01`…`-03` 已有源码缺陷

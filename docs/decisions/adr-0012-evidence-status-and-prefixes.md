@@ -42,14 +42,14 @@ replaces: []
    `EVID-VAL-*` 仍是运行事实的唯一 ID（D-02）。
 4. **`probes.md` 与 `EVID-PROBE-*` 归 CI 负责人**；在文件建立前，任何 `EVID-PROBE-*` 引用都视为 dangling，
    必须改引 `EVID-VAL-*` 或 `SRC`。
-5. **编号稳定**：`EVID-VAL-01…19` 已由 `evidence/validation.md` §2 定义；新增只追加，不改旧 ID 的语义。
+5. **编号稳定**：`EVID-VAL-*` 编号由 `evidence/validation.md` §2 定义；新增只追加，不改旧 ID 的语义。
 
 ## 依据
 
 - `docs/README.md` §2（本轮修订）：状态词表明确 `SPEC`/`WITHDRAWN` 在 evidence 作为断言状态；
   `VERIFIED` 仅 evidence。
 - `docs/README.md` §6：`CLAIM-*` 台账必须使用五词、被推翻的断言保留并标 `WITHDRAWN`。
-- `docs/evidence/validation.md` §2：`EVID-VAL-01…19` 的 ID 索引；§7：`SRC-01…04` 源码核对。
+- `docs/evidence/validation.md` §2：`EVID-VAL-*` 的 ID 索引；§7：`SRC-01…04` 源码核对。
 - `docs/evidence/index.md` §4：引用规则（断言只在 `claim-register.md` 落 `CLAIM-*`，spec/product 只引用）；
   §1：`probes.md` 尚未创建。
 - `CLAIM-001`：rstml parse-only 是 `PROBE`，而非 `VERIFIED`；`CLAIM-025`/`-027`/`-028`：仓库外夹具为
