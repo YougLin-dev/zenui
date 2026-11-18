@@ -81,8 +81,9 @@ struct Node {
 
 /// Read-only view handed to a memo body.
 ///
-/// It can only read; there is no publish path, which is why P1 cannot express
-/// `WriteDuringCompute`. The real phase guard lands with `SPEC-GATE-A0-05`.
+/// It can only read, so a body cannot write through it. Phase guards live on
+/// the write API (`SPEC-RT-038`); a body that reads a node still on the
+/// compute stack is reported as [`GraphError::Cycle`].
 pub struct DepReader<'a> {
     values: &'a [Option<Value>],
     nodes: &'a [Node],
@@ -242,7 +243,9 @@ impl MemoGraph {
     /// demand, and a diamond may recompute a shared dependency more than once
     /// per epoch. Values published here are consistent because reads are lazy,
     /// but the "stable value before publication + observable-count per epoch"
-    /// contract is unverified, as are cycle detection and `WriteDuringCompute`.
+    /// contract is unverified. Cycles *are* detected (see
+    /// [`GraphError::Cycle`]); writes during compute are refused by the phase
+    /// guard on the write API, not here.
     pub fn compute<F>(&mut self, node: NodeId, f: F) -> Result<Value, GraphError>
     where
         F: FnOnce(&mut DepReader<'_>) -> Value,
