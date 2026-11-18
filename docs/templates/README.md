@@ -28,3 +28,4 @@ replaces: []
 
 - **研究草稿**：本仓库不设 `research/` 层。未定的候选方案写成 `status: draft` 的 spec 条目或 `OPEN` 的 `CLAIM-*`，避免出现第二权威。
 - **性能基线**：暂无 `bench/`。第一次产出可复跑数据时，按 `evidence-entry.md` 记录环境、命令、原始输出与对比基线，再决定是否单独建目录。
+
