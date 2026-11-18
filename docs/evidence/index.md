@@ -19,7 +19,7 @@ replaces: []
 | 文件 | 定义什么 | 状态 |
 |---|---|---|
 | `index.md`（本文件） | 复跑入口、主机约定、引用规则、陷阱 | normative |
-| `validation.md` | `EVID-VAL-01…21`：每条命令 + 主机 + 结果 + 边界 | normative |
+| `validation.md` | `EVID-VAL-01…22`：每条命令 + 主机 + 结果 + 边界 | normative |
 | `matrix.json` | `EVID-MATRIX`：上述运行与 11 组合同的机器投影 | normative |
 | `claim-register.md` | `CLAIM-*`：可判真假的单句断言（唯一事实来源） | normative（研究员交付） |
 | `probes.md` | `EVID-PROBE-01…05`：探针能力与证伪边界 | normative（本文件负责人，见 §1.1） |
@@ -64,6 +64,8 @@ replaces: []
 | 10 | `cargo test --workspace --locked` | 40 passed（34 core + 6 golden），0 failed | `EVID-VAL-21` |
 
 1–6 与 `EVID-VAL-12…17` 一一对应（顺序按 ID 排）；7–8 是两处**预期失败**的独立检查，对应 `EVID-VAL-18…19`；9–10 是 M0 的 headless 闭环，分别对应 `EVID-VAL-20`（trace）与 `EVID-VAL-21`（测试）。
+
+第 10 条同一个命令也由 `.github/workflows/workspace.yml` 在 `ubuntu` / `macos` / `windows` 上执行，`EVID-VAL-22` 记录的是 main（`213f772`）上的那一次运行。CI 是**另一类主机**，它本机复跑不了，H2 的结果也不能替代它——结论按主机隔离（见 `validation.md` §1、§6.1）。
 
 一键脚本（只读仓库；只往 `mktemp -d` 里写）：
 
@@ -144,6 +146,6 @@ Gate 判据（`SPEC-GATE-*`）在 `docs/spec/08-gates.md`。当前映射：42 �
 
 本轮新增：`index.md`、`validation.md`、`matrix.json`、`probes.md`（commit `ab5339b` 之后、队长统一提交前）。`claim-register.md` 由研究员交付，本层只引用不改写。原始记录 `archive/review/VALIDATION.md`、`archive/review/validation-matrix-raw.json` 保持原文不动，归档后由本层接管引用。
 
-编号一致性：`claim-register.md` 的证据键表已覆盖 `EVID-VAL-01…21`，`matrix.json` 的 `runs` 与 `counts` 已同步到 21 条（`runsTotal=21`、`testsPassedH2=53`、`runsReproducibleHere=10`）。
+编号一致性：`claim-register.md` 的证据键表已覆盖 `EVID-VAL-01…22`，`matrix.json` 的 `runs` 与 `counts` 已同步到 22 条（`runsTotal=22`、`testsPassedH2=53`、`testsPassedCi=120`、`runsReproducibleHere=10`、`runsOnCi=1`）。
 
 源码事实的引用形式（回应 `claim-register.md` 的 C-18）：不新增 `EVID-SRC`，统一写成 `EVID-PROBE-0N`（`probes.md` 条目内附 `SRC path:line`）。这样源码事实仍落在 evidence 层、仍是 `EVID-*` 形态，且附带"能/不能证明什么"的边界，比裸 `path:line` 更难被断章取义。
