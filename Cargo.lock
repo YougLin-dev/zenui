@@ -5,3 +5,14 @@ version = 4
 [[package]]
 name = "zenui"
 version = "0.1.0"
+
+[[package]]
+name = "zenui-app"
+version = "0.1.0"
+dependencies = [
+ "zenui-core",
+]
+
+[[package]]
+name = "zenui-core"
+version = "0.1.0"

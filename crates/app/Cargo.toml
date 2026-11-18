@@ -1,0 +1,14 @@
+[package]
+name = "zenui-app"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Headless Gate A0 application fixtures for ZenUI"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+zenui-core = { path = "../core" }
+
+[[example]]
+name = "todolist_headless"
+path = "examples/todolist_headless/main.rs"

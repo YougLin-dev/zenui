@@ -36,7 +36,7 @@ replaces: []
 | 主机 | OS | Rust | GPU / adapter | commit | 证据性质 |
 |---|---|---|---|---|---|
 | **H1** | Windows 11，MSVC 工具链 | `1.99.1 x86_64-pc-windows-msvc` | NVIDIA GeForce RTX 4060 Laptop GPU / Vulkan | 未记录 | 上一轮记录（转述） |
-| **H2** | macOS 27.0.1 (26A434)，Apple M4（10 核 GPU，Metal 4） | `1.99.1 (58cf8f9c3 2026-10-13) aarch64-apple-darwin` | Apple M4 / `metal` | `ab5339b4fec807faef3128587721a1599f5aab9b` | **本轮实测** |
+| **H2** | macOS 27.0.1 (26A434)，Apple M4（10 核 GPU，Metal 4） | `1.99.1 (58cf8f9c3 2026-10-13) aarch64-apple-darwin` | Apple M4 / `metal` | `ab5339b`（EVID-VAL-12…19）/ `83b21a4`（EVID-VAL-20/-21） | **本轮实测**（commit 逐条见各条目） |
 
 > H1 的 commit 在原始记录中未写下，这是本轮无法补的缺口；引用 H1 结果时应同时声明"commit 未知"。
 
@@ -63,6 +63,8 @@ replaces: []
 | EVID-VAL-17 | A | 根 `cargo test` | **H2** | 0 tests | VERIFIED（0 = 无测试） |
 | EVID-VAL-18 | A | `#[derive(Copy)] struct{String}` | **H2** | **E0204** | VERIFIED |
 | EVID-VAL-19 | A | 目标示例 `todolist/main.rs` 单独编译 | **H2** | **40 errors** | VERIFIED（不可编译=预期） |
+| EVID-VAL-20 | A | `cargo run -p zenui-app --example todolist_headless --locked` | **H2** | 9 步 trace，两次运行逐字节一致 | VERIFIED（仅 A0-01 的命令与 trace；A0-02…11 仍 OPEN） |
+| EVID-VAL-21 | A | `cargo test --workspace --locked` | **H2** | 40 passed（34 + 6） | VERIFIED |
 
 ## 3. 仓库内测试：H1 原始记录（转述）
 
@@ -247,6 +249,90 @@ error[E0425]: cannot find type `CompletedField` in this scope
 
 - 用途：把"`examples/todolist/main.rs` 是 design-only、不是可运行程序"从叙述变成可复跑的观测。任何把该文件当 A1 证据的说法都可以据此驳回。
 
+### EVID-VAL-20 Headless core 与 `todolist_headless` trace（H2，A0-01 闭环）
+
+- 分支：`feat/MORT-4-a0-headless-core`；被测代码 commit `83b21a46795e4ef1f7e9955b31e76cc2fe430468`（后续只有 docs 提交，不改变 trace 与测试结果）。
+- 主机：H2（macOS 27.0.1 / Apple M4）；`rustc 1.99.1 (58cf8f9c3 2026-10-13) aarch64-apple-darwin`；`cargo 1.99.1 (5f94df478 2026-08-27)`。
+- 场景顺序与 `SPEC-GATE-A0-01` 一致：empty → insert A/B/C → toggle B → Active → reorder → delete focused → bulk clear → invalid id rollback → 下一次 insert 成功。
+
+```text
+$ cargo run -p zenui-app --example todolist_headless --locked
+[step 01 empty]
+  detail=no rows
+  state store_rows=0 visible_rows=0 remaining=0 has_completed=false filter=all store_titles=- visible_titles=- focus=- caret=-
+  delta query_evals=1 id_materializations=1 mounts=0 unmounts=0 memo_recomputes=3 commits=1 focus_moves=0 caret_ops=0 io_reads=0 io_writes=0 string_clones=0
+  graph edges=3 active_sources=1 geometry_epoch=1 live_owners=1 cleanup_runs=0 sink=0
+
+... (steps 02–04 略，逐字见 golden 文件)
+
+[step 05 reorder]
+  detail=reorder C,A,B; focus A
+  state store_rows=3 visible_rows=2 remaining=2 has_completed=true filter=active store_titles=C,A,B visible_titles=C,A focus=view#1 caret=view#1:1
+  delta query_evals=1 id_materializations=1 mounts=0 unmounts=0 memo_recomputes=3 commits=1 focus_moves=1 caret_ops=1 io_reads=0 io_writes=1 string_clones=0
+  graph edges=4 active_sources=1 geometry_epoch=7 live_owners=3 cleanup_runs=1 sink=0
+
+[step 06 delete-focused]
+  detail=delete focused A
+  state store_rows=2 visible_rows=1 remaining=1 has_completed=true filter=active store_titles=C,B visible_titles=C focus=view#3 caret=view#3:1
+  delta query_evals=1 id_materializations=1 mounts=0 unmounts=1 memo_recomputes=3 commits=1 focus_moves=1 caret_ops=1 io_reads=0 io_writes=1 string_clones=0
+  graph edges=4 active_sources=1 geometry_epoch=8 live_owners=2 cleanup_runs=2 sink=0
+
+[step 08 invalid-rollback]
+  detail=result=InvalidHandle(vacant)
+  state store_rows=1 visible_rows=1 remaining=1 has_completed=false filter=active store_titles=C visible_titles=C focus=view#3 caret=view#3:1
+  delta query_evals=0 id_materializations=0 mounts=0 unmounts=0 memo_recomputes=0 commits=1 focus_moves=0 caret_ops=0 io_reads=0 io_writes=0 string_clones=0
+  graph edges=4 active_sources=1 geometry_epoch=8 live_owners=2 cleanup_runs=2 sink=0
+
+
+[summary]
+  steps=9
+  state store_rows=2 visible_rows=2 remaining=2 has_completed=false filter=active store_titles=C,D visible_titles=C,D focus=view#3 caret=view#3:1
+  total query_evals=8 id_materializations=8 mounts=4 unmounts=2 memo_recomputes=22 commits=9 focus_moves=2 caret_ops=2 io_reads=4 io_writes=8 string_clones=4
+  graph edges=4 active_sources=1 geometry_epoch=10 live_owners=3 cleanup_runs=2 sink=0
+[status] outcome=ok
+```
+
+```text
+$ cargo run -p zenui-app --example todolist_headless --locked > run1.txt
+$ cargo run -p zenui-app --example todolist_headless --locked > run2.txt
+$ diff -u run1.txt run2.txt
+（无输出）
+
+$ sha256sum run1.txt crates/app/tests/golden/todolist_headless.trace
+fb16d571748949225b46a5eb78abc72e5badd13e3e2b6cede7b6b7aefd392f21  run1.txt
+fb16d571748949225b46a5eb78abc72e5badd13e3e2b6cede7b6b7aefd392f21  crates/app/tests/golden/todolist_headless.trace
+```
+
+- 测试命令与计数见 EVID-VAL-21：一个 `EVID-VAL` 条目只对应一条命令。
+- 依赖边界：`crates/core/Cargo.toml` 的 `[dependencies]` 为空（纯 `std`）；`crates/app` 只依赖 `crates/core`；根 package、`zenui-core`、`zenui-app` 均 `publish = false`。`Cargo.lock` 只新增 `zenui-core` 与 `zenui-app` 两个 package。
+- 本机附加检查（不在 CI 里）：`cargo clippy --workspace --all-targets --locked -- -D warnings` 与 `cargo fmt --all -- --check` 均通过。
+- 计数口径：`io_writes` 定义为「一次改变模型的 store 变更方法调用 = 一次写入 = 一次 epoch 推进」；`clear_completed` 删 N 行仍记 1 次，顺序未变的 `reorder` 与同值 `set_completed` 记 0 次。`store_rows`/`store_titles` 是整个 Store，`visible_rows`/`visible_titles` 是当前挂载的可见集：两者在 `step 04…06` 不相等（3/2、3/2、2/1），在 `step 07…09` 因只剩可见行而重新相等（1/1、1/1、2/2）。
+- 确定性构造：全 crate 不使用 `HashMap`/`HashSet`（`BTreeMap`/`BTreeSet` 与 `Vec` 顺序）；trace 不含地址、耗时、线程 id；`RowSet` 只含稳定 `RowKey`，不含 `String`。
+- **不证明什么**：这条只说明 `SPEC-GATE-A0-01` 规定的命令可跑、trace 确定。测试通过与否见 EVID-VAL-21，两者都不证明 A0-02…A0-11 的任何一条：
+  - `step 01` 的空 Store 上 `id_materializations=1`——空态仍靠物化集合判定，`SPEC-GATE-A0-08` 未满足；
+  - 每次 store 写都按整 epoch 重算，`step 03/05/06/07` 的 `id_materializations=1`——`SPEC-GATE-A0-07` 的 membership 索引与反向边未接线；
+  - `step 07` 的批量 Clear 在 trace 中没有任何 focus/caret 操作——被清掉的 B 在此之前已被 Active filter unmount——所以 bulk-clear「只结算一次 intent」的语义没有夹具覆盖，`FocusRemovalIntent` 的完整顺序与取消语义也未实现（`SPEC-GATE-A0-10`）；
+  - 无 staging journal 与阶段守卫，`SPEC-GATE-A0-04`/`A0-06` 未验证（`TODO(A0-04)`、`TODO(A0-06)`）；`graph` 无 cycle / `WriteDuringCompute` 领域错误（`A0-05`）；
+  - `A0-02` 无 trybuild fixture；`A0-03` 有 4 条 core 单元测试——2 条在 `store`（`handle_from_another_store_is_rejected`、`removed_row_rejects_its_old_handle`）、2 条在 `arena`（`recycled_slot_rejects_the_previous_generation`、`freed_slot_without_reuse_is_vacant`）——但 handle 侧 `get`/`with`、remount 的 generation 复用与 gate 级 stale dispatch 夹具未实现（`TODO(A0-03)`）；`A0-09` 的 unmount/setup 计数**已采集**（`reorder_preserves_view_ids` 断言 reorder 后 `mounts`/`unmounts` 不变，trace `step 05` 同样为 0/0），仍缺重复 key 在 view 层的拒绝与专属 setup/identity 夹具；`A0-11` 的 churn 基线未采集。
+- Gate 状态：`docs/spec/08-gates.md` 中 `SPEC-GATE-A0-01` 仍写作 `OPEN`。该列属于 spec 层，本次未改动；翻转由文档负责人在归档本条目后单独提交。
+
+### EVID-VAL-21 Headless workspace 测试（H2）
+
+- 分支：`feat/MORT-4-a0-headless-core`；被测代码 commit `83b21a46795e4ef1f7e9955b31e76cc2fe430468`。
+- 主机：H2（同 EVID-VAL-20）。与 EVID-VAL-20 是同一次会话里的两条命令，按「一条记录一个命令」拆开。
+
+```text
+$ cargo test --workspace --locked
+     Running unittests src/lib.rs (zenui_core)          34 passed; 0 failed
+     Running tests/golden_trace.rs (zenui_app)           6 passed; 0 failed
+     其余 target（根 package 与 zenui-app lib）           0 tests
+（合计 40 passed / 0 failed）
+```
+
+- 覆盖：`zenui-core` 的 identity/slot、Store 计数、query 缓存、memo 图、owner 释放顺序、view 焦点与 caret；`zenui-app` 的 golden trace 六个断言。
+- `#[cfg(debug_assertions)]` 的 `unbalanced_end_panics_without_committing` 只在 debug 构建运行；release 下由 `#[cfg(not(debug_assertions))]` 的版本接替，两种构建的用例总数都是 34。
+- **不证明什么**：0-test target（根 package、`zenui-app` lib）不计为通过；这些单测不构成 A0-02…A0-11 的 gate 级证据。
+
 ## 7. 本轮源码核对（不是测试，但可复核）
 
 以下四条是**读源码得到的事实**，用于防止"测试绿了所以没问题"的误判。逐条给出可对照的位置。
@@ -281,14 +367,14 @@ error[E0425]: cannot find type `CompletedField` in this scope
 | baseline / intrinsic / 字体合成 | OPEN | §7 SRC-01…03 显示仍有缺陷 |
 | glTF / 独立 depth / 3D | OPEN | 只有占位纹理与绿色 clear |
 | 性能（任何 p50/p95/p99、帧预算、idle 能耗） | OPEN | 本轮未采任何计时数据；**禁止填 0** |
-| 全 workspace 的 `cargo test / clippy / package` | OPEN | 根 package 不是统一 workspace（EVID-VAL-04/-17） |
+| `cargo clippy --workspace` 与 `cargo package` 的 CI 日志 | OPEN | 两者都是 `SPEC-GATE-C-04` 的判据；本机 `clippy --all-targets -- -D warnings` 通过，但仓库没有对应的 CI 日志，因此 C-04 仍 `OPEN` |
 
 ## 9. 数字台账（仅汇总本文件已定义的事实，供 CLAIM 引用）
 
-- H2 实际通过测试：**13** 条（7 + 2 + 4），来源 EVID-VAL-12/13/14。
+- H2 实际通过测试：**53** 条（7 + 2 + 4 + 40），来源 EVID-VAL-12/13/14/21；其中 40 条来自新的 headless workspace。
 - H2 compile-fail fixture：**3** 条，来源 EVID-VAL-13。
 - 0-test target：根 package，来源 EVID-VAL-17。
 - 跨图形后端 GPU 观测：**2** 个数据点（Vulkan/NVIDIA 来自 H1 转述，Metal/Apple M4 来自 EVID-VAL-15），**不是** "GPU 矩阵已通过"。
-- 可复跑性分布：19 条中 **8 条**（A 类）可在本机原样复跑；**11 条**（B/C 类）依赖上一轮记录或仓库外夹具。
+- 可复跑性分布：21 条中 **10 条**（A 类）可在本机原样复跑；**11 条**（B/C 类）依赖上一轮记录或仓库外夹具。
 
 不得使用"基本完成""大部分支持""应该可以"描述以上任何数字。

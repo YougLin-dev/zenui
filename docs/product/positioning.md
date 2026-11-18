@@ -54,7 +54,7 @@ replaces: []
 
 ## 4. 稳定性承诺强度
 
-**当前（pre-alpha，0.x 之前）**：没有任何公开 API 可被依赖。仓库中的 `examples/todolist/main.rs` 是目标语法预览，不是可运行应用；规划的 workspace 与 launcher 尚不存在。任何「已支持」表述必须能指向 `EVID-*`（`SPEC-SCOPE-021`）。
+**当前（pre-alpha，0.x 之前）**：没有任何公开 API 可被依赖。仓库中的 `examples/todolist/main.rs` 是目标语法预览，不是可运行应用；workspace 已存在（`crates/core`、`crates/app`，仅 headless A0 骨架，`publish = false`），launcher 与公开 API 尚不存在。任何「已支持」表述必须能指向 `EVID-*`（`SPEC-SCOPE-021`）。
 
 **0.x 阶段承诺**（`SPEC`，随首个可发布 crate 生效）：
 - 破坏性变更**允许**发生在 minor 版本，但每次必须：一条 ADR、一条 CHANGELOG 条目、以及一页迁移说明；没有这三样不得发版。

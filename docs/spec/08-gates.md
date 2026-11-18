@@ -45,7 +45,7 @@ blocked 的记录形状（机器可读，写入 `artifacts/desktop/<os>-<display
 
 | Gate | 目标 | 方法 | 阻塞合并 | 当前状态 |
 |---|---|---|---|---|
-| **A0** | 纯 Rust core + Todo reducer（headless，无宏/无窗口/无 GPU） | 编译期 + 运行时 trace | 是 | `OPEN`（规划中的 workspace 尚不存在） |
+| **A0** | 纯 Rust core + Todo reducer（headless，无宏/无窗口/无 GPU） | 编译期 + 运行时 trace | 是 | `OPEN`（workspace 与 headless 入口已存在，`SPEC-GATE-A0-01` 见 `EVID-VAL-20`；其余判据仍 `OPEN`） |
 | **A1** | 单 Windows Todo 真实窗口 | 真机 + 运行时 | 是（针对"桌面可用"宣称） | `OPEN` |
 | **B** | layout / text / style 差分基线 | 运行时 golden | 是（针对样式与文字能力宣称） | `SPEC`（有 3 条 style 探针，见 `EVID-VAL-12`） |
 | **C** | 三平台真实发布门 | 真机 + AT + package | 发布阻断 | `OPEN`（缺 runner） |
@@ -67,12 +67,12 @@ graph LR
 ## 2. Gate A0 — 纯 Rust core + Todo reducer
 
 **范围**：不使用 proc macro、winit 或 GPU。最小 `crates/core` + `crates/app`，空 Store → root Owner → draft/filter/query memo → fake native View，单线程 headless 跑事务并输出 trace。
-**入口（规划，尚不存在）**：`cargo run -p zenui-app --example todolist_headless --locked`。
+**入口**：`cargo run -p zenui-app --example todolist_headless --locked`（可运行，见 `EVID-VAL-20`）。
 **场景顺序**：empty → insert A/B/C → toggle B → Active → reorder → delete focused → bulk clear → invalid id rollback → 下一次 insert 成功。
 
 | ID | 通过判据（MUST） | 需要的证据 | 当前状态 |
 |---|---|---|---|
-| `SPEC-GATE-A0-01` | `crates/core`、`crates/app` 存在；上述命令可跑并输出确定性 trace（query/mount/materialization/edge/geometry/focus/caret/I-O 计数） | 仓库内可复跑的命令 + trace 快照 | `OPEN` |
+| `SPEC-GATE-A0-01` | `crates/core`、`crates/app` 存在；上述命令可跑并输出确定性 trace（query/mount/materialization/edge/geometry/focus/caret/I-O 计数） | 仓库内可复跑的命令 + trace 快照 | `PROBE`（`EVID-VAL-20` 命令与 trace、`EVID-VAL-21` workspace 测试；gate 整体仍 `OPEN`） |
 | `SPEC-GATE-A0-02` | 每个 UI 行 mount 只读一次 owned title；Copy handle 不携带 `String`；`read_once` 返回 `Result` | trybuild：`#[derive(Copy)] struct{String}` 必须 E0204；运行时 read 计数恰为 1；`String::with` 借读合法、拥有式 get 不编译 | `OPEN`（语言层已确证 E0204：`EVID-VAL-18`；仓库内 fixture 尚未建立） |
 | `SPEC-GATE-A0-03` | `{runtime_id, slot, generation}` 分离；旧 handle/旧 generation 只得到一条 `InvalidHandle`，无默认值、无旧值 patch | 运行时：slot 复用后派发旧 click/读/写；跨 runtime handle 拒绝；类型层 ViewId/TodoId/TaffyId 互传必须编译失败 | `OPEN` |
 | `SPEC-GATE-A0-04` | 最外层 batch 只提交一次；嵌套 batch 不外泄中间值 | instrumented committed-read 记录中间值与提交次数 | `OPEN`（**已有现存反例**：嵌套 batch 产出含 `true` 的两条 patch，`EVID-VAL-08`） |
@@ -126,7 +126,7 @@ graph LR
 | `SPEC-GATE-C-01` | 同一 locked Todo 在 Windows / macOS / Linux 真实执行；Linux 的 Wayland 与 X11 分列记录 | 三份 `results.json`，各含 OS/display/adapter/driver/commit/lock hash | `OPEN`（本轮仅 macOS 主机，Windows/Linux 无 runner → blocked） |
 | `SPEC-GATE-C-02` | AT 实际播报与动作：Windows NVDA、macOS VoiceOver、Linux AT-SPI client；semantic node 与 GeometrySnapshot 同 epoch | 人/机可读 AT 记录 + 语义树快照 | `OPEN` |
 | `SPEC-GATE-C-03` | GPU 矩阵：Windows DX12（可用时 Vulkan）、macOS Metal、Linux Vulkan 或诚实 fallback；CPU baseline 同存；Unsupported 不 panic | 每 backend 一份 readback + 能力清单 | `OPEN`（现有 2 个后端数据点：Vulkan/NVIDIA 转述、Metal/Apple M4 实测） |
-| `SPEC-GATE-C-04` | 发布命令全绿：`cargo test --workspace --locked`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo package`、独立 renamed facade | CI 日志（当前根 package 不是统一 workspace，这些命令不能标 passed） | `OPEN` |
+| `SPEC-GATE-C-04` | 发布命令全绿：`cargo test --workspace --locked`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo package`、独立 renamed facade | CI 日志（根 workspace 已存在，`cargo test --workspace --locked` 见 `EVID-VAL-21`；clippy、package 与 facade 尚无 CI 日志） | `OPEN` |
 | `SPEC-GATE-C-05` | 资产与合规：字体/ICU 词典/model 文件随包、licenses 与 lock hash 齐备；`cargo-deny`/`cargo-audit` 无阻断项 | 资产清单 + license 清单 + 审计输出 | `OPEN` |
 | `SPEC-GATE-C-06` | 真实窗口 `ControlFlow::Wait` 下 30–60s 静止不产生每帧重绘 | OS trace（ETW / Instruments / 平台采样） | `OPEN` |
 | `SPEC-GATE-C-07` | 长时间 churn 后 live owner/edges/GPU resources 回到温缓存基线（不要求 allocator RSS 归零） | 前后计数对照 | `OPEN` |

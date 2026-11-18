@@ -6,6 +6,7 @@
   "owner": "测试与 CI/发布负责人（10y+）",
   "_note": "本文件是 validation.md 与 08-gates.md 的机器投影。叙述与判定以 docs/evidence/validation.md 与 docs/spec/08-gates.md 为准；contracts 里的 assertion 只是一行门控摘要，规范原文（green/red 全文）仍在归档的 verification-contract.json 中，不在此复述。",
   "commit": "ab5339b4fec807faef3128587721a1599f5aab9b",
+  "commitNote": "语料基线 commit；EVID-VAL-20 记录于 83b21a46795e4ef1f7e9955b31e76cc2fe430468（见该 run 的 commit 字段）",
   "toolchain": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
   "sources": {
     "runsProse": "docs/evidence/validation.md",
@@ -33,6 +34,7 @@
       "toolchain": "1.99.1 (58cf8f9c3 2026-10-13)",
       "adapter": "Apple M4 (10-core GPU, Metal 4) / metal",
       "commit": "ab5339b4fec807faef3128587721a1599f5aab9b",
+      "commitNote": "EVID-VAL-12…19 记录于 ab5339b；EVID-VAL-20 记录于 83b21a4",
       "evidenceClass": "A-observed-this-round"
     }
   ],
@@ -272,6 +274,30 @@
       "sampleErrors": ["E0433 cannot find crate `zenui`", "cannot find attribute `component`", "cannot find macro `view`", "E0425 cannot find type `CompletedField`"],
       "proves": "目标示例是 design-only，当前不可编译",
       "doesNotProve": "任何 A1 能力"
+    },
+    {
+      "id": "EVID-VAL-20",
+      "class": "A",
+      "host": "H2",
+      "kind": "runtime",
+      "command": "cargo run -p zenui-app --example todolist_headless --locked",
+      "exit": 0,
+      "commit": "83b21a46795e4ef1f7e9955b31e76cc2fe430468",
+      "traceSha256": "fb16d571748949225b46a5eb78abc72e5badd13e3e2b6cede7b6b7aefd392f21",
+      "proves": "SPEC-GATE-A0-01 的命令可跑；9 步 trace 两次运行逐字节一致",
+      "doesNotProve": "A0-02…A0-11 的任何一条；空态物化、query 反向边、事务 journal、focus 顺序均未实现"
+    },
+    {
+      "id": "EVID-VAL-21",
+      "class": "A",
+      "host": "H2",
+      "kind": "test",
+      "command": "cargo test --workspace --locked",
+      "exit": 0,
+      "commit": "83b21a46795e4ef1f7e9955b31e76cc2fe430468",
+      "tests": { "passed": 40, "failed": 0, "ignored": 0 },
+      "proves": "headless workspace 的 34 条 core 单测与 6 条 golden trace 测试通过",
+      "doesNotProve": "A0-02…A0-11 的 gate 级证据；0-test target 不计"
     }
   ],
 
@@ -401,18 +427,18 @@
   "coverage": {
     "criteriaTotal": 42,
     "criteriaVerified": 0,
-    "criteriaProbe": 1,
-    "criteriaOpen": 41,
-    "note": "唯一 PROBE 项为 SPEC-GATE-B-05（3 条 style 探针，无 manifest/provenance）。total 为 42 是巧合，不代表任何覆盖率百分比。"
+    "criteriaProbe": 2,
+    "criteriaOpen": 40,
+    "note": "PROBE 项为 SPEC-GATE-B-05（3 条 style 探针，无 manifest/provenance）与 SPEC-GATE-A0-01（EVID-VAL-20 的命令与 trace）。total 为 42 是巧合，不代表任何覆盖率百分比。"
   },
 
   "counts": {
-    "testsPassedH2": 13,
+    "testsPassedH2": 53,
     "compileFailFixturesH2": 3,
     "zeroTestTargetsH2": ["root package zenui"],
     "gpuBackendsObserved": 2,
-    "runsTotal": 19,
-    "runsReproducibleHere": 8,
+    "runsTotal": 21,
+    "runsReproducibleHere": 10,
     "runsTranscribedOrExternal": 11
   },
 
@@ -426,6 +452,6 @@
     "baseline / intrinsic / Font synthesis",
     "glTF / 独立 depth / 3D",
     "任何性能数字（禁止填 0）",
-    "全 workspace 的 cargo test / clippy / package"
+    "全 workspace 的 cargo clippy / cargo package（`cargo test --workspace` 已由 EVID-VAL-20 覆盖）"
   ]
 }
