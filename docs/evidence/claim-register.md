@@ -51,10 +51,10 @@ replaces: []
 
 ### 0.1 证据键（权威定义见 `docs/evidence/validation.md` §2）
 
-`EVID-VAL-*` 编号已与该文件的 47 条索引对齐。主机定义：
+`EVID-VAL-*` 编号已与该文件的 48 条索引对齐。主机定义：
 
 - **H1**：Windows 11 / MSVC / Rust 1.99.1 / NVIDIA RTX 4060 Laptop / Vulkan；上一轮记录，**commit 未记录**。
-- **H2**：macOS 27.0.1 / Apple M4 / Metal 4 / Rust 1.99.1；commit `ab5339b`（EVID-VAL-12…19）/ `83b21a4`（EVID-VAL-20/-21）/ `e53ae0e`、`f7a2d62`、`7d78cdc`（EVID-VAL-23…40）、`a24faed`（EVID-VAL-41…47）；本轮 Test/CI 实测。
+- **H2**：macOS 27.0.1 / Apple M4 / Metal 4 / Rust 1.99.1；commit `ab5339b`（EVID-VAL-12…19）/ `83b21a4`（EVID-VAL-20/-21）/ `e53ae0e`、`f7a2d62`、`7d78cdc`（EVID-VAL-23…40）、`a24faed`（EVID-VAL-41…46）、`89b651c`（EVID-VAL-48）；本轮 Test/CI 实测。
 
 | 键 | 类别 | 命令 / 位置 | 记录结果 |
 |---|---|---|---|
@@ -105,6 +105,7 @@ replaces: []
 | EVID-VAL-45 | A | `cargo run -p zenui-app --example todolist_headless --locked`（H2，commit `a24faed`） | trace sha256 与 `57a4a142…` 相同 |
 | EVID-VAL-46 | A | `cargo clippy --workspace --all-targets --locked -- -D warnings`（H2，commit `a24faed`） | exit 0（本机，不是 CI 日志） |
 | EVID-VAL-47 | D | `cargo test --workspace --locked`（CI 矩阵 ubuntu/macos/windows，commit `61de7b5`） | 102 passed × 3 平台；trybuild 快照三平台逐字匹配 |
+| EVID-VAL-48 | A | `rustdoc --test --crate-name probe --edition 2024`（H2，commit `89b651c`，8 条用例） | 6 ok / 2 对照组 `FAILED`（合法代码标 `compile_fail`）；错误码后缀不产生约束 |
 | SRC | — | 仓库源码/清单，`path:line` | 本轮静态核对，可直接复查 |
 
 > **已裁决（C-18/D-02，ADR-0012）**：`docs/README.md` §6 现已承认第三种证据前缀 `SRC path:line`，

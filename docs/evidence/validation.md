@@ -37,7 +37,7 @@ replaces: []
 | 主机 | OS | Rust | GPU / adapter | commit | 证据性质 |
 |---|---|---|---|---|---|
 | **H1** | Windows 11，MSVC 工具链 | `1.99.1 x86_64-pc-windows-msvc` | NVIDIA GeForce RTX 4060 Laptop GPU / Vulkan | 未记录 | 上一轮记录（转述） |
-| **H2** | macOS 27.0.1 (26A434)，Apple M4（10 核 GPU，Metal 4） | `1.99.1 (58cf8f9c3 2026-10-13) aarch64-apple-darwin` | Apple M4 / `metal` | `ab5339b`（EVID-VAL-12…19）/ `83b21a4`（EVID-VAL-20/-21）/ `e53ae0e`（EVID-VAL-23…27）/ `f7a2d62`（EVID-VAL-28…32）/ `7d78cdc`（EVID-VAL-33…40）/ `a24faed`（EVID-VAL-41…46） | **本轮实测**（commit 逐条见各条目） |
+| **H2** | macOS 27.0.1 (26A434)，Apple M4（10 核 GPU，Metal 4） | `1.99.1 (58cf8f9c3 2026-10-13) aarch64-apple-darwin` | Apple M4 / `metal` | `ab5339b`（EVID-VAL-12…19）/ `83b21a4`（EVID-VAL-20/-21）/ `e53ae0e`（EVID-VAL-23…27）/ `f7a2d62`（EVID-VAL-28…32）/ `7d78cdc`（EVID-VAL-33…40）/ `a24faed`（EVID-VAL-41…46）/ `89b651c`（EVID-VAL-48） | **本轮实测**（commit 逐条见各条目） |
 | **CI** | GitHub Actions 矩阵：`ubuntu-26.04` / `macos-26-arm64` / `windows-2025-vs2026` | `rustc 1.99.1 (58cf8f9c3 2026-10-13)`，三个 runner 一致（取自 `rust-toolchain.toml` 的 pin） | 无（headless；A0 不需要 GPU） | `e53ae0e`（main 上的 PR #5 merge commit） | **本轮 CI 实测**，run [`44284925421`](https://github.com/YougLin-dev/zenui/actions/runs/44284925421) |
 
 > H1 的 commit 在原始记录中未写下，这是本轮无法补的缺口；引用 H1 结果时应同时声明"commit 未知"。
@@ -93,6 +93,7 @@ replaces: []
 | EVID-VAL-45 | A | `cargo run -p zenui-app --example todolist_headless --locked` | **H2** | trace sha256 与 `57a4a142…` 相同 | VERIFIED（未变，见条目） |
 | EVID-VAL-46 | A | `cargo clippy --workspace --all-targets --locked -- -D warnings` | **H2** | exit 0 | VERIFIED（仅本机，C-04 仍 OPEN） |
 | EVID-VAL-47 | D | `cargo test --workspace --locked` | **CI** | 102 passed × 3 平台（含 trybuild 快照） | VERIFIED（CI 日志与 run URL 可查） |
+| EVID-VAL-48 | A | `rustdoc --test --crate-name probe` × 8 用例 | **H2** | 6 ok / 2 对照组 **FAILED** | VERIFIED（错误码后缀不产生约束，见条目） |
 
 ## 3. 仓库内测试：H1 原始记录（转述）
 
@@ -382,7 +383,7 @@ $ cargo test --workspace --locked        # ubuntu-26.04 / macos-26-arm64 / windo
 - 新事实：同一 commit 的 40 条测试在三个平台各自通过，且 `rustc` 三处都是 `1.99.1`——`rust-toolchain.toml` 的 pin 在三个平台上真的被解析成同一个编译器，而不是各 runner 自带的默认版本。
 - 新事实：`tests/golden_trace.rs` 的逐字节比对在 `windows-2025-vs2026` 上成立。这是 `.gitattributes` 强制 LF 的实证：若 Windows 检出为 CRLF，`include_str!` 的内容与 golden 文件都会变形，测试与 `EVID-VAL-20` 的 sha256 会同时失败。
 - **不证明什么**：任何 GPU / 窗口 / 平台后端能力（A0 是纯 `std` 的 headless core）；`cargo package`、renamed facade 与发布门（`SPEC-GATE-C-04`）——命令集里没有它们，这条记录不能把 C-04 标绿。
-- 计数口径：`testsPassedCi = 120` 是 40 条 × 3 个 runner 的**执行次数**，不是 120 条不同的测试，也不得与 H2 的 53 相加（见 `EVID-MATRIX.countsNote`）。
+- 计数口径：`testsPassedCi = 426` 是**两次** CI 运行的执行次数之和——本轮 40 条 × 3 个 runner（EVID-VAL-22，120 次）加上合流后 102 条 × 3 个 runner（EVID-VAL-47，306 次）。它不是不同测试的条数（并集为 102 条），也不得与 H2 的 `testsPassedH2` 相加：H2 与 CI 是不同主机，同一批测试在两处各跑一次只说明两处都跑过（见 `EVID-MATRIX.countsNote`）。
 
 ## 7. 本轮源码核对（不是测试，但可复核）
 
@@ -821,10 +822,10 @@ $ cargo test -p zenui-core --locked
   test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
   ```
 
-  > **更正（§15）**：上面这条命令缺 `--crate-name`，孤立文件会被注入 `extern crate r#t;` 并报
-  > `E0463`，于是任何片段都"编译失败"，`compile_fail` 一律 `ok`——那次的调用不成立。结论本身
-  > 不变：用正确调用（`rustdoc --test --crate-name probe --edition 2024`）复测三条用例，见
-  > EVID-VAL-41 的表。
+  > **这一段已被 EVID-VAL-48 supersede。** 上面这条命令缺 `--crate-name`：孤立文件被注入
+  > `extern crate r#t;` 后必然报 `E0463`，于是任何片段都"编译失败"，`compile_fail` 恒为 `ok`，
+  > 那次测量没有区分力。修正调用后的对照表（含两条必须判红的对照组）记在 EVID-VAL-48；
+  > 本条目保留原记录，不再用它证明任何结论。
 
   因此 `lib.rs` 里"2 条 doctest 钉住 E0204/E0599"的说法不成立，任何笔误都能让它们保持绿色。
   用 trybuild 固定错误码需要 dev-dependency，按仓库规则先出 ADR（ADR-0021，另一分支），本轮不引入。
@@ -1003,3 +1004,33 @@ run https://github.com/YougLin-dev/zenui/actions/runs/44317724221  (commit 61de7
 - 分支保护（`strict` + 四条 required checks + `enforce_admins`）在本 PR 上是生效状态。
 - **不证明什么**：不含 GPU/窗口/平台后端能力；`cargo package` 与 `SPEC-GATE-C-04` 仍未验证；
   clippy/fmt 只是同一 job 的步骤日志，没有独立 EVID。
+
+### EVID-VAL-48 `compile_fail` 语义探针的对照组（rustdoc）
+
+```text
+$ rustdoc --test --crate-name probe --edition 2024 <case>.rs
+```
+
+八条用例，`<case>.rs` 的内容只有一条 `//!` 文档注释，片段写在 ``` 块里（rustdoc 会包一层
+`fn main`），除标记与片段外调用完全相同：
+
+| 用例 | 标记 | 片段 | 实测诊断 | 结果 |
+|---|---|---|---|---|
+| A | `compile_fail` | `undefined_symbol_xyz();` | E0425 | `ok` |
+| **B（对照组）** | `compile_fail` | `let total = 1 + 1;` | 编译通过 | **`FAILED`** |
+| C | `compile_fail,E0204` | `undefined_symbol_xyz();` | E0425 | `ok` |
+| **D（对照组）** | `compile_fail,E0204` | `let total = 1 + 1;` | 编译通过 | **`FAILED`** |
+| E | `compile_fail,E0204` | `#[derive(Copy)] struct S { s: String }` | E0204 | `ok` |
+| F | `compile_fail,E0204` | `let s = String::from("x"); s.nonexistent_method();` | E0599 | **`ok`**（码不匹配仍通过） |
+| G | `compile_fail,E9999` | `undefined_symbol_xyz();` | E0425 | **`ok`**（不存在的码仍通过） |
+| H | `compile_fail,E0204` | `let v: u8 = 300;` | 无错误码（`overflowing_literals` 拒绝） | **`ok`**（无码错误仍通过） |
+
+- **对照组 B/D 是这条证据的全部价值**：它们证明这个探针不是"永远 ok"。合法代码标
+  `compile_fail` 必须 `FAILED`，否则测量没有区分力——EVID-VAL-37 早先那次无效测量正是缺了
+  这一行，只有 A/C 两个"永远通过"的用例时，任何结论都能被它"支持"。
+- **结论**：在本机 `rustdoc 1.99.1`、以上面这条命令调用时，`compile_fail,<code>` 的错误码后缀
+  **不产生约束**——码写错（F）、写成不存在的码（G）、失败根本无码（H）都 `ok`。doctest 只能表达
+  "这段不能编译"，不能表达"以 E0204 失败"；固定错误码要靠 trybuild 的 `.stderr` 逐字快照
+  （EVID-VAL-41）。
+- **不证明什么**：不证明 trybuild 的跨平台行为（见 EVID-VAL-47）；不证明其他工具链版本的行为，
+  错误码后缀是否被校验属于实现细节，升级 `rustc` 必须重跑这张表。
