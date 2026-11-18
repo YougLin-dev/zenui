@@ -1,0 +1,431 @@
+{
+  "schema": "zenui.evidence.matrix/1",
+  "docId": "EVID-MATRIX",
+  "layer": "evidence",
+  "date": "2026-11-18",
+  "owner": "测试与 CI/发布负责人（10y+）",
+  "_note": "本文件是 validation.md 与 08-gates.md 的机器投影。叙述与判定以 docs/evidence/validation.md 与 docs/spec/08-gates.md 为准；contracts 里的 assertion 只是一行门控摘要，规范原文（green/red 全文）仍在归档的 verification-contract.json 中，不在此复述。",
+  "commit": "ab5339b4fec807faef3128587721a1599f5aab9b",
+  "toolchain": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+  "sources": {
+    "runsProse": "docs/evidence/validation.md",
+    "gates": "docs/spec/08-gates.md",
+    "contractOriginal": "archive/review/verification-contract.json",
+    "contractAfterArchive": "docs/archive/review/verification-contract.json",
+    "rawReviewSnapshot": "archive/review/validation-matrix-raw.json",
+    "previousRoundLog": "archive/review/VALIDATION.md"
+  },
+
+  "hosts": [
+    {
+      "id": "H1",
+      "os": "Windows 11",
+      "toolchain": "1.99.1 x86_64-pc-windows-msvc",
+      "adapter": "NVIDIA GeForce RTX 4060 Laptop GPU / Vulkan",
+      "commit": null,
+      "commitNote": "原始记录未写下 commit，不可补",
+      "evidenceClass": "B-transcribed"
+    },
+    {
+      "id": "H2",
+      "os": "macOS 27.0.1 (26A434)",
+      "arch": "aarch64-apple-darwin",
+      "toolchain": "1.99.1 (58cf8f9c3 2026-10-13)",
+      "adapter": "Apple M4 (10-core GPU, Metal 4) / metal",
+      "commit": "ab5339b4fec807faef3128587721a1599f5aab9b",
+      "evidenceClass": "A-observed-this-round"
+    }
+  ],
+
+  "runs": [
+    {
+      "id": "EVID-VAL-01",
+      "class": "B",
+      "host": "H1",
+      "kind": "test",
+      "command": "cargo test --manifest-path examples/desktop_poc/Cargo.toml --lib",
+      "exit": 0,
+      "tests": { "passed": 7, "failed": 0, "ignored": 0 },
+      "proves": "平坦 field sink + typed style 的 7 条局部断言",
+      "doesNotProve": "生产 Owner/arena、Memo/effect/resource、For 生命周期"
+    },
+    {
+      "id": "EVID-VAL-02",
+      "class": "B",
+      "host": "H1",
+      "kind": "test",
+      "command": "cargo test --manifest-path examples/macro_poc/Cargo.toml --workspace",
+      "exit": 0,
+      "tests": { "passed": 2, "failed": 0, "ignored": 0 },
+      "compileFailFixtures": 3,
+      "zeroTestTargets": ["zenui-macro-processor lib", "zenui-macro-runtime lib", "doc-tests x3"],
+      "proves": "rstml 形状解析 + 3 个 compile-fail 诊断",
+      "doesNotProve": "生产 MountPlan、renamed facade、完整 component/For/Show"
+    },
+    {
+      "id": "EVID-VAL-03",
+      "class": "B",
+      "host": "H1",
+      "kind": "test",
+      "command": "cargo test --manifest-path examples/native_poc/Cargo.toml --lib",
+      "exit": 0,
+      "tests": { "passed": 4, "failed": 0, "ignored": 0 },
+      "proves": "ICU 边界、CPU premultiply、Taffy+Parley 测量失效、CJK 软件像素",
+      "doesNotProve": "baseline、intrinsic、字体合成、输入/无障碍"
+    },
+    {
+      "id": "EVID-VAL-04",
+      "class": "B",
+      "host": "H1",
+      "kind": "test",
+      "command": "cargo test --manifest-path Cargo.toml",
+      "exit": 0,
+      "tests": { "passed": 0, "failed": 0, "ignored": 0 },
+      "proves": "根 hello-world package 可构建",
+      "doesNotProve": "任何能力；0 tests 不得计为完成"
+    },
+    {
+      "id": "EVID-VAL-05",
+      "class": "B",
+      "host": "H1",
+      "kind": "gpu-probe",
+      "command": "cargo run --manifest-path examples/native_poc/Cargo.toml",
+      "exit": 0,
+      "adapter": "NVIDIA GeForce RTX 4060 Laptop GPU / Vulkan",
+      "assertions": ["sparse-strips GPU", "Parley/Glifo CJK 像素", "外部 TextureView 绑定", "半透明红 readback [128,0,0,128] == CPU reference (premultiplied)"],
+      "doesNotProve": "窗口/surface/DPI、device-loss、mask/filter、retained paint、性能"
+    },
+    {
+      "id": "EVID-VAL-06",
+      "class": "B",
+      "host": "H1",
+      "kind": "gpu-probe",
+      "command": "cargo run --manifest-path examples/desktop_poc/Cargo.toml",
+      "exit": 0,
+      "adapter": "NVIDIA GeForce RTX 4060 Laptop GPU / Vulkan",
+      "assertions": ["Vello underlay", "foreign wgpu LoadOp::Load", "straight-alpha overlay 合成"],
+      "doesNotProve": "Classic 0.12 是 probe，不构成第二生产后端"
+    },
+    {
+      "id": "EVID-VAL-07",
+      "class": "C",
+      "host": "H1",
+      "kind": "external-fixture",
+      "command": "cargo run --manifest-path <temp>/zenui-type-contract/Cargo.toml --example type_contract",
+      "exit": 0,
+      "reproducibleInRepo": false,
+      "proves": "Result<MountPlan,MountError> body 内 ? 与 Copy handle move 的普通 Rust 形状",
+      "doesNotProve": "宏降级、Props lowering、runtime commit"
+    },
+    {
+      "id": "EVID-VAL-08",
+      "class": "C",
+      "host": "H1",
+      "kind": "external-fixture",
+      "command": "cargo run --manifest-path <temp>/zenui-type-contract/Cargo.toml",
+      "reproducibleInRepo": false,
+      "assertions": ["PASS parse-only: rstml 接受目标 node/component/attribute 形状"],
+      "redObservations": ["嵌套 batch 外写 a=true、内写 b=true、外写 b=false → 两条 patch 且包含中间值 true"],
+      "gateImpact": "SPEC-GATE-A0-04 的现存反例"
+    },
+    {
+      "id": "EVID-VAL-09",
+      "class": "C",
+      "host": "H1",
+      "kind": "external-fixture",
+      "command": "cargo run --manifest-path <temp>/zenui-final-contract/Cargo.toml",
+      "firstAttempt": "compile error E0277 (WriteError 无 Debug) + E0161 (dyn Command 按值调用)",
+      "afterMinimalFix": "exit 0, shape-only",
+      "reproducibleInRepo": false
+    },
+    {
+      "id": "EVID-VAL-10",
+      "class": "C",
+      "host": "H1",
+      "kind": "external-fixture",
+      "command": "cargo run --manifest-path <temp>/zenui-type-contract/Cargo.toml --example transaction_contract",
+      "firstAttempt": "compile error: 泛型 S 缺 Default bound",
+      "afterMinimalFix": "exit 0, command shape only; staging/commit 仍属 A0",
+      "reproducibleInRepo": false
+    },
+    {
+      "id": "EVID-VAL-11",
+      "class": "C",
+      "host": "H1",
+      "kind": "external-fixture",
+      "command": "cargo run --manifest-path <temp>/zenui-copy-probe/Cargo.toml",
+      "result": "E0204: #[derive(Copy)] 结构不能持有 String",
+      "reproducibleInRepo": false,
+      "supersededBy": "EVID-VAL-18（H2 最小夹具复现同类错误）"
+    },
+    {
+      "id": "EVID-VAL-12",
+      "class": "A",
+      "host": "H2",
+      "kind": "test",
+      "command": "cargo test --manifest-path examples/desktop_poc/Cargo.toml --lib",
+      "exit": 0,
+      "tests": { "passed": 7, "failed": 0, "ignored": 0 },
+      "names": [
+        "style::tests::complete_utility_keys_lowering_to_typed_fields",
+        "style::tests::hover_only_supersedes_the_matching_property",
+        "style::tests::invalid_values_and_unknown_classes_report_source_location",
+        "project_signals::tests::multiple_writes_in_one_per_frame_batch_deduplicate_the_sink",
+        "project_signals::tests::changing_dependencies_removes_inactive_edges",
+        "project_signals::tests::disposing_owner_drops_sinks_and_disables_future_updates",
+        "project_signals::tests::source_update_runs_only_matching_sink"
+      ],
+      "proves": "H1 的 7 条断言在 aarch64-apple-darwin / Metal 上重现（纯逻辑层不依赖 Windows 或 GPU）",
+      "warnings": ["hover_only_supersedes_the_matching_property 的名称沿用已撤销措辞；其断言只涉及 class 内部的 hover 变体覆盖，不涉及 inline vs class 的 origin 排序"]
+    },
+    {
+      "id": "EVID-VAL-13",
+      "class": "A",
+      "host": "H2",
+      "kind": "test",
+      "command": "cargo test --manifest-path examples/macro_poc/Cargo.toml --workspace",
+      "exit": 0,
+      "tests": { "passed": 2, "failed": 0, "ignored": 0 },
+      "compileFailFixtures": 3,
+      "compileFailNames": ["html_element", "script_event", "unknown_class"],
+      "trybuildRunnerTests": 1,
+      "zeroTestTargets": ["zenui-macro-processor lib", "zenui-macro-runtime lib", "doc-tests x3"],
+      "proves": "trybuild .stderr 快照在 macOS 上逐字匹配 → 诊断文本当前无平台漂移",
+      "doesNotProve": "生产 MountPlan；宏仍写死 ::zenui_macro_runtime"
+    },
+    {
+      "id": "EVID-VAL-14",
+      "class": "A",
+      "host": "H2",
+      "kind": "test",
+      "command": "cargo test --manifest-path examples/native_poc/Cargo.toml --lib",
+      "exit": 0,
+      "tests": { "passed": 4, "failed": 0, "ignored": 0 },
+      "names": [
+        "tests::complex_script_dictionary_actually_changes_word_boundaries",
+        "tests::software_semi_transparency_is_premultiplied",
+        "tests::cjk_parley_produces_glyph_runs_and_software_pixels",
+        "tests::taffy_measures_parley_and_invalidates_changed_text"
+      ],
+      "proves": "parley complex-scripts + ICU 词典在 macOS 装载成功，边界断言成立",
+      "doesNotProve": "baseline / intrinsic / 字体合成（见 validation.md SRC-01..03）"
+    },
+    {
+      "id": "EVID-VAL-15",
+      "class": "A",
+      "host": "H2",
+      "kind": "gpu-probe",
+      "command": "cargo run --manifest-path examples/native_poc/Cargo.toml",
+      "exit": 0,
+      "adapter": "Apple M4 / metal",
+      "assertions": [
+        "PASS: sparse-strips GPU, Parley/Glifo CJK pixel runs, external TextureView",
+        "半透明红 GPU readback [128,0,0,128] == CPU reference"
+      ],
+      "proves": "同一 sparse-strips 场景跨图形后端（Vulkan→Metal）得到相同 readback",
+      "doesNotProve": "窗口/surface、device-loss、mask/filter、性能、glTF",
+      "defects": ["程序打印的 SCOPE 字符串硬编码为 Windows，与实际主机 macOS/Metal 不符；引用时必须以上表 H2 为准"]
+    },
+    {
+      "id": "EVID-VAL-16",
+      "class": "A",
+      "host": "H2",
+      "kind": "gpu-probe",
+      "command": "cargo run --manifest-path examples/desktop_poc/Cargo.toml",
+      "exit": 0,
+      "adapter": "Apple M4 / metal",
+      "assertions": ["PASS: Vello underlay, foreign wgpu LoadOp::Load, straight-alpha overlay compositing"],
+      "doesNotProve": "Classic 0.12 仍为 probe",
+      "defects": ["SCOPE 字符串同样硬编码为 Windows"]
+    },
+    {
+      "id": "EVID-VAL-17",
+      "class": "A",
+      "host": "H2",
+      "kind": "test",
+      "command": "cargo test --manifest-path Cargo.toml",
+      "exit": 0,
+      "tests": { "passed": 0, "failed": 0, "ignored": 0 },
+      "proves": "根 package 可构建",
+      "doesNotProve": "任何能力；0 tests 不得计为完成"
+    },
+    {
+      "id": "EVID-VAL-18",
+      "class": "A",
+      "host": "H2",
+      "kind": "compile-fail",
+      "command": "rustc --edition 2024 --crate-type lib copy_string.rs",
+      "exit": 1,
+      "expectedError": "E0204",
+      "source": "#[derive(Copy, Clone)] struct Row { id: u64, title: String }",
+      "proves": "Copy 结构持有 String 在语言层不可能",
+      "doesNotProve": "仓库内正式 trybuild fixture 已建立（仍缺）"
+    },
+    {
+      "id": "EVID-VAL-19",
+      "class": "A",
+      "host": "H2",
+      "kind": "compile-fail",
+      "command": "rustc --edition 2024 --crate-type lib --emit=metadata examples/todolist/main.rs",
+      "exit": 1,
+      "errorCount": 40,
+      "sampleErrors": ["E0433 cannot find crate `zenui`", "cannot find attribute `component`", "cannot find macro `view`", "E0425 cannot find type `CompletedField`"],
+      "proves": "目标示例是 design-only，当前不可编译",
+      "doesNotProve": "任何 A1 能力"
+    }
+  ],
+
+  "contracts": [
+    {
+      "id": "EVID-MATRIX-C01",
+      "gate": "A0",
+      "method": "编译期+运行时",
+      "assertion": "每 UI 行 mount 只读一次 owned title；Copy handle 不携带 String；所有 read/write 均 checked 并进入统一错误 sink；Add 的 insert 与 clear 同事务",
+      "plannedFixture": "crates/core/tests/non_copy_fields.rs",
+      "fixtureExists": false,
+      "status": "SPEC",
+      "sourceRef": "verification-contract.json#contracts[0]"
+    },
+    {
+      "id": "EVID-MATRIX-C02",
+      "gate": "A0",
+      "method": "编译期+运行时",
+      "assertion": "ViewId/OwnerId/TodoId/ResourceId/Taffy NodeId 与 generation 分离；旧 handle 不能复活旧对象；MountPlan 不产生第二棵可求值树",
+      "plannedFixture": "crates/core/tests/lifetimes.rs",
+      "fixtureExists": false,
+      "status": "SPEC",
+      "sourceRef": "verification-contract.json#contracts[1]"
+    },
+    {
+      "id": "EVID-MATRIX-C03",
+      "gate": "A0",
+      "method": "运行时",
+      "assertion": "最外层 batch 只 stabilization/commit 一次；TreeCommit 先完整 preflight 到 staging 再一次 swap；失败不写权威树",
+      "plannedFixture": "crates/core/tests/transactions.rs",
+      "fixtureExists": false,
+      "status": "SPEC",
+      "counterexample": "EVID-VAL-08（嵌套 batch 外泄中间值）",
+      "sourceRef": "verification-contract.json#contracts[2]"
+    },
+    {
+      "id": "EVID-MATRIX-C04",
+      "gate": "A0",
+      "method": "运行时",
+      "assertion": "rows(filter) 求值登记 membership + 实际读取字段反向边；命中只标脏共享 query cache；空态用独立索引标量，row_visit=0、materialization=0",
+      "plannedFixture": "crates/core/tests/store_queries.rs",
+      "fixtureExists": false,
+      "status": "SPEC",
+      "sourceRef": "verification-contract.json#contracts[3]"
+    },
+    {
+      "id": "EVID-MATRIX-C05",
+      "gate": "A1",
+      "method": "真机+运行时",
+      "assertion": "For 强制 key；reorder 保 ViewId/owner/caret；duplicate key 预检拒绝；焦点 intent next→prev→input→toolbar；Tasks=list、row=listitem、两个独立空态",
+      "plannedFixture": "crates/core/tests/for_focus_reducer.rs",
+      "fixtureExists": false,
+      "status": "SPEC",
+      "sourceRef": "verification-contract.json#contracts[4]"
+    },
+    {
+      "id": "EVID-MATRIX-C06",
+      "gate": "A1",
+      "method": "编译期+运行时",
+      "assertion": "MountPlan 只含 descriptor/绑定槽/children factory；move 闭包注册而非执行；宏与 builder 同 golden；renamed facade 可用",
+      "plannedFixture": "crates/macros/tests/macro_builder_golden.rs",
+      "fixtureExists": false,
+      "status": "SPEC",
+      "sourceRef": "verification-contract.json#contracts[5]"
+    },
+    {
+      "id": "EVID-MATRIX-C07",
+      "gate": "A1",
+      "method": "真机+运行时",
+      "assertion": "TextEditSession 分离本地 value/selection/composition 与 committed epoch/origin；IME 候选 Enter 只确认；SubmitEvent 单次提交",
+      "plannedFixture": "crates/core/tests/text_edit_reducer.rs",
+      "fixtureExists": false,
+      "status": "SPEC",
+      "sourceRef": "verification-contract.json#contracts[6]"
+    },
+    {
+      "id": "EVID-MATRIX-C08",
+      "gate": "B",
+      "method": "编译期+运行时",
+      "assertion": "StyleIR 按 property mask 字段级 resolve；pinned registry 决定 N/D/R/X 与 canonical 顺序；普通 inline 在 hover=false/true 均胜过普通 class/hover",
+      "plannedFixture": "crates/style/tests/precedence_golden.rs",
+      "fixtureExists": false,
+      "status": "SPEC",
+      "supersededRules": ["hover 激活后胜过 ordinary inline（旧建议，已由 FINAL §6 取代）"],
+      "sourceRef": "verification-contract.json#contracts[7]"
+    },
+    {
+      "id": "EVID-MATRIX-C09",
+      "gate": "B",
+      "method": "运行时",
+      "assertion": "ViewId→Taffy 私有映射；known/available/min/max 分开；单一 GeometrySnapshot 供 layout/paint/hit/a11y/caret；RendererCapabilities 返回 Result 不 panic",
+      "plannedFixture": "crates/layout/tests/taffy_text_geometry.rs",
+      "fixtureExists": false,
+      "status": "SPEC",
+      "sourceRef": "verification-contract.json#contracts[8]"
+    },
+    {
+      "id": "EVID-MATRIX-C10",
+      "gate": "D",
+      "method": "运行时",
+      "assertion": "可选 3D 是 external offscreen color/depth viewport；每 View generation 独立 Depth32Float；老 device/owner 世代不可写新 target",
+      "plannedFixture": "crates/scene/tests/offscreen_resources.rs",
+      "fixtureExists": false,
+      "status": "SPEC",
+      "sourceRef": "verification-contract.json#contracts[9]"
+    },
+    {
+      "id": "EVID-MATRIX-C11",
+      "gate": "C",
+      "method": "真机+运行时",
+      "assertion": "同一 locked Todo 在三平台真机 + AT 共同验证；Wayland/X11 分列；results.json 记录 OS/硬件/commit/lock hash；缺 runner 记 blocked",
+      "plannedFixture": "tests/desktop/{windows.rs,macos.rs,linux_atspi.rs}",
+      "fixtureExists": false,
+      "status": "SPEC",
+      "sourceRef": "verification-contract.json#contracts[10]"
+    }
+  ],
+
+  "gates": [
+    { "id": "SPEC-GATE-A0", "name": "纯 Rust core + Todo reducer", "method": "编译期+运行时", "blocking": true, "status": "OPEN", "criteria": 11 },
+    { "id": "SPEC-GATE-A1", "name": "单 Windows Todo 真实窗口", "method": "真机+运行时", "blocking": true, "status": "OPEN", "criteria": 9 },
+    { "id": "SPEC-GATE-B", "name": "Layout/Text/Style 差分基线", "method": "运行时 golden", "blocking": true, "status": "SPEC", "criteria": 10 },
+    { "id": "SPEC-GATE-C", "name": "三平台真实发布门", "method": "真机+AT+package", "blocking": true, "status": "OPEN", "criteria": 7 },
+    { "id": "SPEC-GATE-D", "name": "可选 3D 与性能定稿", "method": "运行时+真机", "blocking": true, "status": "OPEN", "criteria": 5 }
+  ],
+
+  "coverage": {
+    "criteriaTotal": 42,
+    "criteriaVerified": 0,
+    "criteriaProbe": 1,
+    "criteriaOpen": 41,
+    "note": "唯一 PROBE 项为 SPEC-GATE-B-05（3 条 style 探针，无 manifest/provenance）。total 为 42 是巧合，不代表任何覆盖率百分比。"
+  },
+
+  "counts": {
+    "testsPassedH2": 13,
+    "compileFailFixturesH2": 3,
+    "zeroTestTargetsH2": ["root package zenui"],
+    "gpuBackendsObserved": 2,
+    "runsTotal": 19,
+    "runsReproducibleHere": 8,
+    "runsTranscribedOrExternal": 11
+  },
+
+  "notVerified": [
+    "真实 winit 窗口 / surface / resize / DPI",
+    "Windows 与 Linux 实机（X11 与 Wayland 分列）",
+    "真实屏幕阅读器 NVDA / VoiceOver / AT-SPI",
+    "中文 IME / caret / selection 坐标换算",
+    "device-loss 恢复与 atlas 重建",
+    "mask / filter / 分层 clip",
+    "baseline / intrinsic / Font synthesis",
+    "glTF / 独立 depth / 3D",
+    "任何性能数字（禁止填 0）",
+    "全 workspace 的 cargo test / clippy / package"
+  ]
+}
