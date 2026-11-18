@@ -51,10 +51,10 @@ replaces: []
 
 ### 0.1 证据键（权威定义见 `docs/evidence/validation.md` §2）
 
-`EVID-VAL-*` 编号已与该文件的 19 条索引对齐。主机定义：
+`EVID-VAL-*` 编号已与该文件的 20 条索引对齐。主机定义：
 
 - **H1**：Windows 11 / MSVC / Rust 1.99.1 / NVIDIA RTX 4060 Laptop / Vulkan；上一轮记录，**commit 未记录**。
-- **H2**：macOS 27.0.1 / Apple M4 / Metal 4 / Rust 1.99.1 / commit `ab5339b`；本轮 Test/CI 实测。
+- **H2**：macOS 27.0.1 / Apple M4 / Metal 4 / Rust 1.99.1；commit `ab5339b`（EVID-VAL-12…19）/ `65e2e43`（EVID-VAL-20）；本轮 Test/CI 实测。
 
 | 键 | 类别 | 命令 / 位置 | 记录结果 |
 |---|---|---|---|
@@ -77,6 +77,7 @@ replaces: []
 | EVID-VAL-17 | A | 根 `cargo test`（H2） | 0 tests |
 | EVID-VAL-18 | A | `#[derive(Copy)] struct { String }`（H2） | E0204 |
 | EVID-VAL-19 | A | `todolist/main.rs` 单独编译（H2） | 40 errors（预期不可编译） |
+| EVID-VAL-20 | A | `cargo run -p zenui-app --example todolist_headless --locked`（H2，commit `65e2e43`） | 9 步 trace；两次运行逐字节一致；workspace 35 tests passed |
 | SRC | — | 仓库源码/清单，`path:line` | 本轮静态核对，可直接复查 |
 
 > **已裁决（C-18/D-02，ADR-0012）**：`docs/README.md` §6 现已承认第三种证据前缀 `SRC path:line`，
@@ -93,11 +94,11 @@ replaces: []
 |---|---|---|---|---|---|
 | CLAIM-001 | 真实 rstml 0.13.1 能解析目标 node/component/attribute 形状，但仅验证到 parse-only | PROBE | EVID-VAL-08；EVID-VAL-02/13 | A0 | 与 `archive/research/native-macro.md` 的目标形状一致；不证明 lowering |
 | CLAIM-002 | 根 package 在 H1 与 H2 的记录中 `cargo test` 均为 0 tests passed | VERIFIED | EVID-VAL-04/17 | — | 只证明 hello-world 可构建，不是能力证据 |
-| CLAIM-003 | 仓库现有 13 个实际通过的库/集成测试（7 + 2 + 4） | VERIFIED | EVID-VAL-01/02/03（H1）与 12/13/14（H2） | A0/B | 两主机同名通过 |
-| CLAIM-004 | macro workspace 另有 1 个 trybuild runner，内含 3 个 compile-fail fixture | VERIFIED | EVID-VAL-02/13 | A1 | runner 本身不是第 14 个能力测试 |
+| CLAIM-003 | 仓库现有 48 个实际通过的库/集成测试（7 + 2 + 4 + 35） | VERIFIED | EVID-VAL-01/02/03（H1）与 12/13/14/20（H2） | A0/B | 13 条 PoC 测试两主机同名通过；35 条 headless 测试**只在 H2 采集**，H1 无对应运行 |
+| CLAIM-004 | macro workspace 另有 1 个 trybuild runner，内含 3 个 compile-fail fixture | VERIFIED | EVID-VAL-02/13 | A1 | runner 本身不计入 48 条能力测试 |
 | CLAIM-005 | H1 记录中的 13 + 3 执行主机是 Windows 11 + NVIDIA RTX 4060 Laptop + Vulkan | VERIFIED | EVID-VAL-01..06 的记录头 | — | H2 另有 macOS/Metal 复跑，见 CLAIM-003/006 |
-| CLAIM-006 | 本台账作者本轮只做静态核对，未亲自执行 cargo；H2 的测试与 GPU 复跑由 Test/CI 记录（`EVID-VAL-12..19`） | VERIFIED | 本会话 `uname -m`/`sw_vers`；`evidence/validation.md` §1、§6 | — | `native_poc` 输出中的 `SCOPE: ... Windows ...` 是硬编码字符串，主机以 validation.md §1 为准 |
-| CLAIM-007 | 根 `Cargo.toml` 无 dependencies，`src/main.rs` 仅打印 hello-world | VERIFIED | SRC `Cargo.toml:1-7`、`src/main.rs:1-3` | — | 生产 runtime 不在此包 |
+| CLAIM-006 | 本台账作者本轮只做静态核对，未亲自执行 cargo；H2 的测试与 GPU 复跑由 Test/CI 记录（`EVID-VAL-12..20`） | VERIFIED | 本会话 `uname -m`/`sw_vers`；`evidence/validation.md` §1、§6 | — | `native_poc` 输出中的 `SCOPE: ... Windows ...` 是硬编码字符串，主机以 validation.md §1 为准 |
+| CLAIM-007 | 根 `Cargo.toml` 无 dependencies，`src/main.rs` 仅打印 hello-world | VERIFIED | SRC `Cargo.toml:1-12`、`src/main.rs:1-3` | — | 根 package 是 workspace 成员，`publish = false`；生产 runtime 不在此包 |
 | CLAIM-008 | 所有已记录的渲染执行都是 headless 离屏 RGBA readback | VERIFIED | EVID-VAL-05/06、15/16；SRC `examples/native_poc/src/gpu.rs`、`examples/desktop_poc/src/main.rs` | C | 无真实 surface/present |
 | CLAIM-009 | 仓库源码中不存在 winit、AccessKit、WindowEvent 或 Surface 的使用 | VERIFIED | SRC 全仓 grep（排除 `target/`） | A1/C | 窗口路径完全缺位 |
 | CLAIM-010 | 根 manifest 设置 `autoexamples = false`，设计稿不会被当作二进制构建 | VERIFIED | SRC `Cargo.toml:5` | — | 防止"0-test 绿"掩盖产品错误 |
@@ -139,18 +140,18 @@ replaces: []
 | CLAIM-036 | `detach` 只从 observer 集合删除，不移除变空的 source bucket | VERIFIED | SRC `project_signals.rs:75-84` | A0 | 长命 Owner 会积累幽灵桶 |
 | CLAIM-037 | `subscriber_count()` 返回 `subscribers.len()`，会把空桶计入订阅数 | VERIFIED | SRC `project_signals.rs:183-185` | A0 | 指标会掩盖泄漏 |
 | CLAIM-038 | `dispose` 只翻转每源一个 `bool` liveness，不存在 ViewId/OwnerId generation | VERIFIED | SRC `project_signals.rs:86-120,171-180` | A0 | 无法拒绝迟到命令 |
-| CLAIM-039 | 生产 Signal/Store/Memo/Owner、事务 journal 与 MountPlan 尚未实现 | VERIFIED | 源码树无对应 crate；`FINAL.md:305-309` | A0 | 目标而非现状 |
-| CLAIM-040 | A0 的 headless trace、query/mount/materialization 计数尚未存在 | OPEN | `FINAL.md:268` | A0 | 规划命令 `tolist_headless` |
+| CLAIM-039 | 生产运行时（事务 journal、`MountPlan`、平台后端）尚未实现；`crates/core` 只有 A0-01 所需的 Store/Memo/Owner 骨架 | VERIFIED | SRC `crates/core/src/lib.rs:1-30`、`src/main.rs:1-3`；`FINAL.md:305-309` | A0 | 骨架不等同生产实现，见 EVID-VAL-20 的"不证明什么" |
+| CLAIM-040 | A0 的 headless trace 与 query/mount/materialization 计数已存在，可用 `cargo run -p zenui-app --example todolist_headless --locked` 复跑 | VERIFIED | EVID-VAL-20 | A0 | 只覆盖 A0-01；A0-02…11 仍 OPEN |
 
 ### 1.4 Store / Query / For / 焦点生命周期（CLAIM-041 – CLAIM-053）
 
 | ID | 断言 | 状态 | 证据 | 关联 Gate | 备注 |
 |---|---|---|---|---|---|
-| CLAIM-041 | 生产 Store 类型、RowSet、QueryMemo、字段 handle 均未实现 | VERIFIED | SRC 源码树；`archive/review/FINAL.md:305-307` | A0 | 只有目标示例中的名字 |
+| CLAIM-041 | 生产 Store/查询层（字段反向边、成员索引、QueryMemo、字段 handle）未实现；`crates/core` 只有 A0-01 骨架 | VERIFIED | SRC `crates/core/src/store.rs`、`crates/core/src/query.rs`（骨架）；`archive/review/FINAL.md:305-307` | A0 | 骨架不覆盖 SPEC-RT-041…047 |
 | CLAIM-042 | 现有 PoC 没有字段反向边、成员索引或查询缓存 | VERIFIED | SRC `project_signals.rs`（仅 source→sink） | A0 | 无法支撑 Active/Done |
 | CLAIM-043 | Active/Done 的 `completed` 字段变化必须使对应 filter query cache 标脏，即使该行当前不是 member | SPEC | `FINAL.md:79-80` | A0 | 候选索引必须覆盖可能进入 filter 的行 |
 | CLAIM-044 | All 的 membership revision 不因单项 `completed` 改变 | SPEC | `FINAL.md:80,265` | A0 | 与 Active 行为不同 |
-| CLAIM-045 | 每个 `(store_epoch, filter)` 在拓扑稳定后至多共享物化一次 RowSet | SPEC | `FINAL.md:82` | A0 | 第二个消费者只共享快照 |
+| CLAIM-045 | 每个 `(store_epoch, filter)` 的 RowSet 由一个 `QueryCache` 共享，第二个消费者不重新物化 | PROBE | EVID-VAL-20（`second_consumer_shares_the_snapshot`）；`FINAL.md:82` | A0 | 只验证共享与按 epoch 失效；拓扑稳定与反向边未实现 |
 | CLAIM-046 | 空态求值必须 `row visits = 0`、RowSet 物化 = 0、String clones = 0 | SPEC | `FINAL.md:265` | A0 | 由独立 counter/membership 索引派生 |
 | CLAIM-047 | 用 collect/遍历实现 `is_empty`，即使返回正确 bool 也必须判红 | SPEC | `round2-debate.md:188,194`；`FINAL.md:83` | A0 | 防"用名称替代成本" |
 | CLAIM-048 | title 是每个 UI 行 mount 时读取一次的 owned `String`，不进入 Copy row | SPEC | `FINAL.md:85`；`examples/todolist/README.md:3` | A1 | 返场是新 mount，可再读一次 |
@@ -158,7 +159,7 @@ replaces: []
 | CLAIM-050 | key 消失或 filtered out 默认 dispose UI owner/订阅，但保留 Store row model | SPEC | `FINAL.md:59-60` | A0 | 再次出现是新 UI generation |
 | CLAIM-051 | 结构 mutation 前必须捕获 `FocusRemovalIntent`，commit 后按 next→prev→可聚焦 input→toolbar 继任 | SPEC | `FINAL.md:57` | A0/A1 | 用户中途换焦点则取消旧 intent |
 | CLAIM-052 | 重复 key 必须在任何 native patch 前被拒绝 | SPEC | `FINAL.md:56` | A0 | 保留之前合法 View 状态 |
-| CLAIM-053 | 上述 Store/Query/For 行为没有任何实现或测试记录 | VERIFIED | 源码树；`FINAL.md:307`；`evidence/validation.md` §8 | A0/A1 | 全部为 SPEC |
+| CLAIM-053 | 上述 Store/Query/For 的生产语义没有完整实现或 gate 级测试记录；A0 只有骨架与局部单测 | VERIFIED | EVID-VAL-20；SRC `crates/core/src/lib.rs` | A0/A1 | 具体覆盖与缺口见 EVID-VAL-20「不证明什么」 |
 
 ### 1.5 布局与文字（CLAIM-054 – CLAIM-063）
 
@@ -238,11 +239,11 @@ replaces: []
 
 | 状态 | 条数 | 主要领域 |
 |---|---|---|
-| VERIFIED | 60 | 执行记录、源码事实、两条官方 CSS/Tailwind 事实 |
-| SPEC | 10 | Store/Query/For/焦点契约 |
-| OPEN | 13 | MSRV、A0 trace、bidi/emoji、capabilities、surface/DPI、Mac/Linux、mask/filter、3D depth、IME、AT、平台矩阵、版本组合 |
+| VERIFIED | 61 | 执行记录、源码事实、两条官方 CSS/Tailwind 事实 |
+| SPEC | 9 | Store/Query/For/焦点契约中尚未实现的部分 |
+| OPEN | 12 | MSRV、bidi/emoji、capabilities、surface/DPI、Mac/Linux、mask/filter、3D depth、IME、AT、平台矩阵、版本组合 |
 | WITHDRAWN | 12 | 旧 mount 形状、条件语法、优先级、Copy+String、retained-visibility 等 |
-| PROBE | 5 | rstml parse-only、3 条 C 类夹具记录、tailwind crate 研究探针 |
+| PROBE | 6 | rstml parse-only、3 条 C 类夹具记录、tailwind crate 研究探针、A0 query 缓存共享 |
 | **合计** | **100** | — |
 
 > 注意：`VERIFIED` 只表示"该断言在其限定范围内有记录"，不表示整个子系统完成。例如
