@@ -69,10 +69,10 @@ replaces: []
 | EVID-VAL-21 | A | `cargo test --workspace --locked` | **H2** | 40 passed（34 + 6） | VERIFIED |
 | EVID-VAL-22 | D | `cargo test --workspace --locked` | **CI** | 40 passed × 3 平台 | VERIFIED（CI 日志） |
 | EVID-VAL-23 | A | `cargo test -p zenui-core --test gates --locked` | **H2** | 6 passed（A0-03/04/06 夹具） | VERIFIED（四条 mutation 逐一判红，见条目） |
-| EVID-VAL-24 | A | `cargo test -p zenui-core --locked` | **H2** | 70 passed（48 + 6 + 10 + 6 doctest） | VERIFIED |
+| EVID-VAL-24 | A | `cargo test -p zenui-core --locked` | **H2** | 71 passed（48 + 6 + 11 + 6 doctest） | VERIFIED |
 | EVID-VAL-25 | A | `cargo run -p zenui-app --example todolist_headless --locked` | **H2** | 9 步 trace，sha256 与 EVID-VAL-20 相同 | VERIFIED（语义未变，不是重新录制） |
 | EVID-VAL-26 | A | `cargo clippy --workspace --all-targets --locked -- -D warnings` | **H2** | exit 0 | VERIFIED（仅本机，C-04 仍 OPEN） |
-| EVID-VAL-27 | A | `cargo test -p zenui-core --test regressions --locked` | **H2** | 10 passed（失败帧与审计回归夹具） | VERIFIED（三条 mutation 判红，见条目） |
+| EVID-VAL-27 | A | `cargo test -p zenui-core --test regressions --locked` | **H2** | 11 passed（失败帧与审计回归夹具） | VERIFIED（三条 mutation 判红，见条目） |
 
 ## 3. 仓库内测试：H1 原始记录（转述）
 
@@ -403,7 +403,7 @@ $ cargo test --workspace --locked        # ubuntu-26.04 / macos-26-arm64 / windo
 ## 9. 数字台账（仅汇总本文件已定义的事实，供 CLAIM 引用）
 
 - H2 实际通过测试：**53** 条（7 + 2 + 4 + 40），来源 EVID-VAL-12/13/14/21；其中 40 条来自新的 headless workspace。这是 commit `83b21a4` 的计数。
-- H2 在 P2 之后的通过**执行数**：**139**（53 加上 EVID-VAL-23 的 6、EVID-VAL-24 的 70 与 EVID-VAL-27 的 10）。它是同一批用例在新 commit 上的复跑，**不是** 107 条互不相同的测试；`EVID-VAL-21` 的 40 与 `EVID-VAL-24` 的 50 有重叠（core lib 由 34 增至 44），不得相加当作"新增覆盖"。
+- H2 在 P2 之后的通过**执行数**：**141**（53 加上 EVID-VAL-23 的 6、EVID-VAL-24 的 71 与 EVID-VAL-27 的 11）。它是同一批用例在新 commit 上的复跑，**不是** 107 条互不相同的测试；`EVID-VAL-21` 的 40 与 `EVID-VAL-24` 的 50 有重叠（core lib 由 34 增至 44），不得相加当作"新增覆盖"。
 - H2 compile-fail fixture：**9** 条 = EVID-VAL-13 的 3 条 trybuild + EVID-VAL-24 的 6 条 `compile_fail` doctest。
 - 0-test target：根 package，来源 EVID-VAL-17。
 - 跨图形后端 GPU 观测：**2** 个数据点（Vulkan/NVIDIA 来自 H1 转述，Metal/Apple M4 来自 EVID-VAL-15），**不是** "GPU 矩阵已通过"。
@@ -461,9 +461,9 @@ test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 $ cargo test -p zenui-core --locked
      Running unittests src/lib.rs (zenui_core)    48 passed; 0 failed
      Running tests/gates.rs (zenui_core)           6 passed; 0 failed
-     Running tests/regressions.rs (zenui_core)     10 passed; 0 failed
+     Running tests/regressions.rs (zenui_core)     11 passed; 0 failed
    Doc-tests zenui_core                            6 passed; 0 failed
-（合计 70 passed / 0 failed）
+（合计 71 passed / 0 failed）
 ```
 
 - 48 条单测里与本次 gate 直接相关的：
@@ -520,7 +520,8 @@ test a_focus_on_an_unmounted_view_is_rejected ... ok
 test a_discarded_frame_does_not_burn_layout_ids ... ok
 test a_row_inserted_after_a_reorder_is_not_dropped ... ok
 test a_frame_internal_view_read_sees_staged_mounts ... ok
-test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test a_no_op_write_does_not_advance_the_epoch ... ok
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 ```
 
 **可视缺陷与条款**
@@ -581,4 +582,5 @@ $ cargo test -p zenui-core --lib a_dirty_dependency_is_not_treated_as_unchanged
   - **memo cycle 仍无检测**：`GraphError` 没有 cycle 变体，环表现为 compute 重入并以陈旧值收敛。A0-05 的 cycle 一半未实现。
   - **Cleanup 阶段没有帧进入过**：cleanup 回调现在在换入之后、`Phase::Cleanup` 下执行，但「cleanup 中 unmount 的意图只入 journal」没有独立夹具。
   - `SPEC-RT-053` 把 duplicate key 列为必须丢弃事务的失败，ADR-0017 决定 7 把它归为值错误；代码按 ADR 执行，冲突待裁决。
+  - **相位机没有真正走完 `SPEC-RT-050` 的八阶段**：帧只经过 `Outside → Preflight → Commit → Cleanup`，`Mark`/`Topo`/`Derived` 从未被进入；`commit` 因此接受 `Outside`（ADR-0017 的澄清允许在 Outside/Mark 打开事务）。这是与阶段表的一处未闭合差距。
   - 这些夹具都在单线程 headless 下跑；不涉及窗口、GPU、平台后端，也不构成任何性能结论。

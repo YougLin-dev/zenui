@@ -342,7 +342,7 @@
       "command": "cargo test -p zenui-core --locked",
       "exit": 0,
       "commit": "867a7b3d9b4ba08ad17b208619b1e8f926080a21",
-      "tests": { "passed": 70, "failed": 0, "ignored": 0 },
+      "tests": { "passed": 71, "failed": 0, "ignored": 0 },
       "compileFailFixtures": 6,
       "proves": "zenui-core lib 44 + gate 夹具 4 + 2 条 compile_fail doctest；含 A0-05 的 diamond/长链无 glitch 与 WriteDuringCompute 领域错误、A0-06 的 LayoutMap preflight 单测",
       "doesNotProve": "zenui-app 的 golden 测试不在本命令内；单测数量不等于 gate 覆盖数"
@@ -378,8 +378,8 @@
       "command": "cargo test -p zenui-core --test regressions --locked",
       "exit": 0,
       "commit": "bb16522bbdb5c861afebe5c7d6cf0864f3d37f17b03abd7fb0102fb092c49284615416fbc",
-      "tests": { "passed": 10, "failed": 0, "ignored": 0 },
-      "proves": "失败帧之后的两条数据一致性缺陷与 8 条审计缺陷各有回归夹具：嵌套失败中毒、discard 不回退 row key、removal 压过 staged 值、同帧 insert+remove 归还槽位、局部 view order 被拒、mount 指向已删行被拒、focus 指向将被卸载的 view 被拒、失败帧不烧 LayoutNodeId",
+      "tests": { "passed": 11, "failed": 0, "ignored": 0 },
+      "proves": "失败帧之后的两条数据一致性缺陷与 9 条审计缺陷各有回归夹具：嵌套失败中毒、discard 不回退 row key、removal 压过 staged 值、同帧 insert+remove 归还槽位、局部 view order 被拒、mount 指向已删行被拒、focus 指向将被卸载的 view 被拒、失败帧不烧 LayoutNodeId",
       "doesNotProve": "审计仍有未修项：memo cycle 无检测、Cleanup 阶段的 unmount 意图未单独验证、A0-05 的 per-epoch 计数只在单测层"
     }
   ],
@@ -516,7 +516,7 @@
   },
 
   "counts": {
-    "testsPassedH2": 139,
+    "testsPassedH2": 141,
     "testsPassedCi": 120,
     "compileFailFixturesH2": 9,
     "zeroTestTargetsH2": ["root package zenui"],
