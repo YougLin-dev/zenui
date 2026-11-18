@@ -19,9 +19,9 @@ replaces: []
 | 文件 | 定义什么 | 状态 |
 |---|---|---|
 | `index.md`（本文件） | 复跑入口、主机约定、引用规则、陷阱 | normative |
-| `validation.md` | `EVID-VAL-01…20`：每条命令 + 主机 + 结果 + 边界 | normative |
+| `validation.md` | `EVID-VAL-01…21`：每条命令 + 主机 + 结果 + 边界 | normative |
 | `matrix.json` | `EVID-MATRIX`：上述运行与 11 组合同的机器投影 | normative |
-| `claim-register.md` | `CLAIM-*`：可判真假的单句断言（唯一事实来源） | normative（研究员交付，436 行） |
+| `claim-register.md` | `CLAIM-*`：可判真假的单句断言（唯一事实来源） | normative（研究员交付） |
 | `probes.md` | `EVID-PROBE-01…05`：探针能力与证伪边界 | normative（本文件负责人，见 §1.1） |
 
 ### 1.1 `EVID-PROBE-*` 的归属
@@ -61,8 +61,9 @@ replaces: []
 | 7 | `rustc --edition 2024 --crate-type lib <tmp>/copy_string.rs`（源码见 `validation.md` `EVID-VAL-18`） | 必须 **E0204**（预期失败） | `EVID-VAL-18` |
 | 8 | `rustc --edition 2024 --crate-type lib --emit=metadata --out-dir <tmp> examples/todolist/main.rs` | 必须 **40 个 error**（预期失败，证明 design-only） | `EVID-VAL-19` |
 | 9 | `cargo run -p zenui-app --example todolist_headless --locked` | 9 步 trace；两次运行逐字节一致 | `EVID-VAL-20` |
+| 10 | `cargo test --workspace --locked` | 40 passed（34 core + 6 golden），0 failed | `EVID-VAL-21` |
 
-1–6 与 `EVID-VAL-12…17` 一一对应（顺序按 ID 排）；7–8 是两处**预期失败**的独立检查，对应 `EVID-VAL-18…19`；9 是 M0 的 headless 闭环，对应 `EVID-VAL-20`。
+1–6 与 `EVID-VAL-12…17` 一一对应（顺序按 ID 排）；7–8 是两处**预期失败**的独立检查，对应 `EVID-VAL-18…19`；9–10 是 M0 的 headless 闭环，分别对应 `EVID-VAL-20`（trace）与 `EVID-VAL-21`（测试）。
 
 一键脚本（只读仓库；只往 `mktemp -d` 里写）：
 
@@ -78,6 +79,7 @@ run cargo run  --manifest-path examples/native_poc/Cargo.toml
 run cargo run  --manifest-path examples/desktop_poc/Cargo.toml
 run cargo test --manifest-path Cargo.toml
 run cargo run -p zenui-app --example todolist_headless --locked
+run cargo test  --workspace --locked
 
 tmp=$(mktemp -d)
 cat > "$tmp/copy_string.rs" <<'EOF'
@@ -98,7 +100,7 @@ run_fail rustc --edition 2024 --crate-type lib --emit=metadata --out-dir "$tmp" 
 ## 3. 主机约定
 
 - `H1`：上一轮 Windows 11 / NVIDIA RTX 4060 Laptop / Vulkan，**commit 未记录**。
-- `H2`：本轮 macOS 27.0.1 / Apple M4 / Metal，commit `ab5339b`（EVID-VAL-12…19）/ `65e2e43`（EVID-VAL-20）；逐条 commit 见 `validation.md`。
+- `H2`：本轮 macOS 27.0.1 / Apple M4 / Metal，commit `ab5339b`（EVID-VAL-12…19）/ `83b21a4`（EVID-VAL-20/-21）；逐条 commit 见 `validation.md`。
 - 结论**按主机隔离**：`EVID-VAL-05` 与 `EVID-VAL-15` 是同一个探针在两台机器上的两次观测，可并列引用，不可互相替代。
 - 这台机器（H2）**没有** Windows/Linux runner、没有中文 IME、没有屏幕阅读器。C Gate 的任何结论在这里都只能是 `blocked`。
 
@@ -127,7 +129,7 @@ run_fail rustc --edition 2024 --crate-type lib --emit=metadata --out-dir "$tmp" 
 | 程序自报主机错误 | 两个 GPU 探针都硬编码打印 `SCOPE: ... Windows ...` | 主机以 H 表为准；该字符串待实现负责人修 |
 | 测试名误导 | `hover_only_supersedes_the_matching_property` 沿用已撤销措辞 | 它只断言 class 内部的 hover 变体覆盖，不涉及 inline vs class 的 origin 顺序 |
 | 文档未记录 commit | H1 的所有结论没有 commit | 引用时声明"commit 未知"，不得当作可精确复现的基线 |
-| 探针通过 ⇒ 产品能力 | 48 条测试全绿（含 M0 的 35 条） | 它们分别只覆盖平坦 sink、rstml 形状、Taffy/Parley 测量、headless 身份/事务骨架；见各自条目的"不证明" |
+| 探针通过 ⇒ 产品能力 | 53 条测试全绿（含 M0 的 40 条） | 它们分别只覆盖平坦 sink、rstml 形状、Taffy/Parley 测量、headless 身份/事务骨架；见各自条目的"不证明" |
 
 ## 7. 与 Gate 的对应
 
@@ -142,6 +144,6 @@ Gate 判据（`SPEC-GATE-*`）在 `docs/spec/08-gates.md`。当前映射：42 �
 
 本轮新增：`index.md`、`validation.md`、`matrix.json`、`probes.md`（commit `ab5339b` 之后、队长统一提交前）。`claim-register.md` 由研究员交付，本层只引用不改写。原始记录 `archive/review/VALIDATION.md`、`archive/review/validation-matrix-raw.json` 保持原文不动，归档后由本层接管引用。
 
-编号一致性：`claim-register.md` 的证据键表已覆盖 `EVID-VAL-01…20`（`CLAIM-003`/`CLAIM-040` 引用 -20），`matrix.json` 的 `runs` 与 `counts` 已同步到 20 条（`runsTotal=20`、`testsPassedH2=48`、`runsReproducibleHere=9`）。
+编号一致性：`claim-register.md` 的证据键表已覆盖 `EVID-VAL-01…21`，`matrix.json` 的 `runs` 与 `counts` 已同步到 21 条（`runsTotal=21`、`testsPassedH2=53`、`runsReproducibleHere=10`）。
 
 源码事实的引用形式（回应 `claim-register.md` 的 C-18）：不新增 `EVID-SRC`，统一写成 `EVID-PROBE-0N`（`probes.md` 条目内附 `SRC path:line`）。这样源码事实仍落在 evidence 层、仍是 `EVID-*` 形态，且附带"能/不能证明什么"的边界，比裸 `path:line` 更难被断章取义。

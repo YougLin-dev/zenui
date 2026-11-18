@@ -51,10 +51,10 @@ replaces: []
 
 ### 0.1 证据键（权威定义见 `docs/evidence/validation.md` §2）
 
-`EVID-VAL-*` 编号已与该文件的 20 条索引对齐。主机定义：
+`EVID-VAL-*` 编号已与该文件的 21 条索引对齐。主机定义：
 
 - **H1**：Windows 11 / MSVC / Rust 1.99.1 / NVIDIA RTX 4060 Laptop / Vulkan；上一轮记录，**commit 未记录**。
-- **H2**：macOS 27.0.1 / Apple M4 / Metal 4 / Rust 1.99.1；commit `ab5339b`（EVID-VAL-12…19）/ `65e2e43`（EVID-VAL-20）；本轮 Test/CI 实测。
+- **H2**：macOS 27.0.1 / Apple M4 / Metal 4 / Rust 1.99.1；commit `ab5339b`（EVID-VAL-12…19）/ `83b21a4`（EVID-VAL-20/-21）；本轮 Test/CI 实测。
 
 | 键 | 类别 | 命令 / 位置 | 记录结果 |
 |---|---|---|---|
@@ -77,7 +77,8 @@ replaces: []
 | EVID-VAL-17 | A | 根 `cargo test`（H2） | 0 tests |
 | EVID-VAL-18 | A | `#[derive(Copy)] struct { String }`（H2） | E0204 |
 | EVID-VAL-19 | A | `todolist/main.rs` 单独编译（H2） | 40 errors（预期不可编译） |
-| EVID-VAL-20 | A | `cargo run -p zenui-app --example todolist_headless --locked`（H2，commit `65e2e43`） | 9 步 trace；两次运行逐字节一致；workspace 35 tests passed |
+| EVID-VAL-20 | A | `cargo run -p zenui-app --example todolist_headless --locked`（H2，commit `83b21a4`） | 9 步 trace；两次运行逐字节一致 |
+| EVID-VAL-21 | A | `cargo test --workspace --locked`（H2，commit `83b21a4`） | 40 passed（34 core + 6 golden） |
 | SRC | — | 仓库源码/清单，`path:line` | 本轮静态核对，可直接复查 |
 
 > **已裁决（C-18/D-02，ADR-0012）**：`docs/README.md` §6 现已承认第三种证据前缀 `SRC path:line`，
@@ -94,8 +95,8 @@ replaces: []
 |---|---|---|---|---|---|
 | CLAIM-001 | 真实 rstml 0.13.1 能解析目标 node/component/attribute 形状，但仅验证到 parse-only | PROBE | EVID-VAL-08；EVID-VAL-02/13 | A0 | 与 `archive/research/native-macro.md` 的目标形状一致；不证明 lowering |
 | CLAIM-002 | 根 package 在 H1 与 H2 的记录中 `cargo test` 均为 0 tests passed | VERIFIED | EVID-VAL-04/17 | — | 只证明 hello-world 可构建，不是能力证据 |
-| CLAIM-003 | 仓库现有 48 个实际通过的库/集成测试（7 + 2 + 4 + 35） | VERIFIED | EVID-VAL-01/02/03（H1）与 12/13/14/20（H2） | A0/B | 13 条 PoC 测试两主机同名通过；35 条 headless 测试**只在 H2 采集**，H1 无对应运行 |
-| CLAIM-004 | macro workspace 另有 1 个 trybuild runner，内含 3 个 compile-fail fixture | VERIFIED | EVID-VAL-02/13 | A1 | runner 本身不计入 48 条能力测试 |
+| CLAIM-003 | 仓库现有 53 个实际通过的库/集成测试（7 + 2 + 4 + 40） | VERIFIED | EVID-VAL-01/02/03（H1）与 12/13/14/21（H2） | A0/B | 13 条 PoC 测试两主机同名通过；40 条 headless 测试**只在 H2 采集**，H1 无对应运行 |
+| CLAIM-004 | macro workspace 另有 1 个 trybuild runner，内含 3 个 compile-fail fixture | VERIFIED | EVID-VAL-02/13 | A1 | runner 本身不计入 53 条能力测试 |
 | CLAIM-005 | H1 记录中的 13 + 3 执行主机是 Windows 11 + NVIDIA RTX 4060 Laptop + Vulkan | VERIFIED | EVID-VAL-01..06 的记录头 | — | H2 另有 macOS/Metal 复跑，见 CLAIM-003/006 |
 | CLAIM-006 | 本台账作者本轮只做静态核对，未亲自执行 cargo；H2 的测试与 GPU 复跑由 Test/CI 记录（`EVID-VAL-12..20`） | VERIFIED | 本会话 `uname -m`/`sw_vers`；`evidence/validation.md` §1、§6 | — | `native_poc` 输出中的 `SCOPE: ... Windows ...` 是硬编码字符串，主机以 validation.md §1 为准 |
 | CLAIM-007 | 根 `Cargo.toml` 无 dependencies，`src/main.rs` 仅打印 hello-world | VERIFIED | SRC `Cargo.toml:1-12`、`src/main.rs:1-3` | — | 根 package 是 workspace 成员，`publish = false`；生产 runtime 不在此包 |
@@ -151,7 +152,7 @@ replaces: []
 | CLAIM-042 | 现有 PoC 没有字段反向边、成员索引或查询缓存 | VERIFIED | SRC `project_signals.rs`（仅 source→sink） | A0 | 无法支撑 Active/Done |
 | CLAIM-043 | Active/Done 的 `completed` 字段变化必须使对应 filter query cache 标脏，即使该行当前不是 member | SPEC | `FINAL.md:79-80` | A0 | 候选索引必须覆盖可能进入 filter 的行 |
 | CLAIM-044 | All 的 membership revision 不因单项 `completed` 改变 | SPEC | `FINAL.md:80,265` | A0 | 与 Active 行为不同 |
-| CLAIM-045 | 每个 `(store_epoch, filter)` 的 RowSet 由一个 `QueryCache` 共享，第二个消费者不重新物化 | PROBE | EVID-VAL-20（`second_consumer_shares_the_snapshot`）；`FINAL.md:82` | A0 | 只验证共享与按 epoch 失效；拓扑稳定与反向边未实现 |
+| CLAIM-045 | 每个 `(store_epoch, filter)` 的 RowSet 由一个 `QueryCache` 共享，第二个消费者不重新物化 | PROBE | EVID-VAL-21（`second_consumer_shares_the_snapshot`）；`FINAL.md:82` | A0 | 只验证共享与按 epoch 失效；拓扑稳定与反向边未实现 |
 | CLAIM-046 | 空态求值必须 `row visits = 0`、RowSet 物化 = 0、String clones = 0 | SPEC | `FINAL.md:265` | A0 | 由独立 counter/membership 索引派生 |
 | CLAIM-047 | 用 collect/遍历实现 `is_empty`，即使返回正确 bool 也必须判红 | SPEC | `round2-debate.md:188,194`；`FINAL.md:83` | A0 | 防"用名称替代成本" |
 | CLAIM-048 | title 是每个 UI 行 mount 时读取一次的 owned `String`，不进入 Copy row | SPEC | `FINAL.md:85`；`examples/todolist/README.md:3` | A1 | 返场是新 mount，可再读一次 |
@@ -159,7 +160,7 @@ replaces: []
 | CLAIM-050 | key 消失或 filtered out 默认 dispose UI owner/订阅，但保留 Store row model | SPEC | `FINAL.md:59-60` | A0 | 再次出现是新 UI generation |
 | CLAIM-051 | 结构 mutation 前必须捕获 `FocusRemovalIntent`，commit 后按 next→prev→可聚焦 input→toolbar 继任 | SPEC | `FINAL.md:57` | A0/A1 | 用户中途换焦点则取消旧 intent |
 | CLAIM-052 | 重复 key 必须在任何 native patch 前被拒绝 | SPEC | `FINAL.md:56` | A0 | 保留之前合法 View 状态 |
-| CLAIM-053 | 上述 Store/Query/For 的生产语义没有完整实现或 gate 级测试记录；A0 只有骨架与局部单测 | VERIFIED | EVID-VAL-20；SRC `crates/core/src/lib.rs` | A0/A1 | 具体覆盖与缺口见 EVID-VAL-20「不证明什么」 |
+| CLAIM-053 | 上述 Store/Query/For 的生产语义没有完整实现或 gate 级测试记录；A0 只有骨架与局部单测 | VERIFIED | EVID-VAL-21；SRC `crates/core/src/lib.rs` | A0/A1 | 具体覆盖与缺口见 EVID-VAL-20「不证明什么」 |
 
 ### 1.5 布局与文字（CLAIM-054 – CLAIM-063）
 
@@ -418,7 +419,7 @@ replaces: []
 
 需要队长/其他 owner 裁决的点（按影响排序）：
 
-1. **C-01**：`SPEC`/`WITHDRAWN` 能否在 evidence 层出现。若不能，本表 10 条 SPEC 与 12 条 WITHDRAWN 需要改挂在
+1. **C-01**：`SPEC`/`WITHDRAWN` 能否在 evidence 层出现。若不能，本表 9 条 SPEC 与 12 条 WITHDRAWN 需要改挂在
    `spec/` 与 `decisions/` 下再被引用。
 2. **C-18（已关闭）**：`probes.md` 由测试与 CI 负责人交付（`EVID-PROBE-01…05`）；`CODE` 前缀统一为 `SRC`，见 §0.1。
 3. **C-04**：两套 Gate 字母表必须只保留一套；research 版需改名归档。
