@@ -612,9 +612,10 @@ impl<'a> Tx<'a> {
         self.txn.model.inserted.push(key);
         self.txn.model.writes += 1;
         self.bump();
-        // A new row joins `All` and `Active` (it is never born completed) and
-        // appends to the display order.
-        self.note_membership(&[Filter::All, Filter::Active]);
+        // Insert/remove/clear move every membership revision, whichever set
+        // the row is actually in: the reverse edge is collapsed per filter, and
+        // over-invalidation is redundant but harmless (`ADR-0022` decision 3).
+        self.note_membership(&[Filter::All, Filter::Active, Filter::Completed]);
         self.note_order();
         Ok(Handle::new(self.store.runtime_id(), slot, generation))
     }
@@ -637,17 +638,10 @@ impl<'a> Tx<'a> {
             // effective flag is no longer readable (the removal wins).
             return Ok(key);
         }
-        let completed = self.effective_completed(row)?;
         self.txn.model.removals.insert(key);
         self.txn.model.writes += 1;
         self.bump();
-        // The row leaves `All` and exactly one of `Active`/`Completed`.
-        let moved = if completed {
-            Filter::Completed
-        } else {
-            Filter::Active
-        };
-        self.note_membership(&[Filter::All, moved]);
+        self.note_membership(&[Filter::All, Filter::Active, Filter::Completed]);
         self.note_order();
         Ok(key)
     }
@@ -675,8 +669,7 @@ impl<'a> Tx<'a> {
             }
             self.txn.model.writes += 1;
             self.bump();
-            // Only completed rows are cleared: `Active` membership is intact.
-            self.note_membership(&[Filter::All, Filter::Completed]);
+            self.note_membership(&[Filter::All, Filter::Active, Filter::Completed]);
             self.note_order();
         }
         Ok(removed)
@@ -811,7 +804,7 @@ impl<'a> Tx<'a> {
     /// and still shared — after the frame lands.
     pub fn rows(&mut self, filter: Filter) -> RowSet {
         let mut view = StagedView::new(self.store, self.txn);
-        self.query.rows(&mut view, filter)
+        self.query.rows_at(&mut view, filter)
     }
 
     /// Rows still active, from the membership counters.

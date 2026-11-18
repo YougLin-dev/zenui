@@ -173,11 +173,15 @@ impl QueryCache {
 
     /// Rows matching `filter` as `view` currently sees them.
     ///
+    /// The revisions come from the view, never from the caller
+    /// (`ADR-0022` decision 2): a caller-supplied revision would be a second
+    /// place where a key could be declared wrong.
+    ///
     /// The first consumer of a `(membership, order, filter)` triple pays one
     /// evaluation; a non-empty result also pays one build, one materialization
     /// and one visit per scanned row. An empty result is answered from the
     /// membership counters and pays none of the three (`SPEC-GATE-A0-08`).
-    pub(crate) fn rows<V: RowView + ?Sized>(&mut self, view: &mut V, filter: Filter) -> RowSet {
+    pub(crate) fn rows_at<V: RowView + ?Sized>(&mut self, view: &mut V, filter: Filter) -> RowSet {
         let index = filter_index(filter);
         let revision = Revision {
             membership: view.membership_revision(filter),
@@ -306,8 +310,8 @@ mod tests {
         let mut view = TestView::new(&[(1, false), (2, false)]);
 
         let mut cache = QueryCache::new();
-        let first = cache.rows(&mut view, Filter::All);
-        let second = cache.rows(&mut view, Filter::All);
+        let first = cache.rows_at(&mut view, Filter::All);
+        let second = cache.rows_at(&mut view, Filter::All);
 
         assert!(first.shares_with(&second));
         assert_eq!(cache.counters().query_evals, 1);
@@ -321,19 +325,19 @@ mod tests {
         let mut view = TestView::new(&[(1, false), (2, true)]);
         let mut cache = QueryCache::new();
 
-        let _ = cache.rows(&mut view, Filter::All);
-        let _ = cache.rows(&mut view, Filter::Active);
-        let _ = cache.rows(&mut view, Filter::Completed);
+        let _ = cache.rows_at(&mut view, Filter::All);
+        let _ = cache.rows_at(&mut view, Filter::Active);
+        let _ = cache.rows_at(&mut view, Filter::Completed);
         assert_eq!(cache.counters().query_evals, 3);
 
         // A completed write cannot move `All`'s membership set.
         view.membership[filter_index(Filter::Active)] += 1;
         view.membership[filter_index(Filter::Completed)] += 1;
 
-        let _ = cache.rows(&mut view, Filter::All);
+        let _ = cache.rows_at(&mut view, Filter::All);
         assert_eq!(cache.counters().query_evals, 3, "All stayed fresh");
-        let _ = cache.rows(&mut view, Filter::Active);
-        let _ = cache.rows(&mut view, Filter::Completed);
+        let _ = cache.rows_at(&mut view, Filter::Active);
+        let _ = cache.rows_at(&mut view, Filter::Completed);
         assert_eq!(cache.counters().query_evals, 5);
     }
 
@@ -344,7 +348,7 @@ mod tests {
         let mut view = TestView::new(&[(1, false), (2, false)]);
         let mut cache = QueryCache::new();
 
-        let before = cache.rows(&mut view, Filter::All);
+        let before = cache.rows_at(&mut view, Filter::All);
         assert_eq!(
             before.as_slice(),
             &[RowKey::from_raw(1), RowKey::from_raw(2)]
@@ -353,7 +357,7 @@ mod tests {
         view.rows.reverse();
         view.order += 1;
 
-        let after = cache.rows(&mut view, Filter::All);
+        let after = cache.rows_at(&mut view, Filter::All);
         assert_eq!(
             after.as_slice(),
             &[RowKey::from_raw(2), RowKey::from_raw(1)]
@@ -367,7 +371,7 @@ mod tests {
         let mut view = TestView::new(&[(1, false)]);
         let mut cache = QueryCache::new();
 
-        let rows = cache.rows(&mut view, Filter::Completed);
+        let rows = cache.rows_at(&mut view, Filter::Completed);
         assert!(rows.is_empty());
         assert_eq!(cache.counters().query_evals, 1);
         assert_eq!(cache.counters().cache_builds, 0);
@@ -382,12 +386,12 @@ mod tests {
         let mut view = TestView::new(&[(1, false)]);
         let mut cache = QueryCache::new();
 
-        let _ = cache.rows(&mut view, Filter::Active);
+        let _ = cache.rows_at(&mut view, Filter::Active);
 
         // Same rows, both revisions moved: the cached slot must not answer.
         view.membership = [1, 1, 1];
         view.order = 1;
-        assert_eq!(cache.rows(&mut view, Filter::Active).len(), 1);
+        assert_eq!(cache.rows_at(&mut view, Filter::Active).len(), 1);
         assert_eq!(cache.counters().query_evals, 2, "a moved pair re-evaluates");
     }
 
@@ -406,11 +410,11 @@ mod tests {
         store.insert("B");
         let mut cache = QueryCache::new();
 
-        let all = cache.rows(&mut store, Filter::All);
+        let all = cache.rows_at(&mut store, Filter::All);
         assert_eq!(all.len(), 2);
         assert_eq!(cache.counters().row_visits, 2);
 
-        let completed = cache.rows(&mut store, Filter::Completed);
+        let completed = cache.rows_at(&mut store, Filter::Completed);
         assert!(completed.is_empty());
         assert_eq!(
             cache.counters().row_visits,
@@ -419,16 +423,16 @@ mod tests {
         );
 
         store.toggle(a).expect("live row");
-        let completed = cache.rows(&mut store, Filter::Completed);
+        let completed = cache.rows_at(&mut store, Filter::Completed);
         assert_eq!(completed.len(), 1);
         assert_eq!(completed.as_slice(), &[store.key_of(a).expect("key")]);
-        assert!(cache.rows(&mut store, Filter::Active).len() == 1);
+        assert!(cache.rows_at(&mut store, Filter::Active).len() == 1);
 
         // An order move is a new state for the committed view too.
         let keys: Vec<RowKey> = store.keys().collect();
         store.reorder(&[keys[1], keys[0]]).expect("reorder");
         assert_eq!(
-            cache.rows(&mut store, Filter::All).as_slice(),
+            cache.rows_at(&mut store, Filter::All).as_slice(),
             &[keys[1], keys[0]]
         );
     }

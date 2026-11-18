@@ -208,8 +208,7 @@ impl Store {
         assert!(self.rows.fill(slot, row), "fresh reservation must be empty");
         self.order.push(slot);
         self.record_write();
-        // A new row joins `All` and `Active`; it is never born completed.
-        self.touch_filters([true, true, false]);
+        self.touch_filters([true, true, true]);
         self.order_epoch += 1;
         Handle::new(self.runtime, slot, generation)
     }
@@ -267,8 +266,7 @@ impl Store {
             self.completed -= 1;
         }
         self.record_write();
-        // The row leaves `All` and exactly one of `Active`/`Completed`.
-        self.touch_filters([true, !was_completed, was_completed]);
+        self.touch_filters([true, true, true]);
         self.order_epoch += 1;
         Ok(removed)
     }
@@ -298,8 +296,7 @@ impl Store {
             // One `clear_completed` call is one write, however many rows it
             // removed (`metrics::Counters::io_writes`).
             self.record_write();
-            // Only completed rows are removed: `Active` membership is intact.
-            self.touch_filters([true, false, true]);
+            self.touch_filters([true, true, true]);
             self.order_epoch += 1;
         }
         removed
