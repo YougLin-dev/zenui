@@ -432,8 +432,9 @@ impl MemoGraph {
             observed,
             observed_at,
             source_rev,
-            ..
+            dirty,
         } = scratch;
+        let mut installed: std::collections::BTreeSet<NodeId> = std::collections::BTreeSet::new();
 
         for (node, revision) in source_rev {
             if let Some(state) = self.nodes.get_mut(node as usize) {
@@ -450,6 +451,7 @@ impl MemoGraph {
                 continue;
             }
             self.values[index] = Some(value);
+            installed.insert(node);
             if let Some(revision) = revisions.get(&node)
                 && let Some(state) = self.nodes.get_mut(index)
             {
@@ -458,6 +460,18 @@ impl MemoGraph {
             }
             if let Some(deps) = observed.get(&node) {
                 self.record_dependencies(node, deps.keys().copied().collect());
+            }
+        }
+
+        // A node that was marked dirty but never recomputed during this frame
+        // must stay dirty. Dropping the scratch set would leave the stale
+        // value marked clean, so the next read would never recompute it.
+        for node in dirty {
+            if installed.contains(&node) {
+                continue;
+            }
+            if let Some(state) = self.nodes.get_mut(node as usize) {
+                state.dirty = true;
             }
         }
     }
@@ -500,9 +514,11 @@ impl MemoGraph {
             return false;
         }
         observed.iter().all(|(dependency, revision)| {
-            self.nodes
-                .get(*dependency as usize)
-                .is_some_and(|state| state.revision == *revision)
+            self.nodes.get(*dependency as usize).is_some_and(|state| {
+                // A dirty dependency may still move this frame, so its
+                // committed revision is not evidence of stability.
+                !state.dirty && state.revision == *revision
+            })
         })
     }
 
@@ -684,6 +700,76 @@ mod tests {
             })
             .expect("leaf recomputed");
         assert_eq!(leaf_value, Value::Count(3));
+    }
+
+    /// Removing the `dirty` handling in `commit_scratch` makes this fail: the
+    /// memo would keep its old value and be treated as clean.
+    #[test]
+    fn a_write_only_frame_leaves_the_memo_dirty() {
+        let mut graph = MemoGraph::new();
+        let source = graph.source("store");
+        let memo = graph.memo("remaining");
+
+        let first = graph
+            .compute(memo, |reader| {
+                reader.read(source);
+                Value::Count(1)
+            })
+            .expect("first compute");
+        assert_eq!(first, Value::Count(1));
+
+        // A frame that writes the source and never reads the memo.
+        let mut scratch = GraphScratch::new();
+        graph.bump_source_staged(&mut scratch, source);
+        graph.commit_scratch(scratch, 1);
+
+        let after = graph
+            .compute(memo, |reader| {
+                reader.read(source);
+                Value::Count(2)
+            })
+            .expect("the memo must recompute after the write-only frame");
+        assert_eq!(
+            after,
+            Value::Count(2),
+            "a stale value survived a write-only frame"
+        );
+    }
+
+    /// Removing the dirty check in `dependencies_unchanged` makes this fail:
+    /// the node would serve a value computed before its dependency moved.
+    #[test]
+    fn a_dirty_dependency_is_not_treated_as_unchanged() {
+        let mut graph = MemoGraph::new();
+        let source = graph.source("store");
+        let middle = graph.memo("middle");
+        let top = graph.memo("top");
+
+        let _ = graph
+            .compute(middle, |reader| {
+                reader.read(source);
+                Value::Count(1)
+            })
+            .expect("middle");
+        let _ = graph
+            .compute(top, |reader| {
+                reader.read(middle);
+                Value::Count(10)
+            })
+            .expect("top");
+
+        // The source moves: `middle` and `top` are both dirty, but `middle` has
+        // not recomputed yet, so its committed revision still matches what
+        // `top` observed.
+        graph.bump_source(source);
+
+        let top_value = graph
+            .compute(top, |reader| {
+                reader.read(middle);
+                Value::Count(20)
+            })
+            .expect("top must not serve a value built on a dirty dependency");
+        assert_eq!(top_value, Value::Count(20));
     }
 
     #[test]

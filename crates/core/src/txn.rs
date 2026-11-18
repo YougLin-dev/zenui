@@ -100,8 +100,10 @@ pub enum Fatal {
     BatchNotAllowed {
         phase: Phase,
     },
+    /// A model/source write attempted while a compute stage is running
+    /// (`SPEC-RT-038`). The phase is the stage that refused it.
     WriteDuringCompute {
-        node: NodeId,
+        phase: Phase,
     },
     Unbalanced {
         depth: u32,
@@ -140,7 +142,9 @@ impl fmt::Display for Fatal {
                 write!(f, "expected phase {expected:?}, found {found:?}")
             }
             Fatal::BatchNotAllowed { phase } => write!(f, "batch not allowed during {phase:?}"),
-            Fatal::WriteDuringCompute { node } => write!(f, "write during compute of node {node}"),
+            Fatal::WriteDuringCompute { phase } => {
+                write!(f, "write during the {phase:?} compute stage")
+            }
             Fatal::Unbalanced { depth } => write!(f, "unbalanced transaction end at depth {depth}"),
             Fatal::StaleStagedRow { key } => {
                 write!(f, "staged operation targets removed row {}", key.raw())
@@ -167,10 +171,10 @@ impl std::error::Error for Fatal {}
 pub enum ValueError {
     Handle(InvalidHandle),
     Store(StoreError),
-    /// A write attempted in a phase that does not permit it. The type is the
-    /// same domain error as the fatal path, but the transaction is also
-    /// poisoned, so the frame cannot commit (`SPEC-RT-038`).
-    Phase(PhaseViolation),
+    /// A domain error that is fatal for the transaction but is reported
+    /// through the value channel at the call site. The transaction is
+    /// poisoned, so `commit` refuses to publish (`SPEC-RT-038`).
+    Fatal(Fatal),
 }
 
 impl From<InvalidHandle> for ValueError {
@@ -180,9 +184,9 @@ impl From<InvalidHandle> for ValueError {
 }
 
 impl ValueError {
-    /// True when the value error also poisoned the transaction.
+    /// True when this error also poisoned the transaction.
     pub const fn is_fatal(&self) -> bool {
-        matches!(self, Self::Phase(_))
+        matches!(self, Self::Fatal(_))
     }
 }
 
@@ -197,11 +201,7 @@ impl fmt::Display for ValueError {
         match self {
             ValueError::Handle(error) => write!(f, "{error}"),
             ValueError::Store(error) => write!(f, "{error}"),
-            ValueError::Phase(violation) => write!(
-                f,
-                "write {:?} is not allowed in phase {:?}",
-                violation.attempted, violation.phase
-            ),
+            ValueError::Fatal(fatal) => write!(f, "{fatal}"),
         }
     }
 }
@@ -445,12 +445,22 @@ impl<'a> Tx<'a> {
 
     fn require(&self, kind: WriteKind) -> Result<(), Fatal> {
         if self.txn.phase.permits(kind) {
-            Ok(())
-        } else {
-            Err(Fatal::PhaseViolation(PhaseViolation {
+            return Ok(());
+        }
+        Err(self.phase_error(kind))
+    }
+
+    /// Classify a refused write: a write during Topo/Binding is the
+    /// `WriteDuringCompute` domain error, anything else is a phase violation.
+    fn phase_error(&self, kind: WriteKind) -> Fatal {
+        match self.txn.phase {
+            Phase::Topo | Phase::Binding => Fatal::WriteDuringCompute {
                 phase: self.txn.phase,
+            },
+            phase => Fatal::PhaseViolation(PhaseViolation {
+                phase,
                 attempted: kind,
-            }))
+            }),
         }
     }
 
@@ -470,10 +480,7 @@ impl<'a> Tx<'a> {
             return Ok(());
         }
         self.txn.poisoned = true;
-        Err(ValueError::Phase(PhaseViolation {
-            phase: self.txn.phase,
-            attempted: kind,
-        }))
+        Err(ValueError::Fatal(self.phase_error(kind)))
     }
 
     fn bump(&mut self) {
@@ -744,8 +751,37 @@ impl<'a> Tx<'a> {
         self.owners.root()
     }
 
+    /// Mounted row views in display order, as this frame sees them: the
+    /// committed tree with this frame's unmounts removed and its staged mounts
+    /// included (`ADR-0017` decision 4 — read your own writes applies to the
+    /// view tree too).
     pub fn row_views(&self) -> Vec<(ViewId, RowKey)> {
-        self.views.row_views()
+        let mut rows: Vec<(ViewId, RowKey)> = self
+            .views
+            .row_views()
+            .into_iter()
+            .filter(|(view, _)| !self.txn.view.unmounts.contains(view))
+            .collect();
+        for mount in &self.txn.view.mounts {
+            if !rows.iter().any(|(view, _)| *view == mount.id) {
+                rows.push((mount.id, mount.row));
+            }
+        }
+        if let Some(order) = &self.txn.view.order {
+            let mut ordered = Vec::with_capacity(rows.len());
+            for view in order {
+                if let Some(entry) = rows.iter().find(|(candidate, _)| candidate == view) {
+                    ordered.push(*entry);
+                }
+            }
+            for entry in &rows {
+                if !ordered.iter().any(|(view, _)| view == &entry.0) {
+                    ordered.push(*entry);
+                }
+            }
+            return ordered;
+        }
+        rows
     }
 
     pub fn view_of_row(&self, row: RowKey) -> Option<ViewId> {
@@ -881,6 +917,10 @@ impl<'a> Tx<'a> {
         // Capture the touched keys before `apply_model` consumes the journal.
         let keys = self.touched_keys();
 
+        // Mark the transaction settled *before* the swap. From here on the
+        // frame has succeeded; if `apply_*` panics, `Drop` must not run
+        // `discard` against a half-applied store (`ADR-0017` decision 9).
+        self.txn.outcome = Outcome::Committed;
         self.txn.phase = Phase::Commit;
         self.apply_model();
         self.apply_views();
@@ -920,8 +960,24 @@ impl<'a> Tx<'a> {
                 .into_iter()
                 .map(|(key, _)| key)
                 .collect();
+            let inserted: BTreeSet<RowKey> = self
+                .txn
+                .model
+                .inserted
+                .iter()
+                .filter(|key| !self.txn.model.removals.contains(*key))
+                .copied()
+                .collect();
             let listed: BTreeSet<RowKey> = order.iter().copied().collect();
-            if listed != live || listed.len() != order.len() {
+            let missing: BTreeSet<RowKey> = live.difference(&listed).copied().collect();
+            // A staged order must name every live row except the ones this
+            // frame inserts: those are appended in insertion order. Anything
+            // else — a dropped row, a duplicate, a ghost — is rejected before
+            // the swap (`SPEC-RT-052`).
+            if listed.len() != order.len()
+                || !listed.is_subset(&live)
+                || !missing.is_subset(&inserted)
+            {
                 return Err(Fatal::OrderNotAPermutation);
             }
         }
@@ -1229,9 +1285,19 @@ impl<'a> Tx<'a> {
         }
 
         if let Some(order) = &self.txn.model.order {
+            // The staged order is authoritative for the rows it names. A row
+            // it does not name — typically one inserted after the reorder —
+            // is appended in insertion order rather than silently dropped:
+            // dropping it would leave a filled slot that no read path can
+            // reach (`SPEC-RT-052`).
             let mut ordered = Vec::with_capacity(rows.len());
             for key in order {
                 if let Some(entry) = rows.iter().find(|(candidate, _)| candidate == key) {
+                    ordered.push(*entry);
+                }
+            }
+            for entry in &rows {
+                if !ordered.iter().any(|(key, _)| key == &entry.0) {
                     ordered.push(*entry);
                 }
             }

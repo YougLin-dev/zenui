@@ -238,3 +238,96 @@ fn a_discarded_frame_does_not_burn_layout_ids() {
         "the discarded frame must not have advanced the layout allocator"
     );
 }
+
+/// `SPEC-RT-052`: a row inserted after a reorder must not vanish from the
+/// committed store. Removing the append step in `effective_rows` makes this
+/// fail: the slot is filled but no read path can reach it.
+#[test]
+fn a_row_inserted_after_a_reorder_is_not_dropped() {
+    let mut runtime = Runtime::new();
+
+    runtime
+        .frame(|tx| {
+            tx.insert("A")?;
+            tx.insert("B")?;
+            Ok(())
+        })
+        .expect("seed");
+
+    let a = key_of(&runtime, "A");
+    let b = key_of(&runtime, "B");
+
+    runtime
+        .frame(|tx| {
+            tx.reorder(&[b, a])
+                .map_err(|_| Fatal::OrderNotAPermutation)?;
+            tx.insert("C")?;
+            Ok(())
+        })
+        .expect("reorder then insert");
+
+    let store = runtime.committed();
+    assert_eq!(
+        store.titles().collect::<Vec<_>>(),
+        vec!["B", "A", "C"],
+        "the new row is appended to the staged order"
+    );
+    assert_eq!(store.len(), 3);
+    assert_eq!(store.rows().count(), 3, "every row is reachable");
+    assert_eq!(store.keys().count(), 3);
+
+    let c = key_of(&runtime, "C");
+    let handle = store.handle_for(c).expect("C resolves");
+    assert_eq!(store.with_title(handle, str::to_owned).unwrap(), "C");
+}
+
+/// `ADR-0017` decision 4: a frame-internal view read sees the mounts and
+/// unmounts staged by the same frame, including inside a nested batch.
+#[test]
+fn a_frame_internal_view_read_sees_staged_mounts() {
+    let mut runtime = Runtime::new();
+    runtime
+        .frame(|tx| {
+            tx.insert("A")?;
+            tx.insert("B")?;
+            Ok(())
+        })
+        .expect("seed");
+
+    let a = key_of(&runtime, "A");
+    let b = key_of(&runtime, "B");
+
+    runtime
+        .frame(|tx| {
+            let va = tx.mount_row(a, 1)?;
+            tx.reorder_views(&[va])?;
+            Ok(())
+        })
+        .expect("mount A");
+
+    let visible = runtime.row_views();
+    let va = visible[0].0;
+
+    runtime
+        .frame(|tx| {
+            tx.unmount(va)?;
+            let vb = tx.batch(|inner| inner.mount_row(b, 1))?;
+            // Inside the same frame the re-render must see both changes.
+            let staged: Vec<(ViewId, RowKey)> = tx.row_views();
+            assert!(
+                !staged.iter().any(|(view, _)| *view == va),
+                "the staged unmount must not be visible"
+            );
+            assert!(
+                staged.iter().any(|(view, key)| *view == vb && *key == b),
+                "the staged mount must be visible"
+            );
+            tx.reorder_views(&[vb])?;
+            Ok(())
+        })
+        .expect("rerender");
+
+    let after = runtime.row_views();
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].1, b);
+}

@@ -243,21 +243,21 @@ mod tests {
         assert_eq!(runtime.committed().len(), 1);
     }
 
-    /// `SPEC-GATE-A0-05`: writing from inside a compute stage is a domain
-    /// error, and the runtime recovers on the next clean frame.
+    /// `SPEC-GATE-A0-05`: writing from inside a compute stage returns
+    /// `Fatal::WriteDuringCompute`, and the runtime recovers on the next clean
+    /// frame. Removing the classification makes this test fail.
     #[test]
     fn a_write_during_compute_is_a_domain_error() {
-        use crate::txn::{Phase, WriteKind};
+        use crate::txn::Phase;
 
         let mut runtime = Runtime::new();
         {
             let mut tx = runtime.probe_tx_in_phase(Phase::Topo);
             let error = tx.insert("A").expect_err("write during Topo must fail");
-            assert!(matches!(
-                error,
-                Fatal::PhaseViolation(violation)
-                    if violation.attempted == WriteKind::ModelWrite && violation.phase == Phase::Topo
-            ));
+            assert!(
+                matches!(error, Fatal::WriteDuringCompute { phase: Phase::Topo }),
+                "expected WriteDuringCompute, got {error:?}"
+            );
         }
 
         // Recovery: the next frame starts Outside and commits.
@@ -284,8 +284,13 @@ mod tests {
             tx.force_phase(Phase::Binding);
             let error = tx.remove(row).expect_err("a Binding-phase write must fail");
             assert!(
-                matches!(error, ValueError::Phase(violation) if violation.phase == Phase::Binding),
-                "expected a typed phase error, got {error:?}"
+                matches!(
+                    error,
+                    ValueError::Fatal(Fatal::WriteDuringCompute {
+                        phase: Phase::Binding
+                    })
+                ),
+                "expected the write-during-compute domain error, got {error:?}"
             );
             Ok(())
         });
@@ -296,6 +301,32 @@ mod tests {
         );
         assert_eq!(runtime.txn().commits(), commits_before);
         assert_eq!(runtime.committed().len(), 1, "the row survives");
+    }
+
+    /// `SPEC-RT-038`: a write outside every write phase returns a typed
+    /// `PhaseViolation`, never a panic (the release-build requirement).
+    #[test]
+    fn a_write_in_a_closed_phase_is_a_typed_error_not_a_panic() {
+        use crate::txn::{Phase, ValueError};
+
+        let mut runtime = Runtime::new();
+        let row = runtime.frame(|tx| tx.insert("A")).expect("insert");
+
+        let result = runtime.frame(|tx| {
+            tx.force_phase(Phase::Commit);
+            let error = tx
+                .set_completed(row, true)
+                .expect_err("a Commit-phase write must fail");
+            assert!(
+                matches!(error, ValueError::Fatal(Fatal::PhaseViolation(_))),
+                "expected PhaseViolation, got {error:?}"
+            );
+            Ok(())
+        });
+
+        assert!(result.is_err(), "the frame must not publish");
+        assert_eq!(runtime.committed().len(), 1);
+        assert!(!runtime.committed().rows().next().unwrap().completed());
     }
 
     #[test]

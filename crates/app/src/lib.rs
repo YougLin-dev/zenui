@@ -467,7 +467,7 @@ fn error_kind(error: &ValueError) -> &'static str {
     match error {
         ValueError::Handle(handle) => handle.reason_kind(),
         ValueError::Store(_) => "store",
-        ValueError::Phase(_) => "phase",
+        ValueError::Fatal(_) => "fatal",
     }
 }
 
