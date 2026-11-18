@@ -588,7 +588,7 @@ $ cargo test -p zenui-core --lib a_self_reading_memo_is_a_cycle                 
 
 ## 13. P3 轮（MORT-6）在 H2 的复跑
 
-被测代码 commit `b81918b652d453b87bdf645cd469f968e52b89ec`。五条记录覆盖 A0-07…A0-11，以及重录后的 golden。
+被测代码 commit `f7a2d62eebae548650664f104bfb6bea1be427bb`。五条记录覆盖 A0-07…A0-11，以及重录后的 golden。
 
 ### EVID-VAL-28 query 计数（A0-07 / A0-08）
 

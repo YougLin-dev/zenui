@@ -85,11 +85,11 @@ replaces: []
 | EVID-VAL-25 | A | `cargo run -p zenui-app --example todolist_headless --locked`（H2，commit `%COMMIT%`） | 9 步 trace，sha256 与 EVID-VAL-20 相同 |
 | EVID-VAL-26 | A | `cargo clippy --workspace --all-targets --locked -- -D warnings`（H2，commit `%COMMIT%`） | exit 0（本机，不是 CI 日志） |
 | EVID-VAL-27 | A | `cargo test -p zenui-core --test regressions --locked`（H2，commit `bb16522b03abd7fb0102fb092c49284615416fbc`） | 8 passed（ADR-0017 审计回归夹具） |
-| EVID-VAL-28 | A | `cargo test -p zenui-core --test queries --locked`（H2，commit `b81918b`） | 4 passed（A0-07/08 计数夹具） |
-| EVID-VAL-29 | A | `cargo test -p zenui-core --test lifecycle --locked`（H2，commit `b81918b`） | 7 passed（A0-09/10/11 与 A0-02 运行时夹具） |
-| EVID-VAL-30 | A | `cargo test -p zenui-core --locked`（H2，commit `b81918b`） | 90 passed（54 + 6 + 7 + 4 + 11 + 8 doctest） |
-| EVID-VAL-31 | A | `cargo run -p zenui-app --example todolist_headless --locked`（H2，commit `b81918b`） | trace sha256 `4da03691…`（A0-08 语义变更后重录） |
-| EVID-VAL-32 | A | `cargo clippy --workspace --all-targets --locked -- -D warnings`（H2，commit `b81918b`） | exit 0（本机，不是 CI 日志） |
+| EVID-VAL-28 | A | `cargo test -p zenui-core --test queries --locked`（H2，commit `f7a2d62`） | 4 passed（A0-07/08 计数夹具） |
+| EVID-VAL-29 | A | `cargo test -p zenui-core --test lifecycle --locked`（H2，commit `f7a2d62`） | 7 passed（A0-09/10/11 与 A0-02 运行时夹具） |
+| EVID-VAL-30 | A | `cargo test -p zenui-core --locked`（H2，commit `f7a2d62`） | 90 passed（54 + 6 + 7 + 4 + 11 + 8 doctest） |
+| EVID-VAL-31 | A | `cargo run -p zenui-app --example todolist_headless --locked`（H2，commit `f7a2d62`） | trace sha256 `4da03691…`（A0-08 语义变更后重录） |
+| EVID-VAL-32 | A | `cargo clippy --workspace --all-targets --locked -- -D warnings`（H2，commit `f7a2d62`） | exit 0（本机，不是 CI 日志） |
 | SRC | — | 仓库源码/清单，`path:line` | 本轮静态核对，可直接复查 |
 
 > **已裁决（C-18/D-02，ADR-0012）**：`docs/README.md` §6 现已承认第三种证据前缀 `SRC path:line`，

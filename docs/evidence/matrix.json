@@ -33,7 +33,7 @@
       "toolchain": "1.99.1 (58cf8f9c3 2026-10-13)",
       "adapter": "Apple M4 (10-core GPU, Metal 4) / metal",
       "commit": "9fae970abee84e7eafe21f82937374a2813f7198",
-      "commitNote": "EVID-VAL-12…19 记录于 ab5339b；EVID-VAL-20/21 记录于 83b21a4；EVID-VAL-23…27 记录于 e53ae0e；EVID-VAL-28…32 记录于 b81918b",
+      "commitNote": "EVID-VAL-12…19 记录于 ab5339b；EVID-VAL-20/21 记录于 83b21a4；EVID-VAL-23…27 记录于 e53ae0e；EVID-VAL-28…32 记录于 f7a2d62",
       "evidenceClass": "A-observed-this-round"
     },
     {
@@ -490,7 +490,7 @@
       "kind": "test",
       "command": "cargo test -p zenui-core --test queries --locked",
       "exit": 0,
-      "commit": "b81918b652d453b87bdf645cd469f968e52b89ec",
+      "commit": "f7a2d62eebae548650664f104bfb6bea1be427bb",
       "tests": {
         "passed": 4,
         "failed": 0,
@@ -506,7 +506,7 @@
       "kind": "test",
       "command": "cargo test -p zenui-core --test lifecycle --locked",
       "exit": 0,
-      "commit": "b81918b652d453b87bdf645cd469f968e52b89ec",
+      "commit": "f7a2d62eebae548650664f104bfb6bea1be427bb",
       "tests": {
         "passed": 7,
         "failed": 0,
@@ -522,7 +522,7 @@
       "kind": "test",
       "command": "cargo test -p zenui-core --locked",
       "exit": 0,
-      "commit": "b81918b652d453b87bdf645cd469f968e52b89ec",
+      "commit": "f7a2d62eebae548650664f104bfb6bea1be427bb",
       "tests": {
         "passed": 90,
         "failed": 0,
@@ -539,7 +539,7 @@
       "kind": "runtime",
       "command": "cargo run -p zenui-app --example todolist_headless --locked",
       "exit": 0,
-      "commit": "b81918b652d453b87bdf645cd469f968e52b89ec",
+      "commit": "f7a2d62eebae548650664f104bfb6bea1be427bb",
       "traceSha256": "4da03691685138fdeb97d3873f566ae0fcf86a964a825b11c75fe7eb1f9fa7ff",
       "proves": "golden 重录后的 trace：与 fb16d571… 的唯一差异是 step 01 的 id_materializations 由 1 变 0（空态不再物化，A0-08）",
       "doesNotProve": "语义变化之外的任何行为；trace 不含 A0-07 的分项计数"
@@ -551,7 +551,7 @@
       "kind": "lint",
       "command": "cargo clippy --workspace --all-targets --locked -- -D warnings",
       "exit": 0,
-      "commit": "b81918b652d453b87bdf645cd469f968e52b89ec",
+      "commit": "f7a2d62eebae548650664f104bfb6bea1be427bb",
       "proves": "本机全 workspace 零 clippy 警告；同轮 cargo fmt --all -- --check 通过",
       "doesNotProve": "不是 CI 日志；SPEC-GATE-C-04 仍缺 CI 记录"
     }
