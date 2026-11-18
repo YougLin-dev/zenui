@@ -1,15 +1,17 @@
 // crates/core/src/query.rs
 //! Query cache and the shared `RowSet` snapshot (`SPEC-RT-041` … `-045`).
 //!
-//! P1 implements the shape and the sharing, not the full wiring: membership
-//! candidates and reverse field edges are P3 work and are marked below.
+//! The cache is a pure function of a [`RowView`] and a revision pair. There is
+//! deliberately no way for a caller to *report* that it evaluated something:
+//! the counters move only inside this file, on the code path that does the
+//! work. A "bookkeeping API" would make the numbers a second, declarable
+//! authority and let a fixture that never touches the runtime stay green.
 
 use std::fmt;
 use std::sync::Arc;
 
 use crate::handle::RowKey;
 use crate::metrics::Counters;
-use crate::store::Store;
 
 /// Which rows a list shows.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -72,6 +74,11 @@ impl RowSet {
         self.ids.iter().copied()
     }
 
+    /// True when both snapshots share one allocation (`SPEC-RT-043`).
+    pub fn shares_with(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.ids, &other.ids)
+    }
+
     pub fn as_slice(&self) -> &[RowKey] {
         &self.ids
     }
@@ -83,106 +90,159 @@ impl fmt::Debug for RowSet {
     }
 }
 
-/// Per-`(store_epoch, filter)` query cache.
+/// The model as one query sees it: the committed store, or a frame's staged
+/// overlay on top of it.
 ///
-/// TODO(A0-07): a field write must only mark the cache dirty and register the
-/// `(row, completed)` reverse edge it actually read; P1 invalidates on the whole
-/// store epoch, so an unrelated write re-materializes every filter.
-/// TODO(A0-08): `is_empty(filter)` currently derives from this materialized set.
-/// The zero-materialization empty state needs the counter/membership index and
-/// is therefore *not* satisfied by P1.
-pub struct QueryCache {
-    filter: Filter,
-    epoch: Option<u64>,
-    cached: Option<RowSet>,
+/// The contract is the five members fixed by `ADR-0022` decision 2. Two
+/// implementations exist — `Store` and `StagedView` — and the cache knows
+/// nothing about either.
+pub(crate) trait RowView {
+    /// The rows `filter` matches, in display order, paired with the effective
+    /// `completed` flag.
+    fn rows_for(&mut self, filter: Filter) -> Vec<(RowKey, bool)>;
+
+    /// True when `filter` matches nothing, answered from counters rather than a
+    /// scan (`SPEC-RT-044`).
+    fn is_empty_for(&mut self, filter: Filter) -> bool;
+
+    /// Revision of `filter`'s *membership set*. A write that cannot change the
+    /// set must not move it (`SPEC-GATE-A0-07`).
+    fn membership_revision(&self, filter: Filter) -> u64;
+
+    /// Revision of the display order.
+    ///
+    /// Membership and order move independently: a `reorder` moves no
+    /// membership, a `completed` write moves no order. Keying on membership
+    /// alone would serve a stale order after a reorder.
+    fn order_revision(&self) -> u64;
+
+    /// Rows this view has enumerated since it was created.
+    ///
+    /// The cache charges `row_visits` with the difference across one
+    /// evaluation, so a row the view enumerates *anywhere* — including inside
+    /// `is_empty_for` — is counted. That is what makes the `ADR-0022`
+    /// decision-6 mutation (answer emptiness by counting `rows_for(All)`)
+    /// visible to a fixture instead of silently free.
+    fn scan_cost(&self) -> u64;
+}
+
+pub(crate) const fn filter_index(filter: Filter) -> usize {
+    match filter {
+        Filter::All => 0,
+        Filter::Active => 1,
+        Filter::Completed => 2,
+    }
+}
+
+/// The pair of revisions one cached snapshot is valid under.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Revision {
+    membership: u64,
+    order: u64,
+}
+
+#[derive(Clone, Default)]
+struct Slot {
+    revision: Option<Revision>,
+    rows: Option<RowSet>,
+}
+
+/// Per-`(membership revision, order revision, filter)` query cache.
+///
+/// Each filter owns one slot. A title write moves neither revision, a
+/// `completed` write moves only `Active`/`Completed`, a `reorder` moves only
+/// the order, and an insert/remove moves all three slots' membership.
+pub(crate) struct QueryCache {
+    slots: [Slot; 3],
     evals: u64,
+    builds: u64,
     materializations: u64,
+    visits: u64,
 }
 
 impl QueryCache {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
-            filter: Filter::All,
-            epoch: None,
-            cached: None,
+            slots: [Slot::default(), Slot::default(), Slot::default()],
             evals: 0,
+            builds: 0,
             materializations: 0,
+            visits: 0,
         }
     }
 
-    /// Rows matching `filter` for the current store epoch.
+    /// Rows matching `filter` as `view` currently sees them.
     ///
-    /// The first consumer of an epoch pays one evaluation and one
-    /// materialization; later consumers share the same `Arc<[RowKey]>`.
-    pub fn rows(&mut self, store: &Store, filter: Filter) -> RowSet {
-        self.rows_at(store, filter, store.epoch())
-    }
-
-    /// Rows keyed on an explicit revision.
+    /// The revisions come from the view, never from the caller
+    /// (`ADR-0022` decision 2): a caller-supplied revision would be a second
+    /// place where a key could be declared wrong.
     ///
-    /// Inside a frame the caller passes the monotonic staged revision rather
-    /// than the committed epoch: keying on `epoch` would serve the previous
-    /// frame's cache while uncommitted writes are still visible.
-    pub fn rows_at(&mut self, store: &Store, filter: Filter, revision: u64) -> RowSet {
-        if self.epoch == Some(revision)
-            && self.filter == filter
-            && let Some(cached) = &self.cached
+    /// The first consumer of a `(membership, order, filter)` triple pays one
+    /// evaluation; a non-empty result also pays one build, one materialization
+    /// and one visit per scanned row. An empty result is answered from the
+    /// membership counters and pays none of the three (`SPEC-GATE-A0-08`).
+    pub(crate) fn rows_at<V: RowView + ?Sized>(&mut self, view: &mut V, filter: Filter) -> RowSet {
+        let index = filter_index(filter);
+        let revision = Revision {
+            membership: view.membership_revision(filter),
+            order: view.order_revision(),
+        };
+        if self.slots[index].revision == Some(revision)
+            && let Some(cached) = &self.slots[index].rows
         {
             return cached.clone();
         }
 
         self.evals += 1;
-        self.materializations += 1;
-        let keys: Vec<RowKey> = store
-            .rows()
-            .filter(|row| filter.matches(row.completed()))
-            .map(|row| row.key())
-            .collect();
-        let rows = RowSet::from_keys(keys);
-        self.filter = filter;
-        self.epoch = Some(revision);
-        self.cached = Some(rows.clone());
+
+        // The view owns the scan counter; the cache charges the difference, so
+        // no enumeration performed to answer this evaluation can be free.
+        let scanned = view.scan_cost();
+        let rows = if view.is_empty_for(filter) {
+            // Zero materialization: the membership counters already answer it.
+            RowSet::empty()
+        } else {
+            self.builds += 1;
+            self.materializations += 1;
+            let keys: Vec<RowKey> = view
+                .rows_for(filter)
+                .into_iter()
+                .map(|(key, _)| key)
+                .collect();
+            RowSet::from_keys(keys)
+        };
+        self.visits += view.scan_cost() - scanned;
+
+        self.slots[index] = Slot {
+            revision: Some(revision),
+            rows: Some(rows.clone()),
+        };
         rows
     }
 
-    /// Account an evaluation the caller performed against a staged overlay.
-    pub(crate) fn note_eval(&mut self) {
-        self.evals += 1;
-        self.materializations += 1;
+    /// Drop the cached snapshots. Revisions are monotonic, so this is only
+    /// needed when a frame is discarded: revisions it reached but never
+    /// committed can be reached again by a later frame, and those snapshots
+    /// describe a state that no longer exists.
+    pub(crate) fn invalidate(&mut self) {
+        self.slots = [Slot::default(), Slot::default(), Slot::default()];
     }
 
-    /// Drop the cached snapshot. The cache is not authority, so a rolled-back
-    /// frame only has to forget it.
-    pub fn invalidate(&mut self) {
-        self.epoch = None;
-        self.cached = None;
-    }
-
-    /// True when a cached set exists for exactly this epoch and filter.
-    pub fn is_fresh(&self, store: &Store, filter: Filter) -> bool {
-        self.epoch == Some(store.epoch()) && self.filter == filter && self.cached.is_some()
-    }
-
-    pub fn counters(&self) -> Counters {
+    pub(crate) fn counters(&self) -> Counters {
         Counters {
             query_evals: self.evals,
             id_materializations: self.materializations,
+            cache_builds: self.builds,
+            row_visits: self.visits,
             ..Counters::default()
         }
-    }
-}
-
-impl Default for QueryCache {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
 impl fmt::Debug for QueryCache {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("QueryCache")
-            .field("filter", &self.filter)
-            .field("epoch", &self.epoch)
+            .field("slots", &self.slots.len())
             .field("evals", &self.evals)
             .field("materializations", &self.materializations)
             .finish()
@@ -193,41 +253,205 @@ impl fmt::Debug for QueryCache {
 mod tests {
     use super::*;
 
-    #[test]
-    fn second_consumer_shares_the_snapshot() {
-        let mut store = Store::for_test();
-        store.insert("A");
-        store.insert("B");
+    /// A view whose revisions the test drives directly.
+    struct TestView {
+        membership: [u64; 3],
+        order: u64,
+        rows: Vec<(RowKey, bool)>,
+        scanned: u64,
+    }
 
-        let mut cache = QueryCache::new();
-        let first = cache.rows(&store, Filter::All);
-        let second = cache.rows(&store, Filter::All);
+    impl TestView {
+        fn new(rows: &[(u64, bool)]) -> Self {
+            Self {
+                membership: [0; 3],
+                order: 0,
+                rows: rows
+                    .iter()
+                    .map(|(raw, completed)| (RowKey::from_raw(*raw), *completed))
+                    .collect(),
+                scanned: 0,
+            }
+        }
+    }
 
-        assert_eq!(first.as_slice(), second.as_slice());
-        assert_eq!(cache.counters().query_evals, 1);
-        assert_eq!(cache.counters().id_materializations, 1);
+    impl RowView for TestView {
+        fn rows_for(&mut self, filter: Filter) -> Vec<(RowKey, bool)> {
+            self.scanned += self.rows.len() as u64;
+            self.rows
+                .iter()
+                .filter(|(_, completed)| filter.matches(*completed))
+                .copied()
+                .collect()
+        }
+
+        fn is_empty_for(&mut self, filter: Filter) -> bool {
+            !self
+                .rows
+                .iter()
+                .any(|(_, completed)| filter.matches(*completed))
+        }
+
+        fn membership_revision(&self, filter: Filter) -> u64 {
+            self.membership[filter_index(filter)]
+        }
+
+        fn order_revision(&self) -> u64 {
+            self.order
+        }
+
+        fn scan_cost(&self) -> u64 {
+            self.scanned
+        }
     }
 
     #[test]
-    fn a_write_forces_exactly_one_reevaluation_per_epoch() {
-        let mut store = Store::for_test();
-        let row = store.insert("A");
+    fn second_consumer_shares_the_snapshot() {
+        let mut view = TestView::new(&[(1, false), (2, false)]);
+
         let mut cache = QueryCache::new();
-        let before = cache.rows(&store, Filter::All);
-        assert_eq!(before.len(), 1);
+        let first = cache.rows_at(&mut view, Filter::All);
+        let second = cache.rows_at(&mut view, Filter::All);
 
-        // Same filter before and after, so the miss can only come from the
-        // store epoch changing.
-        store.toggle(row).expect("live row");
+        assert!(first.shares_with(&second));
+        assert_eq!(cache.counters().query_evals, 1);
+        assert_eq!(cache.counters().cache_builds, 1);
+        assert_eq!(cache.counters().id_materializations, 1);
+        assert_eq!(cache.counters().row_visits, 2);
+    }
 
-        let after = cache.rows(&store, Filter::All);
-        assert_eq!(after.len(), 1);
-        assert_eq!(cache.counters().query_evals, 2, "the write invalidated");
+    #[test]
+    fn a_membership_move_only_invalidates_the_filters_it_touches() {
+        let mut view = TestView::new(&[(1, false), (2, true)]);
+        let mut cache = QueryCache::new();
 
-        // A second consumer in the same epoch shares the snapshot.
-        let again = cache.rows(&store, Filter::All);
+        let _ = cache.rows_at(&mut view, Filter::All);
+        let _ = cache.rows_at(&mut view, Filter::Active);
+        let _ = cache.rows_at(&mut view, Filter::Completed);
+        assert_eq!(cache.counters().query_evals, 3);
+
+        // A completed write cannot move `All`'s membership set.
+        view.membership[filter_index(Filter::Active)] += 1;
+        view.membership[filter_index(Filter::Completed)] += 1;
+
+        let _ = cache.rows_at(&mut view, Filter::All);
+        assert_eq!(cache.counters().query_evals, 3, "All stayed fresh");
+        let _ = cache.rows_at(&mut view, Filter::Active);
+        let _ = cache.rows_at(&mut view, Filter::Completed);
+        assert_eq!(cache.counters().query_evals, 5);
+    }
+
+    /// `SPEC-GATE-A0-07`: an order change is invisible to membership, so the
+    /// order revision has to be part of the key or the stale order survives.
+    #[test]
+    fn an_order_move_rebuilds_without_touching_membership() {
+        let mut view = TestView::new(&[(1, false), (2, false)]);
+        let mut cache = QueryCache::new();
+
+        let before = cache.rows_at(&mut view, Filter::All);
+        assert_eq!(
+            before.as_slice(),
+            &[RowKey::from_raw(1), RowKey::from_raw(2)]
+        );
+
+        view.rows.reverse();
+        view.order += 1;
+
+        let after = cache.rows_at(&mut view, Filter::All);
+        assert_eq!(
+            after.as_slice(),
+            &[RowKey::from_raw(2), RowKey::from_raw(1)]
+        );
         assert_eq!(cache.counters().query_evals, 2);
-        assert_eq!(again.as_slice(), after.as_slice());
+        assert_eq!(cache.counters().cache_builds, 2);
+    }
+
+    #[test]
+    fn an_empty_filter_costs_no_materialization_and_no_visit() {
+        let mut view = TestView::new(&[(1, false)]);
+        let mut cache = QueryCache::new();
+
+        let rows = cache.rows_at(&mut view, Filter::Completed);
+        assert!(rows.is_empty());
+        assert_eq!(cache.counters().query_evals, 1);
+        assert_eq!(cache.counters().cache_builds, 0);
+        assert_eq!(cache.counters().id_materializations, 0);
+        assert_eq!(cache.counters().row_visits, 0);
+    }
+
+    /// The revision pair is the whole key: a view that moves both revisions
+    /// must not be served from the slot of a state it merely resembles.
+    #[test]
+    fn a_different_revision_pair_is_a_different_state() {
+        let mut view = TestView::new(&[(1, false)]);
+        let mut cache = QueryCache::new();
+
+        let _ = cache.rows_at(&mut view, Filter::Active);
+
+        // Same rows, both revisions moved: the cached slot must not answer.
+        view.membership = [1, 1, 1];
+        view.order = 1;
+        assert_eq!(cache.rows_at(&mut view, Filter::Active).len(), 1);
+        assert_eq!(cache.counters().query_evals, 2, "a moved pair re-evaluates");
+    }
+
+    /// The two implementations must answer alike for the same model: the cache
+    /// must not mean one thing for committed state and another for a frame.
+    ///
+    /// This drives the *committed* implementation directly. The runtime uses
+    /// the staged one, and no external fixture can construct either view — so
+    /// this is where `Store`'s side of the trait is exercised.
+    #[test]
+    fn the_committed_view_answers_like_the_staged_one() {
+        use crate::store::Store;
+
+        let mut store = Store::for_test();
+        let a = store.insert("A");
+        store.insert("B");
+        let mut cache = QueryCache::new();
+
+        let all = cache.rows_at(&mut store, Filter::All);
+        assert_eq!(all.len(), 2);
+        assert_eq!(cache.counters().row_visits, 2);
+
+        let completed = cache.rows_at(&mut store, Filter::Completed);
+        assert!(completed.is_empty());
+        assert_eq!(
+            cache.counters().row_visits,
+            2,
+            "the empty answer costs no scan on the committed side either"
+        );
+
+        store.toggle(a).expect("live row");
+        let completed = cache.rows_at(&mut store, Filter::Completed);
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed.as_slice(), &[store.key_of(a).expect("key")]);
+        assert!(cache.rows_at(&mut store, Filter::Active).len() == 1);
+
+        // An order move is a new state for the committed view too.
+        let keys: Vec<RowKey> = store.keys().collect();
+        store.reorder(&[keys[1], keys[0]]).expect("reorder");
+        assert_eq!(
+            cache.rows_at(&mut store, Filter::All).as_slice(),
+            &[keys[1], keys[0]]
+        );
+    }
+
+    /// `SPEC-RT-043`: two snapshots are equal only when their keys are, in
+    /// order — the display order is part of the value, so a reordered set is a
+    /// different set.
+    #[test]
+    fn row_sets_compare_by_content_and_order() {
+        let forward = RowSet::from_keys(vec![RowKey::from_raw(1), RowKey::from_raw(2)]);
+        let again = RowSet::from_keys(vec![RowKey::from_raw(1), RowKey::from_raw(2)]);
+        let reversed = RowSet::from_keys(vec![RowKey::from_raw(2), RowKey::from_raw(1)]);
+
+        assert_eq!(forward, again);
+        assert_ne!(forward, reversed);
+        assert!(
+            !forward.shares_with(&again),
+            "equal values, separate buffers"
+        );
     }
 
     #[test]

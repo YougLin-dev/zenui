@@ -37,7 +37,7 @@ replaces: []
 | 主机 | OS | Rust | GPU / adapter | commit | 证据性质 |
 |---|---|---|---|---|---|
 | **H1** | Windows 11，MSVC 工具链 | `1.99.1 x86_64-pc-windows-msvc` | NVIDIA GeForce RTX 4060 Laptop GPU / Vulkan | 未记录 | 上一轮记录（转述） |
-| **H2** | macOS 27.0.1 (26A434)，Apple M4（10 核 GPU，Metal 4） | `1.99.1 (58cf8f9c3 2026-10-13) aarch64-apple-darwin` | Apple M4 / `metal` | `ab5339b`（EVID-VAL-12…19）/ `83b21a4`（EVID-VAL-20/-21）/ `e53ae0e`（EVID-VAL-23…27） | **本轮实测**（commit 逐条见各条目） |
+| **H2** | macOS 27.0.1 (26A434)，Apple M4（10 核 GPU，Metal 4） | `1.99.1 (58cf8f9c3 2026-10-13) aarch64-apple-darwin` | Apple M4 / `metal` | `ab5339b`（EVID-VAL-12…19）/ `83b21a4`（EVID-VAL-20/-21）/ `e53ae0e`（EVID-VAL-23…27）/ `f7a2d62`（EVID-VAL-28…32）/ `7d78cdc`（EVID-VAL-33…40）/ `a24faed`（EVID-VAL-41…46） | **本轮实测**（commit 逐条见各条目） |
 | **CI** | GitHub Actions 矩阵：`ubuntu-26.04` / `macos-26-arm64` / `windows-2025-vs2026` | `rustc 1.99.1 (58cf8f9c3 2026-10-13)`，三个 runner 一致（取自 `rust-toolchain.toml` 的 pin） | 无（headless；A0 不需要 GPU） | `e53ae0e`（main 上的 PR #5 merge commit） | **本轮 CI 实测**，run [`44284925421`](https://github.com/YougLin-dev/zenui/actions/runs/44284925421) |
 
 > H1 的 commit 在原始记录中未写下，这是本轮无法补的缺口；引用 H1 结果时应同时声明"commit 未知"。
@@ -73,6 +73,26 @@ replaces: []
 | EVID-VAL-25 | A | `cargo run -p zenui-app --example todolist_headless --locked` | **H2** | 9 步 trace，sha256 与 EVID-VAL-20 相同 | VERIFIED（语义未变，不是重新录制） |
 | EVID-VAL-26 | A | `cargo clippy --workspace --all-targets --locked -- -D warnings` | **H2** | exit 0 | VERIFIED（仅本机，C-04 仍 OPEN） |
 | EVID-VAL-27 | A | `cargo test -p zenui-core --test regressions --locked` | **H2** | 11 passed（失败帧与审计回归夹具） | VERIFIED（三条 mutation 判红，见条目） |
+| EVID-VAL-28 | A | `cargo test -p zenui-core --test queries --locked` | **H2** | 4 passed（A0-07/08 计数夹具） | VERIFIED |
+| EVID-VAL-29 | A | `cargo test -p zenui-core --test lifecycle --locked` | **H2** | 7 passed（A0-09/10/11 夹具） | VERIFIED |
+| EVID-VAL-30 | A | `cargo test -p zenui-core --locked` | **H2** | 90 passed（54 + 6 + 7 + 4 + 11 + 8 doctest） | VERIFIED |
+| EVID-VAL-31 | A | `cargo run -p zenui-app --example todolist_headless --locked` | **H2** | trace sha256 由 `fb16d571…` 变为 `4da03691…` | VERIFIED（语义变更后重录，见条目） |
+| EVID-VAL-32 | A | `cargo clippy --workspace --all-targets --locked -- -D warnings` | **H2** | exit 0 | VERIFIED（仅本机，C-04 仍 OPEN） |
+| EVID-VAL-33 | A | `cargo test -p zenui-core --test queries --locked` | **H2** | 7 passed（A0-07/08 重写夹具） | VERIFIED（四条 mutation 判红，见条目） |
+| EVID-VAL-34 | A | `cargo test -p zenui-core --test lifecycle --locked` | **H2** | 9 passed（A0-09/10/11、A0-02 与两条取舍夹具） | VERIFIED（三条 mutation 判红，见条目） |
+| EVID-VAL-35 | A | `cargo test -p zenui-core --test regressions --locked` | **H2** | 12 passed（含丢弃帧的缓存回归） | VERIFIED（一条 mutation 判红，见条目） |
+| EVID-VAL-36 | A | `cargo test -p zenui-app --locked` | **H2** | 10 passed（2 单测 + 6 golden + 2 mount path） | VERIFIED（一条 mutation 判红，见条目） |
+| EVID-VAL-37 | A | `cargo test -p zenui-core --locked` | **H2** | 99 passed（57 + 6 + 9 + 7 + 12 + 8 doctest） | VERIFIED（doctest 不校验错误码，见条目） |
+| EVID-VAL-38 | A | `cargo test --workspace --locked` | **H2** | 109 passed | VERIFIED |
+| EVID-VAL-39 | A | `cargo run -p zenui-app --example todolist_headless --locked` | **H2** | trace sha256 由 `4da03691…` 变为 `57a4a142…` | VERIFIED（接线后重录，见条目） |
+| EVID-VAL-40 | A | `cargo clippy --workspace --all-targets --locked -- -D warnings` | **H2** | exit 0 | VERIFIED（仅本机，C-04 仍 OPEN） |
+| EVID-VAL-41 | A | `cargo test -p zenui-core --test compile_fail --locked` | **H2** | 1 passed（9 条 trybuild UI 用例 + `.stderr` 快照） | VERIFIED（两条 mutation 判红，见条目） |
+| EVID-VAL-42 | A | `cargo test -p zenui-core --test queries --locked` | **H2** | 7 passed（ADR-0022 契约） | VERIFIED（五条 mutation 判红，见条目） |
+| EVID-VAL-43 | A | `cargo test -p zenui-core --locked` | **H2** | 92 passed（57 + 1 + 6 + 9 + 7 + 12，doctest 0） | VERIFIED |
+| EVID-VAL-44 | A | `cargo test --workspace --locked` | **H2** | 102 passed | VERIFIED |
+| EVID-VAL-45 | A | `cargo run -p zenui-app --example todolist_headless --locked` | **H2** | trace sha256 与 `57a4a142…` 相同 | VERIFIED（未变，见条目） |
+| EVID-VAL-46 | A | `cargo clippy --workspace --all-targets --locked -- -D warnings` | **H2** | exit 0 | VERIFIED（仅本机，C-04 仍 OPEN） |
+| EVID-VAL-47 | D | `cargo test --workspace --locked` | **CI** | 102 passed × 3 平台（含 trybuild 快照） | VERIFIED（CI 日志与 run URL 可查） |
 
 ## 3. 仓库内测试：H1 原始记录（转述）
 
@@ -403,12 +423,12 @@ $ cargo test --workspace --locked        # ubuntu-26.04 / macos-26-arm64 / windo
 ## 9. 数字台账（仅汇总本文件已定义的事实，供 CLAIM 引用）
 
 - H2 实际通过测试：**53** 条（7 + 2 + 4 + 40），来源 EVID-VAL-12/13/14/21；其中 40 条来自新的 headless workspace。这是 commit `e53ae0e` 的计数。
-- H2 在 P2 之后的通过**执行数**：**145**（53 加上 EVID-VAL-23 的 6、EVID-VAL-24 的 75 与 EVID-VAL-27 的 11）。它是同一批用例在新 commit 上的复跑，**不是** 107 条互不相同的测试；`EVID-VAL-21` 的 40 与 `EVID-VAL-24` 的 50 有重叠（core lib 由 34 增至 44），不得相加当作"新增覆盖"。
-- H2 compile-fail fixture：**9** 条 = EVID-VAL-13 的 3 条 trybuild + EVID-VAL-24 的 6 条 `compile_fail` doctest。
+- H2 在 P2 之后的通过**执行数**：**246**（在 145 之上加 EVID-VAL-28 的 4、-29 的 7、-30 的 90）。这些数字是同一批用例在不同 commit 上的复跑，彼此重叠，**不是**互不相同的测试数；唯一可相加的"不同用例"口径是单个 commit 上的一次全量运行（见 EVID-VAL-30 的 90）。它是同一批用例在新 commit 上的复跑，**不是** 107 条互不相同的测试；`EVID-VAL-21` 的 40 与 `EVID-VAL-24` 的 50 有重叠（core lib 由 34 增至 44），不得相加当作"新增覆盖"。
+- H2 compile-fail fixture：**17** 条 = EVID-VAL-13 的 3 条 trybuild + EVID-VAL-24 的 6 条 + EVID-VAL-30 的 8 条 `compile_fail` doctest。这是按 runs[] 求和的**累计**口径，跨 commit 有重叠（EVID-VAL-24 的 6 条是 EVID-VAL-30 的 8 条的子集）；单个 commit 上的实际条数是 8。
 - 0-test target：根 package，来源 EVID-VAL-17。
 - 跨图形后端 GPU 观测：**2** 个数据点（Vulkan/NVIDIA 来自 H1 转述，Metal/Apple M4 来自 EVID-VAL-15），**不是** "GPU 矩阵已通过"。
 - CI 实际通过测试：**120** 次执行 = 40 条 × 3 个 runner（`EVID-VAL-22`）。它是**执行次数**，不是 120 条不同的测试，也不得与 H2 的 53 相加；同一批 40 条测试在 H2 与 CI 上各跑过。
-- 可复跑性分布：27 条中 **15 条**（A 类）可在本机原样复跑；**11 条**（B/C 类）依赖上一轮记录或仓库外夹具；**1 条**（D 类，`EVID-VAL-22`）在 CI runner 上，重跑 workflow 可复现，本机不能代替。
+- 可复跑性分布：32 条中 **20 条**（A 类）可在本机原样复跑；**11 条**（B/C 类）依赖上一轮记录或仓库外夹具；**1 条**（D 类，`EVID-VAL-22`）在 CI runner 上，重跑 workflow 可复现，本机不能代替。
 
 不得使用"基本完成""大部分支持""应该可以"描述以上任何数字。
 
@@ -580,3 +600,406 @@ $ cargo test -p zenui-core --lib a_self_reading_memo_is_a_cycle                 
   - **`Fatal::WriteDuringCompute` 已随 ADR-0019 移除**：compute 阶段的写现在按决定 3 返回 `ValueError::Phase(PhaseViolation { phase: Topo|Binding, .. })`，`A0-05` 的「`WriteDuringCompute` 是领域错误」由该 typed 值表达，不再有同名 `Fatal` 变体。
   - `SPEC-RT-053` 与 ADR-0017 决定 7 对 duplicate key 的冲突已由 ADR-0019 的检测点规则解释（写 API 拒绝 = 值错误），不再作为未决项。
   - 这些夹具都在单线程 headless 下跑；不涉及窗口、GPU、平台后端，也不构成任何性能结论。
+
+## 13. P3 轮（MORT-6）在 H2 的复跑
+
+被测代码 commit `f7a2d62eebae548650664f104bfb6bea1be427bb`。五条记录覆盖 A0-07…A0-11，以及重录后的 golden。
+
+### EVID-VAL-28 query 计数（A0-07 / A0-08）
+
+```text
+$ cargo test -p zenui-core --test queries --locked
+test a0_07_one_eval_build_and_materialization_per_epoch_filter ... ok
+test a0_07_a_completed_write_moves_only_the_filters_that_read_it ... ok
+test a0_08_an_empty_filter_materializes_nothing ... ok
+test a0_08_a_thousand_rows_and_three_filters_build_once_each ... ok
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
+- **判据即计数**：`(membership epoch, filter)` 上 `query_evals` / `cache_builds` / `id_materializations` 各恰 +1，`row_visits` 等于扫描行数。
+- 空结果：三者皆为 0，`is_empty` 由 `Store::is_empty_for` 从成员计数回答。**用 `collect()` 实现 `is_empty` 会让 `row_visits` 与 `id_materializations` 移动，夹具即红。**
+- 反向边按 `(row, completed)` 收敛到 filter 维度：标题写与 reorder 不失效任何缓存；completed 写只失效 `Active`/`Completed`。
+- **不证明什么**：这是查询层的计数契约，不证明 memo 只追踪 cache revision 的实现细节；也不含布局/渲染。
+
+### EVID-VAL-29 生命周期（A0-09 / A0-10 / A0-11）
+
+```text
+$ cargo test -p zenui-core --test lifecycle --locked
+test a0_09_a_duplicate_key_is_refused_before_any_patch ... ok
+test a0_09_a_reorder_preserves_identity_and_moves_no_counter ... ok
+test a0_10_deleting_the_focused_row_settles_one_intent ... ok
+test a0_10_a_user_focus_move_cancels_the_intent ... ok
+test a0_10_a_bulk_clear_settles_one_intent ... ok
+test a0_11_churn_returns_to_the_baseline ... ok
+test a0_02_a_mount_reads_the_title_exactly_once ... ok
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
+- A0-09：同一 key 的第二次 mount 返回 `Fatal::DuplicateViewKey` 且不产生 patch；reorder 后 `mounts`/`unmounts` 差值为 0，`ViewId`/owner/live owner 集合/focus/caret 全部保留。
+- A0-10：intent 在 `unmount`/`clear_completed` 时记录（结构变更前），在 commit 末尾结算一次；同帧显式 `focus` 会取消它；批量 Clear 只结算一个 intent。`unmount` 不再自行清空 focus 指针，所以"删除 + 回退"是一次可观测移动。
+- A0-11：300 帧 + 收尾的 1000+ 交错操作后，live owner、edges、active source、layout 映射回到基线。
+- **不证明什么**：A0-10 的回退顺序只实现 `next → previous`；可聚焦 input 与 toolbar 在 A0 不存在（A1 节点）。churn 是确定性脚本，不是随机压力。
+- A0-02 的运行时部分：一次 mount 恰好一次 owned 读，`with_title` 借读不增加 `io_reads`。
+
+### EVID-VAL-30 `zenui-core` 全量测试（H2）
+
+```text
+$ cargo test -p zenui-core --locked
+     Running unittests src/lib.rs       54 passed
+     Running tests/gates.rs              6 passed
+     Running tests/lifecycle.rs          7 passed
+     Running tests/queries.rs            4 passed
+     Running tests/regressions.rs       11 passed
+   Doc-tests zenui_core                  8 passed
+（合计 90 passed / 0 failed）
+```
+
+- 8 条 doctest 全部是 `compile_fail`：6 条身份域互斥 + 2 条 A0-02 契约（`Copy` 类型拥有 `String` → E0204；权威上没有拥有式 `get` → E0599）。
+- **不证明什么**：不含 `zenui-app` 的 6 条 golden 与 2 条 app 单测（EVID-VAL-31 与工作区总计数另计）。
+
+### EVID-VAL-31 golden 重录（H2）
+
+```text
+$ cargo run -p zenui-app --example todolist_headless --locked | shasum -a 256
+4da03691685138fdeb97d3873f566ae0fcf86a964a825b11c75fe7eb1f9fa7ff  -
+```
+
+- **为什么重录**：A0-08 要求空态不物化，`step 01` 的 `id_materializations` 由 1 变为 0，`total` 由 8 变为 7。这是语义真变，不是格式变化；除此之外与 `fb16d571…` 逐行相同（已用 `diff` 核对，只有这两处）。
+- **不证明什么**：trace 不携带 A0-07 的 `cache_builds`/`row_visits`；它只证明 9 步场景的可观测输出。
+
+### EVID-VAL-32 clippy（H2）
+
+```text
+$ cargo clippy --workspace --all-targets --locked -- -D warnings
+（exit 0）
+```
+
+- 同轮 `cargo fmt --all -- --check` 通过。
+- **不证明什么**：本地运行，不是 CI 日志；`SPEC-GATE-C-04` 保持 OPEN。
+
+## 14. P3.2 轮（MORT-6）在 H2 的复跑
+
+被测代码 commit `7d78cdc`。
+
+上一轮（§13）的计数与夹具都活在一条运行时不会走的平行实现里：`Tx::rows` 自己把模型展开成 `Vec<RowKey>`
+再交给 memo，`note_eval` 把"求值"报到计数器上；`tests/queries.rs` 自己 `QueryCache::new()` 配
+`runtime.committed()`。本轮把 `Tx::rows` 接到缓存上：键是
+`(membership revision[filter], order revision)`，两个修订号在 `begin_frame` 从 store 播种、在真正改变
+集合的 staging 点推进、由 `Store::install` 原样采纳，因此帧内构建的快照在 commit 之后仍是答案。
+`QueryCache` 与 `RowView` 都是 `pub(crate)`：外部构造不出缓存，"夹具测自己的实现"在编译期就不成立。
+
+### EVID-VAL-33 query 计数（A0-07 / A0-08）
+
+```text
+$ cargo test -p zenui-core --test queries --locked
+test a0_07_one_eval_build_and_materialization_per_epoch_filter ... ok
+test a0_07_a_completed_write_moves_only_the_filters_that_read_it ... ok
+test a0_07_a_reorder_moves_the_order_and_the_next_read_sees_it ... ok
+test a0_07_a_frame_reads_its_own_staged_writes ... ok
+test a0_08_an_empty_filter_materializes_nothing ... ok
+test a0_08_a_frame_that_empties_a_filter_visits_nothing ... ok
+test a0_08_a_thousand_rows_and_three_filters_build_once_each ... ok
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
+- 夹具只走 `Runtime::frame` / `tx.rows`，计数取自 `Runtime::counters()`。文件头写明这条约束，它靠
+  `QueryCache` 不在公开面成立，不靠评审自觉。
+- 判据即计数：命中不产生 eval/build/materialize/visit；空结果三者皆 0；1000 行 × 三 filter 第二轮全命中；
+  reorder 后读到的顺序真的变（未排序比对），且帧内构建的快照在 commit 后仍是答案（`shares_with`）。
+- **mutation 自证（逐条实测，判红即"删掉接线/行为就红"）**：
+
+  | mutation | 判红条数 |
+  |---|---|
+  | 删掉 `QueryCache::rows` 的空态短路 | 3（含 1000 行那条） |
+  | `StagedView::live_counts` 改回只看已提交计数器 | 2 |
+  | 缓存键去掉 order revision | 1（reorder 夹具） |
+  | `Tx::rows` 恢复成直接展开 `effective_rows()`，不过缓存 | 6 |
+  | `StagedView::is_empty_for` 换成扫描（`visit_rows` 数一遍） | **0**（见下） |
+
+- **一个必须说清的边界**：把 `is_empty_for` 换成 `collect().count() == 0` 的实现在**语义上等价**
+  （同样的布尔值），计数器结构上看不见它——`row_visits` 只在缓存自己的 `visit_rows` 闭包里累加，
+  视图内部另起的扫描不经过那个闭包。实测：把它换成扫描后 7 条夹具全绿。因此 A0-08 里
+  "用 `collect()` 实现 `is_empty` 必须判红"这条判据，靠计数器**做不到**，本轮也不宣称做到；
+  能机械判红的是"删掉空态短路"（3 条红）与"`live_counts` 不从 journal 推导"（2 条红）。
+  剩下的保证是结构性的：`QueryCache` 与 `RowView` 都不在公开面，全仓只有 `Store` 与 `StagedView`
+  两份实现，且两处都是从计数器/日志推导、不遍历行。
+- **不证明什么**：不证明 graph 侧另有一个 `Memo<RowSet>`——本轮移除了三只行集 memo（`memo_recomputes`
+  22 → 14），行集 memo 就是缓存槽；这与 A0-07 判据里 "`Memo<RowSet>` 只追踪 cache revision" 的措辞
+  有出入，属于需要单独裁决的规范问题（见交付说明），不在本轮自行改写冻结的 `spec/`。也不含真实
+  布局与渲染；计数器是执行期观测，不是复杂度证明。
+
+### EVID-VAL-34 生命周期（A0-09 / A0-10 / A0-11）
+
+```text
+$ cargo test -p zenui-core --test lifecycle --locked
+test a0_02_an_owned_read_counts_once_and_a_borrow_read_is_free ... ok
+test a0_09_a_duplicate_key_is_refused_before_any_patch ... ok
+test a0_09_a_reorder_preserves_identity_and_moves_no_counter ... ok
+test a0_10_deleting_the_focused_row_settles_one_intent ... ok
+test a0_10_a_user_focus_move_cancels_the_intent ... ok
+test a0_10_a_user_clear_cancels_the_intent ... ok
+test a0_10_a_bulk_clear_settles_one_intent ... ok
+test a0_10_a_bulk_clear_settles_once_for_the_surviving_sibling ... ok
+test a0_11_churn_returns_to_the_baseline ... ok
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
+- A0-09：同帧内对同一 key 的第二次 mount 由 staged-mount 检查拒绝（`Fatal::DuplicateViewKey`），且帧被丢弃、
+  旧视图不变；同一行为还有 preflight 的 `seen_keys` 兜底——只删前者不会判红（它是"更早拒绝"的快路径，
+  不是唯一防线），把两处一起删掉才判红。
+- A0-09：reorder 夹具改成**未排序**比对（原实现两侧都 `sort()`，reorder 静默失效也能通过）；现在断言
+  `row_views()` 恰好是反转后的顺序，`mounts`/`unmounts` 差值为 0，`ViewId`/owner/focus/caret 保留。
+- A0-10：删除焦点行后结算一次——`focus_moves` 与 `caret_ops` 各 +1。二次结算在同一 view 上不产生第二次
+  `focus_moves`，只有 `caret_ops` 能判红，所以这条断言是必要的。批量 Clear 另有两条：全部候选被清除时
+  二次结算不可观测（如实记录），保留存活兄弟的那条则能判红。
+- A0-10：`clear_focus` 也是用户选择，intent 不得把它拉回来——这条夹具是 `user_focused` 标志唯一的承重处。
+- A0-11：churn 由 300 轮改为 1200 轮（判据要求 1000+ 交错操作），结束后 live owner / edges / active source /
+  layout 映射回到基线。
+- **判据归属的更正**：`Tx::reorder` 是生产路径（golden 场景 step 05 走的就是它，经 `apply_model` →
+  `Store::install`）；`Store::reorder` 才是 `#[cfg(test)]` 的直连助手。上一轮复验把两者混为一谈，
+  因此 A0-09 的 reorder **不是**"测试专用 API"。
+- **mutation 自证**：忽略 `user_focused` → 1 条红；结算块跑两次 → 2 条红；`views.reorder` 置空 → 7 条红；
+  删除夹具里的显式 `focus` 调用 → 该条红；同时删掉 `clear_completed` 的 intent 记录与 commit 末尾的结算
+  → 2 条红（删除焦点行那条、保留存活兄弟那条）；删掉 `mount_row` 的 staged-mount 子句 → 1 条红
+  （夹具在调用点断言 `Err(DuplicateViewKey)` 并主动丢弃帧，否则 preflight 会用同一个变体兜住，测不出差别）；
+  把 `Tx::remove` 改成空操作 → 1 条红（churn 现在断言 `committed().len() == 0`）。
+- **一条如实降级的夹具**：`a0_10_a_bulk_clear_with_no_candidate_leaves_no_focus` 在"所有候选都被清除"
+  的形态下，intent 与"焦点留在已卸载 view 上"的兜底清理给出同样可观测结果，删掉 intent 那段它仍绿。
+  它固定的是兜底**结果**；固定 intent 本身的是保留存活兄弟的那条。
+- **不证明什么**：A0-10 的回退顺序只实现 next → previous；可聚焦 input 与 toolbar 在 A0 不存在（A1 节点）。
+  churn 是确定性脚本，不是随机压力。
+
+### EVID-VAL-35 丢弃帧不留下行集
+
+```text
+$ cargo test -p zenui-core --test regressions --locked
+test a_discarded_frame_does_not_leave_a_row_set_behind ... ok
+（另 11 条 ADR-0017 回归夹具同样通过）
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
+- 缓存键是修订号，而一个被丢弃的帧推进过 store 从未安装的修订号。夹具：帧 A 重排 → 读行集 → 失败丢弃；
+  帧 B 以另一排列到达同一个 order revision。去掉 `discard()` 里的 `query.invalidate()`，帧 B 会拿到帧 A 的
+  行集——本条判红。
+- **不证明什么**：只覆盖"重排后丢弃"这一条修订号复用路径；缓存一致性没有被形式证明。
+
+### EVID-VAL-36 真实 mount 路径（A0-02 / A0-07）
+
+```text
+$ cargo test -p zenui-app --locked
+test a0_02_each_new_view_costs_exactly_one_owned_read ... ok
+test a0_07_binding_a_filter_clones_no_titles ... ok
+（另 2 条 app 单测 + 6 条 golden trace 通过）
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
+- 这两条打在 `zenui_app::TodoApp::render()` 上：它才是 UI 层真正跑的 mount 执行器（`read_once` + `mount_row`）。
+  一次 render 每新挂载一行恰一次 owned 读；再 render 一次不重读不重挂；绑定 filter 不额外克隆标题。
+- **mutation 自证**：把执行器里的 `read_once` 换成 `with_title` 借读 → 两条都红（io_reads 0 vs 3）。
+- **不证明什么**：mount 取消分支（读失败 → 不入树）只由代码结构与 `zenui-app` 的 sink 记录表达，单线程帧内
+  无法在不改产品代码的前提下构造读失败；不含窗口/GPU。
+
+### EVID-VAL-37 zenui-core 全量
+
+```text
+$ cargo test -p zenui-core --locked
+     Running unittests src/lib.rs       57 passed
+     Running tests/gates.rs              6 passed
+     Running tests/lifecycle.rs          9 passed
+     Running tests/queries.rs            7 passed
+     Running tests/regressions.rs       12 passed
+   Doc-tests zenui_core                  8 passed
+（合计 99 passed / 0 failed）
+```
+
+- **8 条 doctest 是 `compile_fail`，它们不校验错误码。** 本轮在 H2 用 rustdoc 复现：把"声称 E0204"的
+  用例正文换成一个未定义符号，用例照样 `ok`：
+
+  ```text
+  $ rustdoc --test t.rs
+  test t.rs - (line 3) - compile fail ... ok
+  test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+  ```
+
+  > **更正（§15）**：上面这条命令缺 `--crate-name`，孤立文件会被注入 `extern crate r#t;` 并报
+  > `E0463`，于是任何片段都"编译失败"，`compile_fail` 一律 `ok`——那次的调用不成立。结论本身
+  > 不变：用正确调用（`rustdoc --test --crate-name probe --edition 2024`）复测三条用例，见
+  > EVID-VAL-41 的表。
+
+  因此 `lib.rs` 里"2 条 doctest 钉住 E0204/E0599"的说法不成立，任何笔误都能让它们保持绿色。
+  用 trybuild 固定错误码需要 dev-dependency，按仓库规则先出 ADR（ADR-0021，另一分支），本轮不引入。
+- **不证明什么**：不含 `zenui-app` 的 10 条（见 EVID-VAL-36/-38）。
+
+### EVID-VAL-38 workspace 全量
+
+```text
+$ cargo test --workspace --locked
+（core 99 + app 10；每一行均为 ok，0 failed）
+```
+
+- 根 package `zenui` 仍是 0 tests（EVID-VAL-04/-17 的结论不变），`exit 0` 只证明能构建。
+- **不证明什么**：不是 CI 日志；三平台矩阵见 EVID-VAL-22，本轮未重跑 CI。
+
+### EVID-VAL-39 golden 重录（接线后）
+
+```text
+$ cargo run -p zenui-app --example todolist_headless --locked | shasum -a 256
+57a4a142999537ddcd0fe4778d5f3604a91a77e664e0a926492f5cc002b0857e  -
+```
+
+- **为什么重录**，逐项（与 EVID-VAL-31 的 `4da03691…` 用 `diff` 核对，除此之外无差异）：
+  1. 三只行集 memo 移除：`graph edges` 3/4 → 2，`memo_recomputes` 每步 3 → 2（step 04 由 1 → 0），
+     `total memo_recomputes` 22 → 14。
+  2. `step 03 toggle-b` 的 `query_evals`/`id_materializations` 由 1/1 → 0/0：completed 写不可能移动 `All`
+     的成员集合，旧值来自"任何写都换 `staged_rev`"加补记逻辑，是伪计数。
+  3. `total query_evals` 8 → 7、`id_materializations` 7 → 6。
+- 9 步的 `state` 行、`mounts`/`unmounts`/`io_*`/`string_clones` 与焦点/布局 gauge 逐字未变——**场景语义没有改变**。
+- **不证明什么**：trace 不携带 `cache_builds`/`row_visits`；它只证明 9 步场景的可观测输出。
+
+### EVID-VAL-40 clippy（H2）
+
+```text
+$ cargo clippy --workspace --all-targets --locked -- -D warnings
+（exit 0）
+```
+
+- 同轮 `cargo fmt --all -- --check` 通过。
+- **不证明什么**：本地运行，不是 CI 日志；`SPEC-GATE-C-04` 保持 OPEN。
+
+## 15. P3.2 追补轮（ADR-0021 / ADR-0022 合流后）在 H2 的复跑
+
+被测代码 commit `a24faed`，在 `7d78cdc`（§14）之上两步：`9ba171c` 按 `ADR-0022` 改造
+`RowView` 契约，`a24faed` 用 trybuild 取代 `compile_fail` doctest（`ADR-0021`）。两份 ADR 由 PR #15
+合入 `main`，本分支以 merge commit `387ba85` 并入。
+
+### EVID-VAL-41 trybuild 错误码快照（A0-02 / A0-03 / ADR-0022 决定 5）
+
+```text
+$ cargo test -p zenui-core --test compile_fail --locked
+test tests/ui/copy_row_with_string.rs ... ok            # E0204
+test tests/ui/owned_get.rs ... ok                      # E0599
+test tests/ui/row_key_from_view_id.rs ... ok            # E0308
+test tests/ui/row_key_from_layout_node.rs ... ok        # E0308
+test tests/ui/view_id_from_row_key.rs ... ok            # E0308
+test tests/ui/layout_node_from_row_key.rs ... ok        # E0308
+test tests/ui/layout_node_from_view_id.rs ... ok        # E0308
+test tests/ui/view_id_from_layout_node.rs ... ok        # E0308
+test tests/ui/query_cache_construction.rs ... ok        # E0603 + E0624
+test the_named_contracts_do_not_compile_for_the_named_reason ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
+- 每条用例的诊断（错误码、span、消息）与 `.stderr` 快照逐字匹配，这正是 `compile_fail` 做不到的。
+  用正确的调用复测（`rustdoc --test --crate-name probe --edition 2024`）：
+
+  ```text
+  test t.rs - (line 3) - compile fail ... ok        # A：声称 E0204，正文是未定义符号
+  test t.rs - (line 19) - compile fail ... ok       # C：写成 compile_fail,E0204，正文同上
+  test t.rs - (line 11) - compile fail ... FAILED   # B：正文是合法代码
+  failures:
+  ---- t.rs - (line 11) stdout ----
+  Test compiled successfully, but it's marked `compile_fail`.
+  ```
+
+  A 与 C 说明它只检查"有没有失败"、不检查"为什么失败"，连错误码后缀都被吞掉；B 说明它确实检查
+  能不能编译。把 A 读成"E0204 已被钉住"就是这一轮的失效模式。
+- **mutation 判红（两条，都是"同一改动在 doctest 下保持绿色"的那个场景）**：
+  1. 把某条用例里的调用改成未定义名字（`takes_a_viewv`）——代码仍然"不能编译"，doctest 会是 `ok`；
+     UI 用例给出 `mismatch`，因为诊断变成 `E0425` + `E0308`。
+  2. 把 `mod query;` 改回 `pub mod query;`——`E0603`（module private）消失、只余 `E0624`，
+     `query_cache_construction` 用例 `mismatch`。这就是 `ADR-0022` 决定 5 要求的机械自证。
+- **不证明什么**：快照绑定本机工具链 `rustc 1.99.1`，升级会让诊断文本变动（`ADR-0021` 决定 5 已接受该
+  代价）；跨平台的诊断差异由 CI 矩阵回答，本轮未在 CI 上跑 trybuild。
+
+### EVID-VAL-42 query 计数与 ADR-0022 的变异表
+
+```text
+$ cargo test -p zenui-core --test queries --locked
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
+`RowView` 现为 `ADR-0022` 决定 2 的五项契约（`rows_for` / `is_empty_for` / `membership_revision` /
+`order_revision` / `scan_cost`）；扫描计数由视图自己持有，缓存按一次求值前后的差值记 `row_visits`，
+所以**视图内部任何位置的枚举都算数**。决定 6 的变异表逐条实测（变异只改计数路径，返回值不变）：
+
+命令统一为 `cargo test -p zenui-core --test queries --locked`。
+
+| 判据 | 变异 | 判红的夹具 |
+|---|---|---|
+| A0-07 `query_eval` 恰 +1 | 命中分支也自增 `evals` | `a0_07_one_eval_build_and_materialization_per_epoch_filter`、`a0_07_a_completed_write_moves_only_the_filters_that_read_it`、`a0_07_a_reorder_moves_the_order_and_the_next_read_sees_it`、`a0_08_a_thousand_rows_and_three_filters_build_once_each`（4） |
+| A0-07 `cache_build`/`id_materialize` 各恰 +1 | 命中分支重建 `RowSet` | `a0_07_one_eval_build_and_materialization_per_epoch_filter`、`a0_07_a_reorder_moves_the_order_and_the_next_read_sees_it`（2） |
+| A0-07 `completed` 写只影响读它的 filter | `completed` 写 bump 三个 filter 的 membership revision | `a0_07_a_completed_write_moves_only_the_filters_that_read_it`（1） |
+| A0-08 `row_visits = 0` | `is_empty_for` 改成数一遍 `rows_for(All)`（布尔不变） | `a0_07_one_eval_build_and_materialization_per_epoch_filter`、`a0_07_a_completed_write_moves_only_the_filters_that_read_it`、`a0_07_a_reorder_moves_the_order_and_the_next_read_sees_it`、`a0_08_an_empty_filter_materializes_nothing`、`a0_08_a_frame_that_empties_a_filter_visits_nothing`、`a0_08_a_thousand_rows_and_three_filters_build_once_each`（6；空态那条 `row_visits` 2000 → 3000） |
+| 接线存在 | `Tx::rows` 改回直接展开 `effective_rows()` | 同上 6 条 |
+
+- **与 §14 的差别**：§14 记的契约是"缓存自己在闭包里数行"，那条 `is_empty_for` 变异当时 7 条全绿；
+  本轮把计数归属移到视图侧后同一条变异判红 6 条。这是 `ADR-0022` 决定 6 想要的效果。
+- **不证明什么**：变异只覆盖这五条；`is_empty_for` 若换成绕开 `rows_for` 的私有扫描仍不可见——本轮
+  的契约把"任何枚举都经 `rows_for`"作为实现约定，没有把它变成类型约束。
+
+### EVID-VAL-43 zenui-core 全量
+
+```text
+$ cargo test -p zenui-core --locked
+     Running unittests src/lib.rs               57 passed
+     Running tests/compile_fail.rs               1 passed
+     Running tests/gates.rs                      6 passed
+     Running tests/lifecycle.rs                  9 passed
+     Running tests/queries.rs                    7 passed
+     Running tests/regressions.rs               12 passed
+   Doc-tests zenui_core                          0 passed（8 条 compile_fail 已迁移）
+（合计 92 passed / 0 failed）
+```
+
+- 与 EVID-VAL-37 的 99 相比少 7：8 条 doctest 移除（−8），新增 trybuild 运行器（+1）。
+- **不证明什么**：trybuild 的 9 条用例在运行器里计为 1 个测试目标。
+
+### EVID-VAL-44 workspace 全量
+
+```text
+$ cargo test --workspace --locked
+（core 92 + app 10；每一行均为 ok，0 failed）
+```
+
+- 根 package `zenui` 仍是 0 tests。**不证明什么**：不是 CI 日志。
+
+### EVID-VAL-45 trace 未变
+
+```text
+$ cargo run -p zenui-app --example todolist_headless --locked | shasum -a 256
+57a4a142999537ddcd0fe4778d5f3604a91a77e664e0a926492f5cc002b0857e  -
+```
+
+- 与 EVID-VAL-39 逐字相同：本轮改的是 `RowView` 的成员与两个聚合量的取数路径（`remaining` /
+  `has_completed` 改走 `live_counts`，不再每帧展开 `effective_rows()`），9 步场景的可观测输出没有变化。
+- `ADR-0022` 决定 7 要求"计数从 1 变 0 之类必须写清是哪一次行为变化造成的"：本轮没有计数变化，
+  变化的只是不可观测的工作量。
+- **不证明什么**：trace 不携带 `cache_builds`/`row_visits`。
+
+### EVID-VAL-46 clippy（H2）
+
+```text
+$ cargo clippy --workspace --all-targets --locked -- -D warnings
+（exit 0）
+```
+
+- 同轮 `cargo fmt --all -- --check` 通过。`trybuild` 只在 `zenui-core` 的 `[dev-dependencies]`，
+  `[dependencies]` 仍为空。
+- **不证明什么**：本地运行，不是 CI 日志；`SPEC-GATE-C-04` 保持 OPEN。
+
+### EVID-VAL-47 CI 矩阵：trybuild 快照跨平台（CI）
+
+```text
+run https://github.com/YougLin-dev/zenui/actions/runs/44317724221  (commit 61de7b5)
+  check                    pass   8s
+  gates (ubuntu-latest)    pass  32s
+  gates (macos-latest)     pass  47s
+  gates (windows-latest)   pass  1m37s
+```
+
+- 同一 commit 上 102 条 workspace 测试在三个 runner 上各自通过。**九条 trybuild UI 用例的 `.stderr`
+  在 Windows 与 Linux 上也逐字匹配**——这是 `ADR-0021` 的一个悬置风险（快照是否绑定平台），本轮
+  在 CI 上得到否证；绑定的是工具链版本，不是平台。
+- 分支保护（`strict` + 四条 required checks + `enforce_admins`）在本 PR 上是生效状态。
+- **不证明什么**：不含 GPU/窗口/平台后端能力；`cargo package` 与 `SPEC-GATE-C-04` 仍未验证；
+  clippy/fmt 只是同一 job 的步骤日志，没有独立 EVID。

@@ -1,0 +1,24 @@
+error[E0603]: module `query` is private
+ --> tests/ui/query_cache_construction.rs:5:25
+  |
+5 |     let _ = zenui_core::query::QueryCache::new();
+  |                         ^^^^^  ---------- struct `QueryCache` is not publicly re-exported
+  |                         |
+  |                         private module
+  |
+note: the module `query` is defined here
+ --> src/lib.rs
+  |
+  | mod query;
+  | ^^^^^^^^^
+
+error[E0624]: associated function `new` is private
+ --> tests/ui/query_cache_construction.rs:5:44
+  |
+5 |     let _ = zenui_core::query::QueryCache::new();
+  |                                            ^^^ private associated function
+  |
+ ::: src/query.rs
+  |
+  |     pub(crate) fn new() -> Self {
+  |     --------------------------- private associated function defined here

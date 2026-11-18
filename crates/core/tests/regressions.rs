@@ -5,7 +5,7 @@
 //! Every test here was written against a real defect: each one fails on the
 //! implementation that had the bug.
 
-use zenui_core::{Fatal, LayoutNodeId, RowId, RowKey, Runtime, ValueError, ViewId};
+use zenui_core::{Fatal, Filter, LayoutNodeId, RowId, RowKey, Runtime, ValueError, ViewId};
 
 fn key_of(runtime: &Runtime, title: &str) -> RowKey {
     runtime
@@ -357,4 +357,55 @@ fn a_no_op_write_does_not_advance_the_epoch() {
         "a no-op is not a write"
     );
     assert!(!runtime.committed().rows().next().unwrap().completed());
+}
+
+/// `SPEC-GATE-A0-07` + `SPEC-RT-053`: a discarded frame reaches revisions the
+/// store never installs, so the snapshots it built must not survive.
+///
+/// The cache is keyed on `(membership, order)`; a later frame reaches the same
+/// order revision with a *different* permutation, and without the invalidation
+/// on discard it is served the dead frame\'s row set.
+#[test]
+fn a_discarded_frame_does_not_leave_a_row_set_behind() {
+    let mut runtime = Runtime::new();
+    runtime
+        .frame(|tx| {
+            for title in ["A", "B", "C"] {
+                tx.insert(title)?;
+            }
+            Ok(())
+        })
+        .expect("seed");
+
+    let forward: Vec<RowKey> = runtime.committed().keys().collect();
+    let reversed: Vec<RowKey> = forward.iter().rev().copied().collect();
+    let rotated: Vec<RowKey> = vec![forward[1], forward[2], forward[0]];
+
+    let result: Result<(), Fatal> = runtime.frame(|tx| {
+        tx.reorder(&reversed)
+            .map_err(|_| Fatal::OrderNotAPermutation)?;
+        let seen = tx.rows(Filter::All);
+        assert_eq!(seen.as_slice(), reversed.as_slice(), "in-frame read");
+        Err(Fatal::Aborted)
+    });
+    assert!(result.is_err(), "the frame was discarded");
+    assert_eq!(
+        runtime.committed().keys().collect::<Vec<_>>(),
+        forward,
+        "nothing was installed"
+    );
+
+    // The next frame reaches the same order revision with another permutation.
+    let seen = runtime
+        .frame(|tx| {
+            tx.reorder(&rotated)
+                .map_err(|_| Fatal::OrderNotAPermutation)?;
+            Ok(tx.rows(Filter::All))
+        })
+        .expect("reorder");
+    assert_eq!(
+        seen.as_slice(),
+        rotated.as_slice(),
+        "the discarded frame\'s snapshot must not answer"
+    );
 }

@@ -32,7 +32,7 @@ use crate::handle::{
 };
 use crate::layout::LayoutMap;
 use crate::owner::OwnerTree;
-use crate::query::{Filter, QueryCache, RowSet};
+use crate::query::{Filter, QueryCache, RowSet, RowView, filter_index};
 use crate::store::{Row, Store, StoreDraft, StoreError};
 use crate::view::{FocusIntent, ViewTree};
 
@@ -113,6 +113,11 @@ pub enum Fatal {
     LayoutMapInconsistent,
     /// The staged view order is not a permutation of the views live at commit.
     ViewOrderNotAPermutation,
+    /// Two views claim the same row key: `For` must be keyed
+    /// (`SPEC-GATE-A0-09`).
+    DuplicateViewKey {
+        key: RowKey,
+    },
     /// A mount targets a row the same transaction removed.
     MountForMissingRow {
         view: ViewId,
@@ -150,6 +155,7 @@ impl fmt::Display for Fatal {
             Fatal::ViewOrderNotAPermutation => {
                 f.write_str("staged view order is not a permutation")
             }
+            Fatal::DuplicateViewKey { .. } => f.write_str("two views claim the same row key"),
             Fatal::MountForMissingRow { .. } => f.write_str("mount targets a removed row"),
             Fatal::FocusTargetNotLive { .. } => f.write_str("focus target will not be live"),
             Fatal::GraphCycle { node } => write!(f, "memo cycle at node {node}"),
@@ -300,8 +306,23 @@ pub struct Txn {
     graph: GraphScratch,
     view: ViewDraft,
     staged_rev: u64,
+    /// Cache revisions this frame has reached: one per filter membership set
+    /// and one for the display order.
+    ///
+    /// Seeded from the store at `begin_frame`, advanced only where a staged
+    /// write really changes the set, and adopted verbatim by `Store::install`.
+    /// One lineage for committed and staged state is what lets a frame's cache
+    /// entry survive its own commit, and it is why there is no second place
+    /// where a revision could be "reported".
+    staged_membership: [u64; 3],
+    staged_order: u64,
     publishes: Vec<Publication>,
     commits: u64,
+    /// Focus intents recorded before a structural change, settled once at the
+    /// end of the commit (`SPEC-RT-026`, `SPEC-GATE-A0-10`).
+    focus_intents: Vec<FocusIntent>,
+    /// Set when the frame moves focus explicitly; cancels pending intents.
+    user_focused: bool,
     /// Test-only: what the Cleanup stage observed when it released an owner.
     #[cfg(test)]
     cleanup_log: Vec<(crate::handle::OwnerId, Phase, usize)>,
@@ -321,19 +342,31 @@ impl Txn {
             graph: GraphScratch::new(),
             view: ViewDraft::default(),
             staged_rev: 0,
+            staged_membership: [0; 3],
+            staged_order: 0,
             publishes: Vec::new(),
             commits: 0,
             poison: None,
+            focus_intents: Vec::new(),
+            user_focused: false,
             #[cfg(test)]
             cleanup_log: Vec::new(),
         }
     }
 
-    pub(crate) fn begin_frame(&mut self, next_view: u32, next_owner: u32) {
+    pub(crate) fn begin_frame(&mut self, store: &Store, next_view: u32, next_owner: u32) {
         self.depth = 1;
         self.phase = Phase::Outside;
         self.outcome = Outcome::Live;
         self.poison = None;
+        // Revisions continue the committed lineage rather than restarting, so
+        // the key a frame builds under is the key the commit installs.
+        self.staged_membership = [
+            store.epoch_for(Filter::All),
+            store.epoch_for(Filter::Active),
+            store.epoch_for(Filter::Completed),
+        ];
+        self.staged_order = store.order_epoch();
         self.view.next_view = next_view;
         self.view.next_owner = next_owner;
     }
@@ -367,6 +400,8 @@ impl Txn {
         self.depth = 0;
         self.phase = Phase::Outside;
         self.outcome = Outcome::Committed;
+        self.focus_intents.clear();
+        self.user_focused = false;
         self.model = ModelJournal::new(self.model.next_key);
         self.graph = GraphScratch::new();
         self.view = ViewDraft::default();
@@ -394,30 +429,21 @@ impl fmt::Debug for Txn {
 #[derive(Clone, Copy, Debug)]
 pub struct Nodes {
     pub store: NodeId,
-    pub all: NodeId,
-    pub active: NodeId,
-    pub completed: NodeId,
     pub remaining: NodeId,
     pub has_completed: NodeId,
 }
 
 impl Nodes {
+    /// The runtime declares no memo for a row set: the query cache slot is that
+    /// memo, keyed on the revisions a memo would otherwise have to track
+    /// (`SPEC-GATE-A0-07`). A graph node on top of it would be a second
+    /// invalidation authority for the same value — the exact shape of defect
+    /// this gate is about.
     pub(crate) fn build(graph: &mut MemoGraph) -> Self {
         Self {
             store: graph.source("store"),
-            all: graph.memo("rows/all"),
-            active: graph.memo("rows/active"),
-            completed: graph.memo("rows/completed"),
             remaining: graph.memo("remaining"),
             has_completed: graph.memo("has-completed"),
-        }
-    }
-
-    pub const fn for_filter(self, filter: Filter) -> NodeId {
-        match filter {
-            Filter::All => self.all,
-            Filter::Active => self.active,
-            Filter::Completed => self.completed,
         }
     }
 }
@@ -527,6 +553,12 @@ impl<'a> Tx<'a> {
 
     /// A cycle found during a staged compute is fatal: latch it so the
     /// outermost exit returns `Fatal::GraphCycle` and discards the stage.
+    ///
+    /// Only the cycle probe reaches this. The runtime's own memo bodies read
+    /// the `store` source node and cannot re-enter, so no production path can
+    /// produce a cycle today; the latch stays because the probe is what pins
+    /// that the failure would be fatal (`SPEC-GATE-A0-05`).
+    #[cfg(test)]
     fn note_graph_error(&mut self) {
         if let Some(node) = self.txn.graph.cycle() {
             self.txn.poison = Some(Fatal::GraphCycle { node });
@@ -537,6 +569,22 @@ impl<'a> Tx<'a> {
         self.txn.staged_rev = self.txn.staged_rev.saturating_add(1);
         self.graph
             .bump_source_staged(&mut self.txn.graph, self.nodes.store);
+    }
+
+    /// Advance the membership revisions a staged write really moves.
+    ///
+    /// Called at the staging site that knows the answer — never by a caller
+    /// claiming work it did not do. `Store::install` adopts the final values,
+    /// so the committed lineage and the staged one are the same numbers.
+    fn note_membership(&mut self, filters: &[Filter]) {
+        for filter in filters {
+            self.txn.staged_membership[filter_index(*filter)] += 1;
+        }
+    }
+
+    /// Advance the display-order revision.
+    fn note_order(&mut self) {
+        self.txn.staged_order += 1;
     }
 
     // ---- model writes ----
@@ -564,6 +612,11 @@ impl<'a> Tx<'a> {
         self.txn.model.inserted.push(key);
         self.txn.model.writes += 1;
         self.bump();
+        // Insert/remove/clear move every membership revision, whichever set
+        // the row is actually in: the reverse edge is collapsed per filter, and
+        // over-invalidation is redundant but harmless (`ADR-0022` decision 3).
+        self.note_membership(&[Filter::All, Filter::Active, Filter::Completed]);
+        self.note_order();
         Ok(Handle::new(self.store.runtime_id(), slot, generation))
     }
 
@@ -580,10 +633,16 @@ impl<'a> Tx<'a> {
     pub fn remove(&mut self, row: Handle<Row>) -> Result<RowKey, ValueError> {
         self.require_staged(WriteKind::ModelWrite)?;
         let key = self.effective_key(row)?;
-        if self.txn.model.removals.insert(key) {
-            self.txn.model.writes += 1;
-            self.bump();
+        if self.txn.model.removals.contains(&key) {
+            // Already staged for removal in this frame: no new change, and the
+            // effective flag is no longer readable (the removal wins).
+            return Ok(key);
         }
+        self.txn.model.removals.insert(key);
+        self.txn.model.writes += 1;
+        self.bump();
+        self.note_membership(&[Filter::All, Filter::Active, Filter::Completed]);
+        self.note_order();
         Ok(key)
     }
 
@@ -596,8 +655,22 @@ impl<'a> Tx<'a> {
             }
         }
         if !removed.is_empty() {
+            // A bulk clear settles one intent, not one per removed row.
+            if self.txn.focus_intents.is_empty()
+                && let Some(focused) = self.views.focused()
+                && self
+                    .views
+                    .node(focused)
+                    .and_then(|node| node.row)
+                    .is_some_and(|row| removed.contains(&row))
+                && let Some(intent) = self.views.focus_intent_for(focused)
+            {
+                self.txn.focus_intents.push(intent);
+            }
             self.txn.model.writes += 1;
             self.bump();
+            self.note_membership(&[Filter::All, Filter::Active, Filter::Completed]);
+            self.note_order();
         }
         Ok(removed)
     }
@@ -623,6 +696,8 @@ impl<'a> Tx<'a> {
             self.txn.model.order = Some(keys.to_vec());
             self.txn.model.writes += 1;
             self.bump();
+            // Membership is untouched: only the display order moves.
+            self.note_order();
         }
         Ok(())
     }
@@ -648,6 +723,10 @@ impl<'a> Tx<'a> {
             entry.completed = Some(value);
             self.txn.model.writes += 1;
             self.bump();
+            // The flag moves the row between `Active` and `Completed`; `All`
+            // membership and the display order are untouched (`SPEC-GATE-A0-07`
+            // reverse edge is `(row, completed)`).
+            self.note_membership(&[Filter::Active, Filter::Completed]);
         }
         Ok(())
     }
@@ -716,43 +795,28 @@ impl<'a> Tx<'a> {
         Ok(title)
     }
 
+    /// Rows matching `filter`, honoring this frame's staged writes
+    /// (`SPEC-RT-050`: read your own writes).
+    ///
+    /// Goes through the query cache, keyed on
+    /// `(membership revision[filter], order revision)`. Both revisions are the
+    /// counters the commit installs, so a snapshot built here is still valid —
+    /// and still shared — after the frame lands.
     pub fn rows(&mut self, filter: Filter) -> RowSet {
-        let keys: Vec<RowKey> = self
-            .effective_rows()
-            .into_iter()
-            .filter(|(_, completed)| filter.matches(*completed))
-            .map(|(key, _)| key)
-            .collect();
-        let node = self.nodes.for_filter(filter);
-        let store_node = self.nodes.store;
-        let revision = self.txn.staged_rev;
-
-        let previous = self.txn.phase;
-        self.txn.phase = Phase::Binding;
-        let outcome = {
-            let txn = &mut *self.txn;
-            self.graph
-                .compute_staged(node, &mut txn.graph, revision, |reader| {
-                    reader.read(store_node);
-                    Value::Rows(RowSet::from_keys(keys))
-                })
-        };
-        self.txn.phase = previous;
-        self.note_graph_error();
-
-        match outcome {
-            Ok((Value::Rows(rows), recomputed)) => {
-                if recomputed {
-                    self.query.note_eval();
-                }
-                rows
-            }
-            _ => RowSet::empty(),
-        }
+        let mut view = StagedView::new(self.store, self.txn);
+        self.query.rows_at(&mut view, filter)
     }
 
+    /// Rows still active, from the membership counters.
+    ///
+    /// Deliberately not `effective_rows().iter().filter(..).count()`: that
+    /// scans and allocates the whole model on *every* call, including the calls
+    /// where the memo below answers from cache, and no counter reports it. Work
+    /// the counters cannot see is the defect this gate is about, so the number
+    /// comes from the same `live_counts` the query layer uses (`SPEC-RT-044`).
     pub fn remaining(&mut self) -> u32 {
-        let remaining = self.effective_rows().iter().filter(|(_, c)| !c).count() as u32;
+        let (live, completed) = StagedView::new(self.store, self.txn).live_counts();
+        let remaining = u32::try_from((live - completed).max(0)).unwrap_or(u32::MAX);
         let node = self.nodes.remaining;
         let store_node = self.nodes.store;
         let revision = self.txn.staged_rev;
@@ -775,11 +839,11 @@ impl<'a> Tx<'a> {
         }
     }
 
+    /// True when any live row is completed, from the membership counters — the
+    /// same rule as [`Tx::remaining`].
     pub fn has_completed(&mut self) -> bool {
-        let flag = self
-            .effective_rows()
-            .iter()
-            .any(|(_, completed)| *completed);
+        let (_, completed) = StagedView::new(self.store, self.txn).live_counts();
+        let flag = completed > 0;
         let node = self.nodes.has_completed;
         let store_node = self.nodes.store;
         let revision = self.txn.staged_rev;
@@ -886,6 +950,17 @@ impl<'a> Tx<'a> {
 
     pub fn mount_row(&mut self, row: RowKey, title_len: u32) -> Result<ViewId, Fatal> {
         self.require(WriteKind::OwnerMount)?;
+        // `For` is keyed: two live views for one row would alias its identity,
+        // so the duplicate is refused before any patch is staged
+        // (`SPEC-GATE-A0-09`).
+        let already_mounted = self
+            .views
+            .row_views()
+            .into_iter()
+            .any(|(view, key)| key == row && !self.txn.view.unmounts.contains(&view));
+        if already_mounted || self.txn.view.mounts.iter().any(|mount| mount.row == row) {
+            return Err(Fatal::DuplicateViewKey { key: row });
+        }
         let view_id = ViewId::from_index(self.txn.view.next_view);
         let owner_id = OwnerId::from_index(self.txn.view.next_owner);
         let parent = self.owners.root();
@@ -904,10 +979,19 @@ impl<'a> Tx<'a> {
         Ok(view_id)
     }
 
+    /// Stage an unmount. The focus intent is recorded here — *before* the
+    /// structure changes — and settled once at the end of the commit
+    /// (`SPEC-GATE-A0-10`).
     pub fn unmount(&mut self, view: ViewId) -> Result<(), Fatal> {
         self.require(WriteKind::ViewPatch)?;
         if !self.txn.view.unmounts.contains(&view) {
             self.txn.view.unmounts.push(view);
+            if self.views.focused() == Some(view)
+                && self.txn.focus_intents.is_empty()
+                && let Some(intent) = self.views.focus_intent_for(view)
+            {
+                self.txn.focus_intents.push(intent);
+            }
         }
         Ok(())
     }
@@ -920,6 +1004,8 @@ impl<'a> Tx<'a> {
 
     pub fn focus(&mut self, view: ViewId) -> Result<(), Fatal> {
         self.require(WriteKind::FocusChange)?;
+        // A user focus move mid-frame cancels any recorded removal intent.
+        self.txn.user_focused = true;
         let caret = self
             .views
             .node(view)
@@ -940,6 +1026,7 @@ impl<'a> Tx<'a> {
 
     pub fn clear_focus(&mut self) -> Result<(), Fatal> {
         self.require(WriteKind::FocusChange)?;
+        self.txn.user_focused = true;
         self.txn.view.focus = Some(None);
         Ok(())
     }
@@ -1046,9 +1133,13 @@ impl<'a> Tx<'a> {
             .into_iter()
             .map(|(key, _)| key)
             .collect();
+        let mut seen_keys: BTreeSet<RowKey> = BTreeSet::new();
         for mount in &self.txn.view.mounts {
             if !live_rows.contains(&mount.row) {
                 return Err(Fatal::MountForMissingRow { view: mount.id });
+            }
+            if !seen_keys.insert(mount.row) {
+                return Err(Fatal::DuplicateViewKey { key: mount.row });
             }
         }
 
@@ -1152,6 +1243,9 @@ impl<'a> Tx<'a> {
         }
         draft.set_order(order);
         draft.set_completed_count(final_rows.iter().filter(|(_, done)| *done).count());
+        // The revisions the frame reached become the committed ones: the cache
+        // keys a frame used are the keys the store now answers under.
+        draft.set_revisions(self.txn.staged_membership, self.txn.staged_order);
 
         self.store.install(draft);
         self.txn.model = ModelJournal::new(journal.next_key);
@@ -1203,6 +1297,34 @@ impl<'a> Tx<'a> {
         self.views.set_next(draft.next_view);
         self.owners.set_next(draft.next_owner);
         self.layout.commit(&draft.unmounts);
+
+        // Two-phase focus settlement (`SPEC-GATE-A0-10`): the intent was
+        // recorded before the tree changed, and it is settled here — after the
+        // swap, once — only when the frame did not move focus explicitly.
+        // Fallback order is next -> previous; a focusable input and the
+        // toolbar do not exist in A0 (they are A1 nodes).
+        if !self.txn.user_focused
+            && focused.is_none()
+            && let Some(intent) = self.txn.focus_intents.last().copied()
+        {
+            let target = intent
+                .next
+                .filter(|view| self.views.is_live(*view))
+                .or_else(|| intent.previous.filter(|view| self.views.is_live(*view)));
+            match target {
+                Some(view) => self.views.focus(view),
+                None => self.views.clear_focus(),
+            };
+        }
+        // A focus pointer left on an unmounted view is resolved once, after
+        // the settlement, and counts as a move.
+        if self
+            .views
+            .focused()
+            .is_some_and(|view| !self.views.is_live(view))
+        {
+            self.views.clear_focus();
+        }
 
         // Cleanup: release the owners the unmounts orphaned. No mount, no
         // flush, no user write — the transaction is already published
@@ -1315,60 +1437,10 @@ impl<'a> Tx<'a> {
         self.store.completed_of(row).map_err(ValueError::from)
     }
 
-    /// Final row set: committed rows with staged inserts, updates and removals
-    /// applied, in the staged order when one exists.
+    /// Final row set, as this frame sees it. The merge itself lives on
+    /// [`StagedView`] so the cache and the commit cannot diverge.
     fn effective_rows(&self) -> Vec<(RowKey, bool)> {
-        let mut rows: Vec<(RowKey, bool)> = self
-            .store
-            .rows()
-            .map(|row| {
-                let key = row.key();
-                let completed = self
-                    .txn
-                    .model
-                    .rows
-                    .get(&key)
-                    .and_then(|staged| staged.completed)
-                    .unwrap_or_else(|| row.completed());
-                (key, completed)
-            })
-            .filter(|(key, _)| !self.txn.model.removals.contains(key))
-            .collect();
-
-        for key in &self.txn.model.inserted {
-            if self.txn.model.removals.contains(key) {
-                continue;
-            }
-            let completed = self
-                .txn
-                .model
-                .rows
-                .get(key)
-                .and_then(|staged| staged.completed)
-                .unwrap_or(false);
-            rows.push((*key, completed));
-        }
-
-        if let Some(order) = &self.txn.model.order {
-            // The staged order is authoritative for the rows it names. A row
-            // it does not name — typically one inserted after the reorder —
-            // is appended in insertion order rather than silently dropped:
-            // dropping it would leave a filled slot that no read path can
-            // reach (`SPEC-RT-052`).
-            let mut ordered = Vec::with_capacity(rows.len());
-            for key in order {
-                if let Some(entry) = rows.iter().find(|(candidate, _)| candidate == key) {
-                    ordered.push(*entry);
-                }
-            }
-            for entry in &rows {
-                if !ordered.iter().any(|(key, _)| key == &entry.0) {
-                    ordered.push(*entry);
-                }
-            }
-            return ordered;
-        }
-        rows
+        StagedView::new(self.store, self.txn).effective_rows()
     }
 
     /// Discard the frame explicitly. Used by `Runtime::frame` when the closure
@@ -1412,6 +1484,227 @@ impl<'a> Tx<'a> {
             self.txn.poison = Some(Fatal::Aborted);
         }
         result
+    }
+}
+
+/// The committed model with one frame's journal applied on top.
+///
+/// This is the second `RowView` implementation (`ADR-0022` decision 2). The
+/// cache cannot tell it apart from `Store`, and nothing outside this crate can
+/// produce a third view: a fixture that wants row counts has to drive a real
+/// frame.
+struct StagedView<'a> {
+    store: &'a Store,
+    journal: &'a ModelJournal,
+    membership: [u64; 3],
+    order: u64,
+    /// Rows this view has enumerated. The cache turns the difference across one
+    /// evaluation into `row_visits`, so no enumeration is free — including one
+    /// performed to answer `is_empty_for`.
+    scanned: u64,
+}
+
+impl<'a> StagedView<'a> {
+    fn new(store: &'a Store, txn: &'a Txn) -> Self {
+        Self {
+            store,
+            journal: &txn.model,
+            membership: txn.staged_membership,
+            order: txn.staged_order,
+            scanned: 0,
+        }
+    }
+
+    /// Final row set: committed rows with staged inserts, updates and removals
+    /// applied, in the staged order when one exists.
+    ///
+    /// This is the commit path's view of the model (preflight, publication); it
+    /// does not count scans, because it is not a query evaluation.
+    fn effective_rows(&self) -> Vec<(RowKey, bool)> {
+        let mut rows: Vec<(RowKey, bool)> = self
+            .store
+            .rows()
+            .map(|row| {
+                let key = row.key();
+                let completed = self
+                    .journal
+                    .rows
+                    .get(&key)
+                    .and_then(|staged| staged.completed)
+                    .unwrap_or_else(|| row.completed());
+                (key, completed)
+            })
+            .filter(|(key, _)| !self.journal.removals.contains(key))
+            .collect();
+
+        for key in &self.journal.inserted {
+            if self.journal.removals.contains(key) {
+                continue;
+            }
+            let completed = self
+                .journal
+                .rows
+                .get(key)
+                .and_then(|staged| staged.completed)
+                .unwrap_or(false);
+            rows.push((*key, completed));
+        }
+
+        if let Some(order) = &self.journal.order {
+            // The staged order is authoritative for the rows it names. A row
+            // it does not name — typically one inserted after the reorder —
+            // is appended in insertion order rather than silently dropped:
+            // dropping it would leave a filled slot that no read path can
+            // reach (`SPEC-RT-052`).
+            let mut ordered = Vec::with_capacity(rows.len());
+            for key in order {
+                if let Some(entry) = rows.iter().find(|(candidate, _)| candidate == key) {
+                    ordered.push(*entry);
+                }
+            }
+            for entry in &rows {
+                if !ordered.iter().any(|(key, _)| key == &entry.0) {
+                    ordered.push(*entry);
+                }
+            }
+            return ordered;
+        }
+        rows
+    }
+
+    /// Live and completed row counts: the store's counters plus the journal's
+    /// own entries, never a scan of the row list (`SPEC-RT-044`).
+    ///
+    /// The journal is as long as the frame is wide, not as the store is; a
+    /// frame that writes one row costs one step here whatever `len()` is.
+    fn live_counts(&self) -> (i64, i64) {
+        let mut live = self.store.len() as i64;
+        let mut completed = (self.store.len() - self.store.remaining()) as i64;
+
+        for key in &self.journal.inserted {
+            if self.journal.removals.contains(key) {
+                continue;
+            }
+            live += 1;
+            if self
+                .journal
+                .rows
+                .get(key)
+                .and_then(|staged| staged.completed)
+                .unwrap_or(false)
+            {
+                completed += 1;
+            }
+        }
+
+        for (key, staged) in &self.journal.rows {
+            if staged.inserted || self.journal.removals.contains(key) {
+                continue;
+            }
+            let Some(value) = staged.completed else {
+                continue;
+            };
+            if self.store_completed(*key) != Some(value) {
+                completed += if value { 1 } else { -1 };
+            }
+        }
+
+        for key in &self.journal.removals {
+            if self
+                .journal
+                .rows
+                .get(key)
+                .is_some_and(|staged| staged.inserted)
+            {
+                continue;
+            }
+            if let Some(was_completed) = self.store_completed(*key) {
+                live -= 1;
+                if was_completed {
+                    completed -= 1;
+                }
+            }
+        }
+
+        (live, completed)
+    }
+
+    fn store_completed(&self, key: RowKey) -> Option<bool> {
+        let (slot, _) = self.store.slot_for(key)?;
+        self.store.completed_at(slot)
+    }
+
+    /// Every live row in display order, counting each row it enumerates.
+    fn each_live(&mut self, visit: &mut dyn FnMut(RowKey, bool)) {
+        if self.journal.order.is_some() {
+            let rows = self.effective_rows();
+            self.scanned += rows.len() as u64;
+            for (key, completed) in rows {
+                visit(key, completed);
+            }
+            return;
+        }
+
+        let store = self.store;
+        let journal = self.journal;
+        for row in store.rows() {
+            let key = row.key();
+            if journal.removals.contains(&key) {
+                continue;
+            }
+            self.scanned += 1;
+            let completed = journal
+                .rows
+                .get(&key)
+                .and_then(|staged| staged.completed)
+                .unwrap_or_else(|| row.completed());
+            visit(key, completed);
+        }
+        for key in &journal.inserted {
+            if journal.removals.contains(key) {
+                continue;
+            }
+            self.scanned += 1;
+            let completed = journal
+                .rows
+                .get(key)
+                .and_then(|staged| staged.completed)
+                .unwrap_or(false);
+            visit(*key, completed);
+        }
+    }
+}
+
+impl RowView for StagedView<'_> {
+    fn rows_for(&mut self, filter: Filter) -> Vec<(RowKey, bool)> {
+        let mut rows = Vec::new();
+        self.each_live(&mut |key, completed| {
+            if filter.matches(completed) {
+                rows.push((key, completed));
+            }
+        });
+        rows
+    }
+
+    fn is_empty_for(&mut self, filter: Filter) -> bool {
+        let (live, completed) = self.live_counts();
+        match filter {
+            Filter::All => live == 0,
+            Filter::Active => completed == live,
+            Filter::Completed => completed == 0,
+        }
+    }
+
+    fn membership_revision(&self, filter: Filter) -> u64 {
+        self.membership[filter_index(filter)]
+    }
+
+    fn order_revision(&self) -> u64 {
+        self.order
+    }
+
+    fn scan_cost(&self) -> u64 {
+        self.scanned
     }
 }
 

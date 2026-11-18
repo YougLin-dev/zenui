@@ -9,3 +9,10 @@ license = "MIT OR Apache-2.0"
 # Gate A0 constraint: this crate is pure `std`. Adding any dependency here is a
 # deliberate design decision and must be justified in an ADR first.
 [dependencies]
+
+# ADR-0021 decision 4: trybuild appears only here. `[dependencies]` stays empty,
+# so the published crate and `cargo tree -e normal` are unchanged; the UI tests
+# and their `.stderr` snapshots ship in the repository, not in the package.
+[dev-dependencies]
+trybuild = "1.0"
+

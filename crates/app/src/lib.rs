@@ -7,15 +7,12 @@
 
 #![forbid(unsafe_code)]
 
-use zenui_core::{
-    Counters, Fatal, Filter, FocusIntent, RowId, RowKey, Runtime, Tx, ValueError, ViewId,
-};
+use zenui_core::{Counters, Fatal, Filter, RowId, RowKey, Runtime, Tx, ValueError, ViewId};
 
 /// UI-only state: not part of the runtime's authority.
 pub struct UiState {
     pub filter: Filter,
     pub sink: Vec<String>,
-    pub focus_intent: Option<FocusIntent>,
     pub remaining: u32,
     pub has_completed: bool,
 }
@@ -25,7 +22,6 @@ impl Default for UiState {
         Self {
             filter: Filter::All,
             sink: Vec::new(),
-            focus_intent: None,
             remaining: 0,
             has_completed: false,
         }
@@ -176,8 +172,10 @@ impl std::fmt::Debug for TodoApp {
 
 /// Bind the current query result to the retained view tree.
 ///
-/// TODO(A0-09): duplicate-key rejection in the view layer and a dedicated
-/// setup/identity fixture are still missing.
+/// One row key maps to one view: the duplicate is refused by `Tx::mount_row`
+/// and again by the commit preflight (`SPEC-GATE-A0-09`), and the identity /
+/// caret / focus behaviour of a reorder is pinned in
+/// `crates/core/tests/lifecycle.rs`.
 pub fn render(tx: &mut Tx<'_>, ui: &mut UiState) -> Result<(), Fatal> {
     let want = tx.rows(ui.filter);
     let want_keys: Vec<RowKey> = want.iter().collect();
@@ -185,9 +183,8 @@ pub fn render(tx: &mut Tx<'_>, ui: &mut UiState) -> Result<(), Fatal> {
 
     for (view, key) in existing.iter().copied() {
         if !want_keys.contains(&key) {
-            if tx.focused() == Some(view) && ui.focus_intent.is_none() {
-                ui.focus_intent = tx.focus_intent_for(view);
-            }
+            // The core records the focus intent before the structural change
+            // and settles it once at the end of the commit (`SPEC-GATE-A0-10`).
             tx.unmount(view)?;
         }
     }
@@ -207,7 +204,6 @@ pub fn render(tx: &mut Tx<'_>, ui: &mut UiState) -> Result<(), Fatal> {
         }
     }
     tx.reorder_views(&order)?;
-    settle_focus(tx, ui)?;
 
     ui.remaining = tx.remaining();
     ui.has_completed = tx.has_completed();
@@ -234,22 +230,6 @@ fn mount_row(tx: &mut Tx<'_>, ui: &mut UiState, key: RowKey) -> Result<Option<Vi
     };
     let view = tx.mount_row(key, title.chars().count() as u32)?;
     Ok(Some(view))
-}
-
-/// TODO(A0-10): settle order is next → previous only. Input/toolbar fallback
-/// and cancellation by a later user focus move are not implemented.
-fn settle_focus(tx: &mut Tx<'_>, ui: &mut UiState) -> Result<(), Fatal> {
-    let Some(intent) = ui.focus_intent.take() else {
-        return Ok(());
-    };
-    let target = intent
-        .next
-        .filter(|view| tx.is_live(*view))
-        .or_else(|| intent.previous.filter(|view| tx.is_live(*view)));
-    match target {
-        Some(view) => tx.focus(view),
-        None => tx.clear_focus(),
-    }
 }
 
 fn format_counters(label: &str, counters: Counters) -> String {

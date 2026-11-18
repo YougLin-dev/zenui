@@ -1,0 +1,9 @@
+error[E0204]: the trait `Copy` cannot be implemented for this type
+ --> tests/ui/copy_row_with_string.rs:5:8
+  |
+4 | #[derive(Clone, Copy)]
+  |                 ---- in this derive macro expansion
+5 | struct CopyRow {
+  |        ^^^^^^^
+6 |     title: String,
+  |     ------------- this field does not implement `Copy`
