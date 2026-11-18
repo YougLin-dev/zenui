@@ -89,7 +89,10 @@ def check_frontmatter(files: list[str]) -> None:
             failures.append(f"{rel(path)}: unknown layer '{fields['layer']}'")
         if fields.get("status") and fields["status"] not in STATUSES:
             failures.append(f"{rel(path)}: unknown status '{fields['status']}'")
-        if fields.get("date") and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", fields["date"]):
+        is_template = rel(path).replace(os.sep, "/").startswith("docs/templates/")
+        if not is_template and fields.get("date") and not re.fullmatch(
+            r"\d{4}-\d{2}-\d{2}", fields["date"]
+        ):
             failures.append(f"{rel(path)}: malformed date '{fields['date']}'")
 
 
