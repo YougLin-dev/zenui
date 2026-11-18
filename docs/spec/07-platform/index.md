@@ -96,6 +96,8 @@ replaces: []
 - **状态**：SPEC
 - **强度**：MUST
 - **要求**：跨平台不变量用 `SPEC-PLAT-0NN`（本文件）；平台分册用 **子命名空间** `SPEC-PLAT-WIN-NNN` / `SPEC-PLAT-MACOS-NNN` / `SPEC-PLAT-LINUX-NNN`。三者 MUST NOT 共用裸 `SPEC-PLAT-NNN` 编号，避免"哪一条属于哪个平台"靠记忆判断。
+  - 平台分册内部的**证据需求槽**统一用 `SPEC-PLAT-<OS>-E NN`（`E01…`），它表达"需要什么证据"，**不是证据**，MUST NOT 占用 `EVID-VAL-*` / `EVID-PROBE-*` 编号空间；真正执行后由 evidence 负责人分配 `EVID-*` 序号回填。
+  - 反例（已修正）：Linux 分册曾用 `EVID-VAL-LX-*` 作占位，等于在未执行的情况下占用证据命名空间；Windows 分册曾用 `-C01` 与 macOS 的 `-E01` 并存。现三者统一为 `-E01…`。
 - **失败模式**：三份分册各自从 001 起编号且不带平台前缀 → 交叉引用静默指向错误条目。
 
 ### SPEC-PLAT-017 平台默认行为可以不同，但必须显式声明且可覆盖

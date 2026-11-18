@@ -302,20 +302,20 @@ replaces: []
 
 > 下表是 Linux 侧进入 C Gate 的**最小**证据集。每条都必须记录：commit、lock 哈希、发行版、会话类型（Wayland/X11）、合成器、显示协议、GPU adapter 与驱动标识、命令、退出码、输出摘要。缺任一前置 → 记 `blocked`，不是 `failed`，更不是 `pass`（`SPEC-GATE-C-01`）。
 >
-> **编号说明**：`EVID-VAL-LX-*` 是本文的占位槽位，正式登记时由 CI 负责人统一分配 `EVID-VAL-*` 序号；槽位内容 MUST NOT 被删减。所有槽位当前 `OPEN`。
+> **编号说明**：`SPEC-PLAT-LINUX-E01…E10` 是**证据需求槽**，不是证据本身——它们不占用 `EVID-VAL-*` 编号空间。真正执行后由 CI 负责人分配 `EVID-VAL-*` 序号回填，槽位内容 MUST NOT 被删减。所有槽位当前 `OPEN`。
 
 | 槽位 | 最小证据内容 | 关键前置 | 判定引用 | 状态 |
 |---|---|---|---|---|
-| `EVID-VAL-LX-01` | Wayland 真实窗口：xdg-shell toplevel、app_id、CSD/SSD 两种协商、resize、最小化恢复 | Wayland 会话 + 支持 xdg-decoration 的合成器 | `SPEC-GATE-C-01`、`SPEC-PLAT-LINUX-001/015` | `OPEN` |
-| `EVID-VAL-LX-02` | X11 真实窗口：EWMH 属性、`ConfigureNotify` 风暴合并、无 override-redirect 正常窗口 | X11 会话 + 窗口管理器 | `SPEC-GATE-C-01`、`SPEC-PLAT-LINUX-001/015` | `OPEN` |
-| `EVID-VAL-LX-03` | 输入：键盘布局运行时切换、Tab/Shift+Tab、wheel、clip 外不可命中、焦点 reveal | 真实窗口 + 可切换布局 | `SPEC-GATE-C-02`、`SPEC-PLAT-LINUX-003` | `OPEN` |
-| `EVID-VAL-LX-04` | 中文 IME（Wayland）：fcitx5 或 IBus；候选 Enter 只确认、随后 Enter 只提交一次；候选窗随滚动更新 | Wayland + 输入法 + 中文词库 | `SPEC-GATE-C-02`、`SPEC-PLAT-LINUX-004/016` | `OPEN` |
-| `EVID-VAL-LX-05` | 中文 IME（X11）：同一场景经 XIM；记录 preedit/周围文本能力差异 | X11 + 输入法 | `SPEC-GATE-C-02`、`SPEC-PLAT-LINUX-004/016` | `OPEN` |
-| `EVID-VAL-LX-06` | AT-SPI 实测：Orca（或 accerciser）读取 Tasks/list/listitem/filter 三 toggle；action 命中当前 generation；错误播报 | session bus + AT-SPI 服务 + 屏幕阅读器 | `SPEC-GATE-C-02`、`SPEC-PLAT-LINUX-009/018` | `OPEN` |
-| `EVID-VAL-LX-07` | 分数缩放与多显示器：1.0/1.25/1.5/2.0 及跨屏拖动；caret/hit/AT 同 epoch | 多输出或可切换 scale 的环境 | `SPEC-GATE-C-02`、`SPEC-PLAT-LINUX-005/019` | `OPEN` |
-| `EVID-VAL-LX-08` | 剪贴板与 DnD：文本、图片、URI 列表；Flatpak 内 portal 文件选择与拖入 | 双应用 + 沙盒运行环境 | `SPEC-GATE-C-01`、`SPEC-PLAT-LINUX-006/007` | `OPEN` |
-| `EVID-VAL-LX-09` | 打包产物：deb 或 rpm + AppImage + Flatpak；ICU 词典/字体/licenses/desktop 文件；最老目标发行版启动 | 构建矩阵 + 老发行版容器/机器 | `SPEC-GATE-C-04/05`、`SPEC-PLAT-LINUX-010` | `OPEN` |
-| `EVID-VAL-LX-10` | GPU 与恢复：Vulkan 主路径 + GL 回退 + 显式软件回退；挂起恢复与 device-loss 注入；静止 30–60s 无重绘 | 真实 GPU + 可挂起会话 | `SPEC-GATE-C-03/06`、`SPEC-PLAT-LINUX-011/014/023` | `OPEN` |
+| `SPEC-PLAT-LINUX-E01` | Wayland 真实窗口：xdg-shell toplevel、app_id、CSD/SSD 两种协商、resize、最小化恢复 | Wayland 会话 + 支持 xdg-decoration 的合成器 | `SPEC-GATE-C-01`、`SPEC-PLAT-LINUX-001/015` | `OPEN` |
+| `SPEC-PLAT-LINUX-E02` | X11 真实窗口：EWMH 属性、`ConfigureNotify` 风暴合并、无 override-redirect 正常窗口 | X11 会话 + 窗口管理器 | `SPEC-GATE-C-01`、`SPEC-PLAT-LINUX-001/015` | `OPEN` |
+| `SPEC-PLAT-LINUX-E03` | 输入：键盘布局运行时切换、Tab/Shift+Tab、wheel、clip 外不可命中、焦点 reveal | 真实窗口 + 可切换布局 | `SPEC-GATE-C-02`、`SPEC-PLAT-LINUX-003` | `OPEN` |
+| `SPEC-PLAT-LINUX-E04` | 中文 IME（Wayland）：fcitx5 或 IBus；候选 Enter 只确认、随后 Enter 只提交一次；候选窗随滚动更新 | Wayland + 输入法 + 中文词库 | `SPEC-GATE-C-02`、`SPEC-PLAT-LINUX-004/016` | `OPEN` |
+| `SPEC-PLAT-LINUX-E05` | 中文 IME（X11）：同一场景经 XIM；记录 preedit/周围文本能力差异 | X11 + 输入法 | `SPEC-GATE-C-02`、`SPEC-PLAT-LINUX-004/016` | `OPEN` |
+| `SPEC-PLAT-LINUX-E06` | AT-SPI 实测：Orca（或 accerciser）读取 Tasks/list/listitem/filter 三 toggle；action 命中当前 generation；错误播报 | session bus + AT-SPI 服务 + 屏幕阅读器 | `SPEC-GATE-C-02`、`SPEC-PLAT-LINUX-009/018` | `OPEN` |
+| `SPEC-PLAT-LINUX-E07` | 分数缩放与多显示器：1.0/1.25/1.5/2.0 及跨屏拖动；caret/hit/AT 同 epoch | 多输出或可切换 scale 的环境 | `SPEC-GATE-C-02`、`SPEC-PLAT-LINUX-005/019` | `OPEN` |
+| `SPEC-PLAT-LINUX-E08` | 剪贴板与 DnD：文本、图片、URI 列表；Flatpak 内 portal 文件选择与拖入 | 双应用 + 沙盒运行环境 | `SPEC-GATE-C-01`、`SPEC-PLAT-LINUX-006/007` | `OPEN` |
+| `SPEC-PLAT-LINUX-E09` | 打包产物：deb 或 rpm + AppImage + Flatpak；ICU 词典/字体/licenses/desktop 文件；最老目标发行版启动 | 构建矩阵 + 老发行版容器/机器 | `SPEC-GATE-C-04/05`、`SPEC-PLAT-LINUX-010` | `OPEN` |
+| `SPEC-PLAT-LINUX-E10` | GPU 与恢复：Vulkan 主路径 + GL 回退 + 显式软件回退；挂起恢复与 device-loss 注入；静止 30–60s 无重绘 | 真实 GPU + 可挂起会话 | `SPEC-GATE-C-03/06`、`SPEC-PLAT-LINUX-011/014/023` | `OPEN` |
 
 ## 5. 不确定项（OPEN）
 

@@ -31,6 +31,7 @@ replaces: []
 | GPU 类型 | `wgpu 30.0.2` | 同代 backend 必须统一 | `PROBE`（headless） |
 | 2D 生产 | `vello_gpu 0.4.0`（sparse-strips 首选）+ `vello_cpu 0.4.0`（reference / fallback） | Scene Adapter 可替换实现 | `PROBE`（headless，单机） |
 | 窗口 / 无障碍 | `winit 0.30.13` / `accesskit 0.25.2` / `accesskit_winit 0.34.2` | WindowShell 可替换 | `SPEC`（三元组合**从未一起编译/运行**，见 `SPEC-ROUTE-003`） |
+| 平台无障碍适配 | 各家 AT 适配器：Windows UIA、macOS NSAccessibility、**Linux AT-SPI（`accesskit_unix`）** | 每平台独立实现，共用同一语义树 | `OPEN`（**版本随 accesskit 代次锁定，尚未选定；三平台适配器均未经真实 AT 验证**。Linux 不在 `SPEC-ROUTE-003` 三元组合内，是 Gate C 的独立前置） |
 | 可选 3D | `gltf 1.4.1` + `glam` + 自有 wgpu mesh | 3D backend 可选 | `SPEC` |
 | Tailwind 语义 oracle | 官方 v4 源码 commit **ac7fd4007178123269cc6c8e03c8d957646331fa**；Rust `tailwind 0.4.0` 仅作离线 oracle | oracle 可换，生成物必须可复现 | `OPEN`（无 manifest/差异测试） |
 

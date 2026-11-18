@@ -236,15 +236,15 @@ Windows 后端是**采集与归一化层**，不是第二套 UI 权威。它 MUS
 
 | ID | 最小证据（必须真实执行） | 关联 | 状态 |
 |---|---|---|---|
-| `SPEC-PLAT-WIN-C01` | 真实 winit 窗口由 `zenui::run(Application)` 启动；记录窗口创建/关闭、`ControlFlow::Wait`、首帧与一次 resize 的 trace | `SPEC-GATE-A1-01`、`SPEC-GATE-C-01` | `OPEN` |
-| `SPEC-PLAT-WIN-C02` | 指针与键盘：click、wheel、Tab/Shift+Tab、Space、clip 外不可 hit；trace 含 logical 坐标与 epoch | `SPEC-GATE-A1-06` | `OPEN` |
-| `SPEC-PLAT-WIN-C03` | 中文 IME：preedit→commit、候选 Enter 只确认、下一次 Enter 只提交一次；计数 `ime_consumed/input_commit/submit/insert/clear` 各符合预期 | `SPEC-GATE-A1-07`、`SPEC-TEXT-014` | `OPEN` |
-| `SPEC-PLAT-WIN-C04` | NVDA 实机：list/listitem、checkbox 状态、filter pressed、删除项名称、两个空态、焦点转移与公告；附人/机可读记录 | `SPEC-GATE-C-02`、`SPEC-RENDER-018` | `OPEN` |
-| `SPEC-PLAT-WIN-C05` | DPI：100%/125%/150%/200% 与跨显示器移动；每档的字体、命中、caret、语义矩形一致；缩窗与最小化后恢复正确 | `SPEC-GATE-C-01`、`SPEC-RENDER-012` | `OPEN` |
-| `SPEC-PLAT-WIN-C06` | GPU：DX12 为主，可用时补 Vulkan；同一 Todo 场景与 CPU reference 做像素对比；至少构造一条 `Unsupported` 路径且不 panic | `SPEC-GATE-C-03`、`SPEC-RENDER-008` | `OPEN` |
-| `SPEC-PLAT-WIN-C07` | 剪贴板与文件拖放：复制/粘贴中文、格式不支持时的 typed 失败、拖入文件产生 `DropEvent`、拖出/自定义格式返回 `Unsupported` | `SPEC-GATE-C-01`、`SPEC-PLAT-WIN-008/009` | `OPEN` |
-| `SPEC-PLAT-WIN-C08` | 空闲：真实窗口 `ControlFlow::Wait` 下 30–60s 无每帧重绘；附 ETW/WPA 或等价采样 | `SPEC-GATE-C-06` | `OPEN` |
-| `SPEC-PLAT-WIN-C09` | 设备丢失恢复：构造 device removed/reset，验证清理→重建→发布，旧 device 资源不再被引用 | `SPEC-RENDER-013`、`SPEC-GATE-C-03` | `OPEN` |
+| `SPEC-PLAT-WIN-E01` | 真实 winit 窗口由 `zenui::run(Application)` 启动；记录窗口创建/关闭、`ControlFlow::Wait`、首帧与一次 resize 的 trace | `SPEC-GATE-A1-01`、`SPEC-GATE-C-01` | `OPEN` |
+| `SPEC-PLAT-WIN-E02` | 指针与键盘：click、wheel、Tab/Shift+Tab、Space、clip 外不可 hit；trace 含 logical 坐标与 epoch | `SPEC-GATE-A1-06` | `OPEN` |
+| `SPEC-PLAT-WIN-E03` | 中文 IME：preedit→commit、候选 Enter 只确认、下一次 Enter 只提交一次；计数 `ime_consumed/input_commit/submit/insert/clear` 各符合预期 | `SPEC-GATE-A1-07`、`SPEC-TEXT-014` | `OPEN` |
+| `SPEC-PLAT-WIN-E04` | NVDA 实机：list/listitem、checkbox 状态、filter pressed、删除项名称、两个空态、焦点转移与公告；附人/机可读记录 | `SPEC-GATE-C-02`、`SPEC-RENDER-018` | `OPEN` |
+| `SPEC-PLAT-WIN-E05` | DPI：100%/125%/150%/200% 与跨显示器移动；每档的字体、命中、caret、语义矩形一致；缩窗与最小化后恢复正确 | `SPEC-GATE-C-01`、`SPEC-RENDER-012` | `OPEN` |
+| `SPEC-PLAT-WIN-E06` | GPU：DX12 为主，可用时补 Vulkan；同一 Todo 场景与 CPU reference 做像素对比；至少构造一条 `Unsupported` 路径且不 panic | `SPEC-GATE-C-03`、`SPEC-RENDER-008` | `OPEN` |
+| `SPEC-PLAT-WIN-E07` | 剪贴板与文件拖放：复制/粘贴中文、格式不支持时的 typed 失败、拖入文件产生 `DropEvent`、拖出/自定义格式返回 `Unsupported` | `SPEC-GATE-C-01`、`SPEC-PLAT-WIN-008/009` | `OPEN` |
+| `SPEC-PLAT-WIN-E08` | 空闲：真实窗口 `ControlFlow::Wait` 下 30–60s 无每帧重绘；附 ETW/WPA 或等价采样 | `SPEC-GATE-C-06` | `OPEN` |
+| `SPEC-PLAT-WIN-E09` | 设备丢失恢复：构造 device removed/reset，验证清理→重建→发布，旧 device 资源不再被引用 | `SPEC-RENDER-013`、`SPEC-GATE-C-03` | `OPEN` |
 | `SPEC-PLAT-WIN-C10` | 打包产物：MSIX/MSI/portable 之一可干净安装、升级、卸载；签名有效；字体/ICU/licence/lock hash 齐备 | `SPEC-GATE-C-04/05` | `OPEN` |
 | `SPEC-PLAT-WIN-C11` | 系统偏好：高对比度、减少动态、深浅主题、文本缩放各切换一次，界面按 `SPEC-STYLE` 规则响应 | `SPEC-PLAT-WIN-015`、`SPEC-STYLE-024` | `OPEN` |
 | `SPEC-PLAT-WIN-C12` | 崩溃上报：Rust panic 与原生异常各构造一次，产出可符号化 minidump 与模块/commit 信息 | `SPEC-PLAT-WIN-012` | `OPEN` |
