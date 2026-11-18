@@ -174,6 +174,11 @@ impl TodoApp {
     }
 
     /// Bind the current query result to the retained view tree.
+    ///
+    /// TODO(A0-06): this is the TreeCommit path, and it patches the live tree
+    /// directly. There is no preflight for key/topology/focus/geometry, no
+    /// staging tree, and therefore no way to restore the previous commit if a
+    /// patch fails part-way. P2 owns the journal and the single swap.
     pub fn render(&mut self) {
         let filter = self.filter;
         let want = self.rows(filter);
@@ -331,8 +336,9 @@ impl TodoApp {
         }
     }
 
-    /// Titles of the rows that are currently mounted, in view order. With a
-    /// filter active this is a proper subset of `Store::titles`.
+    /// Titles of the rows that are currently mounted, in view order. This is a
+    /// subset of `Store::titles`, and a *proper* subset only while the filter
+    /// hides a live row.
     fn visible_titles(&self) -> Vec<String> {
         self.views
             .row_views()

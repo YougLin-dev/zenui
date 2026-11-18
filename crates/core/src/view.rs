@@ -96,6 +96,11 @@ impl ViewTree {
 
     /// Mount one row view. A remount never reuses an id in P1, so a stale
     /// `ViewId` can never point at a different row.
+    ///
+    /// TODO(A0-03): monotonic ids are a *stronger* guarantee than the gate
+    /// requires and deliberately skip generation reuse. A0-03 also wants a
+    /// remounted scope to receive a new generation while the id stays stable,
+    /// plus a stale-click dispatch fixture; both are P2 work.
     pub fn mount_row(&mut self, row: RowKey, owner: OwnerId, title_len: u32) -> ViewId {
         let id = ViewId::from_index(self.next);
         self.next += 1;
@@ -283,7 +288,7 @@ mod tests {
     }
 
     #[test]
-    fn focus_intent_prefers_next_then_previous() {
+    fn focus_intent_reports_both_neighbours() {
         let mut tree = tree();
         let a = tree.mount_row(key(1), owner(), 1);
         let b = tree.mount_row(key(2), owner(), 1);

@@ -187,18 +187,25 @@ mod tests {
     }
 
     #[test]
-    fn a_write_forces_one_reevaluation_for_all_consumers() {
+    fn a_write_forces_exactly_one_reevaluation_per_epoch() {
         let mut store = Store::new();
         let row = store.insert("A");
         let mut cache = QueryCache::new();
-        let _ = cache.rows(&store, Filter::All);
+        let before = cache.rows(&store, Filter::All);
+        assert_eq!(before.len(), 1);
 
+        // Same filter before and after, so the miss can only come from the
+        // store epoch changing.
         store.toggle(row).expect("live row");
 
-        let active = cache.rows(&store, Filter::Active);
-        assert!(active.is_empty());
+        let after = cache.rows(&store, Filter::All);
+        assert_eq!(after.len(), 1);
+        assert_eq!(cache.counters().query_evals, 2, "the write invalidated");
+
+        // A second consumer in the same epoch shares the snapshot.
+        let again = cache.rows(&store, Filter::All);
         assert_eq!(cache.counters().query_evals, 2);
-        assert_eq!(cache.counters().id_materializations, 2);
+        assert_eq!(again.as_slice(), after.as_slice());
     }
 
     #[test]

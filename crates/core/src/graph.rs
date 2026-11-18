@@ -448,13 +448,24 @@ mod tests {
             .expect("compute");
         assert_eq!(graph.edge_count(), 1);
 
+        // Bump a real dependency so the second body is allowed to run; a
+        // clean memo would be served from cache and the body would never run.
+        graph.bump_source(left);
         let _ = graph
             .compute(memo, |reader| {
                 reader.read(right);
                 Value::Count(2)
             })
             .expect("recompute");
-        assert_eq!(graph.edge_count(), 1, "old edge removed, new edge added");
+        assert_eq!(graph.edge_count(), 1, "one edge, not two");
+
+        // The `left` edge is gone: bumping `left` must no longer invalidate
+        // the memo, which only a removed edge can prove.
+        graph.bump_source(left);
+        let cached = graph
+            .compute(memo, |_| panic!("memo must not be invalidated by `left`"))
+            .expect("cached");
+        assert_eq!(cached, Value::Count(2));
     }
 
     #[test]

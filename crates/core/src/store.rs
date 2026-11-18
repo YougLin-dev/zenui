@@ -140,12 +140,15 @@ impl Store {
             row.completed = value;
             previous
         };
-        if was_completed != value {
-            if value {
-                self.completed += 1;
-            } else {
-                self.completed -= 1;
-            }
+        if was_completed == value {
+            // No model change: not a write, and the epoch stays put
+            // (`metrics::Counters::io_writes`).
+            return Ok(());
+        }
+        if value {
+            self.completed += 1;
+        } else {
+            self.completed -= 1;
         }
         self.record_write();
         Ok(())
@@ -446,19 +449,24 @@ mod tests {
         store.toggle(b).expect("live row");
         assert_eq!(store.counters().io_writes, 3);
 
+        // Setting a field to the value it already holds is not a change.
+        store.set_completed(a, false).expect("live row");
+        assert_eq!(store.counters().io_writes, 3, "no-op set_completed");
+
+        // Reordering a non-empty store to its current order changes nothing.
+        let keys: Vec<RowKey> = store.keys().collect();
+        store.reorder(&keys).expect("same order");
+        assert_eq!(store.counters().io_writes, 3, "unchanged order");
+
+        // A real reorder is one write.
+        store.reorder(&[keys[1], keys[0]]).expect("swap two rows");
+        assert_eq!(store.counters().io_writes, 4);
+
         // Clearing two completed rows is still one write.
         store.toggle(a).expect("live row");
         let before = store.counters().io_writes;
         assert_eq!(store.clear_completed().len(), 2);
         assert_eq!(store.counters().io_writes, before + 1);
-
-        // Reordering to the current order changes nothing.
-        let empty: Vec<RowKey> = Vec::new();
-        let before = store.counters().io_writes;
-        store
-            .reorder(&empty)
-            .expect("empty order matches empty store");
-        assert_eq!(store.counters().io_writes, before);
     }
 
     #[test]
