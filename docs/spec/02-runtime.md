@@ -218,7 +218,7 @@ struct MountPlan {
 
 ### SPEC-RT-021 递归释放顺序：后序 + 逆注册
 
-- **状态**：SPEC（顺序细节待 ADR 固化，见 `OPEN-RT-07`）
+- **状态**：SPEC（顺序语义已由 `ADR-0016` 固化；实现与 fixture 仍为 `OPEN-RT-07`）
 - **强度**：MUST / MUST NOT
 - **要求**：
   1. 释放 MUST 按 Owner 树**后序**执行：先子树，后父作用域；子 cleanup 因此不会读到已释放的父槽。
@@ -227,7 +227,7 @@ struct MountPlan {
   4. `dispose` MUST 幂等；重复 dispose MUST 无副作用。
   5. View 的删除 MUST NOT 在 cleanup 中直接改树，只入事务 journal（`SPEC-RT-052`）。
 - **失败模式**：父作用域先释放，子 cleanup 随后读取已失效 handle 并写 sink → 每次卸载都报错；cleanup 内 mount 使释放过程中树增长（重入）；重复 dispose 导致双重注销。
-- **来源**：FINAL §1.3 / §3.2；顺序规则为本文规定（`OPEN-RT-07`）。
+- **来源**：FINAL §1.3 / §3.2；顺序规则见 [ADR-0016](../decisions/adr-0016-release-order.md)。
 
 ### SPEC-RT-022 所有权无环
 
@@ -529,7 +529,7 @@ Derived    layout scratch → GeometrySnapshot → retained paint → present（
 | OPEN-RT-04 | `For` / `Show` / `Index` 未实现（宏侧亦为 `SPEC`） | `SPEC-RT-023`–`-025` | A1 golden + focus/caret fixture |
 | OPEN-RT-05 | query 字段边、membership 索引与回收未连线 | `SPEC-RT-041`–`-047` | A0 的 edge_count / materialization 计数 |
 | OPEN-RT-06 | `FocusRemovalIntent` 未实现 | `SPEC-RT-026` | A0 delete-focused / bulk-clear trace |
-| OPEN-RT-07 | 释放顺序（后序 + LIFO）与 cleanup 重入禁令尚未由 ADR 固化 | `SPEC-RT-021` | 写 ADR 并补一个“cleanup 中 mount 被拒”的 fixture |
+| OPEN-RT-07 | 释放顺序已由 `ADR-0016` 定序；**实现与用例**仍缺：`dispose` 幂等、LIFO 顺序、cleanup 中 mount 被拒 | `SPEC-RT-021` | A0 的 mount/unmount churn fixture + 一个“cleanup 中 mount 被拒”的负例 |
 | OPEN-RT-08 | 是否复用第三方 owner/arena 库（研究材料建议评估）未裁决 | 实现成本与借用模型 | 独立 ADR；无论是否复用，render binding 提交层必须自有（`WITHDRAWN-RT-01`） |
 | OPEN-RT-09 | 显式线程边界 API（`SyncSignal` 形状）未定 | `SPEC-RT-037` | worker→UI 提交的最小 fixture + API 评审 |
 

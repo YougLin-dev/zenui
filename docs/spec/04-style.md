@@ -298,7 +298,8 @@ enum StyleCondition {
 
   `class={expr}` 若不能证明上述任一形态 MUST 编译错误；MUST NOT 接受任意运行时 `String`。
 - **失败模式**：运行时拼接的 class 被接受但无样式；或字符串里混入未登记候选，编译期检查全部失效。
-- **来源**：FINAL §6；`SPEC-SCOPE-012`；`SPEC-ROUTE-028`；`style-system.md` §7。
+- **来源**：FINAL §6；`SPEC-SCOPE-012`；`SPEC-ROUTE-028`；`archive/research/style-system.md` §7。
+- **表面语法归属**：本条只定义**语义**（候选必须编译期完整）；动态 class 如何拼写归 [03-macro.md](03-macro.md) `SPEC-MACRO-013` 与 `OPEN-MACRO-09`，本文不规定语法。
 
 ### SPEC-STYLE-031 `ClassId` manifest 只能引用已生成的静态 StyleProgram
 

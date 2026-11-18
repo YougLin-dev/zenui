@@ -56,6 +56,7 @@ replaces: []
 | [ADR-0013](adr-0013-archive-read-only.md) | 归档只读、不重写；版本 pin / Gate / 完成度描述一律失效；已知过期物单列 | `SPEC-ROUTE-001`、`-002`；`SPEC-STYLE-011`、`-012` | normative |
 | [ADR-0014](adr-0014-baseline-defects-are-gate-criteria.md) | baseline / intrinsic / synthesis 缺陷写成 Gate 硬判据，不以"探针绿"关闭 | `SPEC-GATE-B-01`…`-03`；`SPEC-TEXT-001`…`-003`、`-006` | normative |
 | [ADR-0015](adr-0015-render-ownership-splits.md) | 渲染线三处归属切分：生命周期归 `SPEC-RT`、声明形态归 `SPEC-STYLE`、坐标单位归 `SPEC-TEXT` | `SPEC-RENDER-011`、`-016`；`SPEC-TEXT-015`；`SPEC-RT-024`、`-026`；`SPEC-STYLE-002`、`-004`、`-052`、`-055` | normative |
+| [ADR-0016](adr-0016-release-order.md) | 释放顺序：Owner 后序（子先父）+ 同 owner 逆注册 LIFO；dispose 幂等；cleanup 中禁止 mount/batch/flush | `SPEC-RT-021`、`-022`、`-052` | normative |
 
 ## 3. 每条的固定结构
 

@@ -142,6 +142,7 @@ replaces: []
 - 强度：**MUST**
 - 规范：`class` MUST 是字符串字面量并在编译期解析为 StyleIR；未知 token MUST 编译错误，MUST NOT 静默忽略。动态 class 字符串 MUST NOT 被接受；运行时拼接/拆分 MUST NOT 存在。
 - 失败模式：`class={some_string}` → 编译错误 + help 指向 typed `style:*` 或（未来）登记的 ClassId manifest。静默忽略未知类会产生“样式没生效”的无声失败，必须禁止。
+- **与 `SPEC-STYLE-030` 的边界**：本条只约束 `class=` 的**字符串形态**——它 MUST 是字面量。样式层允许的 enum / 静态条件 / `ClassId` manifest（`SPEC-STYLE-030`）MUST NOT 通过把表达式塞进 `class=` 字符串来实现；这类形态的表面语法（是独立属性还是登记枚举变体）未定，见 `OPEN-MACRO-09`。
 - 归类细节（词表、variant、优先级）归 [04-style.md](04-style.md)，本文不复述。
 
 ### SPEC-MACRO-014 状态样式必须走登记的条件，禁止自造条件属性
@@ -244,6 +245,7 @@ replaces: []
 | OPEN-MACRO-06 | typed builder 等价路径的公开返回类型与模块位置 | “不开宏也能单测”的可用性 | 先让 builder 生成与 `view!` 相同的 descriptor golden |
 | OPEN-MACRO-07 | 展开性能与 IDE 导航（rust-analyzer 对大 `view!` 的响应） | 大页面 DX | A1 后采集展开体积/耗时，不预设预算 |
 | OPEN-MACRO-08 | `{..props}` spread 是否支持、class 合并语义（声明集合并 vs 覆盖） | 组合组件写法 | 没有真实用例前不进入主 API |
+| OPEN-MACRO-09 | 动态 class 的表面语法：登记 enum 写成 `class={C::Active}`，还是独立属性（如 `class-set`） | 与 `SPEC-MACRO-013` 的字面量规则、IDE 补全、错误信息一致性 | 先写 3 个真实用例（状态高亮、主题切换、用户自定义布局），比较两种拼写的可读性与误用率 |
 
 ## 5. 验收映射（A1）
 
