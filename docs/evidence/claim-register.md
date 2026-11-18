@@ -22,7 +22,7 @@ sources:
   - archive/review/text-layout-review.md
   - archive/review/validation-matrix-raw.json
   - archive/review/verification-contract.json
-  - 源码静态核对（见各条 CODE 证据）
+  - 源码静态核对（见各条 SRC 证据）
 replaces: []
 ---
 
@@ -32,7 +32,7 @@ replaces: []
 > 一条断言只在这里定义一次；`spec/`、`product/`、`decisions/` 需要引用事实时引用 `CLAIM-xxx`，不得复述。
 >
 > 本表编写方式：逐份通读 `archive/research/*`、`archive/review/*`（含两份 JSON），并把每条结论回溯到
-> 执行记录（`EVID-VAL-*`）、官方文档（URL）或仓库源码（`CODE path:line`）。**本文件作者没有亲自执行
+> 执行记录（`EVID-VAL-*`）、官方文档（URL）或仓库源码（`SRC path:line`）。**本文件作者没有亲自执行
 > cargo 或 GPU**；H2（macOS/Metal）的复跑由 Test/CI 记录在 `evidence/validation.md`。所有 `VERIFIED`
 > 条目的主机与范围都写进断言本身，不把 H1 的 Windows/Vulkan 结果说成 H2 的，反之亦然。
 
@@ -45,7 +45,7 @@ replaces: []
    - `VERIFIED`：有命令与输出记录（或可静态复核的源码事实），范围随断言限定。
    - `WITHDRAWN`：曾提出、已被裁决推翻；**不删除**，备注写推翻依据。
    - `OPEN`：未决，需要结论。
-3. **证据优先级**：`EVID-VAL-*`（执行记录）＞ `CODE`（源码/清单静态事实）＞ 文档自述。
+3. **证据优先级**：`EVID-VAL-*`（执行记录）＞ `EVID-PROBE-*`（探针边界）＞ `SRC`（源码/清单静态事实，`path:line`）＞ 文档自述。
    文档自述只有在无法入库或已明确标注为历史时才使用，并写 `PROBE` + 备注。
 4. **一条断言只描述一个可观察事实**。"A 通过 7 个测试"与"A 证明生产运行时可用"是两条，不能合并。
 
@@ -77,11 +77,11 @@ replaces: []
 | EVID-VAL-17 | A | 根 `cargo test`（H2） | 0 tests |
 | EVID-VAL-18 | A | `#[derive(Copy)] struct { String }`（H2） | E0204 |
 | EVID-VAL-19 | A | `todolist/main.rs` 单独编译（H2） | 40 errors（预期不可编译） |
-| CODE | — | 仓库源码/清单，`path:line` | 本轮静态核对，可直接复查 |
+| SRC | — | 仓库源码/清单，`path:line` | 本轮静态核对，可直接复查 |
 
-> 治理缺口（见 §3 `C-18`）：`docs/README.md` §6 只允许 `EVID-*` 与 URL 作为证据，未给"源码事实"
-> 留出合法形式。本表用 `CODE` 承载，建议由队长在契约中补 `EVID-SRC` 或把源码事实归入
-> `evidence/probes.md` 的 `EVID-PROBE-*`。
+> **已裁决（C-18/D-02，ADR-0012）**：`docs/README.md` §6 现已承认第三种证据前缀 `SRC path:line`，
+> 优先级为 `EVID-VAL-*` ＞ `EVID-PROBE-*` ＞ `SRC`。`SRC` 只证明"代码此刻是这样"，不能证明运行行为；
+> 探针的能力边界另见 `evidence/probes.md`（`EVID-PROBE-01…05`）。本表原有 `CODE` 前缀已全部改为 `SRC`。
 
 ---
 
@@ -99,9 +99,9 @@ replaces: []
 | CLAIM-006 | 本台账作者本轮只做静态核对，未亲自执行 cargo；H2 的测试与 GPU 复跑由 Test/CI 记录（`EVID-VAL-12..19`） | VERIFIED | 本会话 `uname -m`/`sw_vers`；`evidence/validation.md` §1、§6 | — | `native_poc` 输出中的 `SCOPE: ... Windows ...` 是硬编码字符串，主机以 validation.md §1 为准 |
 | CLAIM-007 | 根 `Cargo.toml` 无 dependencies，`src/main.rs` 仅打印 hello-world | VERIFIED | SRC `Cargo.toml:1-7`、`src/main.rs:1-3` | — | 生产 runtime 不在此包 |
 | CLAIM-008 | 所有已记录的渲染执行都是 headless 离屏 RGBA readback | VERIFIED | EVID-VAL-05/06、15/16；SRC `examples/native_poc/src/gpu.rs`、`examples/desktop_poc/src/main.rs` | C | 无真实 surface/present |
-| CLAIM-009 | 仓库源码中不存在 winit、AccessKit、WindowEvent 或 Surface 的使用 | VERIFIED | CODE 全仓 grep（排除 `target/`） | A1/C | 窗口路径完全缺位 |
+| CLAIM-009 | 仓库源码中不存在 winit、AccessKit、WindowEvent 或 Surface 的使用 | VERIFIED | SRC 全仓 grep（排除 `target/`） | A1/C | 窗口路径完全缺位 |
 | CLAIM-010 | 根 manifest 设置 `autoexamples = false`，设计稿不会被当作二进制构建 | VERIFIED | SRC `Cargo.toml:5` | — | 防止"0-test 绿"掩盖产品错误 |
-| CLAIM-011 | 目标命令 `cargo run --bin todolist --features windows-desktop --locked` 当前不存在可执行的 bin/feature | VERIFIED | CODE（无 `[[bin]]`、无 features）；EVID-VAL-19 | A1 | 规划命令 |
+| CLAIM-011 | 目标命令 `cargo run --bin todolist --features windows-desktop --locked` 当前不存在可执行的 bin/feature | VERIFIED | SRC（无 `[[bin]]`、无 features）；EVID-VAL-19 | A1 | 规划命令 |
 | CLAIM-012 | MSRV 1.89 只是理论下限，尚未验证 | OPEN | `archive/research/README.md:32` | C | 本机 rustc 1.99.1 不等于 MSRV |
 
 ### 1.2 宏前端与 MountPlan（CLAIM-013 – CLAIM-028）
@@ -146,7 +146,7 @@ replaces: []
 
 | ID | 断言 | 状态 | 证据 | 关联 Gate | 备注 |
 |---|---|---|---|---|---|
-| CLAIM-041 | 生产 Store 类型、RowSet、QueryMemo、字段 handle 均未实现 | VERIFIED | CODE 源码树；`FINAL.md:305-307` | A0 | 只有目标示例中的名字 |
+| CLAIM-041 | 生产 Store 类型、RowSet、QueryMemo、字段 handle 均未实现 | VERIFIED | SRC 源码树；`archive/review/FINAL.md:305-307` | A0 | 只有目标示例中的名字 |
 | CLAIM-042 | 现有 PoC 没有字段反向边、成员索引或查询缓存 | VERIFIED | SRC `project_signals.rs`（仅 source→sink） | A0 | 无法支撑 Active/Done |
 | CLAIM-043 | Active/Done 的 `completed` 字段变化必须使对应 filter query cache 标脏，即使该行当前不是 member | SPEC | `FINAL.md:79-80` | A0 | 候选索引必须覆盖可能进入 filter 的行 |
 | CLAIM-044 | All 的 membership revision 不因单项 `completed` 改变 | SPEC | `FINAL.md:80,265` | A0 | 与 Active 行为不同 |
@@ -172,7 +172,7 @@ replaces: []
 | CLAIM-059 | Parley 0.13.0 官方文档声明 `calculate_content_widths()` 对 mixed-direction text 可能返回错误结果 | VERIFIED | URL: https://docs.rs/parley/0.13.0/parley/struct.Layout.html | B | 必须留 canary/fallback |
 | CLAIM-060 | glyph 绘制未读取或转发 Parley `run.synthesis()`，不存在 faux bold/oblique | VERIFIED | SRC `native_poc/src/text.rs:34-63`（全文件无 synthesis） | B | cache key 也未含合成参数 |
 | CLAIM-061 | 缺失中文/日文 ICU segmentation model 曾导致运行期错误；启用 `complex-scripts` 后词边界断言通过 | VERIFIED | EVID-VAL-03/14；`research/validation-and-roadmap.md:34` | B | 发布 artifact 必须带词典 |
-| CLAIM-062 | 仓库没有锁定字体/ICU artifact 清单或 hash | VERIFIED | CODE 目录无 assets/fonts 清单 | B/C | 发布门要求齐备 |
+| CLAIM-062 | 仓库没有锁定字体/ICU artifact 清单或 hash | VERIFIED | SRC 目录无 assets/fonts 清单 | B/C | 发布门要求齐备 |
 | CLAIM-063 | emoji、混合 bidi、font fallback 的真实渲染尚未验证 | OPEN | `evidence/validation.md` §8 | B | 只有 CJK 小样 |
 
 ### 1.6 渲染、GPU 与 3D（CLAIM-064 – CLAIM-078）
@@ -187,7 +187,7 @@ replaces: []
 | CLAIM-069 | 两个探针都用 `request_adapter(Default)` / `request_device(Default)`，无 features/limits/surface capability 检查 | VERIFIED | SRC `gpu.rs:17-28`；`desktop_poc/src/main.rs:189-198` | B/C | 不支持只会 panic |
 | CLAIM-070 | 外部纹理当前是固定绿色 `Clear(0,1,0,1)` 的占位 | VERIFIED | SRC `gpu.rs:176-198` | D | 不是模型/视频内容 |
 | CLAIM-071 | 该探针的 depth 是 renderer 内部 depth view，不是独立 3D depth | VERIFIED | SRC `gpu.rs:52-55` | D | 3D 需独立 Depth32Float |
-| CLAIM-072 | 仓库没有 glTF 依赖、vertex/index buffer、camera、uniform 或 PBR 管线 | VERIFIED | CODE manifests + `gpu.rs`；`CONCLUSION.md:75` | D | 绿色占位≠加载模型 |
+| CLAIM-072 | 仓库没有 glTF 依赖、vertex/index buffer、camera、uniform 或 PBR 管线 | VERIFIED | SRC manifests + `gpu.rs`；`archive/research/CONCLUSION.md:75` | D | 绿色占位≠加载模型 |
 | CLAIM-073 | GPU readback 成功不证明 retained paint cache、窗口 present 或跨平台正确性 | VERIFIED | `evidence/validation.md` §4/§8 | B/C | 只证明当次输出 |
 | CLAIM-074 | `RenderCapabilities` / 能力矩阵尚未实现 | OPEN | `FINAL.md:220` | B/C | 需按 adapter 实际枚举 |
 | CLAIM-075 | 真实 winit surface、resize、DPI、device loss 尚未验证 | OPEN | `evidence/validation.md` §8 | A1/C | 无窗口代码 |
@@ -261,6 +261,9 @@ replaces: []
   `WITHDRAWN` 保留；"没有证据就只能写 `SPEC` 或 `OPEN`"。
 - **裁决建议**：以前者定"权威落点"、后者定"引用状态"。evidence 层可出现 `SPEC`/`WITHDRAWN`，但必须
   注明"引用自 spec/decisions，非在 evidence 层定义"。否则本表无法同时满足两条规则。
+- **处置（D-01，已执行）**：`docs/README.md` §2 已改写——`SPEC`/`WITHDRAWN` 在 evidence 层表示
+  **断言的可信度**，不是规范条文；唯一的硬规则保留为"spec 层永不出现 `VERIFIED`"。未采纳"必须注明
+  引用出处"这一附加要求：本表每行的 `证据` 列已经承担溯源，再加一层标注只会制造重复。裁决记录见 `ADR-0012`。
 
 ### C-02 文档入口三处并列
 
@@ -385,7 +388,8 @@ replaces: []
 - `docs/README.md:53,92-93` 规划了 `evidence/probes.md` 与 `EVID-PROBE-*`。
 - 本轮分工只指派了 `validation.md`、`index.md`、`matrix.json`、`08-gates.md`，没有 owner 写 `probes.md`。
 - 后果：源码级事实（本表 `CODE` 条目）没有合法证据族，`EVID-PROBE` 引用会 dangling。`evidence/validation.md` §7 已自行用 `SRC-01..04` 记录其中四条，与本表 `CODE` 前缀形成第二套命名，必须统一。
-- **建议**：指派 owner，或在 `validation.md` 增补 `EVID-SRC` 附录。
+- **处置**：已采纳（`DOCS` §6 + `ADR-0012`），本表 `CODE` 全部改为 `SRC path:line`，`validation.md` §7 的 `SRC-01..04` 同源，无第二套命名。
+- **处置**：`probes.md` 已由测试与 CI 负责人交付（`EVID-PROBE-01…05`），不再是缺口；`SRC` 由 `docs/README.md` §6 承认为第三种证据前缀，不需另设 `EVID-SRC` 附录。
 
 ### C-19 规划文件与执行证据混在同一目录层级
 
@@ -415,7 +419,7 @@ replaces: []
 
 1. **C-01**：`SPEC`/`WITHDRAWN` 能否在 evidence 层出现。若不能，本表 10 条 SPEC 与 12 条 WITHDRAWN 需要改挂在
    `spec/` 与 `decisions/` 下再被引用。
-2. **C-18**：`probes.md` 的 owner 与 `CODE` 证据前缀是否被接受；`validation.md` §7 的 `SRC-01..04` 需与本表统一命名。
+2. **C-18（已关闭）**：`probes.md` 由测试与 CI 负责人交付（`EVID-PROBE-01…05`）；`CODE` 前缀统一为 `SRC`，见 §0.1。
 3. **C-04**：两套 Gate 字母表必须只保留一套；research 版需改名归档。
 4. **C-03**：版本 pin 收敛到 `spec/01-route.md` 后，其余四处改为引用 `SPEC-ROUTE-00x`。
 5. **C-06**：两份 JSON 中旧的 hover/inline golden 必须在归档时加 `superseded-by`，否则实现者可能照着 old RED 写测试。
@@ -432,5 +436,5 @@ replaces: []
 后续若有人接手：
 
 1. 先跑 `cargo test --manifest-path examples/{desktop,macro,native}_poc/...` 复现 CLAIM-002..004，记录主机。
-2. 用 `rg` 复查 `CODE` 条目；源码若已变，先更新 CLAIM 再改 spec。
+2. 用 `rg` 复查 `SRC` 条目；源码若已变，先更新 CLAIM 再改 spec。
 3. Store/Query/For 的 SPEC 条目在 A0 落地后逐条改 `VERIFIED` 并补 `EVID-VAL`；不得直接改状态而不补证据。
