@@ -63,6 +63,7 @@ replaces: []
 | [ADR-0020](adr-0020-write-during-compute-as-phase-violation.md) | `WriteDuringCompute` 不是独立变体：由 compute 相位的 `PhaseViolation` 表达，最外层兑现为 `Fatal::PhaseViolation` | `SPEC-RT-038`；`SPEC-GATE-A0-05` | normative |
 | [ADR-0021](adr-0021-trybuild-pins-error-codes.md) | 错误码判据只由 trybuild `.stderr` 快照钉住；`compile_fail` doctest 只证明「不编译」，不得作 gate 证据 | `SPEC-GATE-A0-02`、`-03`；`SPEC-ROUTE-001`、`-004` | normative |
 | [ADR-0022](adr-0022-counters-are-observation.md) | 计数器是观测而非第二权威：删除记账 API、`Tx::rows` 经 `RowView`/缓存取行、缓存键含 order revision、`QueryCache` 移出公共面 | `SPEC-RT-043`、`-044`、`-047`；`SPEC-GATE-A0-07`、`-08` | normative |
+| [ADR-0023](adr-0023-row-set-projection-scope.md) | A0 的共享行集投影由缓存快照承担；可订阅的 `Memo<RowSet>` 随 `For` 在 A1 落地且只从 revision 对派生；粗粒度 membership 掩码以「结构写同时推进 order revision」为前提 | `SPEC-GATE-A0-07`；`SPEC-MACRO-011`；`SPEC-RT-043`；`ADR-0022` | normative |
 
 ## 3. 每条的固定结构
 
@@ -87,6 +88,7 @@ replaces: []
 | 2026-11-18 P2 compute 期写裁决（队长） | 0020 | 删除同名变体后的语义映射与名称边界 |
 | 2026-11-18 P3 验收驳回·判据承载（队长） | 0021 | `compile_fail` 不校验错误码（实测），错误码只由 trybuild 快照钉住 |
 | 2026-11-18 P3 验收驳回·计数权威（队长） | 0022 | 计数器与测试夹具不得活在运行时之外的平行实现里 |
+| 2026-11-18 P3.2 收口·行集投影边界（队长） | 0023 | `Memo<RowSet>` 归 A1；粗粒度掩码的前提与撤销条件 |
 | `docs/README.md` 四层治理契约 | 0011 | 文档层的唯一入口与状态词表 |
 
 ## 5. 维护规则
