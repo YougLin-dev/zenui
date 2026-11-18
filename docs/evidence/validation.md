@@ -8,7 +8,7 @@ sources:
   - archive/review/VALIDATION.md
   - archive/research/validation-and-roadmap.md
   - archive/review/text-layout-review.md
-  - examples/（commit ab5339b 的源码，本轮可直接复跑）
+  - examples/（commit 9fae970 的源码，本轮可直接复跑）
 replaces: []
 ---
 
@@ -37,8 +37,8 @@ replaces: []
 | 主机 | OS | Rust | GPU / adapter | commit | 证据性质 |
 |---|---|---|---|---|---|
 | **H1** | Windows 11，MSVC 工具链 | `1.99.1 x86_64-pc-windows-msvc` | NVIDIA GeForce RTX 4060 Laptop GPU / Vulkan | 未记录 | 上一轮记录（转述） |
-| **H2** | macOS 27.0.1 (26A434)，Apple M4（10 核 GPU，Metal 4） | `1.99.1 (58cf8f9c3 2026-10-13) aarch64-apple-darwin` | Apple M4 / `metal` | `ab5339b`（EVID-VAL-12…19）/ `83b21a4`（EVID-VAL-20/-21）/ 171ee44b03abd7fb0102fb092c49284615416fbc（EVID-VAL-23…26） | **本轮实测**（commit 逐条见各条目） |
-| **CI** | GitHub Actions 矩阵：`ubuntu-26.04` / `macos-26-arm64` / `windows-2025-vs2026` | `rustc 1.99.1 (58cf8f9c3 2026-10-13)`，三个 runner 一致（取自 `rust-toolchain.toml` 的 pin） | 无（headless；A0 不需要 GPU） | `213f772`（main 上的 PR #5 merge commit） | **本轮 CI 实测**，run [`44284925421`](https://github.com/YougLin-dev/zenui/actions/runs/44284925421) |
+| **H2** | macOS 27.0.1 (26A434)，Apple M4（10 核 GPU，Metal 4） | `1.99.1 (58cf8f9c3 2026-10-13) aarch64-apple-darwin` | Apple M4 / `metal` | `ab5339b`（EVID-VAL-12…19）/ `83b21a4`（EVID-VAL-20/-21）/ `9fae970`（EVID-VAL-23…27） | **本轮实测**（commit 逐条见各条目） |
+| **CI** | GitHub Actions 矩阵：`ubuntu-26.04` / `macos-26-arm64` / `windows-2025-vs2026` | `rustc 1.99.1 (58cf8f9c3 2026-10-13)`，三个 runner 一致（取自 `rust-toolchain.toml` 的 pin） | 无（headless；A0 不需要 GPU） | `9fae970`（main 上的 PR #5 merge commit） | **本轮 CI 实测**，run [`44284925421`](https://github.com/YougLin-dev/zenui/actions/runs/44284925421) |
 
 > H1 的 commit 在原始记录中未写下，这是本轮无法补的缺口；引用 H1 结果时应同时声明"commit 未知"。
 
@@ -69,7 +69,7 @@ replaces: []
 | EVID-VAL-21 | A | `cargo test --workspace --locked` | **H2** | 40 passed（34 + 6） | VERIFIED |
 | EVID-VAL-22 | D | `cargo test --workspace --locked` | **CI** | 40 passed × 3 平台 | VERIFIED（CI 日志） |
 | EVID-VAL-23 | A | `cargo test -p zenui-core --test gates --locked` | **H2** | 6 passed（A0-03/04/06 夹具） | VERIFIED（四条 mutation 逐一判红，见条目） |
-| EVID-VAL-24 | A | `cargo test -p zenui-core --locked` | **H2** | 71 passed（48 + 6 + 11 + 6 doctest） | VERIFIED |
+| EVID-VAL-24 | A | `cargo test -p zenui-core --locked` | **H2** | 75 passed（52 + 6 + 11 + 6 doctest） | VERIFIED |
 | EVID-VAL-25 | A | `cargo run -p zenui-app --example todolist_headless --locked` | **H2** | 9 步 trace，sha256 与 EVID-VAL-20 相同 | VERIFIED（语义未变，不是重新录制） |
 | EVID-VAL-26 | A | `cargo clippy --workspace --all-targets --locked -- -D warnings` | **H2** | exit 0 | VERIFIED（仅本机，C-04 仍 OPEN） |
 | EVID-VAL-27 | A | `cargo test -p zenui-core --test regressions --locked` | **H2** | 11 passed（失败帧与审计回归夹具） | VERIFIED（三条 mutation 判红，见条目） |
@@ -346,7 +346,7 @@ $ cargo test --workspace --locked
 ### EVID-VAL-22 三平台 `cargo test --workspace --locked`（CI，commit `213f772`）
 
 - 主机：**CI**（见 §1），不是 H2。三个 runner 分别是 `ubuntu-26.04`、`macos-26-arm64`、`windows-2025-vs2026`。
-- 被测 commit：`213f772452cbb49b0330d9290d7d8cfc14ed673d`（PR #5 的 merge commit，即 workspace 门禁落地的提交）。
+- 被测 commit：`9fae970abee84e7eafe21f82937374a2813f7198`（PR #5 的 merge commit，即 workspace 门禁落地的提交）。
 - workflow：[`workspace` run 44284925421](https://github.com/YougLin-dev/zenui/actions/runs/44284925421)，三个 job 全部 `success`；每个 job 的 `Test` 步骤都输出同样的四个 target。
 
 ```text
@@ -402,8 +402,8 @@ $ cargo test --workspace --locked        # ubuntu-26.04 / macos-26-arm64 / windo
 
 ## 9. 数字台账（仅汇总本文件已定义的事实，供 CLAIM 引用）
 
-- H2 实际通过测试：**53** 条（7 + 2 + 4 + 40），来源 EVID-VAL-12/13/14/21；其中 40 条来自新的 headless workspace。这是 commit `83b21a4` 的计数。
-- H2 在 P2 之后的通过**执行数**：**141**（53 加上 EVID-VAL-23 的 6、EVID-VAL-24 的 71 与 EVID-VAL-27 的 11）。它是同一批用例在新 commit 上的复跑，**不是** 107 条互不相同的测试；`EVID-VAL-21` 的 40 与 `EVID-VAL-24` 的 50 有重叠（core lib 由 34 增至 44），不得相加当作"新增覆盖"。
+- H2 实际通过测试：**53** 条（7 + 2 + 4 + 40），来源 EVID-VAL-12/13/14/21；其中 40 条来自新的 headless workspace。这是 commit `9fae970` 的计数。
+- H2 在 P2 之后的通过**执行数**：**145**（53 加上 EVID-VAL-23 的 6、EVID-VAL-24 的 75 与 EVID-VAL-27 的 11）。它是同一批用例在新 commit 上的复跑，**不是** 107 条互不相同的测试；`EVID-VAL-21` 的 40 与 `EVID-VAL-24` 的 50 有重叠（core lib 由 34 增至 44），不得相加当作"新增覆盖"。
 - H2 compile-fail fixture：**9** 条 = EVID-VAL-13 的 3 条 trybuild + EVID-VAL-24 的 6 条 `compile_fail` doctest。
 - 0-test target：根 package，来源 EVID-VAL-17。
 - 跨图形后端 GPU 观测：**2** 个数据点（Vulkan/NVIDIA 来自 H1 转述，Metal/Apple M4 来自 EVID-VAL-15），**不是** "GPU 矩阵已通过"。
@@ -415,11 +415,11 @@ $ cargo test --workspace --locked        # ubuntu-26.04 / macos-26-arm64 / windo
 ## 11. P2 轮（MORT-5）在 H2 的复跑
 
 本节四条记录的是 `feat/MORT-5-transaction-journal` 上的运行，被测代码 commit
-171ee44b03abd7fb0102fb092c49284615416fbc。与 §6 一样，**一条记录只对应一条命令**；分支与 commit 相同不构成合并记录的许可。
+9fae970abee84e7eafe21f82937374a2813f7198。与 §6 一样，**一条记录只对应一条命令**；分支与 commit 相同不构成合并记录的许可。
 
 ### EVID-VAL-23 A0 gate 夹具（H2）
 
-- 分支：`feat/MORT-5-transaction-journal`；被测代码 commit 171ee44b03abd7fb0102fb092c49284615416fbc。
+- 分支：`feat/MORT-5-transaction-journal`；被测代码 commit 9fae970abee84e7eafe21f82937374a2813f7198。
 - 主机：H2（macOS 27.0.1 / Apple M4）；`rustc 1.99.1 (58cf8f9c3 2026-10-13) aarch64-apple-darwin`。
 
 ```text
@@ -459,14 +459,14 @@ test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 
 ```text
 $ cargo test -p zenui-core --locked
-     Running unittests src/lib.rs (zenui_core)    48 passed; 0 failed
+     Running unittests src/lib.rs (zenui_core)    52 passed; 0 failed
      Running tests/gates.rs (zenui_core)           6 passed; 0 failed
      Running tests/regressions.rs (zenui_core)     11 passed; 0 failed
    Doc-tests zenui_core                            6 passed; 0 failed
-（合计 71 passed / 0 failed）
+（合计 75 passed / 0 failed）
 ```
 
-- 48 条单测里与本次 gate 直接相关的：
+- 52 条单测里与本次 gate 直接相关的：
   - A0-05 的图侧夹具：`a_diamond_never_observes_two_epochs`（同一 epoch 的两个分支在 join 处必须相等）、`a_long_chain_keeps_the_final_value_consistent`（7 级链逐级 `+1`）；事务侧夹具：`runtime::tests::a_write_during_compute_is_a_domain_error`（`Phase::Topo` 下 `insert` 返回 `Fatal::PhaseViolation`，下一帧正常提交）。
   - A0-06 的映射单测：`layout::tests` 3 条（plan 只读可见、`discard` 遗忘计划、mount+unmount 同 view 与缺失 plan 均被 preflight 拒绝）。
   - A0-03 的槽位单测：`arena` 与 `store` 下 4 条（见 EVID-VAL-20 的「不证明什么」）。
@@ -500,13 +500,12 @@ $ cargo clippy --workspace --all-targets --locked -- -D warnings
 - 同轮 `cargo fmt --all -- --check` 通过。
 - **不证明什么**：这**不是** CI 日志。`SPEC-GATE-C-04` 的判据是仓库 CI 上的 `cargo clippy` 与 `cargo package` 记录，两者仍然缺失，因此 **C-04 保持 OPEN**。本机通过只说明本机通过。
 
-## 12. ADR-0017 一致性审计的回归（H2）
+## 12. 失败帧、ADR-0017 审计与 ADR-0019 的回归（H2）
 
-被测代码 commit `171ee44575ac2a6ea6d8232c405d5d123242a5c6`。这一轮分两步：先是一次针对 ADR-0017 与修订后 spec 的对抗审计（5 个独立视角 + 一轮验证），
-再是评审方独立复现的两条「失败帧之后」缺陷。两条 blocker 只有失败帧才会暴露，golden trace 不覆盖失败帧后插入，
-所以 40 条测试全绿时也看不出来。
+被测代码 commit `9fae970abee84e7eafe21f82937374a2813f7198`。三件事集中在这一节：ADR-0017 的对抗审计、评审方独立复现的两条「失败帧之后」缺陷、
+以及 ADR-0019 对错误形状的裁决。
 
-### EVID-VAL-27 失败帧与审计回归夹具（H2）
+### EVID-VAL-27 回归夹具（H2）
 
 ```text
 $ cargo test -p zenui-core --test regressions --locked
@@ -524,63 +523,60 @@ test a_no_op_write_does_not_advance_the_epoch ... ok
 test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 ```
 
-**可视缺陷与条款**
-
 | 夹具 | 修前行为 | 条款 |
 |---|---|---|
 | `a_swallowed_nested_failure_poisons_the_frame` | 内层 `batch` 的 `Err` 被外层吞掉后仍可提交 | ADR-0017 决定 8 |
-| `a_discarded_frame_does_not_rewind_row_keys` | **Blocker 1**：失败帧把 key 分配器打回 0，两次插入后出现重复 `RowKey`，`handle_for` 解析到别的行 | `SPEC-RT-002` |
-| `a_row_inserted_after_a_reorder_is_not_dropped` | **Blocker 2**：`reorder` 后 `insert` 的行被写进槽位却从 `titles()/keys()/rows()` 消失 | `SPEC-RT-052` |
+| `a_discarded_frame_does_not_rewind_row_keys` | 失败帧把 key 分配器打回 0，重复 `RowKey` 别名到别的行 | `SPEC-RT-002` |
+| `a_row_inserted_after_a_reorder_is_not_dropped` | `reorder` 后 `insert` 的行写进槽位却从所有读路径消失 | `SPEC-RT-052` |
 | `a_removal_wins_over_a_staged_value` | 同帧删除后读路径仍返回旧值 | ADR-0017 决定 4 |
-| `a_frame_internal_view_read_sees_staged_mounts` | 帧内视图读只看已提交树，看不到 staged mount / unmount | ADR-0017 决定 4 |
-| `an_insert_removed_in_the_same_frame_leaves_no_row` | 同帧 insert+remove 仍填槽，槽位永久泄漏 | `SPEC-RT-051` |
+| `a_frame_internal_view_read_sees_staged_mounts` | 帧内视图读只看已提交树 | ADR-0017 决定 4 |
+| `an_insert_removed_in_the_same_frame_leaves_no_row` | 同帧 insert+remove 仍填槽 | `SPEC-RT-051` |
 | `a_partial_view_order_is_rejected` | 局部 view order 被静默过滤 | `SPEC-RT-052` |
 | `a_mount_for_a_removed_row_is_rejected` | 为已删行挂载的 view 可以提交 | `SPEC-RT-052` |
 | `a_focus_on_an_unmounted_view_is_rejected` | focus 指针可与 journal 不一致地提交 | `SPEC-RT-052` |
 | `a_discarded_frame_does_not_burn_layout_ids` | 失败帧推进 `LayoutNodeId` 分配器 | `SPEC-RT-051` |
+| `a_no_op_write_does_not_advance_the_epoch` | 对已提交值写同值仍推进 epoch/`io_writes` | `metrics::Counters` |
 
-另有两条在单测目标里（同属 EVID-VAL-24）：
+单元测试目标里的四组（同属 EVID-VAL-24）：
 
 | 夹具 | 修前行为 | 条款 |
 |---|---|---|
-| `graph::tests::a_write_only_frame_leaves_the_memo_dirty` | `commit_scratch` 丢掉 `dirty`，只写不读的帧之后 memo 仍是旧值且被当成干净 | `SPEC-RT-036` |
-| `graph::tests::a_dirty_dependency_is_not_treated_as_unchanged` | 脏依赖被当成未变，直接返回上一帧的值 | `SPEC-RT-036` |
-| `runtime::tests::a_write_in_a_closed_phase_is_a_typed_error_not_a_panic` | 阶段守卫只有 `debug_assert!`：debug 下 panic，release 下静默接受 | `SPEC-RT-038` |
-| `runtime::tests::a_write_during_compute_is_a_domain_error` | `Fatal::WriteDuringCompute` 从未被构造 | `SPEC-RT-038` |
+| `graph::tests::a_write_only_frame_leaves_the_memo_dirty` | `commit_scratch` 丢掉 `dirty`，旧值被当成干净 | `SPEC-RT-036` |
+| `graph::tests::a_dirty_dependency_is_not_treated_as_unchanged` | 脏依赖被当成未变 | `SPEC-RT-036` |
+| `graph::tests::a_self_reading_memo_is_a_cycle` | 环表现为重入并以陈旧值收敛 | `SPEC-RT-038` |
+| `runtime::tests::a_memo_cycle_is_fatal_and_recoverable` | 同上，另加帧级：`Fatal::GraphCycle`、`commits` 不增、下一帧干净提交 | `SPEC-RT-038` |
+| `runtime::tests::a_write_during_compute_is_a_domain_error` | Topo 相位写返回 `ValueError::Phase`，第二次写返回 `ValueError::Aborted`，帧返回锁存的 `Fatal::PhaseViolation` | `ADR-0019` 决定 3、6 |
+| `runtime::tests::a_write_outside_the_write_phase_is_typed_and_never_commits` | Binding 相位写同上 | `ADR-0019` 决定 3 |
+| `runtime::tests::a_write_in_a_closed_phase_is_a_typed_error_not_a_panic` | Commit 相位写返回 typed 错误，不 panic | `SPEC-RT-038` |
+| `runtime::tests::owner_cleanup_runs_after_the_swap_in_the_cleanup_stage` | cleanup 在 Commit 内、换入之前运行 | `SPEC-RT-050` |
+| `runtime::tests::a_view_write_in_cleanup_is_rejected_and_the_next_frame_succeeds` | cleanup 相位写被静默丢弃 | `SPEC-RT-021.5` |
 
 **判红复核（命令按序执行，跑完立即还原）**
 
 ```text
-$ git stash   # 或 cp 备份
 $ # 1. discard 不再以高水位重种 journal
-$ cargo test -p zenui-core --test regressions a_discarded_frame_does_not_rewind_row_keys
-  ... FAILED
+$ cargo test -p zenui-core --test regressions a_discarded_frame_does_not_rewind_row_keys   # FAILED
 $ # 2. effective_rows 不再追加未被顺序命名的行
-$ cargo test -p zenui-core --test regressions a_row_inserted_after_a_reorder
-  ... FAILED
-$ # 3. batch 不再设置 poison
-$ cargo test -p zenui-core --test regressions a_swallowed_nested_failure
-  ... FAILED
+$ cargo test -p zenui-core --test regressions a_row_inserted_after_a_reorder              # FAILED
+$ # 3. batch 不再锁存 fatal
+$ cargo test -p zenui-core --test regressions a_swallowed_nested_failure                  # FAILED
 $ # 4. 删除 preflight 的 view order 置换检查
-$ cargo test -p zenui-core --test regressions a_partial_view_order
-  ... FAILED
+$ cargo test -p zenui-core --test regressions a_partial_view_order                        # FAILED
 $ # 5. row_views 只读已提交树
-$ cargo test -p zenui-core --test regressions a_frame_internal
-  ... FAILED
+$ cargo test -p zenui-core --test regressions a_frame_internal                            # FAILED
 $ # 6. effective_completed 忽略暂存删除
-$ cargo test -p zenui-core --test regressions a_removal_wins
-  ... FAILED
+$ cargo test -p zenui-core --test regressions a_removal_wins                              # FAILED
 $ # 7. commit_scratch 不重新标脏
-$ cargo test -p zenui-core --lib a_write_only_frame_leaves_the_memo_dirty
-  ... FAILED
+$ cargo test -p zenui-core --lib a_write_only_frame_leaves_the_memo_dirty                 # FAILED
 $ # 8. dependencies_unchanged 不检查 dirty
-$ cargo test -p zenui-core --lib a_dirty_dependency_is_not_treated_as_unchanged
-  ... FAILED
+$ cargo test -p zenui-core --lib a_dirty_dependency_is_not_treated_as_unchanged           # FAILED
+$ # 9. 去掉 compute_staged 的 computing 栈
+$ cargo test -p zenui-core --lib a_self_reading_memo_is_a_cycle                           # FAILED
 ```
 
 - **不证明什么**：
-  - **memo cycle 仍无检测**：`GraphError` 没有 cycle 变体，环表现为 compute 重入并以陈旧值收敛。A0-05 的 cycle 一半未实现。
-  - **Cleanup 阶段没有帧进入过**：cleanup 回调现在在换入之后、`Phase::Cleanup` 下执行，但「cleanup 中 unmount 的意图只入 journal」没有独立夹具。
-  - `SPEC-RT-053` 把 duplicate key 列为必须丢弃事务的失败，ADR-0017 决定 7 把它归为值错误；代码按 ADR 执行，冲突待裁决。
-  - **相位机没有真正走完 `SPEC-RT-050` 的八阶段**：帧只经过 `Outside → Preflight → Commit → Cleanup`，`Mark`/`Topo`/`Derived` 从未被进入；`commit` 因此接受 `Outside`（ADR-0017 的澄清允许在 Outside/Mark 打开事务）。这是与阶段表的一处未闭合差距。
+  - **相位机仍没有走完 `SPEC-RT-050` 的八阶段**：帧只经过 `Outside → Preflight → Commit → Cleanup`，`Mark`/`Topo`/`Derived` 从未被进入；`commit` 接受 `Outside`（ADR-0017 的澄清允许在 Outside/Mark 打开）。
+  - **cleanup 里的 unmount 不是被「推迟」而是被拒绝**：owner cleanup 是 `'static` 闭包，类型上拿不到 `Tx`，所以「cleanup 只写 journal」由「cleanup 相位拒绝 view 写、下一帧可正常提交」这一对断言表达，不是在同一帧里排队。
+  - **`Fatal::WriteDuringCompute` 已随 ADR-0019 移除**：compute 阶段的写现在按决定 3 返回 `ValueError::Phase(PhaseViolation { phase: Topo|Binding, .. })`，`A0-05` 的「`WriteDuringCompute` 是领域错误」由该 typed 值表达，不再有同名 `Fatal` 变体。
+  - `SPEC-RT-053` 与 ADR-0017 决定 7 对 duplicate key 的冲突已由 ADR-0019 的检测点规则解释（写 API 拒绝 = 值错误），不再作为未决项。
   - 这些夹具都在单线程 headless 下跑；不涉及窗口、GPU、平台后端，也不构成任何性能结论。

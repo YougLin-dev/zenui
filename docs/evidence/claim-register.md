@@ -241,14 +241,17 @@ replaces: []
 | CLAIM-100 | 可用一个无订阅的 Vec 作为 Store 查询的"第二现实" | WITHDRAWN | `FINAL.md:78`；`round2-debate.md:182-188` | A0 | 现行：共享 query cache + 字段边 |
 | CLAIM-101 | `crates/core` 已有单帧事务层：模型、memo、view、owner、layout 写入先暂存，最外层退出时一次发布；回滚等于 drop，`Drop` 不跑用户代码也不 panic；`commit` 在 swap 之后没有失败路径 | VERIFIED | SRC `crates/core/src/txn.rs`；EVID-VAL-23、EVID-VAL-25 | A0 | 取代 CLAIM-039；`MountPlan` 与平台后端仍未实现 |
 | CLAIM-102 | A0-03 有 gate 级夹具：跨 runtime 写被拒绝、remount 后旧 handle 不 alias 复用槽位；去掉 generation 推进即判红 | VERIFIED | EVID-VAL-23（含 mutation 表）；SRC `crates/core/tests/gates.rs` | A0 | **不覆盖**跨 runtime 读与 A0-02 的 trybuild fixture |
-| CLAIM-103 | A0-05 有夹具：diamond 与 7 级长链在同一 epoch 内不产生 glitch；在 `Topo`/`Binding` 相位下调用 `insert` 返回 `Fatal::WriteDuringCompute`，`Commit` 相位下调用 `set_completed` 返回 `Fatal::PhaseViolation`，两者都经值通道并以毒化阻止提交，下一帧可恢复 | VERIFIED | EVID-VAL-24；SRC `crates/core/src/graph.rs`、`crates/core/src/runtime.rs` | A0 | 只覆盖被强制相位下的两条写路径，不是「所有写路径」；**无环检测**：环仍表现为 compute 重入 |
+| CLAIM-103 | A0-05 有夹具：diamond 与 7 级长链在同一 epoch 内不产生 glitch；在 `Topo`/`Binding` 相位下的写返回 `ValueError::Phase(PhaseViolation { phase, .. })` 并锁存致命错误，帧返回 `Fatal::PhaseViolation`、`commits` 不增、下一帧可恢复；自读 memo 环返回 `Fatal::GraphCycle` | VERIFIED | EVID-VAL-24；SRC `crates/core/src/graph.rs`、`crates/core/src/runtime.rs` | A0 | 只覆盖被强制相位下的写路径与自读环，不是「所有写路径」与「所有环形状」 |
 | CLAIM-104 | A0-06 的映射子句由 core 内零依赖 `LayoutMap` 承担：`plan` 只对帧内可见，`preflight` 拒绝 mount+unmount 同 view、缺失 plan 与重复 id，`discard` 清空计划 | VERIFIED | EVID-VAL-23、EVID-VAL-24；SRC `crates/core/src/layout.rs` | A0 | **不是** Taffy 适配器；与真实布局引擎对接仍 OPEN |
 | CLAIM-105 | 帧事务的失败语义已被回归夹具钉住：嵌套失败中毒、discard 不回退 row key、暂存删除压过暂存值、同帧 insert+remove 归还预留槽位 | VERIFIED | EVID-VAL-27；SRC `crates/core/src/txn.rs`、`crates/core/tests/regressions.rs` | A0 | 不含 memo cycle 检测 |
 | CLAIM-106 | preflight 会拒绝局部 view order、指向已删行的 mount 与指向本帧将卸载 view 的 focus，因而换入的 view 树必然与 journal 一致 | VERIFIED | EVID-VAL-27；SRC `crates/core/src/txn.rs` | A0 | 只能在单线程 headless 下验证 |
 | CLAIM-107 | 越阶段写返回 typed `ValueError::Phase` 并毒化事务，帧不会提交；debug 构建不再靠 `debug_assert!` 中止 | VERIFIED | EVID-VAL-24；SRC `crates/core/src/runtime.rs` | A0 | 仅在强制相位下测过 |
 | CLAIM-108 | `LayoutMap` 是 core 私有类型（`mod layout;`，不导出），只经 `Runtime` 的 preflight 与只读访问器对外可见，与 ADR-0017 决定 12 一致 | VERIFIED | SRC `crates/core/src/lib.rs`、`crates/core/src/layout.rs` | A0 | 无夹具断言下游无法命名该类型 |
-| CLAIM-109 | memo 环没有检测：`GraphError` 无 cycle 变体，环表现为 compute 重入并以陈旧值收敛 | OPEN | SRC `crates/core/src/graph.rs`；`docs/spec/08-gates.md` A0-05 | A0 | 「cycle 是领域错误」未实现 |
-| CLAIM-110 | `SPEC-RT-053` 把 duplicate key 列为必须丢弃事务的失败，ADR-0017 决定 7 把它归为值错误；代码按 ADR 执行 | OPEN | SRC `crates/core/src/txn.rs`；`docs/spec/02-runtime.md` -053；ADR-0017 决定 7 | A0 | 需队长裁决，不由实现者就地解释 |
+| CLAIM-109 | memo 环被检测为领域错误：body 读到仍在计算栈上的节点即 `GraphError::Cycle { node }`，事务锁存 `Fatal::GraphCycle { node }`、丢弃 stage、`commits` 不增，下一帧可正常提交 | VERIFIED | EVID-VAL-24；SRC `crates/core/src/graph.rs`、`crates/core/src/runtime.rs` | A0 | 只覆盖自读环；互读环走同一条 computing 栈 |
+| CLAIM-110 | `SPEC-RT-053` 的括号列表被 ADR-0019 解释为检测点示例：写 API 在进入 journal 之前拒绝的 duplicate key 是值错误，preflight 阶段检测到的不一致才丢弃整帧；代码按此执行 | VERIFIED | SRC `crates/core/src/txn.rs`；`docs/decisions/adr-0019-…md` 决定 1、2 | A0 | 由 ADR-0019 裁决，不再是未决项 |
+| CLAIM-111 | `ValueError` 的形状是 `Handle / Store / Phase(PhaseViolation) / Aborted`；不存在通用的 `ValueError::Fatal` 通道，`PhaseViolation` 与 commit 侧的 `Fatal::PhaseViolation` 是同一个结构 | VERIFIED | EVID-VAL-24；SRC `crates/core/src/txn.rs` | A0 | ADR-0019 决定 3、5、8 |
+| CLAIM-112 | 写 API 阶段违规返回 `ValueError::Phase` 并锁存致命错误；帧体即使返回 `Ok`，最外层也返回锁存的 `Fatal`、`commits` 不增、下一帧可提交 | VERIFIED | EVID-VAL-24（`a_write_during_compute_is_a_domain_error`）；SRC `crates/core/src/runtime.rs` | A0 | 夹具断言帧级结果，不只看调用点 |
+| CLAIM-113 | owner cleanup 在换入之后、`Phase::Cleanup` 下运行；cleanup 相位的 view 写返回 typed 错误而不是静默应用，下一帧可正常 staging | VERIFIED | EVID-VAL-24；SRC `crates/core/src/txn.rs` | A0 | cleanup 闭包是 `'static`，类型上无法访问 `Tx`，所以「只入 journal」以「拒绝 + 下一帧可提交」表达 |
 
 ---
 
@@ -256,12 +259,12 @@ replaces: []
 
 | 状态 | 条数 | 主要领域 |
 |---|---|---|
-| VERIFIED | 69 | 执行记录、源码事实、两条官方 CSS/Tailwind 事实 |
+| VERIFIED | 74 | 执行记录、源码事实、两条官方 CSS/Tailwind 事实 |
 | SPEC | 9 | Store/Query/For/焦点契约中尚未实现的部分 |
-| OPEN | 14 | MSRV、bidi/emoji、capabilities、surface/DPI、Mac/Linux、mask/filter、3D depth、IME、AT、平台矩阵、版本组合 |
+| OPEN | 12 | MSRV、bidi/emoji、capabilities、surface/DPI、Mac/Linux、mask/filter、3D depth、IME、AT、平台矩阵、版本组合 |
 | WITHDRAWN | 12 | 旧 mount 形状、条件语法、优先级、Copy+String、retained-visibility 等 |
 | PROBE | 6 | rstml parse-only、3 条 C 类夹具记录、tailwind crate 研究探针、A0 query 缓存共享 |
-| **合计** | **110** | — |
+| **合计** | **113** | — |
 
 > 注意：`VERIFIED` 只表示"该断言在其限定范围内有记录"，不表示整个子系统完成。例如
 > CLAIM-064 只证明 H1/H2 两个 headless 数据点，不证明窗口、surface 或其他 Linux 后端。
