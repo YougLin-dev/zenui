@@ -69,6 +69,28 @@ replaces: [research/README.md, review/README.md]
 
 条目写法：`### SPEC-RT-001 单一 UI 权威：一棵 View 树 + 一张响应式图`。在 `docs/` 内引用写作 `[SPEC-RT-001](spec/02-runtime.md)`（同目录内则用文件名），**链接只指向文件，条目用 ID 文本定位**——标题里带正文，GitHub 生成的锚点不是裸 ID，写 `#spec-rt-001` 会断。**禁止在别处复述该条内容超过一句**，只引用。
 
+### 3.1 主题索引：先查这里，再进文档
+
+| 主题 | 当前权威文档 | 负责人 | 证据到哪里查 |
+|---|---|---|---|
+| 能力边界、目标用户、非目标 | [spec/00-scope.md](spec/00-scope.md) | 框架产品经理 | `SPEC-SCOPE-*`；现无生产 runtime（`CLAIM-039`） |
+| 技术路线、否决的路线、版本 pin | [spec/01-route.md](spec/01-route.md)、`decisions/ADR-0001…0007` | 框架产品经理 / 架构 | `SPEC-ROUTE-*`，pin 只在 `SPEC-ROUTE-001` |
+| 运行时：View 树、Owner、MountPlan、事务、Store | [spec/02-runtime.md](spec/02-runtime.md) | 顶级 Rust 开发工程师 | `EVID-PROBE-02` 覆盖去重；事务原子性有反例（`EVID-VAL-08`，`SPEC-GATE-A0-04` 红） |
+| `view!` 语法、props、组件、错误呈现 | [spec/03-macro.md](spec/03-macro.md) | API 人体工学师 | `EVID-PROBE-01`，仅 parse-only |
+| StyleIR、utility 词表、优先级、诊断 | [spec/04-style.md](spec/04-style.md) | 顶级 Rust 开发工程师 | `EVID-PROBE-03`（utility family 覆盖为分子/分母，见条目） |
+| 文本/字形布局、TextEdit、IME、选区 | [spec/05-text.md](spec/05-text.md) | 渲染与 GPU 抽象负责人 | `EVID-PROBE-04`，三处缺陷已证实 |
+| 布局投影、绘制、合成、窗口、无障碍、3D | [spec/06-render.md](spec/06-render.md) | 渲染与 GPU 抽象负责人 | `EVID-PROBE-04`、`EVID-VAL-15/16` |
+| 平台后端（Windows/macOS/Linux） | [spec/07-platform/index.md](spec/07-platform/index.md) | 各平台工程师 | 三平台均无真机证据，槽位全 `OPEN` |
+| 验收 Gate A0–D | [spec/08-gates.md](spec/08-gates.md) | 测试与 CI/发布负责人 | 42 条判据中 0 `VERIFIED`、1 `PROBE`、41 `OPEN`（`EVID-MATRIX`） |
+| 事实断言（某句到底算不算数） | [evidence/claim-register.md](evidence/claim-register.md) | 顶级研究员 | 100 条 `CLAIM-*`，逐条带状态与证据 |
+| 真实执行记录与复跑命令 | [evidence/validation.md](evidence/validation.md)、[evidence/index.md](evidence/index.md) | 测试与 CI/发布负责人 | `EVID-VAL-01…19` |
+| 探针能证明什么、不能证明什么 | [evidence/probes.md](evidence/probes.md) | 测试与 CI/发布负责人 | `EVID-PROBE-01…05`，每条含证伪边界 |
+| 产品定位与版本路线 | [product/positioning.md](product/positioning.md)、[product/roadmap.md](product/roadmap.md) | 框架产品经理 | 路线 `M0–M4` ↔ Gate `A0/A1/B/C/D` |
+| 历史结论与已撤销方案 | [archive/README.md](archive/README.md) | Crew 队长（架构） | 只读；`§3` 权威替代表、`§4` 已知过期物 |
+| 文档本身怎么改 | 本节、[§4 文件头](#4-文件头契约每份文档必须有)、`templates/` | Crew 队长（架构） | `scripts/check_docs.py`（CI 强制） |
+
+新增主题时必须同时在 `spec/`/`evidence/` 落一条并更新本表；只改表不改文档、或只加文档不改表，都算未完成。
+
 ## 4. 文件头契约（每份文档必须有）
 
 ```yaml
@@ -118,11 +140,16 @@ docs/
   decisions/
     index.md                    # ADR 目录
     adr-0001-*.md ...
+  templates/
+    README.md                   # 四类模板与适用场景
+    adr.md  spec-entry.md  evidence-entry.md  claim-row.md
   archive/
     README.md                   # 归档说明：为什么在此、如何引用
     research/*.md               # 原 archive/research/*
     review/*.md                 # 原 archive/review/*
 ```
+
+**刻意不设的目录**（与初始规划相比）：`research/`（未定内容以 `draft` 的 spec 条目或 `OPEN` 的 `CLAIM-*` 落盘，避免出现第二权威）、`spikes/`（探针报告并入 `evidence/probes.md`，因为探针同时是证据）、`bench/`（当前没有可发布的性能基线，建空目录只会被误读为"已有基线"）、`schema/`（文件头契约在 §4，机器校验由 `scripts/check_docs.py` 执行，静态说明文件会与脚本分叉）。
 
 ## 6. CLAIM 台账：唯一事实来源
 
@@ -147,6 +174,7 @@ docs/
 4. 版本 pin 只写在 `spec/01-route.md` 一处，其他文件引用 `SPEC-ROUTE-00X`。
 5. 不写评审过程与投票，评审过程归 `archive/`；`decisions/` 只留结论与依据。
 6. 不承诺未验证的平台/能力；没有真机结果的一律 `SPEC` 或 `OPEN`。
+7. 新增文档从 `templates/` 对应模板起手，并在 §3.1 主题索引登记；两者缺一视为未完成，`scripts/check_docs.py` 在 CI 上把关其余可机械检查的部分。
 
 ## 8. 本轮整理的工作顺序
 
