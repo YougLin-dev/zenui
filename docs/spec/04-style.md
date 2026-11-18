@@ -285,6 +285,22 @@ enum StyleCondition {
 - **失败模式**：`peer-checked:bg-*` 编译通过但永不生效；用户以为样式写错，实际是能力缺口未报告。
 - **来源**：FINAL §6；`tailwind-coverage.md` §4；`style-system.md` §8（诊断示例）。
 
+### SPEC-STYLE-028 系统文本缩放作用于字体度量，不缩放布局单位
+
+- **状态**：SPEC
+- **强度**：MUST / MUST NOT
+- **要求**：操作系统级"放大文本"（Windows 文本缩放、macOS/GTK 等价项）MUST 只乘到**字体度量**（paragraph descriptor 的 font size / line height 基准），MUST NOT 乘到 `rem`、间距、圆角、边框或容器尺寸。布局 MUST 在收到缩放后的度量后重新测量 intrinsic size，并根据结果重排。
+- **失败模式**：把缩放乘进 `rem` → 间距与控件尺寸一起变大，信息密度崩坏、点击目标错位；或只放大字形不重新测量 → 文字溢出容器、截断。二者都不满足无障碍要求。
+- **来源**：FINAL §6；`SPEC-PLAT-WIN-015`；`SPEC-TEXT-006`（intrinsic 与度量）。
+
+### SPEC-STYLE-029 高对比度是 token 层条件，不是控件级补丁
+
+- **状态**：SPEC
+- **强度**：MUST NOT
+- **要求**：高对比度 / forced-colors MUST 作为登记的 token 重映射条件，在 **token → declaration** 这一层整体替换前景、背景、边框与强调色；MUST NOT 由各控件内部判断系统开关后自行改色（否则每新增一个控件就漏一次）。重映射后的任意前景/背景组合 MUST 满足最小对比度，纯色之外（渐变、图片、半透明遮罩）MUST 有确定性回退。
+- **失败模式**：开启高对比度后文字与背景同色（自适应控件漏改）；图片上的文字失去可读性；同一条规则在深色主题正确、在高对比度下失效。
+- **来源**：FINAL §6；`SPEC-PLAT-WIN-015`；`SPEC-STYLE-024`（theme/dark 同属 token 条件一族）。
+
 ## 4. class 面：字面量、动态与 manifest
 
 ### SPEC-STYLE-030 动态 class 只接受编译期完整候选
