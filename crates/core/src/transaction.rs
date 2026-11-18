@@ -10,6 +10,11 @@
 //! TODO(A0-04): a nested batch may currently publish intermediate values to any
 //! reader that evaluates inside the open batch. Fixing that needs the staging
 //! journal of `SPEC-RT-051` and is out of P1 scope.
+//!
+//! TODO(A0-06): there is no preflight journal and no staging tree. A rejected
+//! operation simply leaves the store untouched; that is the observable effect
+//! A0-06 wants, but not its proof, because nothing is preflighted and no
+//! failure is injected.
 
 use std::collections::BTreeSet;
 
@@ -38,9 +43,15 @@ impl TransactionState {
 
     /// Close one nesting level. Returns the nodes dirtied by the outermost
     /// batch, or `None` while still nested.
+    ///
+    /// An end without a matching begin is a bug, not a transaction: debug
+    /// builds assert, and release builds refuse to record a commit.
     pub fn end(&mut self) -> Option<Vec<NodeId>> {
         debug_assert!(self.depth > 0, "unbalanced transaction end");
-        self.depth = self.depth.saturating_sub(1);
+        if self.depth == 0 {
+            return None;
+        }
+        self.depth -= 1;
         if self.depth == 0 {
             self.commits += 1;
             Some(std::mem::take(&mut self.pending).into_iter().collect())

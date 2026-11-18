@@ -37,11 +37,18 @@ impl Nodes {
 #[derive(Debug)]
 pub struct Snapshot {
     pub counters: Counters,
-    pub rows: usize,
+    /// Every row the store owns, whether or not a filter shows it.
+    pub store_rows: usize,
+    /// Rows currently mounted as views: the visible set.
+    pub visible_rows: usize,
     pub remaining: u32,
     pub has_completed: bool,
     pub filter: Filter,
-    pub keys: String,
+    /// Store titles in model order. This is the whole store, not the filter
+    /// result; when a filter is active the visible set is `visible_titles`.
+    pub store_titles: String,
+    /// Mounted titles in view order.
+    pub visible_titles: String,
     pub focus: String,
     pub caret: String,
     pub edges: usize,
@@ -324,6 +331,19 @@ impl TodoApp {
         }
     }
 
+    /// Titles of the rows that are currently mounted, in view order. With a
+    /// filter active this is a proper subset of `Store::titles`.
+    fn visible_titles(&self) -> Vec<String> {
+        self.views
+            .row_views()
+            .iter()
+            .filter_map(|(_, key)| {
+                let handle = self.store.handle_for(*key)?;
+                self.store.with_title(handle, str::to_owned).ok()
+            })
+            .collect()
+    }
+
     fn counters(&self) -> Counters {
         let mut total = self.store.counters();
         total += self.query.counters();
@@ -338,10 +358,16 @@ impl TodoApp {
         let remaining = self.remaining();
         let has_completed = self.has_completed();
 
-        let keys = if self.store.is_empty() {
+        let store_titles = if self.store.is_empty() {
             String::from("-")
         } else {
             self.store.titles().collect::<Vec<_>>().join(",")
+        };
+        let visible = self.visible_titles();
+        let visible_titles = if visible.is_empty() {
+            String::from("-")
+        } else {
+            visible.join(",")
         };
 
         let focused = self.views.focused();
@@ -358,11 +384,13 @@ impl TodoApp {
 
         Snapshot {
             counters: self.counters(),
-            rows: self.store.len(),
+            store_rows: self.store.len(),
+            visible_rows: self.views.row_views().len(),
             remaining,
             has_completed,
             filter: self.filter,
-            keys,
+            store_titles,
+            visible_titles,
             focus,
             caret,
             edges: self.graph.edge_count(),
@@ -411,12 +439,15 @@ fn format_counters(label: &str, counters: Counters) -> String {
 
 fn format_state(snapshot: &Snapshot) -> String {
     format!(
-        "  state rows={} remaining={} has_completed={} filter={} keys={} focus={} caret={}",
-        snapshot.rows,
+        "  state store_rows={} visible_rows={} remaining={} has_completed={} filter={} \
+         store_titles={} visible_titles={} focus={} caret={}",
+        snapshot.store_rows,
+        snapshot.visible_rows,
         snapshot.remaining,
         snapshot.has_completed,
         snapshot.filter.as_str(),
-        snapshot.keys,
+        snapshot.store_titles,
+        snapshot.visible_titles,
         snapshot.focus,
         snapshot.caret,
     )
@@ -523,21 +554,25 @@ pub fn todolist_trace() -> String {
     recorder.step(&app.snapshot(), "filter-active", "filter=active");
 
     // 05 — reorder the model so the Active list becomes C, A.
+    //
+    // Focus is UI state, not a store mutation, so it is placed before the step
+    // snapshot: the `delete-focused` delta then reflects only the delete and
+    // the focus settlement it triggers.
     let order = [
         row_named(&app, "C").0,
         row_named(&app, "A").0,
         row_named(&app, "B").0,
     ];
+    let (a_key, a_row) = row_named(&app, "A");
     app.frame(|app| {
         app.reorder(&order).expect("reorder is a permutation");
         app.render();
     });
-    recorder.step(&app.snapshot(), "reorder", "reorder C,A,B");
+    assert!(app.focus_row(a_key), "row A must be mounted");
+    recorder.step(&app.snapshot(), "reorder", "reorder C,A,B; focus A");
 
     // 06 — delete the focused row (A).
-    let (a_key, a_row) = row_named(&app, "A");
     app.frame(|app| {
-        assert!(app.focus_row(a_key), "row A must be mounted");
         app.delete(a_row).expect("row A is live");
         app.render();
     });

@@ -3,61 +3,61 @@ scenario=todolist-headless
 
 [step 01 empty]
   detail=no rows
-  state rows=0 remaining=0 has_completed=false filter=all keys=- focus=- caret=-
+  state store_rows=0 visible_rows=0 remaining=0 has_completed=false filter=all store_titles=- visible_titles=- focus=- caret=-
   delta query_evals=1 id_materializations=1 mounts=0 unmounts=0 memo_recomputes=3 commits=1 focus_moves=0 caret_ops=0 io_reads=0 io_writes=0 string_clones=0
   graph edges=3 active_sources=1 geometry_epoch=1 live_owners=1 cleanup_runs=0 sink=0
 
 [step 02 insert-abc]
   detail=insert A,B,C
-  state rows=3 remaining=3 has_completed=false filter=all keys=A,B,C focus=- caret=-
+  state store_rows=3 visible_rows=3 remaining=3 has_completed=false filter=all store_titles=A,B,C visible_titles=A,B,C focus=- caret=-
   delta query_evals=1 id_materializations=1 mounts=3 unmounts=0 memo_recomputes=3 commits=1 focus_moves=0 caret_ops=0 io_reads=3 io_writes=3 string_clones=3
   graph edges=3 active_sources=1 geometry_epoch=5 live_owners=4 cleanup_runs=0 sink=0
 
 [step 03 toggle-b]
   detail=toggle B -> completed
-  state rows=3 remaining=2 has_completed=true filter=all keys=A,B,C focus=- caret=-
+  state store_rows=3 visible_rows=3 remaining=2 has_completed=true filter=all store_titles=A,B,C visible_titles=A,B,C focus=- caret=-
   delta query_evals=1 id_materializations=1 mounts=0 unmounts=0 memo_recomputes=3 commits=1 focus_moves=0 caret_ops=0 io_reads=0 io_writes=1 string_clones=0
   graph edges=3 active_sources=1 geometry_epoch=5 live_owners=4 cleanup_runs=0 sink=0
 
 [step 04 filter-active]
   detail=filter=active
-  state rows=3 remaining=2 has_completed=true filter=active keys=A,B,C focus=- caret=-
+  state store_rows=3 visible_rows=2 remaining=2 has_completed=true filter=active store_titles=A,B,C visible_titles=A,C focus=- caret=-
   delta query_evals=1 id_materializations=1 mounts=0 unmounts=1 memo_recomputes=1 commits=1 focus_moves=0 caret_ops=0 io_reads=0 io_writes=0 string_clones=0
   graph edges=4 active_sources=1 geometry_epoch=6 live_owners=3 cleanup_runs=1 sink=0
 
 [step 05 reorder]
-  detail=reorder C,A,B
-  state rows=3 remaining=2 has_completed=true filter=active keys=C,A,B focus=- caret=-
-  delta query_evals=1 id_materializations=1 mounts=0 unmounts=0 memo_recomputes=3 commits=1 focus_moves=0 caret_ops=0 io_reads=0 io_writes=0 string_clones=0
+  detail=reorder C,A,B; focus A
+  state store_rows=3 visible_rows=2 remaining=2 has_completed=true filter=active store_titles=C,A,B visible_titles=C,A focus=view#1 caret=view#1:1
+  delta query_evals=1 id_materializations=1 mounts=0 unmounts=0 memo_recomputes=3 commits=1 focus_moves=1 caret_ops=1 io_reads=0 io_writes=1 string_clones=0
   graph edges=4 active_sources=1 geometry_epoch=7 live_owners=3 cleanup_runs=1 sink=0
 
 [step 06 delete-focused]
   detail=delete focused A
-  state rows=2 remaining=1 has_completed=true filter=active keys=C,B focus=view#3 caret=view#3:1
-  delta query_evals=1 id_materializations=1 mounts=0 unmounts=1 memo_recomputes=3 commits=1 focus_moves=2 caret_ops=2 io_reads=0 io_writes=1 string_clones=0
+  state store_rows=2 visible_rows=1 remaining=1 has_completed=true filter=active store_titles=C,B visible_titles=C focus=view#3 caret=view#3:1
+  delta query_evals=1 id_materializations=1 mounts=0 unmounts=1 memo_recomputes=3 commits=1 focus_moves=1 caret_ops=1 io_reads=0 io_writes=1 string_clones=0
   graph edges=4 active_sources=1 geometry_epoch=8 live_owners=2 cleanup_runs=2 sink=0
 
 [step 07 bulk-clear]
   detail=clear completed
-  state rows=1 remaining=1 has_completed=false filter=active keys=C focus=view#3 caret=view#3:1
+  state store_rows=1 visible_rows=1 remaining=1 has_completed=false filter=active store_titles=C visible_titles=C focus=view#3 caret=view#3:1
   delta query_evals=1 id_materializations=1 mounts=0 unmounts=0 memo_recomputes=3 commits=1 focus_moves=0 caret_ops=0 io_reads=0 io_writes=1 string_clones=0
   graph edges=4 active_sources=1 geometry_epoch=8 live_owners=2 cleanup_runs=2 sink=0
 
 [step 08 invalid-rollback]
   detail=result=InvalidHandle(vacant)
-  state rows=1 remaining=1 has_completed=false filter=active keys=C focus=view#3 caret=view#3:1
+  state store_rows=1 visible_rows=1 remaining=1 has_completed=false filter=active store_titles=C visible_titles=C focus=view#3 caret=view#3:1
   delta query_evals=0 id_materializations=0 mounts=0 unmounts=0 memo_recomputes=0 commits=1 focus_moves=0 caret_ops=0 io_reads=0 io_writes=0 string_clones=0
   graph edges=4 active_sources=1 geometry_epoch=8 live_owners=2 cleanup_runs=2 sink=0
 
 [step 09 insert-d]
   detail=insert D
-  state rows=2 remaining=2 has_completed=false filter=active keys=C,D focus=view#3 caret=view#3:1
+  state store_rows=2 visible_rows=2 remaining=2 has_completed=false filter=active store_titles=C,D visible_titles=C,D focus=view#3 caret=view#3:1
   delta query_evals=1 id_materializations=1 mounts=1 unmounts=0 memo_recomputes=3 commits=1 focus_moves=0 caret_ops=0 io_reads=1 io_writes=1 string_clones=1
   graph edges=4 active_sources=1 geometry_epoch=10 live_owners=3 cleanup_runs=2 sink=0
 
 [summary]
   steps=9
-  state rows=2 remaining=2 has_completed=false filter=active keys=C,D focus=view#3 caret=view#3:1
-  total query_evals=8 id_materializations=8 mounts=4 unmounts=2 memo_recomputes=22 commits=9 focus_moves=2 caret_ops=2 io_reads=4 io_writes=7 string_clones=4
+  state store_rows=2 visible_rows=2 remaining=2 has_completed=false filter=active store_titles=C,D visible_titles=C,D focus=view#3 caret=view#3:1
+  total query_evals=8 id_materializations=8 mounts=4 unmounts=2 memo_recomputes=22 commits=9 focus_moves=2 caret_ops=2 io_reads=4 io_writes=8 string_clones=4
   graph edges=4 active_sources=1 geometry_epoch=10 live_owners=3 cleanup_runs=2 sink=0
 [status] outcome=ok

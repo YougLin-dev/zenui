@@ -259,7 +259,7 @@ mod tests {
     }
 
     #[test]
-    fn mount_into_a_disposing_scope_is_rejected() {
+    fn disposing_flag_rejects_child_creation_white_box() {
         let mut owners = OwnerTree::new();
         let scope = owners.child_of(owners.root()).expect("child");
 

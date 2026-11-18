@@ -6,12 +6,17 @@
 //! small `Copy` struct of `{runtime_id, slot, generation}`.
 //!
 //! P1 scope: the shape is in place and the store rejects stale or foreign
-//! handles. The handle-side `get`/`with` API of `SPEC-RT-005`, plus the
-//! slot-reuse and cross-runtime policy that `SPEC-GATE-A0-03` verifies, are
-//! owned by P2 and are intentionally not claimed here.
+//! handles.
+//!
+//! TODO(A0-03): the handle-side `get`/`with` API of `SPEC-RT-005` is not built.
+//! P1 resolves through the owning store (`Store::with_title` and friends),
+//! which cannot be reached from a bare `Copy` handle without a runtime
+//! registry. That shape decision, plus the gate-level fixture that dispatches a
+//! stale click/read/write, belongs to P2 and is not claimed here.
 
 use std::fmt;
 use std::marker::PhantomData;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 macro_rules! identity_newtype {
     ($($(#[$meta:meta])* $name:ident),+ $(,)?) => {
@@ -67,9 +72,21 @@ identity_newtype!(
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RuntimeId(u64);
 
+/// Process-wide source of runtime identities.
+///
+/// Stores get a distinct id, so a handle minted by one store is rejected by
+/// every other store. The value never reaches the trace, so the counter does
+/// not affect determinism.
+static NEXT_RUNTIME: AtomicU64 = AtomicU64::new(1);
+
 impl RuntimeId {
-    pub(crate) const fn from_raw(raw: u64) -> Self {
-        Self(raw)
+    /// Mint a fresh runtime identity.
+    ///
+    /// TODO(A0-03): whether the allocator belongs to the process or to an
+    /// explicit runtime object is a P2 API question. What A0-03 verifies is the
+    /// rejection behaviour, which is independent of where the id comes from.
+    pub(crate) fn allocate() -> Self {
+        Self(NEXT_RUNTIME.fetch_add(1, Ordering::Relaxed))
     }
 
     pub const fn raw(self) -> u64 {
@@ -274,17 +291,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn identity_newtypes_do_not_convert_from_each_other() {
-        // Compile-time property: distinct types. This test documents the
-        // intent; the actual proof is that no `From<ViewId> for OwnerId` impl
-        // exists anywhere in the crate.
+    fn view_id_index_is_stable_for_trace_output() {
+        // Distinct identity domains are a compile-time property: no `From`
+        // impl converts one id newtype into another anywhere in the crate.
+        // This test only pins the address-free rendering used by the trace.
         let view = ViewId::from_index(3);
         assert_eq!(view.index(), 3);
         assert_eq!(format!("{view:?}"), "ViewId(3)");
     }
 
     #[test]
-    fn generation_wraps_without_aliasing_a_live_slot() {
+    fn generation_wraps_to_first() {
+        // Aliasing safety comes from the free-then-reuse ordering in
+        // `arena::Slots`, covered by
+        // `recycled_slot_rejects_the_previous_generation`; this test only pins
+        // the wrap-around value.
         let generation = Generation(u32::MAX).next();
         assert_eq!(generation, Generation::FIRST);
     }

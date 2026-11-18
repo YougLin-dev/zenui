@@ -28,7 +28,10 @@ pub struct Counters {
     pub caret_ops: u64,
     /// Owned title reads at mount (`SPEC-RT-045`).
     pub io_reads: u64,
-    /// Store writes.
+    /// Store mutations. Unit definition: **one store mutation method call that
+    /// changed the model is exactly one write**, and it also advances the store
+    /// epoch once. `clear_completed` removing N rows is one write, not N;
+    /// `reorder` with the order already in place is zero.
     pub io_writes: u64,
     /// `String` clones performed by the runtime (not by the fixture's `format!`).
     pub string_clones: u64,
@@ -110,18 +113,47 @@ mod tests {
 
     #[test]
     fn add_assign_accumulates_every_field() {
-        let mut total = Counters::default();
-        total += Counters {
+        let one = Counters {
             query_evals: 1,
             id_materializations: 2,
-            ..Counters::default()
+            mounts: 3,
+            unmounts: 4,
+            memo_recomputes: 5,
+            commits: 6,
+            focus_moves: 7,
+            caret_ops: 8,
+            io_reads: 9,
+            io_writes: 10,
+            string_clones: 11,
         };
-        total += Counters {
-            query_evals: 3,
-            id_materializations: 4,
-            ..Counters::default()
+        let two = Counters {
+            query_evals: 10,
+            id_materializations: 20,
+            mounts: 30,
+            unmounts: 40,
+            memo_recomputes: 50,
+            commits: 60,
+            focus_moves: 70,
+            caret_ops: 80,
+            io_reads: 90,
+            io_writes: 100,
+            string_clones: 110,
         };
-        assert_eq!(total.query_evals, 4);
-        assert_eq!(total.id_materializations, 6);
+
+        let mut total = Counters::default();
+        total += one;
+        total += two;
+
+        assert_eq!(total.query_evals, 11);
+        assert_eq!(total.id_materializations, 22);
+        assert_eq!(total.mounts, 33);
+        assert_eq!(total.unmounts, 44);
+        assert_eq!(total.memo_recomputes, 55);
+        assert_eq!(total.commits, 66);
+        assert_eq!(total.focus_moves, 77);
+        assert_eq!(total.caret_ops, 88);
+        assert_eq!(total.io_reads, 99);
+        assert_eq!(total.io_writes, 110);
+        assert_eq!(total.string_clones, 121);
     }
 }

@@ -89,7 +89,7 @@ pub struct Store {
 impl Store {
     pub fn new() -> Self {
         Self {
-            runtime: RuntimeId::from_raw(1),
+            runtime: RuntimeId::allocate(),
             rows: Slots::new(),
             order: Vec::new(),
             next_key: 1,
@@ -112,8 +112,7 @@ impl Store {
         };
         let (slot, generation) = self.rows.alloc(row);
         self.order.push(slot);
-        self.epoch += 1;
-        self.io_writes += 1;
+        self.record_write();
         Handle::new(self.runtime, slot, generation)
     }
 
@@ -129,8 +128,7 @@ impl Store {
         } else {
             self.completed -= 1;
         }
-        self.epoch += 1;
-        self.io_writes += 1;
+        self.record_write();
         Ok(completed)
     }
 
@@ -149,8 +147,7 @@ impl Store {
                 self.completed -= 1;
             }
         }
-        self.epoch += 1;
-        self.io_writes += 1;
+        self.record_write();
         Ok(())
     }
 
@@ -163,8 +160,7 @@ impl Store {
         if was_completed {
             self.completed -= 1;
         }
-        self.epoch += 1;
-        self.io_writes += 1;
+        self.record_write();
         Ok(removed)
     }
 
@@ -185,12 +181,13 @@ impl Store {
             if let Some(row) = self.rows.free(slot) {
                 removed.push(row.key);
                 self.completed -= 1;
-                self.io_writes += 1;
             }
         }
         self.order.retain(|slot| self.rows.get_ref(*slot).is_some());
         if !removed.is_empty() {
-            self.epoch += 1;
+            // One `clear_completed` call is one write, however many rows it
+            // removed (`metrics::Counters::io_writes`).
+            self.record_write();
         }
         removed
     }
@@ -209,8 +206,12 @@ impl Store {
         if slots.len() != self.order.len() {
             return Err(StoreError::IncompleteOrder);
         }
+        if slots == self.order {
+            // No model change, so no write and no epoch advance.
+            return Ok(());
+        }
         self.order = slots;
-        self.epoch += 1;
+        self.record_write();
         Ok(())
     }
 
@@ -296,6 +297,13 @@ impl Store {
         }
     }
 
+    /// Record one committed model mutation: exactly one epoch advance and one
+    /// write for one successful mutating call (`metrics::Counters::io_writes`).
+    fn record_write(&mut self) {
+        self.epoch += 1;
+        self.io_writes += 1;
+    }
+
     fn entry(&self, row: RowId) -> Result<&Row, InvalidHandle> {
         self.check_runtime(row)?;
         self.rows
@@ -310,6 +318,14 @@ impl Store {
             .map_err(InvalidHandle::from)
     }
 
+    /// Reject a handle minted by another runtime.
+    ///
+    /// TODO(A0-03): this is one slice of the gate. A0-03 also requires that a
+    /// stale handle dispatched through the runtime yields exactly one
+    /// `InvalidHandle` with no default value and no stale-value patch, and that
+    /// `ViewId`/`RowKey`/`LayoutNodeId` cannot be passed to each other. The
+    /// newtypes make cross-domain passing a compile error by construction, but
+    /// the gate-level dispatch fixture is P2 work.
     fn check_runtime(&self, row: RowId) -> Result<(), InvalidHandle> {
         if row.runtime() != self.runtime {
             return Err(InvalidHandle::from(HandleError::ForeignRuntime {
@@ -356,7 +372,7 @@ mod tests {
     }
 
     #[test]
-    fn counters_track_completion_without_scanning() {
+    fn remaining_and_has_completed_follow_toggle() {
         let mut store = Store::new();
         let a = store.insert("A");
         let b = store.insert("B");
@@ -402,6 +418,47 @@ mod tests {
         assert_eq!(store.len(), 1);
         assert_eq!(store.titles().collect::<Vec<_>>(), vec!["A"]);
         assert!(store.with_title(a, str::len).is_ok());
+    }
+
+    #[test]
+    fn handle_from_another_store_is_rejected() {
+        let mut first = Store::new();
+        let second = Store::new();
+        let row = first.insert("A");
+
+        let error = second
+            .with_title(row, str::len)
+            .expect_err("a handle from another runtime must not resolve");
+        assert!(matches!(error.reason, HandleError::ForeignRuntime { .. }));
+        assert_eq!(error.reason_kind(), "foreign_runtime");
+
+        // The owning store still accepts the same handle.
+        assert_eq!(first.with_title(row, str::len).expect("own handle"), 1);
+    }
+
+    #[test]
+    fn one_mutation_is_one_write() {
+        let mut store = Store::new();
+        let a = store.insert("A");
+        let b = store.insert("B");
+        assert_eq!(store.counters().io_writes, 2);
+
+        store.toggle(b).expect("live row");
+        assert_eq!(store.counters().io_writes, 3);
+
+        // Clearing two completed rows is still one write.
+        store.toggle(a).expect("live row");
+        let before = store.counters().io_writes;
+        assert_eq!(store.clear_completed().len(), 2);
+        assert_eq!(store.counters().io_writes, before + 1);
+
+        // Reordering to the current order changes nothing.
+        let empty: Vec<RowKey> = Vec::new();
+        let before = store.counters().io_writes;
+        store
+            .reorder(&empty)
+            .expect("empty order matches empty store");
+        assert_eq!(store.counters().io_writes, before);
     }
 
     #[test]
