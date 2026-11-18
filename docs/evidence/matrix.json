@@ -321,6 +321,54 @@
       "runUrl": "https://github.com/YougLin-dev/zenui/actions/runs/44284925421",
       "proves": "同一 commit 上，40 条 workspace 测试在 ubuntu/macos/windows 三个 runner 上各自通过（每平台 34 core + 6 golden）；Windows 上 golden trace 逐字节比对成立，说明 LF 强制生效",
       "doesNotProve": "任何 GPU/窗口/平台后端能力；`cargo package` 与发布门（SPEC-GATE-C-04）；clippy 与 fmt 只是同一 job 的步骤日志，没有独立的 EVID 条目"
+    },
+    {
+      "id": "EVID-VAL-23",
+      "class": "A",
+      "host": "H2",
+      "kind": "test",
+      "command": "cargo test -p zenui-core --test gates --locked",
+      "exit": 0,
+      "commit": "867a7b3d9b4ba08ad17b208619b1e8f926080a21",
+      "tests": { "passed": 4, "failed": 0, "ignored": 0 },
+      "proves": "A0-03 stale 复用、A0-03 跨 runtime 写拒绝、A0-04 内层 batch 只发布一次且发布外层值、A0-06 预检失败回滚到上一已提交状态；四条均做过去掉实现即判红的 mutation 复核",
+      "doesNotProve": "A0-02 的 trybuild fixture；A0-05 的环检测；A0-06 与真实 Taffy 的对接；任何窗口/GPU/性能结论"
+    },
+    {
+      "id": "EVID-VAL-24",
+      "class": "A",
+      "host": "H2",
+      "kind": "test",
+      "command": "cargo test -p zenui-core --locked",
+      "exit": 0,
+      "commit": "867a7b3d9b4ba08ad17b208619b1e8f926080a21",
+      "tests": { "passed": 50, "failed": 0, "ignored": 0 },
+      "compileFailFixtures": 2,
+      "proves": "zenui-core lib 44 + gate 夹具 4 + 2 条 compile_fail doctest；含 A0-05 的 diamond/长链无 glitch 与 WriteDuringCompute 领域错误、A0-06 的 LayoutMap preflight 单测",
+      "doesNotProve": "zenui-app 的 golden 测试不在本命令内；单测数量不等于 gate 覆盖数"
+    },
+    {
+      "id": "EVID-VAL-25",
+      "class": "A",
+      "host": "H2",
+      "kind": "runtime",
+      "command": "cargo run -p zenui-app --example todolist_headless --locked",
+      "exit": 0,
+      "commit": "867a7b3d9b4ba08ad17b208619b1e8f926080a21",
+      "traceSha256": "fb16d571748949225b46a5eb78abc72e5badd13e3e2b6cede7b6b7aefd392f21",
+      "proves": "把全部模型/memo/view/owner/layout 写入搬进单帧事务后，A0-01 的 9 步 trace 仍与 commit 83b21a4 逐字节相同；golden 未重新录制",
+      "doesNotProve": "事务层正确性；trace 不含 staging 计数，也不含 A0-02…A0-11 的 gate 级信息"
+    },
+    {
+      "id": "EVID-VAL-26",
+      "class": "A",
+      "host": "H2",
+      "kind": "lint",
+      "command": "cargo clippy --workspace --all-targets --locked -- -D warnings",
+      "exit": 0,
+      "commit": "867a7b3d9b4ba08ad17b208619b1e8f926080a21",
+      "proves": "本机全 workspace（含 all-targets）零 clippy 警告；同轮 cargo fmt --all -- --check 通过",
+      "doesNotProve": "不是 CI 日志；SPEC-GATE-C-04 要求的 CI 记录仍缺失，C-04 保持 OPEN"
     }
   ],
 
@@ -456,13 +504,13 @@
   },
 
   "counts": {
-    "testsPassedH2": 53,
+    "testsPassedH2": 107,
     "testsPassedCi": 120,
-    "compileFailFixturesH2": 3,
+    "compileFailFixturesH2": 5,
     "zeroTestTargetsH2": ["root package zenui"],
     "gpuBackendsObserved": 2,
-    "runsTotal": 22,
-    "runsReproducibleHere": 10,
+    "runsTotal": 26,
+    "runsReproducibleHere": 14,
     "runsTranscribedOrExternal": 11,
     "runsOnCi": 1
   },

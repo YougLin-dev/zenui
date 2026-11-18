@@ -37,7 +37,7 @@ replaces: []
 | 主机 | OS | Rust | GPU / adapter | commit | 证据性质 |
 |---|---|---|---|---|---|
 | **H1** | Windows 11，MSVC 工具链 | `1.99.1 x86_64-pc-windows-msvc` | NVIDIA GeForce RTX 4060 Laptop GPU / Vulkan | 未记录 | 上一轮记录（转述） |
-| **H2** | macOS 27.0.1 (26A434)，Apple M4（10 核 GPU，Metal 4） | `1.99.1 (58cf8f9c3 2026-10-13) aarch64-apple-darwin` | Apple M4 / `metal` | `ab5339b`（EVID-VAL-12…19）/ `83b21a4`（EVID-VAL-20/-21） | **本轮实测**（commit 逐条见各条目） |
+| **H2** | macOS 27.0.1 (26A434)，Apple M4（10 核 GPU，Metal 4） | `1.99.1 (58cf8f9c3 2026-10-13) aarch64-apple-darwin` | Apple M4 / `metal` | `ab5339b`（EVID-VAL-12…19）/ `83b21a4`（EVID-VAL-20/-21）/ `%COMMIT%`（EVID-VAL-23…26） | **本轮实测**（commit 逐条见各条目） |
 | **CI** | GitHub Actions 矩阵：`ubuntu-26.04` / `macos-26-arm64` / `windows-2025-vs2026` | `rustc 1.99.1 (58cf8f9c3 2026-10-13)`，三个 runner 一致（取自 `rust-toolchain.toml` 的 pin） | 无（headless；A0 不需要 GPU） | `213f772`（main 上的 PR #5 merge commit） | **本轮 CI 实测**，run [`44284925421`](https://github.com/YougLin-dev/zenui/actions/runs/44284925421) |
 
 > H1 的 commit 在原始记录中未写下，这是本轮无法补的缺口；引用 H1 结果时应同时声明"commit 未知"。
@@ -68,6 +68,10 @@ replaces: []
 | EVID-VAL-20 | A | `cargo run -p zenui-app --example todolist_headless --locked` | **H2** | 9 步 trace，两次运行逐字节一致 | VERIFIED（仅 A0-01 的命令与 trace；A0-02…11 仍 OPEN） |
 | EVID-VAL-21 | A | `cargo test --workspace --locked` | **H2** | 40 passed（34 + 6） | VERIFIED |
 | EVID-VAL-22 | D | `cargo test --workspace --locked` | **CI** | 40 passed × 3 平台 | VERIFIED（CI 日志） |
+| EVID-VAL-23 | A | `cargo test -p zenui-core --test gates --locked` | **H2** | 4 passed（A0-03/04/06 夹具） | VERIFIED（四条 mutation 逐一判红，见条目） |
+| EVID-VAL-24 | A | `cargo test -p zenui-core --locked` | **H2** | 50 passed（44 + 4 + 2 doctest） | VERIFIED |
+| EVID-VAL-25 | A | `cargo run -p zenui-app --example todolist_headless --locked` | **H2** | 9 步 trace，sha256 与 EVID-VAL-20 相同 | VERIFIED（语义未变，不是重新录制） |
+| EVID-VAL-26 | A | `cargo clippy --workspace --all-targets --locked -- -D warnings` | **H2** | exit 0 | VERIFIED（仅本机，C-04 仍 OPEN） |
 
 ## 3. 仓库内测试：H1 原始记录（转述）
 
@@ -397,11 +401,97 @@ $ cargo test --workspace --locked        # ubuntu-26.04 / macos-26-arm64 / windo
 
 ## 9. 数字台账（仅汇总本文件已定义的事实，供 CLAIM 引用）
 
-- H2 实际通过测试：**53** 条（7 + 2 + 4 + 40），来源 EVID-VAL-12/13/14/21；其中 40 条来自新的 headless workspace。
-- H2 compile-fail fixture：**3** 条，来源 EVID-VAL-13。
+- H2 实际通过测试：**53** 条（7 + 2 + 4 + 40），来源 EVID-VAL-12/13/14/21；其中 40 条来自新的 headless workspace。这是 commit `83b21a4` 的计数。
+- H2 在 P2 之后的通过**执行数**：**107**（53 加上 EVID-VAL-23 的 4 与 EVID-VAL-24 的 50）。它是同一批用例在新 commit 上的复跑，**不是** 107 条互不相同的测试；`EVID-VAL-21` 的 40 与 `EVID-VAL-24` 的 50 有重叠（core lib 由 34 增至 44），不得相加当作"新增覆盖"。
+- H2 compile-fail fixture：**5** 条 = EVID-VAL-13 的 3 条 trybuild + EVID-VAL-24 的 2 条 `compile_fail` doctest。
 - 0-test target：根 package，来源 EVID-VAL-17。
 - 跨图形后端 GPU 观测：**2** 个数据点（Vulkan/NVIDIA 来自 H1 转述，Metal/Apple M4 来自 EVID-VAL-15），**不是** "GPU 矩阵已通过"。
 - CI 实际通过测试：**120** 次执行 = 40 条 × 3 个 runner（`EVID-VAL-22`）。它是**执行次数**，不是 120 条不同的测试，也不得与 H2 的 53 相加；同一批 40 条测试在 H2 与 CI 上各跑过。
-- 可复跑性分布：22 条中 **10 条**（A 类）可在本机原样复跑；**11 条**（B/C 类）依赖上一轮记录或仓库外夹具；**1 条**（D 类，`EVID-VAL-22`）在 CI runner 上，重跑 workflow 可复现，本机不能代替。
+- 可复跑性分布：26 条中 **14 条**（A 类）可在本机原样复跑；**11 条**（B/C 类）依赖上一轮记录或仓库外夹具；**1 条**（D 类，`EVID-VAL-22`）在 CI runner 上，重跑 workflow 可复现，本机不能代替。
 
 不得使用"基本完成""大部分支持""应该可以"描述以上任何数字。
+
+## 11. P2 轮（MORT-5）在 H2 的复跑
+
+本节四条记录的是 `feat/MORT-5-transaction-journal` 上的运行，被测代码 commit
+`%COMMIT%`。与 §6 一样，**一条记录只对应一条命令**；分支与 commit 相同不构成合并记录的许可。
+
+### EVID-VAL-23 A0 gate 夹具（H2）
+
+- 分支：`feat/MORT-5-transaction-journal`；被测代码 commit `%COMMIT%`。
+- 主机：H2（macOS 27.0.1 / Apple M4）；`rustc 1.99.1 (58cf8f9c3 2026-10-13) aarch64-apple-darwin`。
+
+```text
+$ cargo test -p zenui-core --test gates --locked
+test a0_03_cross_runtime_access_is_rejected ... ok
+test a0_03_stale_handle_does_not_alias_the_reused_slot ... ok
+test a0_04_nested_batch_publishes_once_with_the_outer_value ... ok
+test a0_06_rejected_commit_restores_the_previous_commit ... ok
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
+每条夹具比对的权威快照只含**会回滚的状态**（`titles`、`order`、`epoch`、`remaining`、
+`has_completed`、`visible`、`focused`、`caret`、`geometry_epoch`、`live_owners`、`layout_nodes`）；
+单调计数器被刻意排除，因为 `SPEC-RT-053` 允许它们在被丢弃的帧上推进。
+
+**判红复核（去掉实现即失败）**。本轮逐条做了最小 mutation，跑完立即还原，工作树干净：
+
+| 夹具 | mutation | 结果 |
+|---|---|---|
+| A0-06 | `preflight` 中 `removals` 与同 key 暂存写冲突的判定短路为 `false` | `a0_06_rejected_commit_restores_the_previous_commit` **FAILED**，其余 3 条 ok |
+| A0-03（stale） | `Slots::free` 不再推进 generation | `a0_03_stale_handle_does_not_alias_the_reused_slot` **FAILED**，其余 3 条 ok |
+| A0-04 | `Tx::batch` 在内层正常返回时也压入一条 `Publication` | `a0_04_nested_batch_publishes_once_with_the_outer_value` **FAILED**，其余 3 条 ok |
+| A0-05 | `Tx::require` 的阶段守卫恒为真（`true \|\| permits`） | `a_write_during_compute_is_a_domain_error` **FAILED**（该条在 `--lib` 目标，见 EVID-VAL-24） |
+
+- **不证明什么**：
+  - A0-03 仍缺 gate 级的**跨 runtime 读**夹具（本条只覆盖写侧拒绝与 stale 复用）与 `A0-02` 的 trybuild fixture。
+  - A0-04 的夹具覆盖「一次交互只发布一次、发布值是外层值」，**不覆盖**预检失败时 `LayoutMap` 与 `ViewTree` 的部分安装；那条路径由 `LayoutMap::discard` 与 `Txn::discard` 的结构保证，没有独立夹具。
+  - A0-05 只证明「阶段守卫会拒绝写」与「下一帧可恢复」，**不证明** memo 图存在环检测。
+  - A0-06 的 `LayoutMap` 是 core 内零依赖映射，**不是** Taffy 适配器；与真实布局引擎对接的部分仍 OPEN。
+  - 四条夹具都不触碰窗口、GPU、平台后端，也不构成任何性能结论。
+
+### EVID-VAL-24 `zenui-core` 全量测试（H2）
+
+- 分支与 commit 同 EVID-VAL-23。命令只跑 `zenui-core` 包，不含 `zenui-app`。
+
+```text
+$ cargo test -p zenui-core --locked
+     Running unittests src/lib.rs (zenui_core)    44 passed; 0 failed
+     Running tests/gates.rs (zenui_core)           4 passed; 0 failed
+   Doc-tests zenui_core                            2 passed; 0 failed
+（合计 50 passed / 0 failed）
+```
+
+- 44 条单测里与本次 gate 直接相关的：
+  - A0-05 的图侧夹具：`a_diamond_never_observes_two_epochs`（同一 epoch 的两个分支在 join 处必须相等）、`a_long_chain_keeps_the_final_value_consistent`（7 级链逐级 `+1`）；事务侧夹具：`runtime::tests::a_write_during_compute_is_a_domain_error`（`Phase::Topo` 下 `insert` 返回 `Fatal::PhaseViolation`，下一帧正常提交）。
+  - A0-06 的映射单测：`layout::tests` 3 条（plan 只读可见、`discard` 遗忘计划、mount+unmount 同 view 与缺失 plan 均被 preflight 拒绝）。
+  - A0-03 的槽位单测：`arena` 与 `store` 下 4 条（见 EVID-VAL-20 的「不证明什么」）。
+- 2 条 doctest 是 `compile_fail` 夹具，锁 `SPEC-RT-002` 的身份域不互通：`ViewId → RowKey` 与 `LayoutNodeId → RowKey` 都必须 **E0308**。这两条是 EVID-VAL-13 三个 compile-fail fixture 之外的**新增**数量，统计见 §9。
+- **不证明什么**：`zenui-app` 的 6 条 golden 测试不在本命令内（见 EVID-VAL-25 与 EVID-VAL-21）；单测数量不等于 gate 覆盖数。
+
+### EVID-VAL-25 重构后的 trace 复跑（H2）
+
+- 分支与 commit 同 EVID-VAL-23。命令与 EVID-VAL-20 相同，**记录的目标不同**：这里是「同一 trace 在新实现上是否仍然逐字节相同」。
+
+```text
+$ cargo run -p zenui-app --example todolist_headless --locked > /tmp/p2trace.txt
+$ shasum -a 256 /tmp/p2trace.txt crates/app/tests/golden/todolist_headless.trace
+fb16d571748949225b46a5eb78abc72e5badd13e3e2b6cede7b6b7aefd392f21  /tmp/p2trace.txt
+fb16d571748949225b46a5eb78abc72e5badd13e3e2b6cede7b6b7aefd392f21  crates/app/tests/golden/todolist_headless.trace
+```
+
+- golden 文件**未重新录制**：这次重构把模型、memo、view、owner、layout 的写入全部搬进一个帧事务，可观测输出一个字节都没动。这是本轮最重要的负面结论：重构没有改变语义。
+- **不证明什么**：trace 相同只说明 `SPEC-GATE-A0-01` 的那 9 步没变，**不说明**事务层正确；事务层由 EVID-VAL-23 的夹具与 mutation 复核承担。trace 中也不含任何 staging 计数。
+
+### EVID-VAL-26 clippy 全 workspace（H2）
+
+- 分支与 commit 同 EVID-VAL-23。
+
+```text
+$ cargo clippy --workspace --all-targets --locked -- -D warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s)
+（exit 0）
+```
+
+- 同轮 `cargo fmt --all -- --check` 通过。
+- **不证明什么**：这**不是** CI 日志。`SPEC-GATE-C-04` 的判据是仓库 CI 上的 `cargo clippy` 与 `cargo package` 记录，两者仍然缺失，因此 **C-04 保持 OPEN**。本机通过只说明本机通过。
