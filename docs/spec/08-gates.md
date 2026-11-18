@@ -45,7 +45,7 @@ blocked 的记录形状（机器可读，写入 `artifacts/desktop/<os>-<display
 
 | Gate | 目标 | 方法 | 阻塞合并 | 当前状态 |
 |---|---|---|---|---|
-| **A0** | 纯 Rust core + Todo reducer（headless，无宏/无窗口/无 GPU） | 编译期 + 运行时 trace | 是 | `OPEN`（workspace 与 headless 入口已存在，`SPEC-GATE-A0-01` 见 `EVID-VAL-20`；其余判据仍 `OPEN`） |
+| **A0** | 纯 Rust core + Todo reducer（headless，无宏/无窗口/无 GPU） | 编译期 + 运行时 trace | 是 | `OPEN`（`A0-01`、`A0-03`…`A0-06` 已达 `PROBE`，证据见 `EVID-VAL-20`…`-24`、`-27`；`A0-02` 与 `A0-07`…`A0-11` 仍 `OPEN`） |
 | **A1** | 单 Windows Todo 真实窗口 | 真机 + 运行时 | 是（针对"桌面可用"宣称） | `OPEN` |
 | **B** | layout / text / style 差分基线 | 运行时 golden | 是（针对样式与文字能力宣称） | `SPEC`（有 3 条 style 探针，见 `EVID-VAL-12`） |
 | **C** | 三平台真实发布门 | 真机 + AT + package | 发布阻断 | `OPEN`（缺 runner） |
@@ -74,10 +74,10 @@ graph LR
 |---|---|---|---|
 | `SPEC-GATE-A0-01` | `crates/core`、`crates/app` 存在；上述命令可跑并输出确定性 trace（query/mount/materialization/edge/geometry/focus/caret/I-O 计数） | 仓库内可复跑的命令 + trace 快照 | `PROBE`（`EVID-VAL-20` 命令与 trace、`EVID-VAL-21` workspace 测试；gate 整体仍 `OPEN`） |
 | `SPEC-GATE-A0-02` | 每个 UI 行 mount 只读一次 owned title；Copy handle 不携带 `String`；`read_once` 返回 `Result` | trybuild：`#[derive(Copy)] struct{String}` 必须 E0204；运行时 read 计数恰为 1；`String::with` 借读合法、拥有式 get 不编译 | `OPEN`（语言层已确证 E0204：`EVID-VAL-18`；仓库内 fixture 尚未建立） |
-| `SPEC-GATE-A0-03` | `{runtime_id, slot, generation}` 分离；旧 handle/旧 generation 只得到一条 `InvalidHandle`，无默认值、无旧值 patch | 运行时：slot 复用后派发旧 click/读/写；跨 runtime handle 拒绝；类型层 ViewId/RowKey/LayoutNodeId 互传必须编译失败（判据原文的 `TodoId`/`TaffyId` 在现行代码中对应 `RowKey`/`LayoutNodeId`） | `OPEN` |
-| `SPEC-GATE-A0-04` | 最外层 batch 只提交一次；嵌套 batch 不外泄中间值 | instrumented committed-read 记录中间值与提交次数 | `OPEN`（**已有现存反例**：嵌套 batch 产出含 `true` 的两条 patch，`EVID-VAL-08`） |
-| `SPEC-GATE-A0-05` | Memo 拓扑到稳定值才发布；diamond/长链无 glitch；`WriteDuringCompute`、cycle 是领域错误 | 运行时 trace：发布值 + 每 epoch 可观测次数；错误可恢复 | `OPEN` |
-| `SPEC-GATE-A0-06` | TreeCommit 先完整 preflight（key/topology/focus/IME/resource/`LayoutMap`）到 staging，再一次 swap；失败后 native 树、id 映射、focus、geometry epoch 与上次提交完全一致 | 注入 `InvalidGeneration`/`DuplicateKey` 后逐字段比对；随后一笔干净事务可正常提交（phase guard 已复位） | `OPEN` |
+| `SPEC-GATE-A0-03` | `{runtime_id, slot, generation}` 分离；旧 handle/旧 generation 只得到一条 `InvalidHandle`，无默认值、无旧值 patch | 运行时：slot 复用后派发旧 click/读/写；跨 runtime handle 拒绝；类型层 ViewId/RowKey/LayoutNodeId 互传必须编译失败（判据原文的 `TodoId`/`TaffyId` 在现行代码中对应 `RowKey`/`LayoutNodeId`） | `PROBE`（`EVID-VAL-23` 的 stale 复用与跨 runtime 夹具、`EVID-VAL-24` 的 6 条互斥编译失败 doctest；gate 整体仍 `OPEN`） |
+| `SPEC-GATE-A0-04` | 最外层 batch 只提交一次；嵌套 batch 不外泄中间值 | instrumented committed-read 记录中间值与提交次数 | `PROBE`（`EVID-VAL-23`：内层读到自身未提交写、发布恰好一次且为外层值；旧反例 `EVID-VAL-08` 的场景已由该夹具覆盖） |
+| `SPEC-GATE-A0-05` | Memo 拓扑到稳定值才发布；diamond/长链无 glitch；`WriteDuringCompute`、cycle 是领域错误 | 运行时 trace：发布值 + 每 epoch 可观测次数；错误可恢复 | `PROBE`（`EVID-VAL-24`：diamond/长链、compute 相位写返回 `ValueError::Phase` 并锁存致命、自读环返回 `Fatal::GraphCycle`；**多节点环无夹具**） |
+| `SPEC-GATE-A0-06` | TreeCommit 先完整 preflight（key/topology/focus/IME/resource/`LayoutMap`）到 staging，再一次 swap；失败后 native 树、id 映射、focus、geometry epoch 与上次提交完全一致 | 注入 `InvalidGeneration`/`DuplicateKey` 后逐字段比对；随后一笔干净事务可正常提交（phase guard 已复位） | `PROBE`（`EVID-VAL-23` 的回滚夹具 + `EVID-VAL-24` 的 `LayoutMap`/preflight 单测；native 树与 IME 在 A0 不存在，属 Gate A1） |
 | `SPEC-GATE-A0-07` | query cache 单接线：`rows(filter)` 求值登记 membership + 实际读取的 `(row, completed)` 反向边；命中只标脏 cache；`Memo<RowSet>` 只追踪 cache revision | `(store_epoch, filter)` 每 epoch query_eval/cache_build/id_materialize 各恰 +1；两个消费者 String clones = 0 | `OPEN` |
 | `SPEC-GATE-A0-08` | 空态由独立 counter/membership 索引派生：`row_visits = 0`、`RowSet materialization = 0` | 1000 行 + 三 filter 切换时计数不增长；用 `collect()` 实现 `is_empty` 必须判红 | `OPEN` |
 | `SPEC-GATE-A0-09` | For 强制 key；same-owner reorder 保留 ViewId/generation/owner/subscriptions/caret/focus；duplicate key 在任何 patch 前拒绝 | reorder 后 unmount/setup = 0；重复 key 抛领域错误且旧视图不变 | `OPEN` |

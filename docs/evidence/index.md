@@ -135,7 +135,7 @@ run_fail rustc --edition 2024 --crate-type lib --emit=metadata --out-dir "$tmp" 
 
 ## 7. 与 Gate 的对应
 
-Gate 判据（`SPEC-GATE-*`）在 `docs/spec/08-gates.md`。当前映射：42 条判据中 **0 条 VERIFIED、2 条 PROBE、40 条 OPEN**（`EVID-MATRIX.coverage`）。
+Gate 判据（`SPEC-GATE-*`）在 `docs/spec/08-gates.md`。当前映射：42 条判据中 **0 条 VERIFIED、6 条 PROBE、36 条 OPEN**（`EVID-MATRIX.coverage`）。
 
 最容易被误读的两处已在该文件显式标注：
 
