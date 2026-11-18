@@ -784,6 +784,19 @@
       "runUrl": "https://github.com/YougLin-dev/zenui/actions/runs/44317724221",
       "proves": "同一 commit 上 102 条 workspace 测试在 ubuntu/macos/windows 上各自通过；九条 trybuild UI 用例的 .stderr 快照在三个平台逐字匹配，说明迁移到 trybuild 没有把诊断绑定到 macOS",
       "doesNotProve": "任何 GPU/窗口/平台后端能力；`cargo package` 与发布门（SPEC-GATE-C-04）；clippy 与 fmt 只是同一 job 的步骤日志"
+    },
+    {
+      "id": "EVID-VAL-48",
+      "class": "A",
+      "host": "H2",
+      "kind": "compile-fail",
+      "command": "rustdoc --test --crate-name probe --edition 2024 <case>.rs",
+      "exit": 0,
+      "probeCases": 8,
+      "controlCasesFailed": 2,
+      "commit": "89b651c058a9fa877dd055cd71bd998a27606288",
+      "proves": "八条 rustdoc compile_fail 用例中，两条对照组（合法代码标 compile_fail）判 FAILED，其余六条 ok；错误码后缀不产生约束：E0204 标在 E0599 上、标成不存在的 E9999、标在无码错误上都 ok。doctest 只能表达『不能编译』，固定错误码必须靠 trybuild 的 .stderr 快照（EVID-VAL-41）",
+      "doesNotProve": "trybuild 的跨平台行为（EVID-VAL-47）；其他工具链版本的行为——错误码后缀是否被校验属于实现细节，升级 rustc 必须重跑"
     }
   ],
   "contracts": [
@@ -959,12 +972,12 @@
       "root package zenui"
     ],
     "gpuBackendsObserved": 2,
-    "runsTotal": 47,
-    "runsReproducibleHere": 34,
+    "runsTotal": 48,
+    "runsReproducibleHere": 35,
     "runsTranscribedOrExternal": 11,
     "runsOnCi": 2
   },
-  "countsNote": "testsPassedCi 是 40 条 × 3 个 runner 的执行次数，不是 120 条不同的测试，也不得与 testsPassedH2 相加：同一批 40 条测试在 H2 与 CI 上各跑了一次。H1/H2 与 CI 是不同主机，结论不可互相替代。",
+  "countsNote": "testsPassedCi = 426 是两次 CI 运行的执行次数之和：EVID-VAL-22 的 40 条 × 3 个 runner（120 次）加 EVID-VAL-47 的 102 条 × 3 个 runner（306 次）。它不是不同测试的条数（并集 102 条），也不得与 testsPassedH2 相加：H2 与 CI 是不同主机，同一批测试在两处各跑一次只说明两处都跑过。",
   "notVerified": [
     "真实 winit 窗口 / surface / resize / DPI",
     "Windows 与 Linux 实机（X11 与 Wayland 分列）",
