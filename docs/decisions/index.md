@@ -58,6 +58,7 @@ replaces: []
 | [ADR-0015](adr-0015-render-ownership-splits.md) | 渲染线三处归属切分：生命周期归 `SPEC-RT`、声明形态归 `SPEC-STYLE`、坐标单位归 `SPEC-TEXT` | `SPEC-RENDER-011`、`-016`；`SPEC-TEXT-015`；`SPEC-RT-024`、`-026`；`SPEC-STYLE-002`、`-004`、`-052`、`-055` | normative |
 | [ADR-0016](adr-0016-release-order.md) | 释放顺序：Owner 后序（子先父）+ 同 owner 逆注册 LIFO；dispose 幂等；cleanup 中禁止 mount/batch/flush | `SPEC-RT-021`、`-022`、`-052` | normative |
 | [ADR-0017](adr-0017-p2-runtime-authority-and-transaction-shape.md) | P2 形状：解析权归权威、值暂存 + 发布屏障、`RuntimeId` 归属与脱敏、A0-06 用 core 内零依赖 `LayoutMap` | `SPEC-RT-002`、`-005`、`-006`、`-033`、`-038`、`-050`…`-053`；`SPEC-GATE-A0-03`、`-06` | normative |
+| [ADR-0018](adr-0018-docs-language-scope.md) | 语言分工：分支/commit/PR/代码/标识符一律英文；`docs/` 正文沿用中文；一个文件一种语言；不就地翻译冻结层 | 无（约束文档与产物的语言，不改写 `SPEC-*` 要求） | normative |
 
 ## 3. 每条的固定结构
 
