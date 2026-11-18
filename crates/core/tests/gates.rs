@@ -7,8 +7,9 @@
 
 use zenui_core::{Fatal, RowId, Runtime, StoreError, Tx, ValueError, ViewId};
 
-/// A value error never aborts a transaction; a fixture that wants to abort on
-/// one has to say so explicitly.
+/// `ValueError` is not a synonym for "harmless" (`ADR-0019` decision 7): a
+/// fixture that wants to abort the frame on a call-site failure says so
+/// explicitly.
 fn fatal<T>(result: Result<T, ValueError>) -> Result<T, Fatal> {
     result.map_err(|_| Fatal::Aborted)
 }

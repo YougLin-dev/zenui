@@ -44,6 +44,10 @@ pub enum GraphError {
     UnknownNode(NodeId),
     /// A memo was declared but never computed before being read.
     Uncomputed(NodeId),
+    /// A memo body read a node that is already computing: a cycle.
+    Cycle {
+        node: NodeId,
+    },
     /// The memo body returned a value of a different shape than before.
     ValueKindChanged {
         node: NodeId,
@@ -56,6 +60,9 @@ impl fmt::Display for GraphError {
         match self {
             GraphError::UnknownNode(node) => write!(f, "unknown graph node {node}"),
             GraphError::Uncomputed(node) => write!(f, "graph node {node} has no value"),
+            GraphError::Cycle { node } => {
+                write!(f, "graph node {node} is part of a cycle")
+            }
             GraphError::ValueKindChanged { node, expected } => {
                 write!(f, "graph node {node} no longer yields a {expected} value")
             }
@@ -81,6 +88,7 @@ pub struct DepReader<'a> {
     nodes: &'a [Node],
     scratch: Option<&'a GraphScratch>,
     deps: Vec<NodeId>,
+    cycle: Option<NodeId>,
 }
 
 impl<'a> DepReader<'a> {
@@ -91,6 +99,14 @@ impl<'a> DepReader<'a> {
         let scratch = self.scratch;
         let index = node as usize;
         if index >= values.len() {
+            return None;
+        }
+        if let Some(scratch) = self.scratch
+            && scratch.computing.contains(&node)
+        {
+            // Reading a node that is still computing is a cycle. Report it and
+            // hand back no value; the caller turns this into `GraphError::Cycle`.
+            self.cycle = Some(node);
             return None;
         }
         if !self.deps.contains(&node) {
@@ -135,11 +151,27 @@ pub(crate) struct GraphScratch {
     /// node -> staged revision for sources and memos
     source_rev: BTreeMap<NodeId, u64>,
     dirty: BTreeSet<NodeId>,
+    /// Nodes whose bodies are currently running, innermost last.
+    computing: Vec<NodeId>,
+    /// Set when a body reads a node that is already computing on this stack
+    /// (`SPEC-RT-038`: a memo cycle is a domain error, not a value).
+    cycle: Option<NodeId>,
 }
 
 impl GraphScratch {
     pub(crate) fn new() -> Self {
         Self::default()
+    }
+
+    /// Test-only: force a node to recompute on the next staged compute.
+    #[cfg(test)]
+    pub(crate) fn mark_dirty(&mut self, node: NodeId) {
+        self.dirty.insert(node);
+    }
+
+    /// The node whose body closed a cycle, if one was seen.
+    pub(crate) const fn cycle(&self) -> Option<NodeId> {
+        self.cycle
     }
 }
 
@@ -243,6 +275,7 @@ impl MemoGraph {
                 nodes: &self.nodes,
                 scratch: None,
                 deps: Vec::new(),
+                cycle: None,
             };
             let value = f(&mut reader);
             (reader.deps, value)
@@ -378,16 +411,24 @@ impl MemoGraph {
                 .ok_or(GraphError::Uncomputed(node));
         }
 
-        let (deps, value) = {
+        scratch.computing.push(node);
+        let (deps, value, cycle) = {
             let mut reader = DepReader {
                 values: &self.values,
                 nodes: &self.nodes,
                 scratch: Some(&*scratch),
                 deps: Vec::new(),
+                cycle: None,
             };
             let value = f(&mut reader);
-            (reader.deps, value)
+            (reader.deps, value, reader.cycle)
         };
+        scratch.computing.pop();
+        if let Some(node) = cycle {
+            // `SPEC-RT-038`: a memo cycle is a domain error, not a value.
+            scratch.cycle = Some(node);
+            return Err(GraphError::Cycle { node });
+        }
 
         if let Some(previous) = self.staged_value(scratch, node)
             && previous.kind() != value.kind()
@@ -433,6 +474,7 @@ impl MemoGraph {
             observed_at,
             source_rev,
             dirty,
+            ..
         } = scratch;
         let mut installed: std::collections::BTreeSet<NodeId> = std::collections::BTreeSet::new();
 
@@ -704,6 +746,29 @@ mod tests {
 
     /// Removing the `dirty` handling in `commit_scratch` makes this fail: the
     /// memo would keep its old value and be treated as clean.
+    /// `SPEC-RT-038`: a memo body reading a node that is still computing is a
+    /// cycle, reported as a domain error instead of converging on a stale
+    /// value. Removing the `computing` check makes this fail.
+    #[test]
+    fn a_self_reading_memo_is_a_cycle() {
+        let mut graph = MemoGraph::new();
+        let node = graph.memo("loop");
+        let mut scratch = GraphScratch::new();
+
+        let error = graph
+            .compute_staged(node, &mut scratch, 1, |reader| {
+                let _ = reader.read(node);
+                Value::Count(1)
+            })
+            .expect_err("a self-reading memo must not converge");
+
+        assert!(
+            matches!(error, GraphError::Cycle { node: reported } if reported == node),
+            "expected Cycle({node}), got {error:?}"
+        );
+        assert_eq!(scratch.cycle(), Some(node));
+    }
+
     #[test]
     fn a_write_only_frame_leaves_the_memo_dirty() {
         let mut graph = MemoGraph::new();

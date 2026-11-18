@@ -100,11 +100,6 @@ pub enum Fatal {
     BatchNotAllowed {
         phase: Phase,
     },
-    /// A model/source write attempted while a compute stage is running
-    /// (`SPEC-RT-038`). The phase is the stage that refused it.
-    WriteDuringCompute {
-        phase: Phase,
-    },
     Unbalanced {
         depth: u32,
     },
@@ -126,6 +121,10 @@ pub enum Fatal {
     FocusTargetNotLive {
         view: ViewId,
     },
+    /// A memo body read a node that is already computing (`SPEC-RT-038`).
+    GraphCycle {
+        node: NodeId,
+    },
     /// The caller chose to abort the frame.
     Aborted,
 }
@@ -142,9 +141,6 @@ impl fmt::Display for Fatal {
                 write!(f, "expected phase {expected:?}, found {found:?}")
             }
             Fatal::BatchNotAllowed { phase } => write!(f, "batch not allowed during {phase:?}"),
-            Fatal::WriteDuringCompute { phase } => {
-                write!(f, "write during the {phase:?} compute stage")
-            }
             Fatal::Unbalanced { depth } => write!(f, "unbalanced transaction end at depth {depth}"),
             Fatal::StaleStagedRow { key } => {
                 write!(f, "staged operation targets removed row {}", key.raw())
@@ -156,6 +152,7 @@ impl fmt::Display for Fatal {
             }
             Fatal::MountForMissingRow { .. } => f.write_str("mount targets a removed row"),
             Fatal::FocusTargetNotLive { .. } => f.write_str("focus target will not be live"),
+            Fatal::GraphCycle { node } => write!(f, "memo cycle at node {node}"),
             Fatal::Aborted => f.write_str("transaction aborted by the caller"),
         }
     }
@@ -171,10 +168,13 @@ impl std::error::Error for Fatal {}
 pub enum ValueError {
     Handle(InvalidHandle),
     Store(StoreError),
-    /// A domain error that is fatal for the transaction but is reported
-    /// through the value channel at the call site. The transaction is
-    /// poisoned, so `commit` refuses to publish (`SPEC-RT-038`).
-    Fatal(Fatal),
+    /// A write API call made in a phase that does not permit it
+    /// (`ADR-0019` decision 3). The error is reported on the value channel
+    /// and the transaction is poisoned, so the frame cannot publish.
+    Phase(PhaseViolation),
+    /// Any write call after the transaction was already poisoned
+    /// (`ADR-0019` decision 6).
+    Aborted,
 }
 
 impl From<InvalidHandle> for ValueError {
@@ -185,8 +185,8 @@ impl From<InvalidHandle> for ValueError {
 
 impl ValueError {
     /// True when this error also poisoned the transaction.
-    pub const fn is_fatal(&self) -> bool {
-        matches!(self, Self::Fatal(_))
+    pub const fn is_poisoning(&self) -> bool {
+        matches!(self, Self::Phase(_))
     }
 }
 
@@ -201,7 +201,12 @@ impl fmt::Display for ValueError {
         match self {
             ValueError::Handle(error) => write!(f, "{error}"),
             ValueError::Store(error) => write!(f, "{error}"),
-            ValueError::Fatal(fatal) => write!(f, "{fatal}"),
+            ValueError::Phase(violation) => write!(
+                f,
+                "write {:?} is not allowed in phase {:?}",
+                violation.attempted, violation.phase
+            ),
+            ValueError::Aborted => f.write_str("transaction already aborted"),
         }
     }
 }
@@ -295,8 +300,13 @@ pub struct Txn {
     staged_rev: u64,
     publishes: Vec<Publication>,
     commits: u64,
-    /// Set when a nested level failed; `commit` refuses to publish.
-    poisoned: bool,
+    /// Test-only: what the Cleanup stage observed when it released an owner.
+    #[cfg(test)]
+    cleanup_log: Vec<(crate::handle::OwnerId, Phase, usize)>,
+    /// Latched fatal error: set by a phase violation or a nested failure.
+    /// `commit` returns it even when the frame body returned `Ok`
+    /// (`ADR-0019` decision 6).
+    poison: Option<Fatal>,
 }
 
 impl Txn {
@@ -311,7 +321,9 @@ impl Txn {
             staged_rev: 0,
             publishes: Vec::new(),
             commits: 0,
-            poisoned: false,
+            poison: None,
+            #[cfg(test)]
+            cleanup_log: Vec::new(),
         }
     }
 
@@ -319,7 +331,7 @@ impl Txn {
         self.depth = 1;
         self.phase = Phase::Outside;
         self.outcome = Outcome::Live;
-        self.poisoned = false;
+        self.poison = None;
         self.view.next_view = next_view;
         self.view.next_owner = next_owner;
     }
@@ -334,6 +346,11 @@ impl Txn {
 
     pub const fn staged_rev(&self) -> u64 {
         self.staged_rev
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cleanup_log(&self) -> &[(crate::handle::OwnerId, Phase, usize)] {
+        &self.cleanup_log
     }
 
     pub fn publications(&self) -> &[Publication] {
@@ -443,25 +460,19 @@ impl<'a> Tx<'a> {
 
     // ---- phase ----
 
-    fn require(&self, kind: WriteKind) -> Result<(), Fatal> {
+    fn require(&mut self, kind: WriteKind) -> Result<(), Fatal> {
+        if let Some(fatal) = self.txn.poison {
+            return Err(fatal);
+        }
         if self.txn.phase.permits(kind) {
             return Ok(());
         }
-        Err(self.phase_error(kind))
-    }
-
-    /// Classify a refused write: a write during Topo/Binding is the
-    /// `WriteDuringCompute` domain error, anything else is a phase violation.
-    fn phase_error(&self, kind: WriteKind) -> Fatal {
-        match self.txn.phase {
-            Phase::Topo | Phase::Binding => Fatal::WriteDuringCompute {
-                phase: self.txn.phase,
-            },
-            phase => Fatal::PhaseViolation(PhaseViolation {
-                phase,
-                attempted: kind,
-            }),
-        }
+        let violation = PhaseViolation {
+            phase: self.txn.phase,
+            attempted: kind,
+        };
+        self.txn.poison = Some(Fatal::PhaseViolation(violation));
+        Err(Fatal::PhaseViolation(violation))
     }
 
     /// Phase guard for a stager whose error channel is `ValueError`.
@@ -475,12 +486,49 @@ impl<'a> Tx<'a> {
         self.txn.force_phase(phase);
     }
 
+    /// Test-only: run a staged compute whose body reads its own node, which is
+    /// exactly the cycle a recursive memo would produce.
+    #[cfg(test)]
+    pub(crate) fn probe_cycle(&mut self) -> bool {
+        let node = self.nodes.store;
+        let revision = self.txn.staged_rev;
+        self.txn.graph.mark_dirty(node);
+        let previous = self.txn.phase;
+        self.txn.phase = Phase::Binding;
+        let outcome = {
+            let txn = &mut *self.txn;
+            self.graph
+                .compute_staged(node, &mut txn.graph, revision, |reader| {
+                    let _ = reader.read(node);
+                    Value::Count(0)
+                })
+        };
+        self.txn.phase = previous;
+        self.note_graph_error();
+        matches!(outcome, Err(crate::graph::GraphError::Cycle { .. }))
+    }
+
     fn require_staged(&mut self, kind: WriteKind) -> Result<(), ValueError> {
+        if self.txn.poison.is_some() {
+            return Err(ValueError::Aborted);
+        }
         if self.txn.phase.permits(kind) {
             return Ok(());
         }
-        self.txn.poisoned = true;
-        Err(ValueError::Fatal(self.phase_error(kind)))
+        let violation = PhaseViolation {
+            phase: self.txn.phase,
+            attempted: kind,
+        };
+        self.txn.poison = Some(Fatal::PhaseViolation(violation));
+        Err(ValueError::Phase(violation))
+    }
+
+    /// A cycle found during a staged compute is fatal: latch it so the
+    /// outermost exit returns `Fatal::GraphCycle` and discards the stage.
+    fn note_graph_error(&mut self) {
+        if let Some(node) = self.txn.graph.cycle() {
+            self.txn.poison = Some(Fatal::GraphCycle { node });
+        }
     }
 
     fn bump(&mut self) {
@@ -688,6 +736,7 @@ impl<'a> Tx<'a> {
                 })
         };
         self.txn.phase = previous;
+        self.note_graph_error();
 
         match outcome {
             Ok((Value::Rows(rows), recomputed)) => {
@@ -902,17 +951,19 @@ impl<'a> Tx<'a> {
                 depth: self.txn.depth,
             });
         }
+        if let Some(fatal) = self.txn.poison {
+            // A phase violation or a nested failure left the transaction
+            // poisoned. The frame body may still have returned `Ok`; the
+            // latched fatal is what the outermost exit returns, and it wins
+            // over the phase-order check (`ADR-0019` decision 6).
+            self.discard();
+            return Err(fatal);
+        }
         if self.txn.phase != Phase::Outside && self.txn.phase != Phase::Mark {
             return Err(Fatal::PhaseOrder {
                 expected: Phase::Mark,
                 found: self.txn.phase,
             });
-        }
-        if self.txn.poisoned {
-            // A nested level failed and the caller swallowed the error; the
-            // stage still cannot be published (`ADR-0017` decision 8).
-            self.discard();
-            return Err(Fatal::Aborted);
         }
 
         if let Err(fatal) = self.preflight() {
@@ -1156,6 +1207,12 @@ impl<'a> Tx<'a> {
         // (`SPEC-RT-050`, `SPEC-RT-054`).
         self.txn.phase = Phase::Cleanup;
         for owner in disposals {
+            // Test-only observation point: the phase and the *already
+            // published* view count at the moment cleanup runs.
+            #[cfg(test)]
+            self.txn
+                .cleanup_log
+                .push((owner, self.txn.phase, self.views.row_views().len()));
             self.owners.dispose(owner);
         }
         self.txn.phase = Phase::Commit;
@@ -1348,7 +1405,9 @@ impl<'a> Tx<'a> {
         self.txn.depth = self.txn.depth.saturating_sub(1);
         if result.is_err() {
             // No savepoints: the failure belongs to the whole transaction.
-            self.txn.poisoned = true;
+            // The frame body may still swallow the error, so the fatal is
+            // latched and returned by `commit` (`ADR-0019` decision 6).
+            self.txn.poison = Some(Fatal::Aborted);
         }
         result
     }

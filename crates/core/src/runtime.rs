@@ -169,14 +169,6 @@ impl Runtime {
         }
     }
 
-    /// Test-only: open a transaction in a forced phase so the write guard can
-    /// be exercised without reaching into the graph internals.
-    #[cfg(test)]
-    pub(crate) fn probe_tx_in_phase(&mut self, phase: crate::txn::Phase) -> Tx<'_> {
-        self.txn.force_phase(phase);
-        self.tx()
-    }
-
     fn tx(&mut self) -> Tx<'_> {
         Tx::new(
             &mut self.txn,
@@ -243,22 +235,53 @@ mod tests {
         assert_eq!(runtime.committed().len(), 1);
     }
 
-    /// `SPEC-GATE-A0-05`: writing from inside a compute stage returns
-    /// `Fatal::WriteDuringCompute`, and the runtime recovers on the next clean
-    /// frame. Removing the classification makes this test fail.
+    /// `SPEC-GATE-A0-05` + `ADR-0019`: a write inside a compute stage is a
+    /// typed `ValueError::Phase` at the call site, the frame is poisoned, and
+    /// the outermost exit returns the latched fatal. The next frame commits.
+    ///
+    /// Removing the latch (returning only the call-site error) makes the
+    /// frame-level assertions fail.
     #[test]
     fn a_write_during_compute_is_a_domain_error() {
-        use crate::txn::Phase;
+        use crate::txn::{Phase, PhaseViolation, ValueError, WriteKind};
 
         let mut runtime = Runtime::new();
-        {
-            let mut tx = runtime.probe_tx_in_phase(Phase::Topo);
-            let error = tx.insert("A").expect_err("write during Topo must fail");
+        let row = runtime.frame(|tx| tx.insert("A")).expect("insert");
+        let commits_before = runtime.txn().commits();
+
+        let result = runtime.frame(|tx| {
+            tx.force_phase(Phase::Topo);
+            let error = tx
+                .set_completed(row, true)
+                .expect_err("a write during Topo must fail");
             assert!(
-                matches!(error, Fatal::WriteDuringCompute { phase: Phase::Topo }),
-                "expected WriteDuringCompute, got {error:?}"
+                matches!(
+                    error,
+                    ValueError::Phase(PhaseViolation {
+                        phase: Phase::Topo,
+                        ..
+                    })
+                ),
+                "expected a typed phase error, got {error:?}"
             );
-        }
+            // A second write after poisoning reports the abort, not a phase.
+            assert!(matches!(
+                tx.set_completed(row, false),
+                Err(ValueError::Aborted)
+            ));
+            Ok(())
+        });
+
+        assert_eq!(
+            result,
+            Err(Fatal::PhaseViolation(PhaseViolation {
+                phase: Phase::Topo,
+                attempted: WriteKind::ModelWrite,
+            })),
+            "the frame must return the latched fatal"
+        );
+        assert_eq!(runtime.txn().commits(), commits_before, "nothing committed");
+        assert!(!runtime.committed().rows().next().unwrap().completed());
 
         // Recovery: the next frame starts Outside and commits.
         runtime
@@ -267,11 +290,14 @@ mod tests {
                 Ok(())
             })
             .expect("recovery frame");
-        assert_eq!(runtime.committed().titles().collect::<Vec<_>>(), vec!["B"]);
+        assert_eq!(
+            runtime.committed().titles().collect::<Vec<_>>(),
+            vec!["A", "B"]
+        );
     }
 
-    /// `SPEC-RT-038`: a model write outside the write phases is a typed domain
-    /// error, and the frame cannot publish afterwards.
+    /// `ADR-0019` decision 3: a write outside the write phases is a typed
+    /// value error that poisons the transaction, so the frame cannot publish.
     #[test]
     fn a_write_outside_the_write_phase_is_typed_and_never_commits() {
         use crate::txn::{Phase, ValueError};
@@ -284,13 +310,8 @@ mod tests {
             tx.force_phase(Phase::Binding);
             let error = tx.remove(row).expect_err("a Binding-phase write must fail");
             assert!(
-                matches!(
-                    error,
-                    ValueError::Fatal(Fatal::WriteDuringCompute {
-                        phase: Phase::Binding
-                    })
-                ),
-                "expected the write-during-compute domain error, got {error:?}"
+                matches!(error, ValueError::Phase(_)),
+                "expected a typed phase error, got {error:?}"
             );
             Ok(())
         });
@@ -303,8 +324,8 @@ mod tests {
         assert_eq!(runtime.committed().len(), 1, "the row survives");
     }
 
-    /// `SPEC-RT-038`: a write outside every write phase returns a typed
-    /// `PhaseViolation`, never a panic (the release-build requirement).
+    /// `SPEC-RT-038`: a write in a closed phase returns a typed error, never a
+    /// panic (the release-build requirement).
     #[test]
     fn a_write_in_a_closed_phase_is_a_typed_error_not_a_panic() {
         use crate::txn::{Phase, ValueError};
@@ -318,7 +339,7 @@ mod tests {
                 .set_completed(row, true)
                 .expect_err("a Commit-phase write must fail");
             assert!(
-                matches!(error, ValueError::Fatal(Fatal::PhaseViolation(_))),
+                matches!(error, ValueError::Phase(_)),
                 "expected PhaseViolation, got {error:?}"
             );
             Ok(())
@@ -327,6 +348,128 @@ mod tests {
         assert!(result.is_err(), "the frame must not publish");
         assert_eq!(runtime.committed().len(), 1);
         assert!(!runtime.committed().rows().next().unwrap().completed());
+    }
+
+    /// `SPEC-RT-038` + `ADR-0019`: a memo cycle surfaces as
+    /// `Fatal::GraphCycle`, discards the stage, and the next frame is clean.
+    #[test]
+    fn a_memo_cycle_is_fatal_and_recoverable() {
+        let mut runtime = Runtime::new();
+        let commits_before = runtime.txn().commits();
+
+        let result = runtime.frame(|tx| {
+            tx.insert("A")?;
+            assert!(tx.probe_cycle(), "the probe must observe a cycle");
+            Ok(())
+        });
+
+        assert!(
+            matches!(result, Err(Fatal::GraphCycle { .. })),
+            "expected GraphCycle, got {result:?}"
+        );
+        assert_eq!(runtime.txn().commits(), commits_before);
+        assert_eq!(runtime.committed().len(), 0, "the stage was discarded");
+
+        runtime
+            .frame(|tx| {
+                tx.insert("B")?;
+                Ok(())
+            })
+            .expect("recovery frame");
+        assert_eq!(runtime.committed().titles().collect::<Vec<_>>(), vec!["B"]);
+    }
+
+    /// `SPEC-RT-050` / `SPEC-RT-054`: owner cleanup runs after the swap, in
+    /// the Cleanup stage, so a callback observes the published tree. Moving
+    /// `dispose` back into Commit makes the phase assertion fail.
+    #[test]
+    fn owner_cleanup_runs_after_the_swap_in_the_cleanup_stage() {
+        use crate::txn::Phase;
+
+        let mut runtime = Runtime::new();
+        runtime
+            .frame(|tx| {
+                tx.insert("A")?;
+                tx.insert("B")?;
+                Ok(())
+            })
+            .expect("seed");
+        let keys: Vec<_> = runtime.committed().keys().collect();
+
+        let views = runtime
+            .frame(|tx| {
+                let mut mounted = Vec::new();
+                for key in &keys {
+                    mounted.push(tx.mount_row(*key, 1)?);
+                }
+                tx.reorder_views(&mounted)?;
+                Ok(mounted)
+            })
+            .expect("mount");
+
+        runtime
+            .frame(|tx| {
+                tx.unmount(views[0])?;
+                Ok(())
+            })
+            .expect("unmount");
+
+        let log = runtime.txn().cleanup_log();
+        assert_eq!(log.len(), 1, "exactly one owner was released");
+        let (_, phase, visible_at_cleanup) = log[0];
+        assert_eq!(phase, Phase::Cleanup, "cleanup must run in its own stage");
+        assert_eq!(
+            visible_at_cleanup, 1,
+            "the surviving view is already published when cleanup runs"
+        );
+    }
+
+    /// `SPEC-RT-021.5` / `ADR-0019`: a view write requested during Cleanup is
+    /// refused with a typed error rather than silently applied; the next frame
+    /// can stage it normally. Owner cleanups are `'static` closures with no
+    /// access to `Tx`, so this guard is what keeps them out of the tree.
+    #[test]
+    fn a_view_write_in_cleanup_is_rejected_and_the_next_frame_succeeds() {
+        use crate::txn::{Phase, PhaseViolation};
+
+        let mut runtime = Runtime::new();
+        let row = runtime.frame(|tx| tx.insert("A")).expect("insert");
+        let key = runtime.committed().keys().next().unwrap();
+        let view = runtime
+            .frame(|tx| {
+                let view = tx.mount_row(key, 1)?;
+                tx.reorder_views(&[view])?;
+                Ok(view)
+            })
+            .expect("mount");
+
+        let result = runtime.frame(|tx| {
+            tx.force_phase(Phase::Cleanup);
+            let error = tx.unmount(view).expect_err("cleanup cannot unmount");
+            assert!(
+                matches!(
+                    error,
+                    Fatal::PhaseViolation(PhaseViolation {
+                        phase: Phase::Cleanup,
+                        ..
+                    })
+                ),
+                "expected a typed phase error, got {error:?}"
+            );
+            Ok(())
+        });
+        assert!(result.is_err(), "the poisoned frame must not publish");
+        assert_eq!(runtime.row_views().len(), 1, "the view is still mounted");
+        let _ = row;
+
+        // The next frame is clean and can stage the same operation.
+        runtime
+            .frame(|tx| {
+                tx.unmount(view)?;
+                Ok(())
+            })
+            .expect("next frame unmounts");
+        assert_eq!(runtime.row_views().len(), 0);
     }
 
     #[test]
