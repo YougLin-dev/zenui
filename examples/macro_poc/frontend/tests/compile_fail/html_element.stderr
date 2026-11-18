@@ -1,0 +1,5 @@
+error: probe accepts only native view/text/button
+ --> tests/compile_fail/html_element.rs:4:22
+  |
+4 |     let _ = view! { <html-dom-body /> };
+  |                      ^^^^^^^^^^^^^

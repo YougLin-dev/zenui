@@ -1,0 +1,20 @@
+[package]
+name = "zenui-macro-facade"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+zenui-macro-processor = { path = "../macro" }
+zenui-macro-runtime = { path = "../runtime" }
+
+[[test]]
+name = "integration"
+path = "tests.rs"
+
+[dev-dependencies]
+trybuild = "1.0"
+
+[[test]]
+name = "compile_fail"
+path = "tests/compile_fail.rs"
