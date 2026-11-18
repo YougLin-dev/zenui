@@ -554,6 +554,125 @@
       "commit": "f7a2d62eebae548650664f104bfb6bea1be427bb",
       "proves": "本机全 workspace 零 clippy 警告；同轮 cargo fmt --all -- --check 通过",
       "doesNotProve": "不是 CI 日志；SPEC-GATE-C-04 仍缺 CI 记录"
+    },
+    {
+      "id": "EVID-VAL-33",
+      "class": "A",
+      "host": "H2",
+      "kind": "test",
+      "command": "cargo test -p zenui-core --test queries --locked",
+      "exit": 0,
+      "commit": "7d78cdcd08a5720af795d827b093099d2abaf19f",
+      "tests": {
+        "passed": 7,
+        "failed": 0,
+        "ignored": 0
+      },
+      "proves": "A0-07/A0-08 在重写后的夹具上成立：计数只由缓存内部路径推进；空结果 0 build / 0 materialize / 0 visit（含帧内暂存态）；reorder 通过 order revision 使旧顺序失效；帧内的暂存插入与删除被查询路径看到。四条 mutation 逐一判红：删掉空态短路 3 条红，live_counts 忽略 journal 2 条红，缓存键去掉 order revision 1 条红，Tx::rows 绕过缓存 6 条红",
+      "doesNotProve": "不证明 Graph 侧另有一个 Memo<RowSet>（本轮按设计移除：行集 memo 就是缓存槽）；不含真实布局/渲染；计数是执行期观测，不是复杂度证明"
+    },
+    {
+      "id": "EVID-VAL-34",
+      "class": "A",
+      "host": "H2",
+      "kind": "test",
+      "command": "cargo test -p zenui-core --test lifecycle --locked",
+      "exit": 0,
+      "commit": "7d78cdcd08a5720af795d827b093099d2abaf19f",
+      "tests": {
+        "passed": 9,
+        "failed": 0,
+        "ignored": 0
+      },
+      "proves": "A0-09/10/11 与 A0-02 在生命周期夹具上成立：同帧重复 mount 被拒且不产生 patch；reorder 按未排序顺序比对身份且 mounts/unmounts 差为 0；删除/批量 Clear 只结算一次（caret_ops 钉住）；用户显式 focus 与 clear_focus 都取消 intent；1200 次交错操作回到基线。三条 mutation 判红：忽略 user_focused 1 条红，结算块跑两次 2 条红，view reorder 置空 7 条红",
+      "doesNotProve": "A0-10 的 fallback 只实现 next → previous，可聚焦 input 与 toolbar 在 A0 不存在（A1 节点）；churn 是确定性脚本，不是随机压力；批量 Clear 在\"所有候选都被清除\"这一形态下二次结算不可观测，故另有一条保留存活兄弟的夹具"
+    },
+    {
+      "id": "EVID-VAL-35",
+      "class": "A",
+      "host": "H2",
+      "kind": "test",
+      "command": "cargo test -p zenui-core --test regressions --locked",
+      "exit": 0,
+      "commit": "7d78cdcd08a5720af795d827b093099d2abaf19f",
+      "tests": {
+        "passed": 12,
+        "failed": 0,
+        "ignored": 0
+      },
+      "proves": "丢弃帧不会把它的行集留在缓存里：缓存键是修订号，回滚从不安装那些修订号；去掉 discard 里的 invalidate 后本条判红",
+      "doesNotProve": "只覆盖\"重排后丢弃\"这一条修订号复用路径，不构成缓存一致性的形式证明"
+    },
+    {
+      "id": "EVID-VAL-36",
+      "class": "A",
+      "host": "H2",
+      "kind": "test",
+      "command": "cargo test -p zenui-app --locked",
+      "exit": 0,
+      "commit": "7d78cdcd08a5720af795d827b093099d2abaf19f",
+      "tests": {
+        "passed": 10,
+        "failed": 0,
+        "ignored": 0
+      },
+      "proves": "A0-02/A0-07 在真实 mount 执行器上成立：render 每新挂载一行恰好一次 owned 读，已存在的视图不重读不重挂；绑定 filter 不额外克隆标题（string_clones 只来自 mount 读取）。把 read_once 换成借读后本条判红",
+      "doesNotProve": "不覆盖 mount 取消分支（单线程帧内无法构造读失败而不改产品代码）；不含窗口/GPU"
+    },
+    {
+      "id": "EVID-VAL-37",
+      "class": "A",
+      "host": "H2",
+      "kind": "test",
+      "command": "cargo test -p zenui-core --locked",
+      "exit": 0,
+      "commit": "7d78cdcd08a5720af795d827b093099d2abaf19f",
+      "tests": {
+        "passed": 99,
+        "failed": 0,
+        "ignored": 0
+      },
+      "proves": "zenui-core 全量：lib 57 + gates 6 + lifecycle 9 + queries 7 + regressions 12 + 8 条 compile_fail doctest",
+      "doesNotProve": "8 条 doctest 仍是 compile_fail：只要求\"编译失败\"，不校验错误码——用 rustdoc 实测，正文写成未定义符号也通过（见 §14）。因此 E0204/E0599 并未被这两条钉住，trybuild 待 ADR-0021"
+    },
+    {
+      "id": "EVID-VAL-38",
+      "class": "A",
+      "host": "H2",
+      "kind": "test",
+      "command": "cargo test --workspace --locked",
+      "exit": 0,
+      "commit": "7d78cdcd08a5720af795d827b093099d2abaf19f",
+      "tests": {
+        "passed": 109,
+        "failed": 0,
+        "ignored": 0
+      },
+      "proves": "整个 workspace 109 passed（core 99 + app 10），三个测试二进制与两条 app 集成测试全部通过",
+      "doesNotProve": "不是 CI 日志；三个平台的矩阵由 EVID-VAL-22 记录，本轮未重跑 CI"
+    },
+    {
+      "id": "EVID-VAL-39",
+      "class": "A",
+      "host": "H2",
+      "kind": "runtime",
+      "command": "cargo run -p zenui-app --example todolist_headless --locked",
+      "exit": 0,
+      "commit": "7d78cdcd08a5720af795d827b093099d2abaf19f",
+      "traceSha256": "57a4a142999537ddcd0fe4778d5f3604a91a77e664e0a926492f5cc002b0857e",
+      "proves": "接线后的 trace：与 EVID-VAL-31 的差异仅为三处可解释项——三只行集 memo 消失（edges 3/4 → 2、memo_recomputes 22 → 14），step 03 的 query_evals/id_materializations 由 1/1 变 0/0（completed 写不可能移动 All，缓存现在知道这一点）。9 步场景的 state 行逐字未变",
+      "doesNotProve": "trace 不携带 cache_builds/row_visits；不证明任何 UI 行为"
+    },
+    {
+      "id": "EVID-VAL-40",
+      "class": "A",
+      "host": "H2",
+      "kind": "lint",
+      "command": "cargo clippy --workspace --all-targets --locked -- -D warnings",
+      "exit": 0,
+      "commit": "7d78cdcd08a5720af795d827b093099d2abaf19f",
+      "proves": "本机全 workspace 零 clippy 警告；同轮 cargo fmt --all -- --check 通过",
+      "doesNotProve": "不是 CI 日志；SPEC-GATE-C-04 仍缺 CI 记录"
     }
   ],
   "contracts": [
@@ -722,15 +841,15 @@
     "note": "PROBE 项为 SPEC-GATE-B-05（3 条 style 探针，无 manifest/provenance）与 SPEC-GATE-A0-01/-03/-04/-05/-06（EVID-VAL-20…-24、-27 的 gate 夹具与 trace）。total 为 42 是巧合，不代表任何覆盖率百分比。"
   },
   "counts": {
-    "testsPassedH2": 246,
+    "testsPassedH2": 492,
     "testsPassedCi": 120,
     "compileFailFixturesH2": 17,
     "zeroTestTargetsH2": [
       "root package zenui"
     ],
     "gpuBackendsObserved": 2,
-    "runsTotal": 32,
-    "runsReproducibleHere": 20,
+    "runsTotal": 40,
+    "runsReproducibleHere": 28,
     "runsTranscribedOrExternal": 11,
     "runsOnCi": 1
   },

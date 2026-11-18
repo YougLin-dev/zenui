@@ -83,7 +83,7 @@ replaces: [research/README.md, review/README.md]
 | 平台后端（Windows/macOS/Linux） | [spec/07-platform/index.md](spec/07-platform/index.md) | 各平台工程师 | 三平台均无真机证据，槽位全 `OPEN` |
 | 验收 Gate A0–D | [spec/08-gates.md](spec/08-gates.md) | 测试与 CI/发布负责人 | 42 条判据中 0 `VERIFIED`、6 `PROBE`、36 `OPEN`（`EVID-MATRIX`） |
 | 事实断言（某句到底算不算数） | [evidence/claim-register.md](evidence/claim-register.md) | 顶级研究员 | 100 条 `CLAIM-*`，逐条带状态与证据 |
-| 真实执行记录与复跑命令 | [evidence/validation.md](evidence/validation.md)、[evidence/index.md](evidence/index.md) | 测试与 CI/发布负责人 | `EVID-VAL-01…32` |
+| 真实执行记录与复跑命令 | [evidence/validation.md](evidence/validation.md)、[evidence/index.md](evidence/index.md) | 测试与 CI/发布负责人 | `EVID-VAL-01…40` |
 | 探针能证明什么、不能证明什么 | [evidence/probes.md](evidence/probes.md) | 测试与 CI/发布负责人 | `EVID-PROBE-01…05`，每条含证伪边界 |
 | 产品定位与版本路线 | [product/positioning.md](product/positioning.md)、[product/roadmap.md](product/roadmap.md) | 框架产品经理 | 路线 `M0–M4` ↔ Gate `A0/A1/B/C/D` |
 | 历史结论与已撤销方案 | [archive/README.md](archive/README.md) | Crew 队长（架构） | 只读；`§3` 权威替代表、`§4` 已知过期物 |
@@ -191,7 +191,7 @@ docs/
 | 层 | 文件 | 规模 | 状态 |
 |---|---|---|---|
 | 规范 | `spec/` 12 篇（含 `07-platform/` 4 篇） | `SPEC-SCOPE/ROUTE/RT/MACRO/STYLE/TEXT/RENDER/PLAT/GATE` | `normative`（2026-11-18 整体冻结为现行规范） |
-| 证据 | `evidence/` 5 篇 | `EVID-VAL-01…32`、`EVID-PROBE-01…05`、`EVID-MATRIX` | `normative` |
+| 证据 | `evidence/` 5 篇 | `EVID-VAL-01…40`、`EVID-PROBE-01…05`、`EVID-MATRIX` | `normative` |
 | 事实台账 | `evidence/claim-register.md` | 100 条 `CLAIM-*` | `draft` |
 | 决策 | `decisions/` 21 个文件 | `ADR-0001…0020` + `index.md` | `normative` |
 | 产品 | `product/` 2 篇 | 定位、路线（M0–M4 ↔ A0/A1/B/C/D） | `draft` |
