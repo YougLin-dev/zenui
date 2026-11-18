@@ -156,7 +156,11 @@ impl TodoApp {
     }
 
     pub fn row_by_title(&self, title: &str) -> Option<(RowKey, RowId)> {
-        let row = self.runtime.store().rows().find(|row| row.title() == title)?;
+        let row = self
+            .runtime
+            .store()
+            .rows()
+            .find(|row| row.title() == title)?;
         let key = row.key();
         Some((key, self.runtime.store().handle_for(key)?))
     }
@@ -242,7 +246,10 @@ impl TodoApp {
         let store_node = self.nodes.store;
         let node = self.nodes.remaining;
         let Self {
-            graph, runtime, sink, ..
+            graph,
+            runtime,
+            sink,
+            ..
         } = self;
         let store = runtime.store();
         match graph.compute(node, |reader| {
@@ -265,7 +272,10 @@ impl TodoApp {
         let store_node = self.nodes.store;
         let node = self.nodes.has_completed;
         let Self {
-            graph, runtime, sink, ..
+            graph,
+            runtime,
+            sink,
+            ..
         } = self;
         let store = runtime.store();
         match graph.compute(node, |reader| {

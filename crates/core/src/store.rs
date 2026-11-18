@@ -292,6 +292,11 @@ impl Store {
         self.completed > 0
     }
 
+    /// Identity of the runtime that owns this store.
+    pub const fn runtime_id(&self) -> RuntimeId {
+        self.runtime
+    }
+
     pub const fn epoch(&self) -> u64 {
         self.epoch
     }

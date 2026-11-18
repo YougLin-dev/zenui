@@ -66,3 +66,17 @@ impl fmt::Debug for Runtime {
             .finish()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn each_runtime_mints_its_own_id() {
+        let a = Runtime::new();
+        let b = Runtime::new();
+        assert_ne!(a.id(), b.id());
+        // The store is bound to the runtime that built it.
+        assert_eq!(a.store().runtime_id(), a.id());
+    }
+}
