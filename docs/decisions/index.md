@@ -59,6 +59,7 @@ replaces: []
 | [ADR-0016](adr-0016-release-order.md) | 释放顺序：Owner 后序（子先父）+ 同 owner 逆注册 LIFO；dispose 幂等；cleanup 中禁止 mount/batch/flush | `SPEC-RT-021`、`-022`、`-052` | normative |
 | [ADR-0017](adr-0017-p2-runtime-authority-and-transaction-shape.md) | P2 形状：解析权归权威、值暂存 + 发布屏障、`RuntimeId` 归属与脱敏、A0-06 用 core 内零依赖 `LayoutMap` | `SPEC-RT-002`、`-005`、`-006`、`-033`、`-038`、`-050`…`-053`；`SPEC-GATE-A0-03`、`-06` | normative |
 | [ADR-0018](adr-0018-docs-language-scope.md) | 语言分工：分支/commit/PR/代码/标识符一律英文；`docs/` 正文沿用中文；一个文件一种语言；不就地翻译冻结层 | 无（约束文档与产物的语言，不改写 `SPEC-*` 要求） | normative |
+| [ADR-0019](adr-0019-failure-classification-and-phase-typing.md) | 失败按检测点分类；写 API 阶段违规返回值错误并毒化事务；commit 阶段违规返回致命错误 | `SPEC-RT-038`、`-053`、`-057`；`SPEC-GATE-A0-04`、`-05`、`-06` | normative |
 
 ## 3. 每条的固定结构
 
@@ -79,6 +80,7 @@ replaces: []
 | 2026-11-18 队长裁决 D-01…D-06 | 0012、0013、0014（0010 同步） | 证据状态词、归档只读、Gate 唯一化、baseline 硬判据 |
 | 渲染线三处归属切分（队长裁决） | 0015 | 生命周期 / 声明形态 / caret 单位的唯一 owner |
 | 2026-11-18 P2 形状评审（API 设计 → 队长采纳） | 0017 | 解析权、事务机制、`RuntimeId` 归属、A0-06 `LayoutMap` |
+| 2026-11-18 P2 失败分类裁决（队长） | 0019 | 检测点规则、阶段违规的值通道与毒化 |
 | `docs/README.md` 四层治理契约 | 0011 | 文档层的唯一入口与状态词表 |
 
 ## 5. 维护规则

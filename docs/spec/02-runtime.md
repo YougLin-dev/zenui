@@ -351,6 +351,7 @@ struct MountPlan {
 - **强度**：MUST
 - **要求**：只有事件与业务命令可以写 Signal/Store。Memo、binding、measure、layout 阶段的写 MUST 被判定为领域错误（`WriteDuringCompute`、memo cycle、phase violation）并以 typed 错误返回；MUST NOT 让 `RefCell` borrow 文案泄漏给用户，MUST NOT panic。运行时的内部 privileged 更新路径 MUST 与用户写权限分离。
 - **澄清**：本条的「事件与业务命令」等于 `SPEC-RT-050` 阶段表中的 `Outside`；`Mark` 允许暂存写，其余阶段对用户代码只读。`SPEC-RT-021.5` 允许 cleanup 向事务 journal 写入删除意图，但不构成对 Signal/Store 的写许可（[ADR-0017](../decisions/adr-0017-p2-runtime-authority-and-transaction-shape.md)）。
+- **澄清**：阶段违规的写 API 返回值是值错误（`ValueError::Phase`），但它**毒化**事务：帧不得提交，最外层返回对应的致命错误，下一帧可恢复；`commit` 阶段的违规直接返回致命错误。类型与致命性的这处错位由 [ADR-0019](../decisions/adr-0019-failure-classification-and-phase-typing.md) 记录。
 - **失败模式**：布局测量中写 → 无限重排；用户看到 `already borrowed: BorrowMutError` 而非可执行的领域错误。
 - **来源**：FINAL §3.1；`runtime-and-rendering.md` §2。
 
@@ -470,7 +471,8 @@ Derived    layout scratch → GeometrySnapshot → retained paint → present（
 
 - **状态**：SPEC
 - **强度**：MUST NOT
-- **要求**：任一 preflight 失败（duplicate key、`InvalidGeneration`、`InvalidHandle`、read failure、phase violation）MUST 丢弃本事务的全部 model/derived scratch 与 View journal。pending snapshot、geometry epoch、focus pointer、ID 映射 MUST 与上一已提交状态**完全一致**；MUST NOT 只回滚一部分。
+- **要求**：任一**在 preflight 阶段检测到的**失败（duplicate key、`InvalidGeneration`、`InvalidHandle`、read failure、phase violation）MUST 丢弃本事务的全部 model/derived scratch 与 View journal。pending snapshot、geometry epoch、focus pointer、ID 映射 MUST 与上一已提交状态**完全一致**；MUST NOT 只回滚一部分。
+- **澄清**：括号里的条目描述**检测点**，不是错误类别。写 API 在操作进入 journal 之前拒绝的输入（坏 handle、非排列的 reorder 参数、未知 key）是值错误：操作从未暂存，错误进 `SPEC-RT-057` 的 sink，帧继续提交。只有 preflight 读取 journal 与权威状态时发现的不一致才触发本条的整帧丢弃（[ADR-0019](../decisions/adr-0019-failure-classification-and-phase-typing.md)）。
 - **澄清**：上面「完全一致」的比较集只含权威状态——模型内容与顺序、视图节点与顺序、pending snapshot、geometry epoch、focus pointer、caret、`ViewId → LayoutNodeId` 映射、视图与 owner 的 id 高水位、live owner 集合。单调诊断计数器（`io_reads`、`string_clones`、`query_evals`、`id_materializations`、`memo_recomputes`）不在比较集内，失败事务中的读遥测可以前进；`io_writes` 与 `commits` 只在提交时推进，失败事务不推进（[ADR-0017](../decisions/adr-0017-p2-runtime-authority-and-transaction-shape.md)）。
 - **失败模式**：失败后残留半更新的 focus pointer → 下一次点击命中“幽灵”节点；ID 映射残留 → 布局访问已释放节点。
 - **来源**：FINAL §3.2 / §9 A0。
