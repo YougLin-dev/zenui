@@ -115,7 +115,16 @@ impl QueryCache {
     /// The first consumer of an epoch pays one evaluation and one
     /// materialization; later consumers share the same `Arc<[RowKey]>`.
     pub fn rows(&mut self, store: &Store, filter: Filter) -> RowSet {
-        if self.epoch == Some(store.epoch())
+        self.rows_at(store, filter, store.epoch())
+    }
+
+    /// Rows keyed on an explicit revision.
+    ///
+    /// Inside a frame the caller passes the monotonic staged revision rather
+    /// than the committed epoch: keying on `epoch` would serve the previous
+    /// frame's cache while uncommitted writes are still visible.
+    pub fn rows_at(&mut self, store: &Store, filter: Filter, revision: u64) -> RowSet {
+        if self.epoch == Some(revision)
             && self.filter == filter
             && let Some(cached) = &self.cached
         {
@@ -131,9 +140,22 @@ impl QueryCache {
             .collect();
         let rows = RowSet::from_keys(keys);
         self.filter = filter;
-        self.epoch = Some(store.epoch());
+        self.epoch = Some(revision);
         self.cached = Some(rows.clone());
         rows
+    }
+
+    /// Account an evaluation the caller performed against a staged overlay.
+    pub(crate) fn note_eval(&mut self) {
+        self.evals += 1;
+        self.materializations += 1;
+    }
+
+    /// Drop the cached snapshot. The cache is not authority, so a rolled-back
+    /// frame only has to forget it.
+    pub fn invalidate(&mut self) {
+        self.epoch = None;
+        self.cached = None;
     }
 
     /// True when a cached set exists for exactly this epoch and filter.

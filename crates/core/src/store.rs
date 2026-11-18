@@ -8,7 +8,7 @@ use std::collections::BTreeSet;
 use std::fmt;
 
 use crate::arena::Slots;
-use crate::handle::{Handle, HandleError, InvalidHandle, RowKey, RuntimeId, SlotIndex};
+use crate::handle::{Generation, Handle, HandleError, InvalidHandle, RowKey, RuntimeId, SlotIndex};
 use crate::metrics::Counters;
 
 /// Generation-checked handle to one store row (`SPEC-RT-005`).
@@ -115,7 +115,8 @@ impl Store {
             title: title.into(),
             completed: false,
         };
-        let (slot, generation) = self.rows.alloc(row);
+        let (slot, generation) = self.rows.reserve();
+        assert!(self.rows.fill(slot, row), "fresh reservation must be empty");
         self.order.push(slot);
         self.record_write();
         Handle::new(self.runtime, slot, generation)
@@ -239,6 +240,100 @@ impl Store {
         self.io_reads += 1;
         self.string_clones += 1;
         Ok(title)
+    }
+
+    // ---- transaction support (`pub(crate)`, `SPEC-RT-051`) ----
+
+    /// Reserve a slot for a row that a transaction is about to insert.
+    pub(crate) fn reserve_slot(&mut self) -> (SlotIndex, Generation) {
+        self.rows.reserve()
+    }
+
+    /// Fill a reserved slot at commit. Returns false if the reservation was lost.
+    pub(crate) fn fill_reserved(
+        &mut self,
+        slot: SlotIndex,
+        key: RowKey,
+        title: String,
+        completed: bool,
+    ) -> bool {
+        self.rows.fill(
+            slot,
+            Row {
+                key,
+                title,
+                completed,
+            },
+        )
+    }
+
+    /// Drop a reservation and burn its generation (`SPEC-RT-053`).
+    pub(crate) fn release_reserved(&mut self, slot: SlotIndex) {
+        self.rows.release(slot);
+    }
+
+    /// Slot lookup that does not depend on the order vector, so it works while
+    /// a commit is filling freshly reserved slots.
+    pub(crate) fn slot_for(&self, key: RowKey) -> Option<(SlotIndex, Generation)> {
+        let slot = self.rows.find(|row| row.key() == key)?;
+        Some((slot, self.rows.generation(slot)?))
+    }
+
+    /// Apply a committed field update. Never fails: the caller preflighted.
+    pub(crate) fn apply_set(
+        &mut self,
+        slot: SlotIndex,
+        title: Option<&str>,
+        completed: Option<bool>,
+    ) -> Option<(bool, bool)> {
+        let row = self.rows.get_mut(slot, self.rows.generation(slot)?).ok()?;
+        let (changed_title, changed_completed) =
+            (title.is_some(), completed == Some(!row.completed));
+        if let Some(title) = title {
+            row.title = title.to_owned();
+        }
+        if let Some(completed) = completed {
+            row.completed = completed;
+        }
+        Some((changed_title, changed_completed))
+    }
+
+    pub(crate) fn apply_remove(&mut self, slot: SlotIndex) -> bool {
+        self.rows.free(slot).is_some()
+    }
+
+    pub(crate) fn apply_order(&mut self, order: Vec<SlotIndex>) {
+        self.order = order;
+    }
+
+    /// Write the committed counters computed by the draft.
+    pub(crate) fn apply_counters(&mut self, completed: usize, epoch: u64, io_writes: u64) {
+        self.completed = completed;
+        self.epoch = epoch;
+        self.io_writes = io_writes;
+    }
+
+    pub(crate) fn key_of(&self, row: Handle<Row>) -> Option<RowKey> {
+        self.entry(row).ok().map(Row::key)
+    }
+
+    pub(crate) fn completed_of(&self, row: Handle<Row>) -> Result<bool, InvalidHandle> {
+        Ok(self.entry(row)?.completed())
+    }
+
+    /// Count one owned title read. Staged rows do not live in the slot table,
+    /// so the transaction has to account for their reads here.
+    pub(crate) fn note_read(&mut self) {
+        self.io_reads += 1;
+        self.string_clones += 1;
+    }
+
+    pub(crate) const fn next_key(&self) -> u64 {
+        self.next_key
+    }
+
+    pub(crate) const fn set_next_key(&mut self, next: u64) {
+        self.next_key = next;
     }
 
     /// Resolve a stable key back to a live handle.

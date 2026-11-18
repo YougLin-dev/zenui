@@ -83,6 +83,36 @@ impl OwnerTree {
         self.root
     }
 
+    pub(crate) const fn set_next(&mut self, next: u32) {
+        self.next = next;
+    }
+
+    pub(crate) const fn next_id(&self) -> u32 {
+        self.next
+    }
+
+    /// Insert a scope whose id was reserved by a transaction draft.
+    pub(crate) fn insert_staged(&mut self, id: OwnerId, parent: OwnerId) -> bool {
+        if self.nodes.contains_key(&id) || !self.nodes.contains_key(&parent) {
+            return false;
+        }
+        self.nodes.insert(
+            id,
+            OwnerNode {
+                parent: Some(parent),
+                children: Vec::new(),
+                cleanups: Vec::new(),
+                disposed: false,
+                disposing: false,
+            },
+        );
+        if let Some(parent_node) = self.nodes.get_mut(&parent) {
+            parent_node.children.push(id);
+        }
+        self.live += 1;
+        true
+    }
+
     pub fn child_of(&mut self, parent: OwnerId) -> Result<OwnerId, OwnerError> {
         let Some(node) = self.nodes.get(&parent) else {
             return Err(OwnerError::UnknownOwner(parent));

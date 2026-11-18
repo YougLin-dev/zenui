@@ -16,7 +16,6 @@ use std::fmt;
 
 use crate::metrics::Counters;
 use crate::query::RowSet;
-use crate::transaction::TransactionState;
 
 /// Dense internal index of a graph node. Not an identity domain: it is never
 /// exposed outside the runtime and never printed in a trace.
@@ -80,6 +79,7 @@ struct Node {
 pub struct DepReader<'a> {
     values: &'a [Option<Value>],
     nodes: &'a [Node],
+    scratch: Option<&'a GraphScratch>,
     deps: Vec<NodeId>,
 }
 
@@ -88,6 +88,7 @@ impl<'a> DepReader<'a> {
     /// carry no value yet, but still records the dependency.
     pub fn read(&mut self, node: NodeId) -> Option<&'a Value> {
         let values = self.values;
+        let scratch = self.scratch;
         let index = node as usize;
         if index >= values.len() {
             return None;
@@ -95,17 +96,50 @@ impl<'a> DepReader<'a> {
         if !self.deps.contains(&node) {
             self.deps.push(node);
         }
-        values[index].as_ref()
+        match scratch {
+            // Staged writes shadow committed ones for the length of the frame.
+            Some(scratch) => scratch.values.get(&node).or(values[index].as_ref()),
+            None => values[index].as_ref(),
+        }
     }
 
     pub fn is_dirty(&self, node: NodeId) -> bool {
-        self.nodes
-            .get(node as usize)
-            .is_some_and(|state| state.dirty)
+        let staged = self
+            .scratch
+            .is_some_and(|scratch| scratch.dirty.contains(&node));
+        staged
+            || self
+                .nodes
+                .get(node as usize)
+                .is_some_and(|state| state.dirty)
     }
 
     pub fn deps(&self) -> &[NodeId] {
         &self.deps
+    }
+}
+
+/// Memo writes staged for one frame (`SPEC-RT-051`).
+///
+/// Nothing here touches the committed graph: dropping the scratch is the
+/// rollback, so a failed frame leaves revisions, values and dependency sets
+/// exactly as they were.
+#[derive(Debug, Default)]
+pub(crate) struct GraphScratch {
+    values: BTreeMap<NodeId, Value>,
+    revisions: BTreeMap<NodeId, u64>,
+    /// node -> dependency revisions observed at compute time
+    observed: BTreeMap<NodeId, BTreeMap<NodeId, u64>>,
+    /// node -> the `staged_rev` at which it was computed
+    observed_at: BTreeMap<NodeId, u64>,
+    /// node -> staged revision for sources and memos
+    source_rev: BTreeMap<NodeId, u64>,
+    dirty: BTreeSet<NodeId>,
+}
+
+impl GraphScratch {
+    pub(crate) fn new() -> Self {
+        Self::default()
     }
 }
 
@@ -121,7 +155,6 @@ pub struct MemoGraph {
     /// memo whose dependencies all still carry these revisions can serve its
     /// cached value instead of recomputing (`SPEC-RT-032` suppression).
     observed: Vec<BTreeMap<NodeId, u64>>,
-    tx: TransactionState,
     memo_recomputes: u64,
 }
 
@@ -133,7 +166,6 @@ impl MemoGraph {
             forward: BTreeMap::new(),
             reverse: BTreeMap::new(),
             observed: Vec::new(),
-            tx: TransactionState::new(),
             memo_recomputes: 0,
         }
     }
@@ -170,7 +202,6 @@ impl MemoGraph {
             state.revision += 1;
         }
         self.mark_dependents(node);
-        self.tx.note_dirty(node);
     }
 
     /// Recompute `node` if dirty; otherwise return the cached value.
@@ -210,6 +241,7 @@ impl MemoGraph {
             let mut reader = DepReader {
                 values: &self.values,
                 nodes: &self.nodes,
+                scratch: None,
                 deps: Vec::new(),
             };
             let value = f(&mut reader);
@@ -252,32 +284,181 @@ impl MemoGraph {
         self.forward.values().filter(|set| !set.is_empty()).count()
     }
 
-    pub fn begin_batch(&mut self) {
-        self.tx.begin();
-    }
-
-    pub fn end_batch(&mut self) -> Option<Vec<NodeId>> {
-        self.tx.end()
-    }
-
-    pub fn commits(&self) -> u64 {
-        self.tx.commits()
-    }
-
-    pub fn transaction_depth(&self) -> u32 {
-        self.tx.depth()
-    }
-
-    /// True while a frame transaction is open.
-    pub fn in_transaction(&self) -> bool {
-        self.tx.is_open()
-    }
-
     pub fn counters(&self) -> Counters {
         Counters {
             memo_recomputes: self.memo_recomputes,
-            commits: self.tx.commits(),
             ..Counters::default()
+        }
+    }
+
+    // ---- staged writes for a frame transaction (`SPEC-RT-051`) ----
+
+    pub(crate) fn effective_revision(&self, scratch: &GraphScratch, node: NodeId) -> u64 {
+        scratch
+            .source_rev
+            .get(&node)
+            .copied()
+            .or_else(|| scratch.revisions.get(&node).copied())
+            .unwrap_or_else(|| {
+                self.nodes
+                    .get(node as usize)
+                    .map_or(0, |state| state.revision)
+            })
+    }
+
+    fn staged_value(&self, scratch: &GraphScratch, node: NodeId) -> Option<Value> {
+        scratch
+            .values
+            .get(&node)
+            .cloned()
+            .or_else(|| self.values.get(node as usize).and_then(Option::clone))
+    }
+
+    /// Stage a source revision bump. Nothing is applied until commit.
+    pub(crate) fn bump_source_staged(&self, scratch: &mut GraphScratch, node: NodeId) {
+        let next = self.effective_revision(scratch, node).saturating_add(1);
+        scratch.source_rev.insert(node, next);
+        self.mark_dependents_staged(scratch, node);
+    }
+
+    fn mark_dependents_staged(&self, scratch: &mut GraphScratch, node: NodeId) {
+        let mut stack = vec![node];
+        while let Some(current) = stack.pop() {
+            let Some(dependents) = self.forward.get(&current) else {
+                continue;
+            };
+            for dependent in dependents {
+                if scratch.dirty.insert(*dependent) {
+                    stack.push(*dependent);
+                }
+            }
+        }
+    }
+
+    /// Compute a memo against the staged overlay, leaving the committed graph
+    /// untouched. The result is installed by [`MemoGraph::commit_scratch`].
+    pub(crate) fn compute_staged<F>(
+        &mut self,
+        node: NodeId,
+        scratch: &mut GraphScratch,
+        staged_rev: u64,
+        f: F,
+    ) -> Result<(Value, bool), GraphError>
+    where
+        F: FnOnce(&mut DepReader<'_>) -> Value,
+    {
+        let index = node as usize;
+        let Some(state) = self.nodes.get(index) else {
+            return Err(GraphError::UnknownNode(node));
+        };
+
+        let dirty = state.dirty || scratch.dirty.contains(&node);
+        if !dirty {
+            return self
+                .staged_value(scratch, node)
+                .map(|value| (value, false))
+                .ok_or(GraphError::Uncomputed(node));
+        }
+
+        let observed = scratch
+            .observed
+            .get(&node)
+            .cloned()
+            .or_else(|| self.observed.get(index).cloned());
+        if let Some(observed) = observed
+            && !observed.is_empty()
+            && observed
+                .iter()
+                .all(|(dep, rev)| self.effective_revision(scratch, *dep) == *rev)
+        {
+            scratch.dirty.remove(&node);
+            return self
+                .staged_value(scratch, node)
+                .map(|value| (value, false))
+                .ok_or(GraphError::Uncomputed(node));
+        }
+
+        let (deps, value) = {
+            let mut reader = DepReader {
+                values: &self.values,
+                nodes: &self.nodes,
+                scratch: Some(&*scratch),
+                deps: Vec::new(),
+            };
+            let value = f(&mut reader);
+            (reader.deps, value)
+        };
+
+        if let Some(previous) = self.staged_value(scratch, node)
+            && previous.kind() != value.kind()
+        {
+            return Err(GraphError::ValueKindChanged {
+                node,
+                expected: previous.kind(),
+            });
+        }
+
+        self.memo_recomputes += 1;
+        let previous = self.staged_value(scratch, node);
+        let changed = previous.as_ref() != Some(&value);
+        let revision = self
+            .effective_revision(scratch, node)
+            .saturating_add(u64::from(changed));
+        let dep_revs: BTreeMap<NodeId, u64> = deps
+            .iter()
+            .map(|dep| (*dep, self.effective_revision(scratch, *dep)))
+            .collect();
+
+        scratch.values.insert(node, value.clone());
+        scratch.revisions.insert(node, revision);
+        scratch.observed.insert(node, dep_revs);
+        scratch.observed_at.insert(node, staged_rev);
+        scratch.dirty.remove(&node);
+        if changed {
+            self.mark_dependents_staged(scratch, node);
+        }
+        Ok((value, true))
+    }
+
+    /// Install the staged memos that were computed at the final `staged_rev`.
+    ///
+    /// Entries computed before a later staged write are dropped; they were
+    /// computed from an overlay that no longer exists, and installing them
+    /// would let a mid-frame value survive the commit.
+    pub(crate) fn commit_scratch(&mut self, scratch: GraphScratch, final_staged_rev: u64) {
+        let GraphScratch {
+            values,
+            revisions,
+            observed,
+            observed_at,
+            source_rev,
+            ..
+        } = scratch;
+
+        for (node, revision) in source_rev {
+            if let Some(state) = self.nodes.get_mut(node as usize) {
+                state.revision = revision;
+            }
+        }
+
+        for (node, value) in values {
+            if observed_at.get(&node) != Some(&final_staged_rev) {
+                continue;
+            }
+            let index = node as usize;
+            if self.values.get(index).is_none() {
+                continue;
+            }
+            self.values[index] = Some(value);
+            if let Some(revision) = revisions.get(&node)
+                && let Some(state) = self.nodes.get_mut(index)
+            {
+                state.revision = *revision;
+                state.dirty = false;
+            }
+            if let Some(deps) = observed.get(&node) {
+                self.record_dependencies(node, deps.keys().copied().collect());
+            }
         }
     }
 
@@ -353,7 +534,6 @@ impl fmt::Debug for MemoGraph {
         f.debug_struct("MemoGraph")
             .field("nodes", &self.nodes.len())
             .field("edges", &self.edge_count())
-            .field("commits", &self.tx.commits())
             .finish()
     }
 }
@@ -504,6 +684,92 @@ mod tests {
             })
             .expect("leaf recomputed");
         assert_eq!(leaf_value, Value::Count(3));
+    }
+
+    #[test]
+    fn a_diamond_never_observes_two_epochs() {
+        let mut graph = MemoGraph::new();
+        let source = graph.source("store");
+        let left = graph.memo("left");
+        let right = graph.memo("right");
+        let join = graph.memo("join");
+        let mut scratch = GraphScratch::new();
+        let mut revision = 0u64;
+
+        let read_count = |value: Option<&Value>| match value {
+            Some(Value::Count(count)) => *count,
+            _ => 0,
+        };
+
+        for epoch in 1..=3u32 {
+            revision += 1;
+            graph.bump_source_staged(&mut scratch, source);
+            let _ = graph
+                .compute_staged(left, &mut scratch, revision, |reader| {
+                    reader.read(source);
+                    Value::Count(epoch)
+                })
+                .expect("left");
+            let _ = graph
+                .compute_staged(right, &mut scratch, revision, |reader| {
+                    reader.read(source);
+                    Value::Count(epoch)
+                })
+                .expect("right");
+            let (joined, _) = graph
+                .compute_staged(join, &mut scratch, revision, |reader| {
+                    let left_value = read_count(reader.read(left));
+                    let right_value = read_count(reader.read(right));
+                    assert_eq!(
+                        left_value, right_value,
+                        "a diamond must not mix epochs: {left_value} vs {right_value}"
+                    );
+                    Value::Count(left_value + right_value)
+                })
+                .expect("join");
+            assert_eq!(joined, Value::Count(epoch * 2));
+        }
+    }
+
+    #[test]
+    fn a_long_chain_keeps_the_final_value_consistent() {
+        let mut graph = MemoGraph::new();
+        let source = graph.source("store");
+        let mut nodes = vec![graph.memo("chain")];
+        for _ in 1..8 {
+            nodes.push(graph.memo("chain"));
+        }
+
+        let mut scratch = GraphScratch::new();
+        graph.bump_source_staged(&mut scratch, source);
+
+        for (index, node) in nodes.iter().copied().enumerate() {
+            let staged = match index {
+                0 => graph
+                    .compute_staged(node, &mut scratch, 1, |reader| {
+                        reader.read(source);
+                        Value::Count(1)
+                    })
+                    .expect("chain head"),
+                _ => {
+                    let previous = nodes[index - 1];
+                    graph
+                        .compute_staged(node, &mut scratch, 1, |reader| {
+                            let previous_value = match reader.read(previous) {
+                                Some(Value::Count(value)) => *value,
+                                _ => 0,
+                            };
+                            Value::Count(previous_value + 1)
+                        })
+                        .expect("chain node")
+                }
+            };
+            assert_eq!(
+                staged.0,
+                Value::Count(index as u32 + 1),
+                "chain node {index} saw a stale predecessor"
+            );
+        }
     }
 
     #[test]
