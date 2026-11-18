@@ -255,7 +255,9 @@ impl MemoGraph {
     /// arms of a diamond see one epoch and a memo is observable at most once per
     /// epoch (`a_diamond_never_observes_two_epochs`), and a long chain keeps its
     /// head consistent (`a_long_chain_keeps_the_final_value_consistent`).
-    /// Cycles are a domain error ([`GraphError::Cycle`]); a write during compute
+    /// Cycles are a domain error ([`GraphError::Cycle`]) on this path too: the
+    /// body runs under a stack that already holds `node`, so reading itself is
+    /// reported instead of returning the previous value. A write during compute
     /// is refused by the phase guard on the write API, not here.
     pub fn compute<F>(&mut self, node: NodeId, f: F) -> Result<Value, GraphError>
     where
@@ -283,17 +285,27 @@ impl MemoGraph {
                 .ok_or(GraphError::Uncomputed(node));
         }
 
-        let (deps, value) = {
+        let (deps, value, cycle) = {
+            // The public path carries the same compute stack check as
+            // `compute_staged`: without it a body that reads its own node gets
+            // the previous value back and the cycle disappears. The scratch is
+            // local and holds nothing but the stack, so reads and dirtiness
+            // still resolve against the committed graph exactly as before.
+            let mut stack = GraphScratch::new();
+            stack.computing.push(node);
             let mut reader = DepReader {
                 values: &self.values,
                 nodes: &self.nodes,
-                scratch: None,
+                scratch: Some(&stack),
                 deps: Vec::new(),
                 cycle: None,
             };
             let value = f(&mut reader);
-            (reader.deps, value)
+            (reader.deps, value, reader.cycle)
         };
+        if let Some(node) = cycle {
+            return Err(GraphError::Cycle { node });
+        }
 
         if let Some(previous) = &self.values[index]
             && previous.kind() != value.kind()
@@ -801,6 +813,34 @@ mod tests {
             "expected Cycle({node}), got {error:?}"
         );
         assert_eq!(scratch.cycle(), Some(node));
+    }
+
+    /// The same body through the **public** `compute` path: a self-read must be
+    /// a cycle, not the previous value (`SPEC-RT-038`).
+    ///
+    /// Red-ability: build the reader with `scratch: None` in
+    /// `MemoGraph::compute` (the pre-guard shape) and this fixture fails — the
+    /// body reads `None` on the first compute and the call returns `Ok`.
+    #[test]
+    fn the_public_compute_path_reports_a_self_read_cycle() {
+        let mut graph = MemoGraph::new();
+        let node = graph.memo("loop");
+
+        let error = graph
+            .compute(node, |reader| {
+                let _ = reader.read(node);
+                Value::Count(1)
+            })
+            .expect_err("a self-reading memo must not converge");
+
+        assert!(
+            matches!(error, GraphError::Cycle { node: reported } if reported == node),
+            "expected Cycle({node}), got {error:?}"
+        );
+        assert!(
+            graph.peek(node).is_none(),
+            "the refused body must not install a value"
+        );
     }
 
     /// Removing the `dirty` handling in `commit_scratch` makes this fail: the
