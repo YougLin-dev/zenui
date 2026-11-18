@@ -193,7 +193,7 @@ docs/
 | 规范 | `spec/` 12 篇（含 `07-platform/` 4 篇） | `SPEC-SCOPE/ROUTE/RT/MACRO/STYLE/TEXT/RENDER/PLAT/GATE` | `normative`（2026-11-18 整体冻结为现行规范） |
 | 证据 | `evidence/` 5 篇 | `EVID-VAL-01…27`、`EVID-PROBE-01…05`、`EVID-MATRIX` | `normative` |
 | 事实台账 | `evidence/claim-register.md` | 100 条 `CLAIM-*` | `draft` |
-| 决策 | `decisions/` 20 个文件 | `ADR-0001…0019` + `index.md` | `normative` |
+| 决策 | `decisions/` 21 个文件 | `ADR-0001…0020` + `index.md` | `normative` |
 | 产品 | `product/` 2 篇 | 定位、路线（M0–M4 ↔ A0/A1/B/C/D） | `draft` |
 | 历史 | `archive/` 18 个文件 | `README.md` + 原 `research/` 8 篇 + `review/` 9 个 | 逐字只读（无 frontmatter，见 `ADR-0013`） |
 
