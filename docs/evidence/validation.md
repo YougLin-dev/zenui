@@ -25,6 +25,7 @@ replaces: []
 | **A 本轮实测** | 本轮（2026-11-18）在主机 H2 上亲自执行、看到输出 | 可复跑到命令级 | EVID-VAL-12 起 |
 | **B 上一轮转述** | 上一轮在主机 H1 执行，本轮仅转述其记录 | 只能证明"当时记录如此" | EVID-VAL-01…06 |
 | **C 仓库外夹具** | 位于仓库之外的临时目录，**本仓库无法复跑** | 一次性，永久不可复现 | EVID-VAL-07…11 |
+| **D CI 托管 runner** | 本轮在 GitHub Actions 的 ubuntu/macos/windows runner 上执行，日志与 run URL 可查；本机不是那些主机，不能拿本机结果代替 | 可复跑到 run 级（重跑 workflow） | EVID-VAL-22 |
 
 两条铁律：
 
@@ -37,6 +38,7 @@ replaces: []
 |---|---|---|---|---|---|
 | **H1** | Windows 11，MSVC 工具链 | `1.99.1 x86_64-pc-windows-msvc` | NVIDIA GeForce RTX 4060 Laptop GPU / Vulkan | 未记录 | 上一轮记录（转述） |
 | **H2** | macOS 27.0.1 (26A434)，Apple M4（10 核 GPU，Metal 4） | `1.99.1 (58cf8f9c3 2026-10-13) aarch64-apple-darwin` | Apple M4 / `metal` | `ab5339b`（EVID-VAL-12…19）/ `83b21a4`（EVID-VAL-20/-21） | **本轮实测**（commit 逐条见各条目） |
+| **CI** | GitHub Actions 矩阵：`ubuntu-26.04` / `macos-26-arm64` / `windows-2025-vs2026` | `rustc 1.99.1 (58cf8f9c3 2026-10-13)`，三个 runner 一致（取自 `rust-toolchain.toml` 的 pin） | 无（headless；A0 不需要 GPU） | `213f772`（main 上的 PR #5 merge commit） | **本轮 CI 实测**，run [`44284925421`](https://github.com/YougLin-dev/zenui/actions/runs/44284925421) |
 
 > H1 的 commit 在原始记录中未写下，这是本轮无法补的缺口；引用 H1 结果时应同时声明"commit 未知"。
 
@@ -65,6 +67,7 @@ replaces: []
 | EVID-VAL-19 | A | 目标示例 `todolist/main.rs` 单独编译 | **H2** | **40 errors** | VERIFIED（不可编译=预期） |
 | EVID-VAL-20 | A | `cargo run -p zenui-app --example todolist_headless --locked` | **H2** | 9 步 trace，两次运行逐字节一致 | VERIFIED（仅 A0-01 的命令与 trace；A0-02…11 仍 OPEN） |
 | EVID-VAL-21 | A | `cargo test --workspace --locked` | **H2** | 40 passed（34 + 6） | VERIFIED |
+| EVID-VAL-22 | D | `cargo test --workspace --locked` | **CI** | 40 passed × 3 平台 | VERIFIED（CI 日志） |
 
 ## 3. 仓库内测试：H1 原始记录（转述）
 
@@ -333,6 +336,29 @@ $ cargo test --workspace --locked
 - `#[cfg(debug_assertions)]` 的 `unbalanced_end_panics_without_committing` 只在 debug 构建运行；release 下由 `#[cfg(not(debug_assertions))]` 的版本接替，两种构建的用例总数都是 34。
 - **不证明什么**：0-test target（根 package、`zenui-app` lib）不计为通过；这些单测不构成 A0-02…A0-11 的 gate 级证据。
 
+## 6.1 CI 矩阵：main 上的 workspace 运行
+
+### EVID-VAL-22 三平台 `cargo test --workspace --locked`（CI，commit `213f772`）
+
+- 主机：**CI**（见 §1），不是 H2。三个 runner 分别是 `ubuntu-26.04`、`macos-26-arm64`、`windows-2025-vs2026`。
+- 被测 commit：`213f772452cbb49b0330d9290d7d8cfc14ed673d`（PR #5 的 merge commit，即 workspace 门禁落地的提交）。
+- workflow：[`workspace` run 44284925421](https://github.com/YougLin-dev/zenui/actions/runs/44284925421)，三个 job 全部 `success`；每个 job 的 `Test` 步骤都输出同样的四个 target。
+
+```text
+$ cargo test --workspace --locked        # ubuntu-26.04 / macos-26-arm64 / windows-2025-vs2026 各一次
+     Running unittests src/main.rs (zenui)              0 passed
+     Running unittests src/lib.rs (zenui_app)           0 passed
+     Running tests/golden_trace.rs (zenui_app)          6 passed
+     Running unittests src/lib.rs (zenui_core)         34 passed
+（每个平台合计 40 passed / 0 failed）
+```
+
+- **这条记录只对应一条命令**：`cargo test --workspace --locked`。同一 workflow 里的 `cargo fmt --all -- --check` 与 `cargo clippy --workspace --all-targets --locked -- -D warnings` 是同一 job 的单独步骤，日志在同一个 run 里可查，但**没有独立的 EVID 条目**——本文件不把它们并入这条记录，也不据此宣布任何 lint 结论。
+- 新事实：同一 commit 的 40 条测试在三个平台各自通过，且 `rustc` 三处都是 `1.99.1`——`rust-toolchain.toml` 的 pin 在三个平台上真的被解析成同一个编译器，而不是各 runner 自带的默认版本。
+- 新事实：`tests/golden_trace.rs` 的逐字节比对在 `windows-2025-vs2026` 上成立。这是 `.gitattributes` 强制 LF 的实证：若 Windows 检出为 CRLF，`include_str!` 的内容与 golden 文件都会变形，测试与 `EVID-VAL-20` 的 sha256 会同时失败。
+- **不证明什么**：任何 GPU / 窗口 / 平台后端能力（A0 是纯 `std` 的 headless core）；`cargo package`、renamed facade 与发布门（`SPEC-GATE-C-04`）——命令集里没有它们，这条记录不能把 C-04 标绿。
+- 计数口径：`testsPassedCi = 120` 是 40 条 × 3 个 runner 的**执行次数**，不是 120 条不同的测试，也不得与 H2 的 53 相加（见 `EVID-MATRIX.countsNote`）。
+
 ## 7. 本轮源码核对（不是测试，但可复核）
 
 以下四条是**读源码得到的事实**，用于防止"测试绿了所以没问题"的误判。逐条给出可对照的位置。
@@ -375,6 +401,7 @@ $ cargo test --workspace --locked
 - H2 compile-fail fixture：**3** 条，来源 EVID-VAL-13。
 - 0-test target：根 package，来源 EVID-VAL-17。
 - 跨图形后端 GPU 观测：**2** 个数据点（Vulkan/NVIDIA 来自 H1 转述，Metal/Apple M4 来自 EVID-VAL-15），**不是** "GPU 矩阵已通过"。
-- 可复跑性分布：21 条中 **10 条**（A 类）可在本机原样复跑；**11 条**（B/C 类）依赖上一轮记录或仓库外夹具。
+- CI 实际通过测试：**120** 次执行 = 40 条 × 3 个 runner（`EVID-VAL-22`）。它是**执行次数**，不是 120 条不同的测试，也不得与 H2 的 53 相加；同一批 40 条测试在 H2 与 CI 上各跑过。
+- 可复跑性分布：22 条中 **10 条**（A 类）可在本机原样复跑；**11 条**（B/C 类）依赖上一轮记录或仓库外夹具；**1 条**（D 类，`EVID-VAL-22`）在 CI runner 上，重跑 workflow 可复现，本机不能代替。
 
 不得使用"基本完成""大部分支持""应该可以"描述以上任何数字。

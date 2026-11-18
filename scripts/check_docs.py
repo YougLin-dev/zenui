@@ -78,7 +78,7 @@ DERIVED_KEYS = ("runsTotal", "testsPassedH2", "runsReproducibleHere", "runsTrans
 KEY_VALUE = re.compile(r"\b(" + "|".join(DERIVED_KEYS) + r")\s*=\s*(\d+)")
 
 RUN_REQUIRED = ("id", "class", "host", "kind", "command")
-RUN_CLASSES = {"A", "B", "C"}
+RUN_CLASSES = {"A", "B", "C", "D"}
 
 failures: list[str] = []
 
@@ -349,6 +349,12 @@ def check_matrix_runs(matrix: dict) -> None:
             failures.append(f"{where}: unknown class '{run.get('class')}'")
         if host_ids and run.get("host") not in host_ids:
             failures.append(f"{where}: host '{run.get('host')}' not declared in 'hosts'")
+        tests = run.get("tests")
+        if isinstance(tests, dict) and "platforms" in tests and tests["platforms"] != platform_count(run):
+            failures.append(
+                f"{where}: tests.platforms={tests['platforms']!r} but the run lists "
+                f"{platform_count(run)} platform(s)"
+            )
 
     expected = [f"EVID-VAL-{n:02d}" for n in range(1, len(runs) + 1)]
     actual = [run.get("id") if isinstance(run, dict) else None for run in runs]
@@ -364,6 +370,12 @@ def passed_tests(run: dict, default: int = 0) -> int:
     if isinstance(tests, dict) and isinstance(tests.get("passed"), int):
         return tests["passed"]
     return default
+
+
+def platform_count(run: dict) -> int:
+    """A run may hold one command executed on several CI runners at once."""
+    platforms = run.get("platforms")
+    return len(platforms) if isinstance(platforms, list) and platforms else 1
 
 
 def matrix_counts(matrix: dict) -> dict[str, int]:
@@ -384,6 +396,12 @@ def matrix_counts(matrix: dict) -> dict[str, int]:
         ),
         "runsReproducibleHere": sum(1 for run in runs if run.get("class") == "A"),
         "runsTranscribedOrExternal": sum(1 for run in runs if run.get("class") in {"B", "C"}),
+        "runsOnCi": sum(1 for run in runs if run.get("host") == "CI"),
+        # Execution count, not distinct tests: 40 tests on 3 runners is 120
+        # executions, and it must never be folded into testsPassedH2.
+        "testsPassedCi": sum(
+            passed_tests(run) * platform_count(run) for run in runs if run.get("host") == "CI"
+        ),
     }
     derived["zeroTestTargetsH2"] = sum(
         1
@@ -410,6 +428,18 @@ def check_matrix_counts(matrix: dict) -> None:
             failures.append(
                 f"{rel(MATRIX)} counts.{key}={stored!r} but runs[] recompute to {value!r}"
             )
+
+    # Every run belongs to exactly one provenance class, so the three buckets
+    # must add up to runsTotal; otherwise a new class silently escapes a count.
+    derived = matrix_counts(matrix)
+    partition = (
+        derived["runsReproducibleHere"] + derived["runsTranscribedOrExternal"] + derived["runsOnCi"]
+    )
+    if partition != derived["runsTotal"]:
+        failures.append(
+            f"{rel(MATRIX)}: A + (B/C) + CI cover {partition} runs but runsTotal is "
+            f"{derived['runsTotal']}"
+        )
 
 
 def spec_criteria() -> dict[str, str]:

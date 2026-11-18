@@ -51,7 +51,7 @@ replaces: []
 
 ### 0.1 证据键（权威定义见 `docs/evidence/validation.md` §2）
 
-`EVID-VAL-*` 编号已与该文件的 21 条索引对齐。主机定义：
+`EVID-VAL-*` 编号已与该文件的 22 条索引对齐。主机定义：
 
 - **H1**：Windows 11 / MSVC / Rust 1.99.1 / NVIDIA RTX 4060 Laptop / Vulkan；上一轮记录，**commit 未记录**。
 - **H2**：macOS 27.0.1 / Apple M4 / Metal 4 / Rust 1.99.1；commit `ab5339b`（EVID-VAL-12…19）/ `83b21a4`（EVID-VAL-20/-21）；本轮 Test/CI 实测。
@@ -79,6 +79,7 @@ replaces: []
 | EVID-VAL-19 | A | `todolist/main.rs` 单独编译（H2） | 40 errors（预期不可编译） |
 | EVID-VAL-20 | A | `cargo run -p zenui-app --example todolist_headless --locked`（H2，commit `83b21a4`） | 9 步 trace；两次运行逐字节一致 |
 | EVID-VAL-21 | A | `cargo test --workspace --locked`（H2，commit `83b21a4`） | 40 passed（34 core + 6 golden） |
+| EVID-VAL-22 | D | `cargo test --workspace --locked`（CI 矩阵 ubuntu/macos/windows，commit `213f772`） | 40 passed × 3 平台 |
 | SRC | — | 仓库源码/清单，`path:line` | 本轮静态核对，可直接复查 |
 
 > **已裁决（C-18/D-02，ADR-0012）**：`docs/README.md` §6 现已承认第三种证据前缀 `SRC path:line`，

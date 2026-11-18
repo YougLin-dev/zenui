@@ -36,6 +36,15 @@
       "commit": "ab5339b4fec807faef3128587721a1599f5aab9b",
       "commitNote": "EVID-VAL-12…19 记录于 ab5339b；EVID-VAL-20 记录于 83b21a4",
       "evidenceClass": "A-observed-this-round"
+    },
+    {
+      "id": "CI",
+      "os": "GitHub Actions matrix: ubuntu-26.04 / macos-26-arm64 / windows-2025-vs2026",
+      "toolchain": "rustc 1.99.1 (58cf8f9c3 2026-10-13) on all three runners",
+      "adapter": "none (headless; A0 needs no GPU)",
+      "commit": "213f772452cbb49b0330d9290d7d8cfc14ed673d",
+      "commitNote": "main merge commit of PR #5; workflow run 44284925421",
+      "evidenceClass": "D-ci-run-this-round"
     }
   ],
 
@@ -298,6 +307,20 @@
       "tests": { "passed": 40, "failed": 0, "ignored": 0 },
       "proves": "headless workspace 的 34 条 core 单测与 6 条 golden trace 测试通过",
       "doesNotProve": "A0-02…A0-11 的 gate 级证据；0-test target 不计"
+    },
+    {
+      "id": "EVID-VAL-22",
+      "class": "D",
+      "host": "CI",
+      "kind": "test",
+      "command": "cargo test --workspace --locked",
+      "exit": 0,
+      "tests": { "passed": 40, "failed": 0, "ignored": 0, "platforms": 3 },
+      "platforms": ["ubuntu-26.04", "macos-26-arm64", "windows-2025-vs2026"],
+      "commit": "213f772452cbb49b0330d9290d7d8cfc14ed673d",
+      "runUrl": "https://github.com/YougLin-dev/zenui/actions/runs/44284925421",
+      "proves": "同一 commit 上，40 条 workspace 测试在 ubuntu/macos/windows 三个 runner 上各自通过（每平台 34 core + 6 golden）；Windows 上 golden trace 逐字节比对成立，说明 LF 强制生效",
+      "doesNotProve": "任何 GPU/窗口/平台后端能力；`cargo package` 与发布门（SPEC-GATE-C-04）；clippy 与 fmt 只是同一 job 的步骤日志，没有独立的 EVID 条目"
     }
   ],
 
@@ -434,13 +457,17 @@
 
   "counts": {
     "testsPassedH2": 53,
+    "testsPassedCi": 120,
     "compileFailFixturesH2": 3,
     "zeroTestTargetsH2": ["root package zenui"],
     "gpuBackendsObserved": 2,
-    "runsTotal": 21,
+    "runsTotal": 22,
     "runsReproducibleHere": 10,
-    "runsTranscribedOrExternal": 11
+    "runsTranscribedOrExternal": 11,
+    "runsOnCi": 1
   },
+
+  "countsNote": "testsPassedCi 是 40 条 × 3 个 runner 的执行次数，不是 120 条不同的测试，也不得与 testsPassedH2 相加：同一批 40 条测试在 H2 与 CI 上各跑了一次。H1/H2 与 CI 是不同主机，结论不可互相替代。",
 
   "notVerified": [
     "真实 winit 窗口 / surface / resize / DPI",
@@ -452,6 +479,6 @@
     "baseline / intrinsic / Font synthesis",
     "glTF / 独立 depth / 3D",
     "任何性能数字（禁止填 0）",
-    "全 workspace 的 cargo clippy / cargo package（`cargo test --workspace` 已由 EVID-VAL-20 覆盖）"
+    "全 workspace 的 cargo clippy / cargo package：clippy 与 fmt 在 CI 里作为「EVID-VAL-22 的同一 run」的步骤通过，但没有独立 EVID 条目；`cargo package` 从未运行"
   ]
 }
