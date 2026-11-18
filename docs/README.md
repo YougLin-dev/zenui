@@ -84,7 +84,7 @@ replaces: []           # 本文件取代的旧文档
 ---
 ```
 
-历史文档在归档时补 `status: historical` 与 `superseded-by:`，正文**不做任何改写**。
+归档文件**不补 frontmatter**：原文逐字保留，失效声明与权威替代关系统一维护在 `archive/README.md` §3–§4（见 `ADR-0013`）。
 
 ## 5. 目标目录树
 
@@ -150,12 +150,12 @@ docs/
 
 | 层 | 文件 | 规模 | 状态 |
 |---|---|---|---|
-| 规范 | `spec/` 12 篇（含 `07-platform/` 4 篇） | `SPEC-SCOPE/ROUTE/RT/MACRO/STYLE/TEXT/RENDER/PLAT/GATE` | `draft`，待冻结 |
+| 规范 | `spec/` 12 篇（含 `07-platform/` 4 篇） | `SPEC-SCOPE/ROUTE/RT/MACRO/STYLE/TEXT/RENDER/PLAT/GATE` | 4 篇 `normative`（`00`/`01`/`08`/`07-platform/windows`），8 篇 `draft`，整体冻结待定 |
 | 证据 | `evidence/` 5 篇 | `EVID-VAL-01…19`、`EVID-PROBE-01…05`、`EVID-MATRIX` | `normative` |
 | 事实台账 | `evidence/claim-register.md` | 100 条 `CLAIM-*` | `draft` |
-| 决策 | `decisions/` 15 个文件 | `ADR-0001…0014` | `normative` |
+| 决策 | `decisions/` 17 个文件 | `ADR-0001…0016` + `index.md` | `normative` |
 | 产品 | `product/` 2 篇 | 定位、路线（M0–M4 ↔ A0/A1/B/C/D） | `draft` |
-| 历史 | `archive/` 17 个文件 | 原 `research/` 7 篇 + `review/` 10 个 | `historical`，只读 |
+| 历史 | `archive/` 17 个文件 | 原 `research/` 8 篇 + `review/` 9 个 | 逐字只读（无 frontmatter，见 `ADR-0013`） |
 
 收敛检查（本轮实际执行）：相对链接 **0 断链**（含 archive 内部）、`SPEC-*`/`ADR-*`/`CLAIM-*` 定义 **0 重复**、`spec/` 内 **0 处版本号复述**、**0 处** "已实现/已通过" 型未证据宣称。
 
