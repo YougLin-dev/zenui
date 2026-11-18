@@ -22,7 +22,7 @@ replaces: []
 | `validation.md` | `EVID-VAL-01…47`：每条命令 + 主机 + 结果 + 边界 | normative |
 | `matrix.json` | `EVID-MATRIX`：上述运行与 11 组合同的机器投影 | normative |
 | `claim-register.md` | `CLAIM-*`：可判真假的单句断言（唯一事实来源） | normative（研究员交付） |
-| `probes.md` | `EVID-PROBE-01…05`：探针能力与证伪边界 | normative（本文件负责人，见 §1.1） |
+| `probes.md` | `EVID-PROBE-01…06`：探针能力与证伪边界 | normative（本文件负责人，见 §1.1） |
 
 ### 1.1 `EVID-PROBE-*` 的归属
 
@@ -135,7 +135,7 @@ run_fail rustc --edition 2024 --crate-type lib --emit=metadata --out-dir "$tmp" 
 
 ## 7. 与 Gate 的对应
 
-Gate 判据（`SPEC-GATE-*`）在 `docs/spec/08-gates.md`。当前映射：42 条判据中 **0 条 VERIFIED、6 条 PROBE、36 条 OPEN**（`EVID-MATRIX.coverage`）。
+Gate 判据（`SPEC-GATE-*`）在 `docs/spec/08-gates.md`。当前映射：42 条判据中 **0 条 VERIFIED、12 条 PROBE、30 条 OPEN**（`EVID-MATRIX.coverage`）。
 
 最容易被误读的两处已在该文件显式标注：
 
