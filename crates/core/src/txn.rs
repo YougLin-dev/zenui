@@ -1718,3 +1718,285 @@ impl Drop for Tx<'_> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::Runtime;
+
+    /// The order revision this frame's cache reads are keyed under.
+    ///
+    /// The fixture is a unit test on purpose: the field is private to the
+    /// transaction, and integration tests under `crates/core/tests/` are
+    /// compiled against a library built without `cfg(test)`, so only a module
+    /// inside this file can observe it without widening the public surface.
+    fn order_revision(tx: &Tx<'_>) -> u64 {
+        tx.txn.staged_order
+    }
+
+    /// `ADR-0023` decision 2: an insert that adds a live row moves the display
+    /// order, and the commit adopts the staged value.
+    ///
+    /// Red-ability: delete the `note_order()` call in `Tx::insert` and the
+    /// `end == start + 1` assertion fails.
+    #[test]
+    fn an_insert_advances_the_order_revision() {
+        let mut runtime = Runtime::new();
+
+        let (start, end) = runtime
+            .frame(|tx| {
+                let start = order_revision(tx);
+                tx.insert("A").expect("insert must be accepted");
+                Ok((start, order_revision(tx)))
+            })
+            .expect("the frame must commit");
+
+        assert_eq!(
+            end,
+            start + 1,
+            "an insert that adds a live row must advance the order revision"
+        );
+        assert_eq!(
+            runtime.committed().order_epoch(),
+            end,
+            "the commit must adopt the staged order revision"
+        );
+    }
+
+    /// Red-ability: delete the `note_order()` call in `Tx::remove` and the
+    /// `end == start + 1` assertion fails.
+    #[test]
+    fn a_remove_advances_the_order_revision() {
+        let mut runtime = Runtime::new();
+        let row = runtime
+            .frame(|tx| tx.insert("A"))
+            .expect("the setup frame must commit");
+
+        let (start, end) = runtime
+            .frame(|tx| {
+                let start = order_revision(tx);
+                tx.remove(row).expect("remove must be accepted");
+                Ok((start, order_revision(tx)))
+            })
+            .expect("the frame must commit");
+
+        assert_eq!(
+            end,
+            start + 1,
+            "a remove that drops a live row must advance the order revision"
+        );
+        assert_eq!(
+            runtime.committed().order_epoch(),
+            end,
+            "the commit must adopt the staged order revision"
+        );
+        assert_eq!(runtime.committed().len(), 0, "the row must really be gone");
+    }
+
+    /// Red-ability: delete the `note_order()` call in `Tx::clear_completed`
+    /// (or move it out of the `removed.is_empty()` guard) and this fixture
+    /// fails.
+    #[test]
+    fn a_clear_completed_advances_the_order_revision_once() {
+        let mut runtime = Runtime::new();
+        runtime
+            .frame(|tx| {
+                let a = tx.insert("A")?;
+                let b = tx.insert("B")?;
+                tx.set_completed(a, true).expect("complete A");
+                tx.set_completed(b, true).expect("complete B");
+                Ok(())
+            })
+            .expect("the setup frame must commit");
+
+        let (start, end) = runtime
+            .frame(|tx| {
+                let start = order_revision(tx);
+                let removed = tx.clear_completed().expect("clear must be accepted");
+                assert_eq!(removed.len(), 2, "both rows are completed");
+                Ok((start, order_revision(tx)))
+            })
+            .expect("the frame must commit");
+
+        assert_eq!(
+            end,
+            start + 1,
+            "a clear moves the order once for the call, not once per removed row"
+        );
+        assert_eq!(
+            runtime.committed().order_epoch(),
+            end,
+            "the commit must adopt the staged order revision"
+        );
+    }
+
+    /// Red-ability: delete the `note_order()` call in `Tx::reorder` and the
+    /// `end == start + 1` assertion fails.
+    #[test]
+    fn a_reorder_advances_the_order_revision() {
+        let mut runtime = Runtime::new();
+        runtime
+            .frame(|tx| {
+                tx.insert("A")?;
+                tx.insert("B")?;
+                Ok(())
+            })
+            .expect("the setup frame must commit");
+
+        let (start, end) = runtime
+            .frame(|tx| {
+                let start = order_revision(tx);
+                let mut keys = tx.rows(Filter::All).as_slice().to_vec();
+                keys.reverse();
+                tx.reorder(&keys).expect("reorder must be accepted");
+                Ok((start, order_revision(tx)))
+            })
+            .expect("the frame must commit");
+
+        assert_eq!(
+            end,
+            start + 1,
+            "a reorder that moves a row must advance the order revision"
+        );
+        assert_eq!(
+            runtime.committed().order_epoch(),
+            end,
+            "the commit must adopt the staged order revision"
+        );
+        assert_eq!(
+            runtime.committed().titles().collect::<Vec<_>>(),
+            vec!["B", "A"],
+            "the fixture must reorder for real, not stage a no-op"
+        );
+    }
+
+    /// `ADR-0023` decision 2, the other half: a `completed` write moves only
+    /// the `Active` / `Completed` membership sets. It must not move the order.
+    ///
+    /// Red-ability: add a `note_order()` call to `stage_completed` and the
+    /// `end == start` assertion fails. The `epoch_for(Filter::Active)`
+    /// assertion is what keeps the fixture honest when the write stops
+    /// happening at all.
+    #[test]
+    fn a_completed_write_does_not_advance_the_order_revision() {
+        let mut runtime = Runtime::new();
+        let row = runtime
+            .frame(|tx| tx.insert("A"))
+            .expect("the setup frame must commit");
+
+        let active_before = runtime.committed().epoch_for(Filter::Active);
+        let order_before = runtime.committed().order_epoch();
+
+        let (start, end) = runtime
+            .frame(|tx| {
+                let start = order_revision(tx);
+                tx.set_completed(row, true)
+                    .expect("set_completed must be accepted");
+                Ok((start, order_revision(tx)))
+            })
+            .expect("the frame must commit");
+
+        assert_eq!(
+            end, start,
+            "a completed write changes membership, not the display order"
+        );
+        assert_eq!(
+            runtime.committed().order_epoch(),
+            order_before,
+            "the commit must not move the order revision"
+        );
+        assert_eq!(
+            runtime.committed().epoch_for(Filter::Active),
+            active_before + 1,
+            "the write must really have moved the Active membership"
+        );
+    }
+
+    /// No-op calls are not writes: re-removing a key already staged for
+    /// removal returns early, before any revision is touched.
+    ///
+    /// Red-ability: move the `note_order()` call in `Tx::remove` above the
+    /// `removals.contains` early return and the `end == start + 1` assertion
+    /// fails on the second remove.
+    #[test]
+    fn a_remove_of_an_already_removed_key_does_not_advance_the_order_revision() {
+        let mut runtime = Runtime::new();
+        let row = runtime
+            .frame(|tx| tx.insert("A"))
+            .expect("the setup frame must commit");
+
+        let (start, end) = runtime
+            .frame(|tx| {
+                let start = order_revision(tx);
+                tx.remove(row).expect("the first remove is effective");
+                tx.remove(row)
+                    .expect("re-removing a staged key is accepted as a no-op");
+                Ok((start, order_revision(tx)))
+            })
+            .expect("the frame must commit");
+
+        assert_eq!(
+            end,
+            start + 1,
+            "the second remove changed nothing and must not advance the revision"
+        );
+    }
+
+    /// Red-ability: remove the `removed.is_empty()` guard around the staging
+    /// block in `Tx::clear_completed` and the `end == start` assertion fails.
+    #[test]
+    fn a_clear_with_no_completed_rows_does_not_advance_the_order_revision() {
+        let mut runtime = Runtime::new();
+        runtime
+            .frame(|tx| {
+                tx.insert("A")?;
+                Ok(())
+            })
+            .expect("the setup frame must commit");
+
+        let (start, end) = runtime
+            .frame(|tx| {
+                let start = order_revision(tx);
+                let removed = tx
+                    .clear_completed()
+                    .expect("a clear with nothing to clear must be accepted");
+                assert!(removed.is_empty(), "no row is completed");
+                Ok((start, order_revision(tx)))
+            })
+            .expect("the frame must commit");
+
+        assert_eq!(
+            end, start,
+            "a clear that removes nothing must not advance the order revision"
+        );
+    }
+
+    /// Red-ability: delete the `current != keys` guard in `Tx::reorder` and
+    /// the `end == start` assertion fails.
+    #[test]
+    fn a_reorder_to_the_current_order_does_not_advance_the_order_revision() {
+        let mut runtime = Runtime::new();
+        runtime
+            .frame(|tx| {
+                tx.insert("A")?;
+                tx.insert("B")?;
+                Ok(())
+            })
+            .expect("the setup frame must commit");
+
+        let (start, end) = runtime
+            .frame(|tx| {
+                let start = order_revision(tx);
+                let keys = tx.rows(Filter::All).as_slice().to_vec();
+                tx.reorder(&keys)
+                    .expect("the current order is a valid order");
+                Ok((start, order_revision(tx)))
+            })
+            .expect("the frame must commit");
+
+        assert_eq!(
+            end, start,
+            "a reorder that moves nothing must not advance the order revision"
+        );
+    }
+}
