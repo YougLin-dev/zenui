@@ -92,6 +92,7 @@ replaces: []
 | EVID-VAL-44 | A | `cargo test --workspace --locked` | **H2** | 102 passed | VERIFIED |
 | EVID-VAL-45 | A | `cargo run -p zenui-app --example todolist_headless --locked` | **H2** | trace sha256 与 `57a4a142…` 相同 | VERIFIED（未变，见条目） |
 | EVID-VAL-46 | A | `cargo clippy --workspace --all-targets --locked -- -D warnings` | **H2** | exit 0 | VERIFIED（仅本机，C-04 仍 OPEN） |
+| EVID-VAL-47 | D | `cargo test --workspace --locked` | **CI** | 102 passed × 3 平台（含 trybuild 快照） | VERIFIED（CI 日志与 run URL 可查） |
 
 ## 3. 仓库内测试：H1 原始记录（转述）
 
@@ -820,6 +821,11 @@ $ cargo test -p zenui-core --locked
   test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
   ```
 
+  > **更正（§15）**：上面这条命令缺 `--crate-name`，孤立文件会被注入 `extern crate r#t;` 并报
+  > `E0463`，于是任何片段都"编译失败"，`compile_fail` 一律 `ok`——那次的调用不成立。结论本身
+  > 不变：用正确调用（`rustdoc --test --crate-name probe --edition 2024`）复测三条用例，见
+  > EVID-VAL-41 的表。
+
   因此 `lib.rs` 里"2 条 doctest 钉住 E0204/E0599"的说法不成立，任何笔误都能让它们保持绿色。
   用 trybuild 固定错误码需要 dev-dependency，按仓库规则先出 ADR（ADR-0021，另一分支），本轮不引入。
 - **不证明什么**：不含 `zenui-app` 的 10 条（见 EVID-VAL-36/-38）。
@@ -883,8 +889,20 @@ test the_named_contracts_do_not_compile_for_the_named_reason ... ok
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 ```
 
-- 每条用例的诊断（错误码、span、消息）与 `.stderr` 快照逐字匹配，这正是 `compile_fail` 做不到的
-  （§14 EVID-VAL-37 的 rustdoc 实测）。
+- 每条用例的诊断（错误码、span、消息）与 `.stderr` 快照逐字匹配，这正是 `compile_fail` 做不到的。
+  用正确的调用复测（`rustdoc --test --crate-name probe --edition 2024`）：
+
+  ```text
+  test t.rs - (line 3) - compile fail ... ok        # A：声称 E0204，正文是未定义符号
+  test t.rs - (line 19) - compile fail ... ok       # C：写成 compile_fail,E0204，正文同上
+  test t.rs - (line 11) - compile fail ... FAILED   # B：正文是合法代码
+  failures:
+  ---- t.rs - (line 11) stdout ----
+  Test compiled successfully, but it's marked `compile_fail`.
+  ```
+
+  A 与 C 说明它只检查"有没有失败"、不检查"为什么失败"，连错误码后缀都被吞掉；B 说明它确实检查
+  能不能编译。把 A 读成"E0204 已被钉住"就是这一轮的失效模式。
 - **mutation 判红（两条，都是"同一改动在 doctest 下保持绿色"的那个场景）**：
   1. 把某条用例里的调用改成未定义名字（`takes_a_viewv`）——代码仍然"不能编译"，doctest 会是 `ok`；
      UI 用例给出 `mismatch`，因为诊断变成 `E0425` + `E0308`。
@@ -904,13 +922,15 @@ test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 `order_revision` / `scan_cost`）；扫描计数由视图自己持有，缓存按一次求值前后的差值记 `row_visits`，
 所以**视图内部任何位置的枚举都算数**。决定 6 的变异表逐条实测（变异只改计数路径，返回值不变）：
 
-| 判据 | 变异 | 判红 |
+命令统一为 `cargo test -p zenui-core --test queries --locked`。
+
+| 判据 | 变异 | 判红的夹具 |
 |---|---|---|
-| A0-07 `query_eval` 恰 +1 | 命中分支也自增 `evals` | 4 条 |
-| A0-07 `cache_build`/`id_materialize` 各恰 +1 | 命中分支重建 `RowSet` | 2 条 |
-| A0-07 `completed` 写只影响读它的 filter | `completed` 写 bump 三个 filter 的 membership revision | 1 条（`All` 不失效那条） |
-| A0-08 `row_visits = 0` | `is_empty_for` 改成数一遍 `rows_for(All)`（布尔不变） | 6 条，含 1000 行空态（`row_visits` 2000 → 3000） |
-| 接线存在 | `Tx::rows` 改回直接展开 `effective_rows()` | 6 条 |
+| A0-07 `query_eval` 恰 +1 | 命中分支也自增 `evals` | `a0_07_one_eval_build_and_materialization_per_epoch_filter`、`a0_07_a_completed_write_moves_only_the_filters_that_read_it`、`a0_07_a_reorder_moves_the_order_and_the_next_read_sees_it`、`a0_08_a_thousand_rows_and_three_filters_build_once_each`（4） |
+| A0-07 `cache_build`/`id_materialize` 各恰 +1 | 命中分支重建 `RowSet` | `a0_07_one_eval_build_and_materialization_per_epoch_filter`、`a0_07_a_reorder_moves_the_order_and_the_next_read_sees_it`（2） |
+| A0-07 `completed` 写只影响读它的 filter | `completed` 写 bump 三个 filter 的 membership revision | `a0_07_a_completed_write_moves_only_the_filters_that_read_it`（1） |
+| A0-08 `row_visits = 0` | `is_empty_for` 改成数一遍 `rows_for(All)`（布尔不变） | `a0_07_one_eval_build_and_materialization_per_epoch_filter`、`a0_07_a_completed_write_moves_only_the_filters_that_read_it`、`a0_07_a_reorder_moves_the_order_and_the_next_read_sees_it`、`a0_08_an_empty_filter_materializes_nothing`、`a0_08_a_frame_that_empties_a_filter_visits_nothing`、`a0_08_a_thousand_rows_and_three_filters_build_once_each`（6；空态那条 `row_visits` 2000 → 3000） |
+| 接线存在 | `Tx::rows` 改回直接展开 `effective_rows()` | 同上 6 条 |
 
 - **与 §14 的差别**：§14 记的契约是"缓存自己在闭包里数行"，那条 `is_empty_for` 变异当时 7 条全绿；
   本轮把计数归属移到视图侧后同一条变异判红 6 条。这是 `ADR-0022` 决定 6 想要的效果。
@@ -966,3 +986,20 @@ $ cargo clippy --workspace --all-targets --locked -- -D warnings
 - 同轮 `cargo fmt --all -- --check` 通过。`trybuild` 只在 `zenui-core` 的 `[dev-dependencies]`，
   `[dependencies]` 仍为空。
 - **不证明什么**：本地运行，不是 CI 日志；`SPEC-GATE-C-04` 保持 OPEN。
+
+### EVID-VAL-47 CI 矩阵：trybuild 快照跨平台（CI）
+
+```text
+run https://github.com/YougLin-dev/zenui/actions/runs/44317724221  (commit 61de7b5)
+  check                    pass   8s
+  gates (ubuntu-latest)    pass  32s
+  gates (macos-latest)     pass  47s
+  gates (windows-latest)   pass  1m37s
+```
+
+- 同一 commit 上 102 条 workspace 测试在三个 runner 上各自通过。**九条 trybuild UI 用例的 `.stderr`
+  在 Windows 与 Linux 上也逐字匹配**——这是 `ADR-0021` 的一个悬置风险（快照是否绑定平台），本轮
+  在 CI 上得到否证；绑定的是工具链版本，不是平台。
+- 分支保护（`strict` + 四条 required checks + `enforce_admins`）在本 PR 上是生效状态。
+- **不证明什么**：不含 GPU/窗口/平台后端能力；`cargo package` 与 `SPEC-GATE-C-04` 仍未验证；
+  clippy/fmt 只是同一 job 的步骤日志，没有独立 EVID。
