@@ -1,3 +1,7 @@
+[workspace]
+members = ["crates/core", "crates/app"]
+resolver = "3"
+
 [package]
 name = "zenui"
 version = "0.1.0"

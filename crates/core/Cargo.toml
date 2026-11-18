@@ -1,0 +1,11 @@
+[package]
+name = "zenui-core"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Headless runtime primitives for ZenUI Gate A0 (pure std, no third-party dependencies)"
+license = "MIT OR Apache-2.0"
+
+# Gate A0 constraint: this crate is pure `std`. Adding any dependency here is a
+# deliberate design decision and must be justified in an ADR first.
+[dependencies]
