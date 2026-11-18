@@ -352,6 +352,7 @@ struct MountPlan {
 - **要求**：只有事件与业务命令可以写 Signal/Store。Memo、binding、measure、layout 阶段的写 MUST 被判定为领域错误（`WriteDuringCompute`、memo cycle、phase violation）并以 typed 错误返回；MUST NOT 让 `RefCell` borrow 文案泄漏给用户，MUST NOT panic。运行时的内部 privileged 更新路径 MUST 与用户写权限分离。
 - **澄清**：本条的「事件与业务命令」等于 `SPEC-RT-050` 阶段表中的 `Outside`；`Mark` 允许暂存写，其余阶段对用户代码只读。`SPEC-RT-021.5` 允许 cleanup 向事务 journal 写入删除意图，但不构成对 Signal/Store 的写许可（[ADR-0017](../decisions/adr-0017-p2-runtime-authority-and-transaction-shape.md)）。
 - **澄清**：阶段违规的写 API 返回值是值错误（`ValueError::Phase`），但它**毒化**事务：帧不得提交，最外层返回对应的致命错误，下一帧可恢复；`commit` 阶段的违规直接返回致命错误。类型与致命性的这处错位由 [ADR-0019](../decisions/adr-0019-failure-classification-and-phase-typing.md) 记录。
+- **澄清**：括号里的 `WriteDuringCompute` 是**领域错误名**，不是独立错误变体：compute 阶段（`Topo`/`Binding`）的写由 `ValueError::Phase(PhaseViolation)` 表达，并在最外层兑现为 `Fatal::PhaseViolation`；代码中不存在同名变体（[ADR-0020](../decisions/adr-0020-write-during-compute-as-phase-violation.md)）。
 - **失败模式**：布局测量中写 → 无限重排；用户看到 `already borrowed: BorrowMutError` 而非可执行的领域错误。
 - **来源**：FINAL §3.1；`runtime-and-rendering.md` §2。
 
