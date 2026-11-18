@@ -6,10 +6,10 @@
 //! tracks what its body actually read, mirroring `SPEC-RT-042`'s "actual read"
 //! rule for queries.
 //!
-//! P1 scope: dirty propagation, lazy recompute, equality suppression at the memo
-//! boundary, and edge counting. Glitch-free topological publication, cycle
-//! detection and `WriteDuringCompute` as a domain error are `SPEC-GATE-A0-05`
-//! and remain TODO — see the notes on [`MemoGraph::compute`].
+//! Scope: dirty propagation, lazy recompute, equality suppression at the memo
+//! boundary, edge counting, and cycle detection — a body that reads a node
+//! still on the compute stack yields [`GraphError::Cycle`] instead of
+//! converging on a stale value (`SPEC-RT-038`, `SPEC-GATE-A0-05`).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;

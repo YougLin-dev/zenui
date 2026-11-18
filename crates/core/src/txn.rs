@@ -160,7 +160,9 @@ impl fmt::Display for Fatal {
 
 impl std::error::Error for Fatal {}
 
-/// Value-level failure: the write is rejected, the transaction still commits.
+/// A pre-journal rejection (`ADR-0019` decision 1): the write never entered
+/// the journal. Whether the frame commits depends on the variant — `Phase`
+/// and `Aborted` poison it; `Handle` and `Store` do not.
 ///
 /// `golden step 08` is exactly this shape — a stale handle is refused and the
 /// committed state does not move.

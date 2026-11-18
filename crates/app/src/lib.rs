@@ -520,7 +520,9 @@ mod tests {
         app.frame(|tx, _ui| {
             let result = tx.toggle(row);
             assert!(matches!(result, Err(ValueError::Handle(_))));
-            // The frame still commits: a rejected write is not a fatal one.
+            // A stale-handle rejection happens before the journal, so this
+            // particular frame still commits (`ADR-0019` decision 1). That is
+            // not a general rule: `ValueError::Phase` and `Aborted` poison.
             Ok(())
         })
         .expect("frame");
