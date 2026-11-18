@@ -147,7 +147,7 @@ replaces: []
 | CLAIM-036 | `detach` 只从 observer 集合删除，不移除变空的 source bucket | VERIFIED | SRC `project_signals.rs:75-84` | A0 | 长命 Owner 会积累幽灵桶 |
 | CLAIM-037 | `subscriber_count()` 返回 `subscribers.len()`，会把空桶计入订阅数 | VERIFIED | SRC `project_signals.rs:183-185` | A0 | 指标会掩盖泄漏 |
 | CLAIM-038 | `dispose` 只翻转每源一个 `bool` liveness，不存在 ViewId/OwnerId generation | VERIFIED | SRC `project_signals.rs:86-120,171-180` | A0 | 无法拒绝迟到命令 |
-| CLAIM-039 | 生产运行时（事务 journal、`MountPlan`、平台后端）尚未实现；`crates/core` 只有 A0-01 所需的 Store/Memo/Owner 骨架 | WITHDRAWN | 原文保留以追溯；被 CLAIM-101 取代（P2 已落地单帧 journal，`MountPlan` 与平台后端仍缺） | A0 | 撤销理由：`crates/core/src/txn.rs` 已实现 journal，原句不再成立 |
+| CLAIM-039 | 生产运行时中 `MountPlan` 与平台后端尚未实现（原句里的「事务 journal」已由 P2 落地，见 CLAIM-101） | VERIFIED | SRC `crates/core/src/`（无 `MountPlan`、无平台后端模块）；`FINAL.md:305-309` | A0 | 只保留仍然成立的两项；journal 一项由 CLAIM-101 覆盖 |
 | CLAIM-040 | A0 的 headless trace 与 query/mount/materialization 计数已存在，可用 `cargo run -p zenui-app --example todolist_headless --locked` 复跑 | VERIFIED | EVID-VAL-20 | A0 | 只覆盖 A0-01；A0-02…11 仍 OPEN |
 
 ### 1.4 Store / Query / For / 焦点生命周期（CLAIM-041 – CLAIM-053）
@@ -241,7 +241,7 @@ replaces: []
 | CLAIM-100 | 可用一个无订阅的 Vec 作为 Store 查询的"第二现实" | WITHDRAWN | `FINAL.md:78`；`round2-debate.md:182-188` | A0 | 现行：共享 query cache + 字段边 |
 | CLAIM-101 | `crates/core` 已有单帧事务层：模型、memo、view、owner、layout 写入先暂存，最外层退出时一次发布；回滚等于 drop，`Drop` 不跑用户代码也不 panic；`commit` 在 swap 之后没有失败路径 | VERIFIED | SRC `crates/core/src/txn.rs`；EVID-VAL-23、EVID-VAL-25 | A0 | 取代 CLAIM-039；`MountPlan` 与平台后端仍未实现 |
 | CLAIM-102 | A0-03 有 gate 级夹具：跨 runtime 写被拒绝、remount 后旧 handle 不 alias 复用槽位；去掉 generation 推进即判红 | VERIFIED | EVID-VAL-23（含 mutation 表）；SRC `crates/core/tests/gates.rs` | A0 | **不覆盖**跨 runtime 读与 A0-02 的 trybuild fixture |
-| CLAIM-103 | A0-05 有夹具：diamond 与 7 级长链在同一 epoch 内不产生 glitch；`Phase::Topo` 下的写返回 `Fatal::PhaseViolation` 且下一帧可提交 | VERIFIED | EVID-VAL-24；SRC `crates/core/src/graph.rs`、`crates/core/src/runtime.rs` | A0 | **无环检测**：环仍表现为 compute 重入，没有对应错误变体 |
+| CLAIM-103 | A0-05 有夹具：diamond 与 7 级长链在同一 epoch 内不产生 glitch；在 `Topo`/`Binding` 相位下调用 `insert` 返回 `Fatal::WriteDuringCompute`，`Commit` 相位下调用 `set_completed` 返回 `Fatal::PhaseViolation`，两者都经值通道并以毒化阻止提交，下一帧可恢复 | VERIFIED | EVID-VAL-24；SRC `crates/core/src/graph.rs`、`crates/core/src/runtime.rs` | A0 | 只覆盖被强制相位下的两条写路径，不是「所有写路径」；**无环检测**：环仍表现为 compute 重入 |
 | CLAIM-104 | A0-06 的映射子句由 core 内零依赖 `LayoutMap` 承担：`plan` 只对帧内可见，`preflight` 拒绝 mount+unmount 同 view、缺失 plan 与重复 id，`discard` 清空计划 | VERIFIED | EVID-VAL-23、EVID-VAL-24；SRC `crates/core/src/layout.rs` | A0 | **不是** Taffy 适配器；与真实布局引擎对接仍 OPEN |
 | CLAIM-105 | 帧事务的失败语义已被回归夹具钉住：嵌套失败中毒、discard 不回退 row key、暂存删除压过暂存值、同帧 insert+remove 归还预留槽位 | VERIFIED | EVID-VAL-27；SRC `crates/core/src/txn.rs`、`crates/core/tests/regressions.rs` | A0 | 不含 memo cycle 检测 |
 | CLAIM-106 | preflight 会拒绝局部 view order、指向已删行的 mount 与指向本帧将卸载 view 的 focus，因而换入的 view 树必然与 journal 一致 | VERIFIED | EVID-VAL-27；SRC `crates/core/src/txn.rs` | A0 | 只能在单线程 headless 下验证 |
@@ -256,10 +256,10 @@ replaces: []
 
 | 状态 | 条数 | 主要领域 |
 |---|---|---|
-| VERIFIED | 68 | 执行记录、源码事实、两条官方 CSS/Tailwind 事实 |
+| VERIFIED | 69 | 执行记录、源码事实、两条官方 CSS/Tailwind 事实 |
 | SPEC | 9 | Store/Query/For/焦点契约中尚未实现的部分 |
 | OPEN | 14 | MSRV、bidi/emoji、capabilities、surface/DPI、Mac/Linux、mask/filter、3D depth、IME、AT、平台矩阵、版本组合 |
-| WITHDRAWN | 13 | 旧 mount 形状、条件语法、优先级、Copy+String、retained-visibility 等 |
+| WITHDRAWN | 12 | 旧 mount 形状、条件语法、优先级、Copy+String、retained-visibility 等 |
 | PROBE | 6 | rstml parse-only、3 条 C 类夹具记录、tailwind crate 研究探针、A0 query 缓存共享 |
 | **合计** | **110** | — |
 
