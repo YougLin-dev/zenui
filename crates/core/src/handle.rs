@@ -88,15 +88,14 @@ impl RuntimeId {
     pub(crate) fn allocate() -> Self {
         Self(NEXT_RUNTIME.fetch_add(1, Ordering::Relaxed))
     }
-
-    pub const fn raw(self) -> u64 {
-        self.0
-    }
 }
 
 impl fmt::Debug for RuntimeId {
+    /// The numeric value never appears in a rendered string: it is an
+    /// implementation detail, and a trace or diagnostic containing it would
+    /// make output depend on how many runtimes the process happened to mint.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "RuntimeId({})", self.0)
+        f.write_str("RuntimeId(..)")
     }
 }
 
@@ -195,12 +194,11 @@ impl From<HandleError> for InvalidHandle {
 }
 
 impl fmt::Display for InvalidHandle {
+    /// `Display` reaches diagnostics and the app's error sink, so it must not
+    /// render a `RuntimeId` value (`SPEC-RT-057`).
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.reason {
-            HandleError::ForeignRuntime { expected, found } => write!(
-                f,
-                "handle from foreign runtime: expected {expected:?}, found {found:?}"
-            ),
+            HandleError::ForeignRuntime { .. } => f.write_str("handle from foreign runtime"),
             HandleError::Vacant { slot } => write!(f, "handle points at vacant slot {slot:?}"),
             HandleError::StaleGeneration {
                 slot,
@@ -298,6 +296,37 @@ mod tests {
         let view = ViewId::from_index(3);
         assert_eq!(view.index(), 3);
         assert_eq!(format!("{view:?}"), "ViewId(3)");
+    }
+
+    #[test]
+    fn runtime_id_debug_hides_the_value() {
+        let id = RuntimeId::allocate();
+        assert_eq!(format!("{id:?}"), "RuntimeId(..)");
+    }
+
+    #[test]
+    fn foreign_runtime_display_hides_the_values() {
+        let error = InvalidHandle::from(HandleError::ForeignRuntime {
+            expected: RuntimeId::allocate(),
+            found: RuntimeId::allocate(),
+        });
+        // `Display` reaches the app sink; it must not leak either id.
+        assert_eq!(error.to_string(), "handle from foreign runtime");
+        assert_eq!(error.reason_kind(), "foreign_runtime");
+    }
+
+    #[test]
+    fn minted_runtime_ids_are_unique_across_threads() {
+        let handles: Vec<_> = (0..8)
+            .map(|_| std::thread::spawn(RuntimeId::allocate))
+            .collect();
+        let mut ids: Vec<u64> = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("thread").0)
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), 8, "the allocator must not repeat an id");
     }
 
     #[test]

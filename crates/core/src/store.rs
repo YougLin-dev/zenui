@@ -4,11 +4,12 @@
 //! The store owns model entities only. It never renders, never diffs a second
 //! UI tree, and never creates views.
 
+#[cfg(test)]
 use std::collections::BTreeSet;
 use std::fmt;
 
 use crate::arena::Slots;
-use crate::handle::{Handle, HandleError, InvalidHandle, RowKey, RuntimeId, SlotIndex};
+use crate::handle::{Generation, Handle, HandleError, InvalidHandle, RowKey, RuntimeId, SlotIndex};
 use crate::metrics::Counters;
 
 /// Generation-checked handle to one store row (`SPEC-RT-005`).
@@ -86,10 +87,74 @@ pub struct Store {
     string_clones: u64,
 }
 
-impl Store {
-    pub fn new() -> Self {
+/// The whole model as it will look once this commit lands (`SPEC-RT-052`).
+///
+/// The draft records target values, never inverse operations (`SPEC-RT-051`).
+/// Building it is where every fallible slot lookup happens; `Store::install`
+/// then performs a single swap.
+#[derive(Debug, Default)]
+pub(crate) struct StoreDraft {
+    fills: Vec<(SlotIndex, RowKey, String, bool)>,
+    updates: Vec<(SlotIndex, Option<String>, Option<bool>)>,
+    removals: Vec<SlotIndex>,
+    /// Reservations cancelled before they were ever filled.
+    releases: Vec<SlotIndex>,
+    order: Vec<SlotIndex>,
+    completed: usize,
+    next_key: u64,
+    epoch: u64,
+    io_writes: u64,
+}
+
+impl StoreDraft {
+    pub(crate) fn new(next_key: u64, epoch: u64, io_writes: u64) -> Self {
         Self {
-            runtime: RuntimeId::allocate(),
+            next_key,
+            epoch,
+            io_writes,
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn fill(&mut self, slot: SlotIndex, key: RowKey, title: String, completed: bool) {
+        self.fills.push((slot, key, title, completed));
+    }
+
+    pub(crate) fn update(
+        &mut self,
+        slot: SlotIndex,
+        title: Option<String>,
+        completed: Option<bool>,
+    ) {
+        self.updates.push((slot, title, completed));
+    }
+
+    pub(crate) fn remove(&mut self, slot: SlotIndex) {
+        self.removals.push(slot);
+    }
+
+    pub(crate) fn release(&mut self, slot: SlotIndex) {
+        self.releases.push(slot);
+    }
+
+    pub(crate) fn set_order(&mut self, order: Vec<SlotIndex>) {
+        self.order = order;
+    }
+
+    pub(crate) fn set_completed_count(&mut self, completed: usize) {
+        self.completed = completed;
+    }
+}
+
+impl Store {
+    /// Build a store owned by `id`.
+    ///
+    /// `pub(crate)` on purpose: a public constructor taking a `Copy` id would
+    /// let two stores share one id and defeat cross-runtime rejection. The only
+    /// public minting point is `Runtime::new` (`SPEC-RT-005`).
+    pub(crate) fn with_runtime(id: RuntimeId) -> Self {
+        Self {
+            runtime: id,
             rows: Slots::new(),
             order: Vec::new(),
             next_key: 1,
@@ -102,7 +167,8 @@ impl Store {
     }
 
     /// Insert a row at the end of the display order.
-    pub fn insert(&mut self, title: impl Into<String>) -> RowId {
+    #[cfg(test)]
+    pub(crate) fn insert(&mut self, title: impl Into<String>) -> RowId {
         let key = RowKey::from_raw(self.next_key);
         self.next_key += 1;
         let row = Row {
@@ -110,14 +176,16 @@ impl Store {
             title: title.into(),
             completed: false,
         };
-        let (slot, generation) = self.rows.alloc(row);
+        let (slot, generation) = self.rows.reserve();
+        assert!(self.rows.fill(slot, row), "fresh reservation must be empty");
         self.order.push(slot);
         self.record_write();
         Handle::new(self.runtime, slot, generation)
     }
 
     /// Flip `completed` and return the new value.
-    pub fn toggle(&mut self, row: RowId) -> Result<bool, InvalidHandle> {
+    #[cfg(test)]
+    pub(crate) fn toggle(&mut self, row: RowId) -> Result<bool, InvalidHandle> {
         let completed = {
             let row = self.entry_mut(row)?;
             row.completed = !row.completed;
@@ -133,7 +201,8 @@ impl Store {
     }
 
     /// Set `completed` explicitly.
-    pub fn set_completed(&mut self, row: RowId, value: bool) -> Result<(), InvalidHandle> {
+    #[cfg(test)]
+    pub(crate) fn set_completed(&mut self, row: RowId, value: bool) -> Result<(), InvalidHandle> {
         let was_completed = {
             let row = self.entry_mut(row)?;
             let previous = row.completed;
@@ -155,7 +224,8 @@ impl Store {
     }
 
     /// Remove one row and return it.
-    pub fn remove(&mut self, row: RowId) -> Result<Row, InvalidHandle> {
+    #[cfg(test)]
+    pub(crate) fn remove(&mut self, row: RowId) -> Result<Row, InvalidHandle> {
         let slot = row.slot();
         let was_completed = self.entry(row)?.completed;
         let removed = self.rows.free(slot).ok_or(HandleError::Vacant { slot })?;
@@ -171,7 +241,8 @@ impl Store {
     ///
     /// TODO(A0-10): bulk clear must settle exactly one `FocusRemovalIntent`.
     /// P1 removes the rows and leaves focus settlement to the caller.
-    pub fn clear_completed(&mut self) -> Vec<RowKey> {
+    #[cfg(test)]
+    pub(crate) fn clear_completed(&mut self) -> Vec<RowKey> {
         let doomed: Vec<SlotIndex> = self
             .order
             .iter()
@@ -196,7 +267,8 @@ impl Store {
     }
 
     /// Reorder the display list. Every live row must appear exactly once.
-    pub fn reorder(&mut self, keys: &[RowKey]) -> Result<(), StoreError> {
+    #[cfg(test)]
+    pub(crate) fn reorder(&mut self, keys: &[RowKey]) -> Result<(), StoreError> {
         let mut seen = BTreeSet::new();
         let mut slots = Vec::with_capacity(keys.len());
         for key in keys {
@@ -229,11 +301,90 @@ impl Store {
     /// that cancels the mount on failure. P1 returns the `Result` and the caller
     /// records the error in the sink, but mount atomicity (`SPEC-RT-013`) is not
     /// verified here.
-    pub fn read_owned_title(&mut self, row: RowId) -> Result<String, InvalidHandle> {
+    #[cfg(test)]
+    pub(crate) fn read_owned_title(&mut self, row: RowId) -> Result<String, InvalidHandle> {
         let title = self.entry(row)?.title.clone();
         self.io_reads += 1;
         self.string_clones += 1;
         Ok(title)
+    }
+
+    // ---- transaction support (`pub(crate)`, `SPEC-RT-051`) ----
+
+    /// Reserve a slot for a row that a transaction is about to insert.
+    pub(crate) fn reserve_slot(&mut self) -> (SlotIndex, Generation) {
+        self.rows.reserve()
+    }
+
+    pub(crate) const fn next_key(&self) -> u64 {
+        self.next_key
+    }
+
+    /// Drop a reservation and burn its generation (`SPEC-RT-053`).
+    pub(crate) fn release_reserved(&mut self, slot: SlotIndex) {
+        self.rows.release(slot);
+    }
+
+    /// Slot lookup that does not depend on the order vector, so it works while
+    /// a commit is filling freshly reserved slots.
+    pub(crate) fn slot_for(&self, key: RowKey) -> Option<(SlotIndex, Generation)> {
+        let slot = self.rows.find(|row| row.key() == key)?;
+        Some((slot, self.rows.generation(slot)?))
+    }
+
+    /// Swap a finished model draft in (`SPEC-RT-052`).
+    ///
+    /// Infallible by construction: every lookup that can fail happened while
+    /// the draft was being built, so a commit cannot stop half way.
+    pub(crate) fn install(&mut self, draft: StoreDraft) {
+        for (slot, key, title, completed) in draft.fills {
+            let _ = self.rows.fill(
+                slot,
+                Row {
+                    key,
+                    title,
+                    completed,
+                },
+            );
+        }
+        for (slot, title, completed) in draft.updates {
+            if let Some(generation) = self.rows.generation(slot)
+                && let Ok(row) = self.rows.get_mut(slot, generation)
+            {
+                if let Some(title) = title {
+                    row.title = title;
+                }
+                if let Some(completed) = completed {
+                    row.completed = completed;
+                }
+            }
+        }
+        for slot in draft.removals {
+            let _ = self.rows.free(slot);
+        }
+        for slot in draft.releases {
+            self.rows.release(slot);
+        }
+        self.order = draft.order;
+        self.completed = draft.completed;
+        self.next_key = draft.next_key;
+        self.epoch = draft.epoch;
+        self.io_writes = draft.io_writes;
+    }
+
+    pub(crate) fn key_of(&self, row: Handle<Row>) -> Option<RowKey> {
+        self.entry(row).ok().map(Row::key)
+    }
+
+    pub(crate) fn completed_of(&self, row: Handle<Row>) -> Result<bool, InvalidHandle> {
+        Ok(self.entry(row)?.completed())
+    }
+
+    /// Count one owned title read. Staged rows do not live in the slot table,
+    /// so the transaction has to account for their reads here.
+    pub(crate) fn note_read(&mut self) {
+        self.io_reads += 1;
+        self.string_clones += 1;
     }
 
     /// Resolve a stable key back to a live handle.
@@ -287,6 +438,11 @@ impl Store {
         self.completed > 0
     }
 
+    /// Identity of the runtime that owns this store.
+    pub const fn runtime_id(&self) -> RuntimeId {
+        self.runtime
+    }
+
     pub const fn epoch(&self) -> u64 {
         self.epoch
     }
@@ -302,6 +458,7 @@ impl Store {
 
     /// Record one committed model mutation: exactly one epoch advance and one
     /// write for one successful mutating call (`metrics::Counters::io_writes`).
+    #[cfg(test)]
     fn record_write(&mut self) {
         self.epoch += 1;
         self.io_writes += 1;
@@ -314,6 +471,7 @@ impl Store {
             .map_err(InvalidHandle::from)
     }
 
+    #[cfg(test)]
     fn entry_mut(&mut self, row: RowId) -> Result<&mut Row, InvalidHandle> {
         self.check_runtime(row)?;
         self.rows
@@ -340,12 +498,6 @@ impl Store {
     }
 }
 
-impl Default for Store {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl fmt::Debug for Store {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Store")
@@ -357,12 +509,20 @@ impl fmt::Debug for Store {
 }
 
 #[cfg(test)]
+impl Store {
+    /// Test-only store with its own runtime identity.
+    pub(crate) fn for_test() -> Self {
+        Self::with_runtime(RuntimeId::allocate())
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn removed_row_rejects_its_old_handle() {
-        let mut store = Store::new();
+        let mut store = Store::for_test();
         let row = store.insert("A");
         assert!(store.with_title(row, str::len).is_ok());
 
@@ -376,7 +536,7 @@ mod tests {
 
     #[test]
     fn remaining_and_has_completed_follow_toggle() {
-        let mut store = Store::new();
+        let mut store = Store::for_test();
         let a = store.insert("A");
         let b = store.insert("B");
         assert_eq!(store.remaining(), 2);
@@ -394,7 +554,7 @@ mod tests {
 
     #[test]
     fn reorder_rejects_duplicate_keys_before_mutating() {
-        let mut store = Store::new();
+        let mut store = Store::for_test();
         store.insert("A");
         store.insert("B");
         let keys: Vec<RowKey> = store.keys().collect();
@@ -411,7 +571,7 @@ mod tests {
 
     #[test]
     fn clear_completed_removes_only_completed_rows() {
-        let mut store = Store::new();
+        let mut store = Store::for_test();
         let a = store.insert("A");
         let b = store.insert("B");
         store.toggle(b).expect("live row");
@@ -425,8 +585,8 @@ mod tests {
 
     #[test]
     fn handle_from_another_store_is_rejected() {
-        let mut first = Store::new();
-        let second = Store::new();
+        let mut first = Store::for_test();
+        let second = Store::for_test();
         let row = first.insert("A");
 
         let error = second
@@ -441,7 +601,7 @@ mod tests {
 
     #[test]
     fn one_mutation_is_one_write() {
-        let mut store = Store::new();
+        let mut store = Store::for_test();
         let a = store.insert("A");
         let b = store.insert("B");
         assert_eq!(store.counters().io_writes, 2);
@@ -471,7 +631,7 @@ mod tests {
 
     #[test]
     fn set_completed_updates_counters_in_both_directions() {
-        let mut store = Store::new();
+        let mut store = Store::for_test();
         let row = store.insert("A");
         assert_eq!(store.remaining(), 1);
         assert!(!store.has_completed());
@@ -493,8 +653,8 @@ mod tests {
 
     #[test]
     fn write_through_a_foreign_handle_is_rejected() {
-        let mut first = Store::new();
-        let mut second = Store::new();
+        let mut first = Store::for_test();
+        let mut second = Store::for_test();
         let row = first.insert("A");
 
         let error = second
@@ -509,7 +669,7 @@ mod tests {
 
     #[test]
     fn removing_a_completed_row_decrements_the_counter() {
-        let mut store = Store::new();
+        let mut store = Store::for_test();
         let a = store.insert("A");
         let b = store.insert("B");
         store.set_completed(a, true).expect("live row");
@@ -525,7 +685,7 @@ mod tests {
 
     #[test]
     fn owned_title_read_counts_once() {
-        let mut store = Store::new();
+        let mut store = Store::for_test();
         let row = store.insert("A");
         let title = store.read_owned_title(row).expect("live row");
         assert_eq!(title, "A");

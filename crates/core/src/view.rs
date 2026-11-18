@@ -94,16 +94,21 @@ impl ViewTree {
         self.root
     }
 
-    /// Mount one row view. A remount never reuses an id in P1, so a stale
-    /// `ViewId` can never point at a different row.
-    ///
-    /// TODO(A0-03): monotonic ids are a *stronger* guarantee than the gate
-    /// requires and deliberately skip generation reuse. A0-03 also wants a
-    /// remounted scope to receive a new generation while the id stays stable,
-    /// plus a stale-click dispatch fixture; both are P2 work.
-    pub fn mount_row(&mut self, row: RowKey, owner: OwnerId, title_len: u32) -> ViewId {
-        let id = ViewId::from_index(self.next);
-        self.next += 1;
+    /// Next free view id. A frame draft starts here so a rollback does not
+    /// consume ids (`SPEC-RT-053` keeps the high-water mark out of the
+    /// comparison set's mutation).
+    pub(crate) const fn next_id(&self) -> u32 {
+        self.next
+    }
+
+    /// Apply a mount whose id was reserved by a transaction draft.
+    pub(crate) fn mount_row_with_id(
+        &mut self,
+        id: ViewId,
+        row: RowKey,
+        owner: OwnerId,
+        title_len: u32,
+    ) -> ViewId {
         self.nodes.insert(
             id,
             ViewNode {
@@ -118,6 +123,23 @@ impl ViewTree {
         self.mounts += 1;
         self.geometry_epoch += 1;
         id
+    }
+
+    pub(crate) const fn set_next(&mut self, next: u32) {
+        self.next = next;
+    }
+
+    /// Mount one row view. A remount never reuses an id in P1, so a stale
+    /// `ViewId` can never point at a different row.
+    ///
+    /// TODO(A0-03): monotonic ids are a *stronger* guarantee than the gate
+    /// requires and deliberately skip generation reuse. A0-03 also wants a
+    /// remounted scope to receive a new generation while the id stays stable,
+    /// plus a stale-click dispatch fixture; both are P2 work.
+    pub fn mount_row(&mut self, row: RowKey, owner: OwnerId, title_len: u32) -> ViewId {
+        let id = ViewId::from_index(self.next);
+        self.next += 1;
+        self.mount_row_with_id(id, row, owner, title_len)
     }
 
     pub fn unmount(&mut self, view: ViewId) -> Option<ViewNode> {
@@ -161,6 +183,14 @@ impl ViewTree {
         let caret = node.title_len as usize;
         self.carets.insert(view, caret);
         self.caret_ops += 1;
+    }
+
+    /// Place the caret without moving focus (`SPEC-TEXT-012`).
+    pub fn set_caret(&mut self, view: ViewId, offset: usize) {
+        if self.nodes.contains_key(&view) {
+            self.carets.insert(view, offset);
+            self.caret_ops += 1;
+        }
     }
 
     pub fn clear_focus(&mut self) {
