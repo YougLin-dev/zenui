@@ -81,7 +81,7 @@ replaces: [research/README.md, review/README.md]
 | 文本/字形布局、TextEdit、IME、选区 | [spec/05-text.md](spec/05-text.md) | 渲染与 GPU 抽象负责人 | `EVID-PROBE-04`，三处缺陷已证实 |
 | 布局投影、绘制、合成、窗口、无障碍、3D | [spec/06-render.md](spec/06-render.md) | 渲染与 GPU 抽象负责人 | `EVID-PROBE-04`、`EVID-VAL-15/16` |
 | 平台后端（Windows/macOS/Linux） | [spec/07-platform/index.md](spec/07-platform/index.md) | 各平台工程师 | 三平台均无真机证据，槽位全 `OPEN` |
-| 验收 Gate A0–D | [spec/08-gates.md](spec/08-gates.md) | 测试与 CI/发布负责人 | 42 条判据中 0 `VERIFIED`、2 `PROBE`、40 `OPEN`（`EVID-MATRIX`） |
+| 验收 Gate A0–D | [spec/08-gates.md](spec/08-gates.md) | 测试与 CI/发布负责人 | 42 条判据中 0 `VERIFIED`、6 `PROBE`、36 `OPEN`（`EVID-MATRIX`） |
 | 事实断言（某句到底算不算数） | [evidence/claim-register.md](evidence/claim-register.md) | 顶级研究员 | 100 条 `CLAIM-*`，逐条带状态与证据 |
 | 真实执行记录与复跑命令 | [evidence/validation.md](evidence/validation.md)、[evidence/index.md](evidence/index.md) | 测试与 CI/发布负责人 | `EVID-VAL-01…27` |
 | 探针能证明什么、不能证明什么 | [evidence/probes.md](evidence/probes.md) | 测试与 CI/发布负责人 | `EVID-PROBE-01…05`，每条含证伪边界 |
