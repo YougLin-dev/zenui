@@ -42,7 +42,7 @@ replaces: []
 
 - `docs/README.md` §1–§8：四层模型、状态词、ID 前缀、文件头契约、写作规则、工作顺序。
 - `SPEC-SCOPE-021`：能力宣称必须能落到证据；这与"spec 不写已验证"一致。
-- `CLAIM-003`/`CLAIM-006`：探针测试计数与 H1/H2 主机边界（计数以台账为准）；`CLAIM-039`：生产 runtime 未实现。
+- `CLAIM-003`/`CLAIM-006`：13 条探针与 H1/H2 主机边界；`CLAIM-039`：生产 runtime 未实现。
 - `EVID-VAL-19`：目标示例 `todolist/main.rs` 单独编译有 40 个错误，证明"设计稿 ≠ 可运行程序"必须
   在文档层显式区分。
 - `CLAIM-001`…`CLAIM-100`：事实层的唯一台账，供 spec/decisions 引用。

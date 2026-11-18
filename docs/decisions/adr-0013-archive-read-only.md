@@ -49,7 +49,7 @@ replaces: []
 - `SPEC-STYLE-011`/`-012`：ordinary inline 恒胜、condition 非排序键——与归档中 D4/D8 的旧规则相反。
 - `CLAIM-089`、`CLAIM-090`、`CLAIM-091`、`CLAIM-092`、`CLAIM-095`、`CLAIM-096`：六条 `WITHDRAWN`
   断言，均以现行 spec 为推翻依据。
-- `CLAIM-003`/`CLAIM-006`：探针测试计数与 H1/H2 主机边界（计数以台账为准）；归档中的"已通过"不能跨主机复用。
+- `CLAIM-003`/`CLAIM-006`：13 条探针与 H1/H2 主机边界；归档中的"已通过"不能跨主机复用。
 
 ## 影响与撤销条件
 

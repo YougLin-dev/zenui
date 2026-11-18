@@ -469,6 +469,44 @@ mod tests {
     }
 
     #[test]
+    fn dirty_propagates_transitively() {
+        let mut graph = MemoGraph::new();
+        let source = graph.source("source");
+        let middle = graph.memo("middle");
+        let leaf = graph.memo("leaf");
+
+        let _ = graph
+            .compute(middle, |reader| {
+                reader.read(source);
+                Value::Count(1)
+            })
+            .expect("middle");
+        let _ = graph
+            .compute(leaf, |reader| {
+                reader.read(middle);
+                Value::Count(2)
+            })
+            .expect("leaf");
+
+        graph.bump_source(source);
+        // A changed middle must dirty the leaf two hops away. If propagation
+        // stopped at direct dependents, the leaf would serve its cached value.
+        let _ = graph
+            .compute(middle, |reader| {
+                reader.read(source);
+                Value::Count(9)
+            })
+            .expect("middle changed");
+        let leaf_value = graph
+            .compute(leaf, |reader| {
+                reader.read(middle);
+                Value::Count(3)
+            })
+            .expect("leaf recomputed");
+        assert_eq!(leaf_value, Value::Count(3));
+    }
+
+    #[test]
     fn row_values_compare_by_content() {
         assert_eq!(rows(&[1, 2]), rows(&[1, 2]));
         assert_ne!(rows(&[1, 2]), rows(&[2, 1]));

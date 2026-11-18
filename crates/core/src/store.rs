@@ -470,6 +470,60 @@ mod tests {
     }
 
     #[test]
+    fn set_completed_updates_counters_in_both_directions() {
+        let mut store = Store::new();
+        let row = store.insert("A");
+        assert_eq!(store.remaining(), 1);
+        assert!(!store.has_completed());
+
+        store.set_completed(row, true).expect("live row");
+        assert_eq!(store.remaining(), 0);
+        assert!(store.has_completed());
+        assert_eq!(store.counters().io_writes, 2);
+
+        // Repeating the same value is not a change.
+        store.set_completed(row, true).expect("live row");
+        assert_eq!(store.counters().io_writes, 2);
+
+        store.set_completed(row, false).expect("live row");
+        assert_eq!(store.remaining(), 1);
+        assert!(!store.has_completed());
+        assert_eq!(store.counters().io_writes, 3);
+    }
+
+    #[test]
+    fn write_through_a_foreign_handle_is_rejected() {
+        let mut first = Store::new();
+        let mut second = Store::new();
+        let row = first.insert("A");
+
+        let error = second
+            .toggle(row)
+            .expect_err("a foreign handle must not write");
+        assert!(matches!(error.reason, HandleError::ForeignRuntime { .. }));
+        assert_eq!(second.len(), 0, "the foreign store is untouched");
+        assert_eq!(first.remaining(), 1, "the owning store is unchanged");
+
+        assert!(first.toggle(row).expect("own handle"));
+    }
+
+    #[test]
+    fn removing_a_completed_row_decrements_the_counter() {
+        let mut store = Store::new();
+        let a = store.insert("A");
+        let b = store.insert("B");
+        store.set_completed(a, true).expect("live row");
+        assert!(store.has_completed());
+        assert_eq!(store.remaining(), 1);
+
+        store.remove(a).expect("live row");
+        assert!(!store.has_completed());
+        assert_eq!(store.remaining(), 1, "B is still active");
+        assert_eq!(store.len(), 1);
+        let _ = b;
+    }
+
+    #[test]
     fn owned_title_read_counts_once() {
         let mut store = Store::new();
         let row = store.insert("A");

@@ -101,4 +101,25 @@ mod tests {
         assert_eq!(state.commits(), 1);
         assert!(!state.is_open());
     }
+
+    /// Debug builds assert on an unbalanced end; the point of the assertion is
+    /// that the panic happens *before* any commit is recorded.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn unbalanced_end_panics_without_committing() {
+        let mut state = TransactionState::new();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| state.end()));
+        assert!(result.is_err(), "debug builds assert on an unbalanced end");
+        assert_eq!(state.commits(), 0, "a refused end must not commit");
+    }
+
+    /// Release builds skip the assertion, so this is where the "refuse to
+    /// commit" branch is actually exercised.
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn unbalanced_end_does_not_commit() {
+        let mut state = TransactionState::new();
+        assert_eq!(state.end(), None);
+        assert_eq!(state.commits(), 0);
+    }
 }
