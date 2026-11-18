@@ -85,6 +85,11 @@ replaces: []
 | EVID-VAL-25 | A | `cargo run -p zenui-app --example todolist_headless --locked`（H2，commit `%COMMIT%`） | 9 步 trace，sha256 与 EVID-VAL-20 相同 |
 | EVID-VAL-26 | A | `cargo clippy --workspace --all-targets --locked -- -D warnings`（H2，commit `%COMMIT%`） | exit 0（本机，不是 CI 日志） |
 | EVID-VAL-27 | A | `cargo test -p zenui-core --test regressions --locked`（H2，commit `bb16522b03abd7fb0102fb092c49284615416fbc`） | 8 passed（ADR-0017 审计回归夹具） |
+| EVID-VAL-28 | A | `cargo test -p zenui-core --test queries --locked`（H2，commit `b81918b`） | 4 passed（A0-07/08 计数夹具） |
+| EVID-VAL-29 | A | `cargo test -p zenui-core --test lifecycle --locked`（H2，commit `b81918b`） | 7 passed（A0-09/10/11 与 A0-02 运行时夹具） |
+| EVID-VAL-30 | A | `cargo test -p zenui-core --locked`（H2，commit `b81918b`） | 90 passed（54 + 6 + 7 + 4 + 11 + 8 doctest） |
+| EVID-VAL-31 | A | `cargo run -p zenui-app --example todolist_headless --locked`（H2，commit `b81918b`） | trace sha256 `4da03691…`（A0-08 语义变更后重录） |
+| EVID-VAL-32 | A | `cargo clippy --workspace --all-targets --locked -- -D warnings`（H2，commit `b81918b`） | exit 0（本机，不是 CI 日志） |
 | SRC | — | 仓库源码/清单，`path:line` | 本轮静态核对，可直接复查 |
 
 > **已裁决（C-18/D-02，ADR-0012）**：`docs/README.md` §6 现已承认第三种证据前缀 `SRC path:line`，
@@ -252,6 +257,12 @@ replaces: []
 | CLAIM-111 | `ValueError` 的形状是 `Handle / Store / Phase(PhaseViolation) / Aborted`；不存在通用的 `ValueError::Fatal` 通道，`PhaseViolation` 与 commit 侧的 `Fatal::PhaseViolation` 是同一个结构 | VERIFIED | EVID-VAL-24；SRC `crates/core/src/txn.rs` | A0 | ADR-0019 决定 3、5、8 |
 | CLAIM-112 | 写 API 阶段违规返回 `ValueError::Phase` 并锁存致命错误；帧体即使返回 `Ok`，最外层也返回锁存的 `Fatal`、`commits` 不增、下一帧可提交 | VERIFIED | EVID-VAL-24（`a_write_during_compute_is_a_domain_error`）；SRC `crates/core/src/runtime.rs` | A0 | 夹具断言帧级结果，不只看调用点 |
 | CLAIM-113 | owner cleanup 在换入之后、`Phase::Cleanup` 下运行；cleanup 相位的 view 写返回 typed 错误而不是静默应用，下一帧可正常 staging | VERIFIED | EVID-VAL-24；SRC `crates/core/src/txn.rs` | A0 | cleanup 闭包是 `'static`，类型上无法访问 `Tx`，所以「只入 journal」以「拒绝 + 下一帧可提交」表达 |
+| CLAIM-114 | query cache 按 filter 分别以 membership epoch 为键：标题写与 reorder 不失效任何缓存，completed 写只失效 Active/Completed，insert/remove/clear 失效三者 | VERIFIED | EVID-VAL-28；SRC `crates/core/src/query.rs`、`crates/core/src/store.rs` | A0 | 反向边收敛到 filter 维度，不记录逐行边 |
+| CLAIM-115 | 空 filter 由成员计数回答：`cache_builds`/`id_materializations`/`row_visits` 均为 0；用 `collect()` 实现 `is_empty` 会判红 | VERIFIED | EVID-VAL-28；SRC `crates/core/src/store.rs` | A0 | 只覆盖本 crate 的三个 filter |
+| CLAIM-116 | For 强制 key：同一 RowKey 的第二次 mount 在任何 patch 之前返回 `Fatal::DuplicateViewKey`；reorder 不产生 unmount/setup 且保留 ViewId/owner/focus/caret | VERIFIED | EVID-VAL-29；SRC `crates/core/src/txn.rs` | A0 | 只覆盖 row 级 view；嵌套 For 未实现 |
+| CLAIM-117 | FocusRemovalIntent 在结构变更前记录、commit 末尾结算一次；用户同帧转移焦点会取消；批量 Clear 只结算一次 | VERIFIED | EVID-VAL-29；SRC `crates/core/src/txn.rs` | A0 | 回退顺序只有 next → previous；input/toolbar 节点在 A0 不存在 |
+| CLAIM-118 | 1000+ 交错 mount/unmount/filter churn 后 live owner、edges、active source 与 layout 映射回到基线 | VERIFIED | EVID-VAL-29；SRC `crates/core/tests/lifecycle.rs` | A0 | 确定性脚本，不是随机压力 |
+| CLAIM-119 | A0-02 的契约由 2 条 `compile_fail` doctest 与运行时 read 计数共同钉住（`Copy` 类型不能拥有 `String`；权威无拥有式 `get`；一次 mount 恰一次 owned 读） | VERIFIED | EVID-VAL-30；SRC `crates/core/src/lib.rs`、`crates/core/tests/lifecycle.rs` | A0 | **没有引入 trybuild**：dev-dependency 需要 ADR，已上报队长待裁 |
 
 ---
 
@@ -259,12 +270,12 @@ replaces: []
 
 | 状态 | 条数 | 主要领域 |
 |---|---|---|
-| VERIFIED | 74 | 执行记录、源码事实、两条官方 CSS/Tailwind 事实 |
+| VERIFIED | 80 | 执行记录、源码事实、两条官方 CSS/Tailwind 事实 |
 | SPEC | 9 | Store/Query/For/焦点契约中尚未实现的部分 |
 | OPEN | 12 | MSRV、bidi/emoji、capabilities、surface/DPI、Mac/Linux、mask/filter、3D depth、IME、AT、平台矩阵、版本组合 |
 | WITHDRAWN | 12 | 旧 mount 形状、条件语法、优先级、Copy+String、retained-visibility 等 |
 | PROBE | 6 | rstml parse-only、3 条 C 类夹具记录、tailwind crate 研究探针、A0 query 缓存共享 |
-| **合计** | **113** | — |
+| **合计** | **119** | — |
 
 > 注意：`VERIFIED` 只表示"该断言在其限定范围内有记录"，不表示整个子系统完成。例如
 > CLAIM-064 只证明 H1/H2 两个 headless 数据点，不证明窗口、surface 或其他 Linux 后端。

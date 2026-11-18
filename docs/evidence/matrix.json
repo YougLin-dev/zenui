@@ -33,7 +33,7 @@
       "toolchain": "1.99.1 (58cf8f9c3 2026-10-13)",
       "adapter": "Apple M4 (10-core GPU, Metal 4) / metal",
       "commit": "9fae970abee84e7eafe21f82937374a2813f7198",
-      "commitNote": "EVID-VAL-12…19 记录于 ab5339b；EVID-VAL-20/21 记录于 83b21a4；EVID-VAL-23…27 记录于 e53ae0e",
+      "commitNote": "EVID-VAL-12…19 记录于 ab5339b；EVID-VAL-20/21 记录于 83b21a4；EVID-VAL-23…27 记录于 e53ae0e；EVID-VAL-28…32 记录于 b81918b",
       "evidenceClass": "A-observed-this-round"
     },
     {
@@ -482,6 +482,78 @@
       },
       "proves": "失败帧之后的两条数据一致性缺陷与 9 条审计缺陷各有回归夹具：嵌套失败错误被锁存、discard 不回退 row key、reorder 后的 insert 不被丢弃、removal 压过 staged 值、同帧 insert+remove 归还槽位、局部 view order 被拒、mount 指向已删行被拒、focus 指向将被卸载的 view 被拒、失败帧不烧 LayoutNodeId、空写不推进 epoch",
       "doesNotProve": "只覆盖自读 memo 环；cleanup 的「只入 journal」以「拒绝 + 下一帧可提交」表达，不是同帧排队；单线程 headless"
+    },
+    {
+      "id": "EVID-VAL-28",
+      "class": "A",
+      "host": "H2",
+      "kind": "test",
+      "command": "cargo test -p zenui-core --test queries --locked",
+      "exit": 0,
+      "commit": "b81918b652d453b87bdf645cd469f968e52b89ec",
+      "tests": {
+        "passed": 4,
+        "failed": 0,
+        "ignored": 0
+      },
+      "proves": "A0-07/A0-08：每个 (membership epoch, filter) 恰一次 query_eval，非空恰一次 cache_build + id_materialize，空结果三者皆 0；1000 行 × 三 filter 第二轮全命中",
+      "doesNotProve": "没有断言 memo 只追踪 cache revision 的实现细节；计数是执行期观测，不含真实布局/渲染"
+    },
+    {
+      "id": "EVID-VAL-29",
+      "class": "A",
+      "host": "H2",
+      "kind": "test",
+      "command": "cargo test -p zenui-core --test lifecycle --locked",
+      "exit": 0,
+      "commit": "b81918b652d453b87bdf645cd469f968e52b89ec",
+      "tests": {
+        "passed": 7,
+        "failed": 0,
+        "ignored": 0
+      },
+      "proves": "A0-09/A0-10/A0-11：reorder 零 unmount/setup 且身份保留、duplicate key 在任何 patch 前被拒、intent 两段式结算一次且被用户转移取消、1000+ churn 回到基线",
+      "doesNotProve": "input/toolbar 回退节点在 A0 不存在；churn 是确定性脚本，不是随机压力"
+    },
+    {
+      "id": "EVID-VAL-30",
+      "class": "A",
+      "host": "H2",
+      "kind": "test",
+      "command": "cargo test -p zenui-core --locked",
+      "exit": 0,
+      "commit": "b81918b652d453b87bdf645cd469f968e52b89ec",
+      "tests": {
+        "passed": 90,
+        "failed": 0,
+        "ignored": 0
+      },
+      "compileFailFixtures": 8,
+      "proves": "zenui-core：lib 54 + gates 6 + lifecycle 7 + queries 4 + regressions 11 + 8 条 compile_fail doctest",
+      "doesNotProve": "zenui-app 的 golden 测试不在本命令内；单测数量不等于 gate 覆盖数"
+    },
+    {
+      "id": "EVID-VAL-31",
+      "class": "A",
+      "host": "H2",
+      "kind": "runtime",
+      "command": "cargo run -p zenui-app --example todolist_headless --locked",
+      "exit": 0,
+      "commit": "b81918b652d453b87bdf645cd469f968e52b89ec",
+      "traceSha256": "4da03691685138fdeb97d3873f566ae0fcf86a964a825b11c75fe7eb1f9fa7ff",
+      "proves": "golden 重录后的 trace：与 fb16d571… 的唯一差异是 step 01 的 id_materializations 由 1 变 0（空态不再物化，A0-08）",
+      "doesNotProve": "语义变化之外的任何行为；trace 不含 A0-07 的分项计数"
+    },
+    {
+      "id": "EVID-VAL-32",
+      "class": "A",
+      "host": "H2",
+      "kind": "lint",
+      "command": "cargo clippy --workspace --all-targets --locked -- -D warnings",
+      "exit": 0,
+      "commit": "b81918b652d453b87bdf645cd469f968e52b89ec",
+      "proves": "本机全 workspace 零 clippy 警告；同轮 cargo fmt --all -- --check 通过",
+      "doesNotProve": "不是 CI 日志；SPEC-GATE-C-04 仍缺 CI 记录"
     }
   ],
   "contracts": [
@@ -650,15 +722,15 @@
     "note": "PROBE 项为 SPEC-GATE-B-05（3 条 style 探针，无 manifest/provenance）与 SPEC-GATE-A0-01/-03/-04/-05/-06（EVID-VAL-20…-24、-27 的 gate 夹具与 trace）。total 为 42 是巧合，不代表任何覆盖率百分比。"
   },
   "counts": {
-    "testsPassedH2": 145,
+    "testsPassedH2": 246,
     "testsPassedCi": 120,
-    "compileFailFixturesH2": 9,
+    "compileFailFixturesH2": 17,
     "zeroTestTargetsH2": [
       "root package zenui"
     ],
     "gpuBackendsObserved": 2,
-    "runsTotal": 27,
-    "runsReproducibleHere": 15,
+    "runsTotal": 32,
+    "runsReproducibleHere": 20,
     "runsTranscribedOrExternal": 11,
     "runsOnCi": 1
   },
