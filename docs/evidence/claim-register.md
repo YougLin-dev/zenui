@@ -51,10 +51,10 @@ replaces: []
 
 ### 0.1 证据键（权威定义见 `docs/evidence/validation.md` §2）
 
-`EVID-VAL-*` 编号已与该文件的 40 条索引对齐。主机定义：
+`EVID-VAL-*` 编号已与该文件的 46 条索引对齐。主机定义：
 
 - **H1**：Windows 11 / MSVC / Rust 1.99.1 / NVIDIA RTX 4060 Laptop / Vulkan；上一轮记录，**commit 未记录**。
-- **H2**：macOS 27.0.1 / Apple M4 / Metal 4 / Rust 1.99.1；commit `ab5339b`（EVID-VAL-12…19）/ `83b21a4`（EVID-VAL-20/-21）/ `e53ae0e`、`f7a2d62`、`7d78cdc`（EVID-VAL-23…40）；本轮 Test/CI 实测。
+- **H2**：macOS 27.0.1 / Apple M4 / Metal 4 / Rust 1.99.1；commit `ab5339b`（EVID-VAL-12…19）/ `83b21a4`（EVID-VAL-20/-21）/ `e53ae0e`、`f7a2d62`、`7d78cdc`（EVID-VAL-23…40）、`a24faed`（EVID-VAL-41…46）；本轮 Test/CI 实测。
 
 | 键 | 类别 | 命令 / 位置 | 记录结果 |
 |---|---|---|---|
@@ -98,6 +98,12 @@ replaces: []
 | EVID-VAL-38 | A | `cargo test --workspace --locked`（H2，commit `7d78cdc`） | 109 passed |
 | EVID-VAL-39 | A | `cargo run -p zenui-app --example todolist_headless --locked`（H2，commit `7d78cdc`） | trace sha256 `57a4a142…`（接线后重录） |
 | EVID-VAL-40 | A | `cargo clippy --workspace --all-targets --locked -- -D warnings`（H2，commit `7d78cdc`） | exit 0（本机，不是 CI 日志） |
+| EVID-VAL-41 | A | `cargo test -p zenui-core --test compile_fail --locked`（H2，commit `a24faed`） | 1 passed（9 条 trybuild UI 用例；两条 mutation 判红） |
+| EVID-VAL-42 | A | `cargo test -p zenui-core --test queries --locked`（H2，commit `a24faed`） | 7 passed（ADR-0022 决定 6 的五条 mutation 判红） |
+| EVID-VAL-43 | A | `cargo test -p zenui-core --locked`（H2，commit `a24faed`） | 92 passed（doctest 0，8 条已迁移到 trybuild） |
+| EVID-VAL-44 | A | `cargo test --workspace --locked`（H2，commit `a24faed`） | 102 passed |
+| EVID-VAL-45 | A | `cargo run -p zenui-app --example todolist_headless --locked`（H2，commit `a24faed`） | trace sha256 与 `57a4a142…` 相同 |
+| EVID-VAL-46 | A | `cargo clippy --workspace --all-targets --locked -- -D warnings`（H2，commit `a24faed`） | exit 0（本机，不是 CI 日志） |
 | SRC | — | 仓库源码/清单，`path:line` | 本轮静态核对，可直接复查 |
 
 > **已裁决（C-18/D-02，ADR-0012）**：`docs/README.md` §6 现已承认第三种证据前缀 `SRC path:line`，
@@ -266,11 +272,11 @@ replaces: []
 | CLAIM-112 | 写 API 阶段违规返回 `ValueError::Phase` 并锁存致命错误；帧体即使返回 `Ok`，最外层也返回锁存的 `Fatal`、`commits` 不增、下一帧可提交 | VERIFIED | EVID-VAL-24（`a_write_during_compute_is_a_domain_error`）；SRC `crates/core/src/runtime.rs` | A0 | 夹具断言帧级结果，不只看调用点 |
 | CLAIM-113 | owner cleanup 在换入之后、`Phase::Cleanup` 下运行；cleanup 相位的 view 写返回 typed 错误而不是静默应用，下一帧可正常 staging | VERIFIED | EVID-VAL-24；SRC `crates/core/src/txn.rs` | A0 | cleanup 闭包是 `'static`，类型上无法访问 `Tx`，所以「只入 journal」以「拒绝 + 下一帧可提交」表达 |
 | CLAIM-114 | query cache 的键是 `(membership revision[filter], order revision)`：completed 写只推进 Active/Completed，reorder 只推进 order revision，insert 推进 All+Active，remove/clear 推进它们真正改变的集合；标题不参与任何 filter 的成员判定，因此不在键内 | VERIFIED | EVID-VAL-33；SRC `crates/core/src/query.rs`、`crates/core/src/txn.rs`、`crates/core/src/store.rs` | A0 | 反向边收敛到 filter 维度，不记录逐行边；修订号在 staging 点推进、由 `Store::install` 原样采纳，因此帧内构建的快照在 commit 后仍有效 |
-| CLAIM-115 | 空 filter 由成员计数回答：`cache_builds`/`id_materializations`/`row_visits` 均为 0；删掉这条短路会让 3 条夹具判红。**用 `collect()` 实现 `is_empty` 不会判红**——计数器只统计缓存自己闭包里的行访问，视图内部的扫描对它不可见 | VERIFIED | EVID-VAL-33；SRC `crates/core/src/query.rs`、`crates/core/src/txn.rs` | A0 | 只覆盖本 crate 的三个 filter；"is_empty 不许扫描"靠结构（缓存与视图都不在公开面、只有两份实现）而不是计数器保证，本轮 mutation 实测确认了这一点 |
+| CLAIM-115 | 空 filter 由成员计数回答：`cache_builds`/`id_materializations`/`row_visits` 均为 0；删掉这条短路会让 3 条夹具判红。把 `is_empty_for` 换成数一遍 `rows_for(All)`（布尔不变）会让 6 条夹具判红，含 1000 行空态（`row_visits` 2000 → 3000）——扫描计数的归属在视图侧，缓存按求值前后的差值记 `row_visits` | VERIFIED | EVID-VAL-42；SRC `crates/core/src/query.rs`、`crates/core/src/txn.rs` | A0 | 只覆盖本 crate 的三个 filter；裁决来自 ADR-0022 决定 6。§14（EVID-VAL-33）记的是 ADR 之前的契约，那里同一条变异 7 条全绿 |
 | CLAIM-116 | For 强制 key：同一 RowKey 的第二次 mount 在任何 patch 之前返回 `Fatal::DuplicateViewKey`；reorder 不产生 unmount/setup 且保留 ViewId/owner/focus/caret | VERIFIED | EVID-VAL-29；SRC `crates/core/src/txn.rs` | A0 | 只覆盖 row 级 view；嵌套 For 未实现 |
 | CLAIM-117 | FocusRemovalIntent 在结构变更前记录、commit 末尾结算一次；用户同帧转移焦点会取消；批量 Clear 只结算一次 | VERIFIED | EVID-VAL-29；SRC `crates/core/src/txn.rs` | A0 | 回退顺序只有 next → previous；input/toolbar 节点在 A0 不存在 |
 | CLAIM-118 | 1000+ 交错 mount/unmount/filter churn 后 live owner、edges、active source 与 layout 映射回到基线 | VERIFIED | EVID-VAL-29；SRC `crates/core/tests/lifecycle.rs` | A0 | 确定性脚本，不是随机压力 |
-| CLAIM-119 | A0-02 的契约由 2 条 `compile_fail` doctest 与运行时 read 计数共同钉住（`Copy` 类型不能拥有 `String`；权威无拥有式 `get`；一次 mount 恰一次 owned 读） | VERIFIED | EVID-VAL-30；SRC `crates/core/src/lib.rs`、`crates/core/tests/lifecycle.rs` | A0 | **没有引入 trybuild**：dev-dependency 需要 ADR，已上报队长待裁 |
+| CLAIM-119 | A0-02 的契约由 trybuild UI 快照与运行时 read 计数共同钉住（E0204 `Copy` 类型不能拥有 `String`；E0599 权威无拥有式 `get`；一次 mount 恰一次 owned 读），A0-03 的六条身份域互斥固定在 E0308 | VERIFIED | EVID-VAL-41、EVID-VAL-36；SRC `crates/core/tests/ui/`、`crates/app/src/lib.rs` | A0 | 原 `compile_fail` doctest 已删除：它只证明"不能编译"，笔误也能保持绿色（ADR-0021、EVID-VAL-41 的 mutation） |
 
 ---
 

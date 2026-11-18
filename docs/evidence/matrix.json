@@ -673,6 +673,94 @@
       "commit": "7d78cdcd08a5720af795d827b093099d2abaf19f",
       "proves": "本机全 workspace 零 clippy 警告；同轮 cargo fmt --all -- --check 通过",
       "doesNotProve": "不是 CI 日志；SPEC-GATE-C-04 仍缺 CI 记录"
+    },
+    {
+      "id": "EVID-VAL-41",
+      "class": "A",
+      "host": "H2",
+      "kind": "test",
+      "command": "cargo test -p zenui-core --test compile_fail --locked",
+      "exit": 0,
+      "commit": "a24faed924a719b6b9ca32f36cf35e6260ebb7b1",
+      "tests": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0
+      },
+      "compileFailFixtures": 9,
+      "proves": "九条类型契约由 trybuild UI 用例与 .stderr 快照钉住：E0204（Copy 类型拥有 String）、E0599（权威无拥有式 get）、六条 E0308 身份域互斥、E0603+E0624（zenui_core::query::QueryCache 不可构造）。两条 mutation 判红：UI 用例里把调用改成未定义名字（E0425）→ mismatch；把 query 模块改回 pub → E0603 用例 mismatch。同一处改动在 compile_fail doctest 下保持绿色",
+      "doesNotProve": "快照包含编译器诊断的逐字文本与 span，工具链升级会使其变红（ADR-0021 决定 5 的代价）；只在本机工具链上验证，跨平台由 CI 矩阵回答"
+    },
+    {
+      "id": "EVID-VAL-42",
+      "class": "A",
+      "host": "H2",
+      "kind": "test",
+      "command": "cargo test -p zenui-core --test queries --locked",
+      "exit": 0,
+      "commit": "a24faed924a719b6b9ca32f36cf35e6260ebb7b1",
+      "tests": {
+        "passed": 7,
+        "failed": 0,
+        "ignored": 0
+      },
+      "proves": "A0-07/A0-08 在 ADR-0022 的 RowView 契约上成立，且决定 6 的变异表逐条判红：is_empty_for 改成数一遍 rows_for(All) → 6 条红（含 1000 行空态，row_visits 由 2000 变 3000）；命中分支也自增 query_evals → 4 条红；命中分支重建 RowSet → 2 条红；completed 写 bump 三个 filter → 1 条红；Tx::rows 改回直接展开 effective_rows() → 6 条红",
+      "doesNotProve": "变异只改计数路径、不改返回值；不含真实布局/渲染；计数器仍是执行期观测"
+    },
+    {
+      "id": "EVID-VAL-43",
+      "class": "A",
+      "host": "H2",
+      "kind": "test",
+      "command": "cargo test -p zenui-core --locked",
+      "exit": 0,
+      "commit": "a24faed924a719b6b9ca32f36cf35e6260ebb7b1",
+      "tests": {
+        "passed": 92,
+        "failed": 0,
+        "ignored": 0
+      },
+      "proves": "zenui-core 全量 92 passed：lib 57 + compile-fail 运行器 1 + gates 6 + lifecycle 9 + queries 7 + regressions 12；doctest 由 8 条降为 0（迁移到 trybuild，见 EVID-VAL-41）",
+      "doesNotProve": "trybuild 的九条用例在运行器里计为 1 个测试目标，9 这个数字来自 UI 用例数而不是测试计数；单测数量不等于 gate 覆盖数"
+    },
+    {
+      "id": "EVID-VAL-44",
+      "class": "A",
+      "host": "H2",
+      "kind": "test",
+      "command": "cargo test --workspace --locked",
+      "exit": 0,
+      "commit": "a24faed924a719b6b9ca32f36cf35e6260ebb7b1",
+      "tests": {
+        "passed": 102,
+        "failed": 0,
+        "ignored": 0
+      },
+      "proves": "整个 workspace 102 passed（core 92 + app 10）",
+      "doesNotProve": "不是 CI 日志；三平台矩阵见 EVID-VAL-22，本轮未重跑 CI"
+    },
+    {
+      "id": "EVID-VAL-45",
+      "class": "A",
+      "host": "H2",
+      "kind": "runtime",
+      "command": "cargo run -p zenui-app --example todolist_headless --locked",
+      "exit": 0,
+      "commit": "a24faed924a719b6b9ca32f36cf35e6260ebb7b1",
+      "traceSha256": "57a4a142999537ddcd0fe4778d5f3604a91a77e664e0a926492f5cc002b0857e",
+      "proves": "ADR-0022 契约改造后 trace 与 EVID-VAL-39 逐字相同（sha256 不变）：RowView 的成员变化与 remaining/has_completed 的取数路径改造没有改变 9 步场景的任何可观测输出",
+      "doesNotProve": "trace 不携带 cache_builds/row_visits；相等只说明该场景未受影响"
+    },
+    {
+      "id": "EVID-VAL-46",
+      "class": "A",
+      "host": "H2",
+      "kind": "lint",
+      "command": "cargo clippy --workspace --all-targets --locked -- -D warnings",
+      "exit": 0,
+      "commit": "a24faed924a719b6b9ca32f36cf35e6260ebb7b1",
+      "proves": "本机全 workspace 零 clippy 警告；同轮 cargo fmt --all -- --check 通过；trybuild 只在 dev-dependencies，cargo tree -e normal 不含它",
+      "doesNotProve": "不是 CI 日志；SPEC-GATE-C-04 仍缺 CI 记录"
     }
   ],
   "contracts": [
@@ -841,15 +929,15 @@
     "note": "PROBE 项为 SPEC-GATE-B-05（3 条 style 探针，无 manifest/provenance）与 SPEC-GATE-A0-01/-03/-04/-05/-06（EVID-VAL-20…-24、-27 的 gate 夹具与 trace）。total 为 42 是巧合，不代表任何覆盖率百分比。"
   },
   "counts": {
-    "testsPassedH2": 492,
+    "testsPassedH2": 694,
     "testsPassedCi": 120,
-    "compileFailFixturesH2": 17,
+    "compileFailFixturesH2": 26,
     "zeroTestTargetsH2": [
       "root package zenui"
     ],
     "gpuBackendsObserved": 2,
-    "runsTotal": 40,
-    "runsReproducibleHere": 28,
+    "runsTotal": 46,
+    "runsReproducibleHere": 34,
     "runsTranscribedOrExternal": 11,
     "runsOnCi": 1
   },

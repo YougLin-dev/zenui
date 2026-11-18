@@ -19,7 +19,7 @@ replaces: []
 | 文件 | 定义什么 | 状态 |
 |---|---|---|
 | `index.md`（本文件） | 复跑入口、主机约定、引用规则、陷阱 | normative |
-| `validation.md` | `EVID-VAL-01…40`：每条命令 + 主机 + 结果 + 边界 | normative |
+| `validation.md` | `EVID-VAL-01…46`：每条命令 + 主机 + 结果 + 边界 | normative |
 | `matrix.json` | `EVID-MATRIX`：上述运行与 11 组合同的机器投影 | normative |
 | `claim-register.md` | `CLAIM-*`：可判真假的单句断言（唯一事实来源） | normative（研究员交付） |
 | `probes.md` | `EVID-PROBE-01…05`：探针能力与证伪边界 | normative（本文件负责人，见 §1.1） |
@@ -146,6 +146,6 @@ Gate 判据（`SPEC-GATE-*`）在 `docs/spec/08-gates.md`。当前映射：42 �
 
 本轮新增：`index.md`、`validation.md`、`matrix.json`、`probes.md`（commit `ab5339b` 之后、队长统一提交前）。`claim-register.md` 由研究员交付，本层只引用不改写。原始记录 `archive/review/VALIDATION.md`、`archive/review/validation-matrix-raw.json` 保持原文不动，归档后由本层接管引用。
 
-编号一致性：`claim-register.md` 的证据键表已覆盖 `EVID-VAL-01…40`，`matrix.json` 的 `runs` 与 `counts` 已同步（`runsTotal=40`、`testsPassedH2=492`、`testsPassedCi=120`、`runsReproducibleHere=28`、`runsOnCi=1`）。
+编号一致性：`claim-register.md` 的证据键表已覆盖 `EVID-VAL-01…46`，`matrix.json` 的 `runs` 与 `counts` 已同步（`runsTotal=46`、`testsPassedH2=694`、`testsPassedCi=120`、`runsReproducibleHere=34`、`runsOnCi=1`）。
 
 源码事实的引用形式（回应 `claim-register.md` 的 C-18）：不新增 `EVID-SRC`，统一写成 `EVID-PROBE-0N`（`probes.md` 条目内附 `SRC path:line`）。这样源码事实仍落在 evidence 层、仍是 `EVID-*` 形态，且附带"能/不能证明什么"的边界，比裸 `path:line` 更难被断章取义。
