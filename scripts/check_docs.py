@@ -15,7 +15,9 @@ Checks, in order:
      corpus rather than trusted: the EVID-VAL range, the coverage split, the
      runsTotal/testsPassedH2/runsReproducibleHere triple and the CLAIM totals;
   8. matrix.json runs[] and the validation.md index describe the same runs,
-     and the claim-register evidence-key table covers every EVID-VAL.
+     and the claim-register evidence-key table covers every EVID-VAL;
+  9. every commit a run cites exists in this repository and is an ancestor of
+     HEAD, because a rewritten commit leaves the id and the numbers behind.
 
 Exit code is the number of failures, capped at 99. Standard library only.
 """
@@ -25,6 +27,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
 import sys
 import unicodedata
 from collections import Counter
@@ -79,6 +82,7 @@ KEY_VALUE = re.compile(r"\b(" + "|".join(DERIVED_KEYS) + r")\s*=\s*(\d+)")
 
 RUN_REQUIRED = ("id", "class", "host", "kind", "command")
 RUN_CLASSES = {"A", "B", "C", "D"}
+COMMIT_SHA = re.compile(r"[0-9a-f]{40}")
 
 failures: list[str] = []
 
@@ -549,6 +553,65 @@ def check_matrix_matches_validation(matrix: dict) -> None:
             )
 
 
+def git(*argv: str) -> tuple[bool, str]:
+    """Run git against the corpus checkout; returns (ok, stderr)."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", ROOT, *argv],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, str(exc)
+    return result.returncode == 0, result.stderr.strip()
+
+
+def check_run_commits(matrix: dict) -> None:
+    """Every commit a run cites must exist here and be an ancestor of HEAD.
+
+    A rebase rewrites hashes. The entry keeps its id, its numbers and its
+    `commit` string, but the object is gone — and nothing in the text can tell
+    that apart from an honest record. Only the repository can. Runs without a
+    `commit` field (transcribed hosts, external fixtures) are skipped: there is
+    nothing to look up, and inventing one would be worse than the gap. A field
+    that exists but is empty or malformed is not that gap — it is bad data.
+    """
+    runs = [run for run in matrix.get("runs") or [] if isinstance(run, dict)]
+    cited = [(run.get("id"), run["commit"]) for run in runs if "commit" in run]
+    if not cited:
+        return
+    inside, stderr = git("rev-parse", "--is-inside-work-tree")
+    if not inside:
+        failures.append(
+            f"{rel(MATRIX)}: cannot verify commit provenance — not a git checkout "
+            f"({stderr or 'git unavailable'})"
+        )
+        return
+    for run_id, commit in cited:
+        if not isinstance(commit, str) or not COMMIT_SHA.fullmatch(commit):
+            failures.append(
+                f"{rel(MATRIX)} {run_id}: commit {commit!r} is not a full "
+                f"40-character sha; an empty or malformed value is bad data, not a "
+                f"missing record — drop the field instead"
+            )
+            continue
+        exists, _ = git("cat-file", "-e", f"{commit}^{{commit}}")
+        if not exists:
+            failures.append(
+                f"{rel(MATRIX)} {run_id}: commit {commit} does not exist in this "
+                f"repository (rewritten, never pushed, or the clone is shallow — "
+                f"the docs job checks out with fetch-depth: 0)"
+            )
+            continue
+        ancestor, _ = git("merge-base", "--is-ancestor", commit, "HEAD")
+        if not ancestor:
+            failures.append(
+                f"{rel(MATRIX)} {run_id}: commit {commit} exists but is not an "
+                f"ancestor of HEAD (another branch, or a rebuild that dropped it)"
+            )
+
+
 def validation_entries() -> tuple[set[str], set[str]]:
     """The EVID-VAL ids the validation ledger declares: §2 index rows and the
     entry sections themselves. Grouped headings ("EVID-VAL-09 / -10") count
@@ -712,6 +775,7 @@ def main() -> int:
         check_matrix_counts(matrix)
         check_matrix_coverage(matrix, known)
         check_matrix_matches_validation(matrix)
+        check_run_commits(matrix)
         check_derived_numbers(matrix, max_val)
         check_claim_totals()
         check_claim_evid_keys()
