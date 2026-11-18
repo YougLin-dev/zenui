@@ -220,6 +220,60 @@ fn a0_10_deleting_the_focused_row_settles_one_intent() {
     );
 }
 
+/// `SPEC-GATE-A0-10`: the fallback is next → previous. Deleting the **last**
+/// row has no next sibling, so settlement must take `previous`; the
+/// delete-the-first-row fixture above only ever exercises the next arm.
+///
+/// Red-ability: drop the `.or_else(... intent.previous ...)` arm in `Tx::commit`
+/// and this fixture fails — the target becomes `None` and focus is cleared.
+#[test]
+fn a0_10_deleting_the_last_focused_row_falls_back_to_previous() {
+    let mut runtime = Runtime::new();
+    runtime
+        .frame(|tx| {
+            tx.insert("A")?;
+            tx.insert("B")?;
+            tx.insert("C")?;
+            Ok(())
+        })
+        .expect("seed");
+    let views = mount_all(&mut runtime);
+    runtime
+        .frame(|tx| {
+            tx.focus(views[2])?;
+            Ok(())
+        })
+        .expect("focus C");
+
+    let moves_before = runtime.counters().focus_moves;
+    let carets_before = runtime.counters().caret_ops;
+
+    let row = runtime_row(&runtime, "C");
+    runtime
+        .frame(|tx| {
+            tx.remove(row).map_err(|_| Fatal::Aborted)?;
+            tx.unmount(views[2])?;
+            Ok(())
+        })
+        .expect("delete the last focused row");
+
+    assert_eq!(
+        runtime.focused(),
+        Some(views[1]),
+        "no next sibling exists, so the settlement must take previous"
+    );
+    assert_eq!(
+        runtime.counters().focus_moves,
+        moves_before + 1,
+        "exactly one settlement"
+    );
+    assert_eq!(
+        runtime.counters().caret_ops,
+        carets_before + 1,
+        "one settlement places the caret once"
+    );
+}
+
 /// `SPEC-GATE-A0-10`: `clear_focus` is a user choice too. The recorded intent
 /// must not pull focus back after the user cleared it in the same frame.
 #[test]
@@ -531,6 +585,207 @@ fn a0_11_churn_returns_to_the_baseline() {
         0,
         "the model is back to empty, not just the view tree"
     );
+}
+
+/// Read one filter and return the titles in display order. Reading the titles
+/// through the frame keeps the assertion on the row *set* the cache returned,
+/// not just its length.
+fn read_titles(runtime: &mut Runtime, filter: Filter) -> Vec<String> {
+    runtime
+        .frame(|tx| {
+            let rows = tx.rows(filter);
+            let mut titles = Vec::with_capacity(rows.len());
+            for key in rows.iter() {
+                let handle = tx.handle_for(key).expect("the row set names a live row");
+                titles.push(
+                    tx.with_title(handle, |title| title.to_owned())
+                        .map_err(|_| Fatal::Aborted)?,
+                );
+            }
+            Ok(titles)
+        })
+        .expect("read")
+}
+
+/// `SPEC-GATE-A0-11`: "caches return to the baseline" has a numeric meaning.
+/// After 1200 interleaved operations, a drain, a discarded frame and a seed,
+/// the query cache must behave like a fresh runtime's: one evaluation and one
+/// build per filter on first read, the same row sets as a runtime that never
+/// churned, and nothing materialized on a second read.
+///
+/// The discarded frame is load-bearing: it stages the same three inserts and
+/// the same `completed` write as the seed frame that follows, so both reach
+/// the same revision numbers. Without `QueryCache::invalidate()` at discard,
+/// the ghost frame's slots answer the seed frame's reads.
+///
+/// Red-ability: delete `self.query.invalidate()` in `Tx::discard`, and both the
+/// counter assertion and the fresh-runtime comparison fail.
+#[test]
+fn a0_11_the_cache_returns_to_the_baseline_after_churn() {
+    let filters = [Filter::All, Filter::Active, Filter::Completed];
+    let mut runtime = Runtime::new();
+    runtime
+        .frame(|tx| {
+            for filter in filters {
+                tx.rows(filter);
+            }
+            Ok(())
+        })
+        .expect("warm-up");
+
+    let mut mounted: Vec<(ViewId, RowKey)> = Vec::new();
+    let mut orphaned: Vec<RowKey> = Vec::new();
+    let mut operations = 0u32;
+    for round in 0..1200u32 {
+        let filter = filters[(round % 3) as usize];
+        // Every fifth round stages a write and a read, then discards the frame:
+        // the slots it built must not outlive it.
+        if round % 5 == 4 {
+            let result: Result<(), Fatal> = runtime.frame(|tx| {
+                tx.insert(format!("ghost-{round}"))?;
+                tx.rows(filter);
+                Err(Fatal::Aborted)
+            });
+            assert!(result.is_err(), "the ghost frame was discarded");
+            operations += 1;
+            continue;
+        }
+        runtime
+            .frame(|tx| {
+                tx.rows(filter);
+                match round % 4 {
+                    0 => {
+                        let handle = tx.insert(format!("row-{round}"))?;
+                        let key = keys(tx)
+                            .into_iter()
+                            .find(|candidate| tx.handle_for(*candidate) == Some(handle))
+                            .expect("staged key");
+                        let view = tx.mount_row(key, 1)?;
+                        mounted.push((view, key));
+                    }
+                    2 => {
+                        if let Some((view, key)) = mounted.pop() {
+                            tx.unmount(view)?;
+                            orphaned.push(key);
+                        }
+                    }
+                    3 => {
+                        if let Some(key) = orphaned.pop()
+                            && let Some(handle) = tx.handle_for(key)
+                        {
+                            let _ = tx.remove(handle);
+                        }
+                    }
+                    _ => {}
+                }
+                Ok(())
+            })
+            .expect("churn frame");
+        operations += 1;
+    }
+    while let Some((view, key)) = mounted.pop() {
+        runtime
+            .frame(|tx| {
+                tx.unmount(view)?;
+                Ok(())
+            })
+            .expect("drain unmount");
+        orphaned.push(key);
+    }
+    for key in orphaned {
+        runtime
+            .frame(|tx| {
+                if let Some(handle) = tx.handle_for(key) {
+                    let _ = tx.remove(handle);
+                }
+                Ok(())
+            })
+            .expect("drain remove");
+    }
+    assert_eq!(
+        operations, 1200,
+        "`SPEC-GATE-A0-11` asks for 1000+ operations"
+    );
+    assert_eq!(runtime.committed().len(), 0, "the drain emptied the model");
+
+    // Same shape of writes on both sides of the discard, so the revision
+    // numbers coincide and a surviving slot would answer the seed's reads.
+    let ghost: Result<(), Fatal> = runtime.frame(|tx| {
+        let a = tx.insert("ghost-A")?;
+        let b = tx.insert("ghost-B")?;
+        let c = tx.insert("ghost-C")?;
+        tx.set_completed(c, true).expect("complete ghost C");
+        let _ = (a, b);
+        for filter in filters {
+            tx.rows(filter);
+        }
+        Err(Fatal::Aborted)
+    });
+    assert!(ghost.is_err(), "the ghost frame was discarded");
+
+    runtime
+        .frame(|tx| {
+            let a = tx.insert("A")?;
+            let b = tx.insert("B")?;
+            let c = tx.insert("C")?;
+            tx.set_completed(c, true).expect("complete C");
+            let _ = (a, b);
+            Ok(())
+        })
+        .expect("seed the baseline");
+
+    let before = runtime.counters();
+    let seen: Vec<Vec<String>> = filters
+        .iter()
+        .map(|filter| read_titles(&mut runtime, *filter))
+        .collect();
+    let delta = runtime.counters().delta(before);
+    assert_eq!(
+        delta.query_evals, 3,
+        "one evaluation per filter; a stale hit would evaluate fewer"
+    );
+    assert_eq!(
+        delta.cache_builds, 3,
+        "one build per non-empty filter; the model has three rows, one completed"
+    );
+    assert_eq!(
+        delta.id_materializations, 3,
+        "each build materializes one snapshot"
+    );
+
+    let mut fresh = Runtime::new();
+    fresh
+        .frame(|tx| {
+            let a = tx.insert("A")?;
+            let b = tx.insert("B")?;
+            let c = tx.insert("C")?;
+            tx.set_completed(c, true).expect("complete C");
+            let _ = (a, b);
+            Ok(())
+        })
+        .expect("fresh seed");
+    let expected: Vec<Vec<String>> = filters
+        .iter()
+        .map(|filter| read_titles(&mut fresh, *filter))
+        .collect();
+    assert_eq!(
+        seen, expected,
+        "the churned runtime must read the same row sets as a fresh one"
+    );
+
+    let before_second = runtime.counters();
+    let again: Vec<Vec<String>> = filters
+        .iter()
+        .map(|filter| read_titles(&mut runtime, *filter))
+        .collect();
+    let delta = runtime.counters().delta(before_second);
+    assert_eq!(again, seen, "a cache hit returns the same snapshot");
+    assert_eq!(
+        delta.id_materializations, 0,
+        "a cache hit must not materialize again"
+    );
+    assert_eq!(delta.query_evals, 0, "a cache hit is not an evaluation");
+    assert_eq!(delta.cache_builds, 0, "a cache hit is not a build");
 }
 
 fn runtime_row(runtime: &Runtime, title: &str) -> RowId {
