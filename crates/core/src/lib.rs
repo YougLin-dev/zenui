@@ -19,90 +19,22 @@
 //! There is no proc macro, no windowing, no GPU and no platform backend here;
 //! those are M1+ (`docs/product/roadmap.md`).
 //!
-//! Identity domains do not convert into each other (`SPEC-RT-002`):
+//! Identity domains do not convert into each other (`SPEC-RT-002`), and the
+//! type-level contracts are carried by `tests/ui/` under `ADR-0021`: trybuild
+//! compiles each case and matches the diagnostic — error code, span and
+//! message — against a checked-in `.stderr` snapshot.
 //!
-//! `SPEC-GATE-A0-02`: a handle stays `Copy`, so it cannot carry the title.
-//! These two failures are the contract, not decoration — the first is the
-//! language rule that forces `read_once` to return an owned `String`, and the
-//! second is the absence of an owned `get` on the authority.
+//! - `SPEC-GATE-A0-02`: a handle stays `Copy`, so it cannot carry the title
+//!   (`E0204` on a `Copy` type owning a `String`); the authority has no owned
+//!   `get` (`E0599`), because an owned title read is `Tx::read_once` returning
+//!   `Result<String, InvalidHandle>`.
+//! - `SPEC-GATE-A0-03`: `RowKey`, `ViewId` and `LayoutNodeId` do not accept
+//!   each other in either direction (`E0308`, six cases).
+//! - `ADR-0022` decision 5: the query cache is not constructible from outside
+//!   this crate (`E0603`: the module is private, `E0624`: the constructor is).
 //!
-//! ```compile_fail
-//! // E0204: `Copy` cannot be implemented for a type that owns a `String`.
-//! #[derive(Clone, Copy)]
-//! struct CopyRow {
-//!     title: String,
-//! }
-//! ```
-//!
-//! ```compile_fail
-//! use zenui_core::{RowId, Runtime};
-//!
-//! fn owned_get(runtime: &Runtime, row: RowId) {
-//!     let _ = runtime.get(row); // E0599: no owned `get`; use `read_once`
-//! }
-//! ```
-//!
-//! ```compile_fail
-//! use zenui_core::{RowKey, ViewId};
-//!
-//! fn takes_row_key(_key: RowKey) {}
-//!
-//! fn pass_a_view(view: ViewId) {
-//!     takes_row_key(view); // E0308: ViewId is not RowKey
-//! }
-//! ```
-//!
-//! ```compile_fail
-//! use zenui_core::{LayoutNodeId, RowKey};
-//!
-//! fn takes_row_key(_key: RowKey) {}
-//!
-//! fn pass_a_layout_node(node: LayoutNodeId) {
-//!     takes_row_key(node); // E0308: LayoutNodeId is not RowKey
-//! }
-//! ```
-//!
-//! The separation is mutual (`SPEC-GATE-A0-03`):
-//!
-//! ```compile_fail
-//! use zenui_core::{RowKey, ViewId};
-//!
-//! fn takes_a_view(_view: ViewId) {}
-//!
-//! fn pass_a_key(key: RowKey) {
-//!     takes_a_view(key); // E0308: RowKey is not ViewId
-//! }
-//! ```
-//!
-//! ```compile_fail
-//! use zenui_core::{LayoutNodeId, RowKey};
-//!
-//! fn takes_a_layout_node(_node: LayoutNodeId) {}
-//!
-//! fn pass_a_key(key: RowKey) {
-//!     takes_a_layout_node(key); // E0308: RowKey is not LayoutNodeId
-//! }
-//! ```
-//!
-//! ```compile_fail
-//! use zenui_core::{LayoutNodeId, ViewId};
-//!
-//! fn takes_a_layout_node(_node: LayoutNodeId) {}
-//!
-//! fn pass_a_view(view: ViewId) {
-//!     takes_a_layout_node(view); // E0308: ViewId is not LayoutNodeId
-//! }
-//! ```
-//!
-//! ```compile_fail
-//! use zenui_core::{LayoutNodeId, ViewId};
-//!
-//! fn takes_a_view(_view: ViewId) {}
-//!
-//! fn pass_a_layout_node(node: LayoutNodeId) {
-//!     takes_a_view(node); // E0308: LayoutNodeId is not ViewId
-//! }
-//! ```
+//! A `compile_fail` doctest cannot carry these: it only checks that the
+//! snippet does not compile, so a typo keeps it green. See `ADR-0021`.
 
 #![forbid(unsafe_code)]
 
@@ -113,7 +45,7 @@ pub mod handle;
 mod layout;
 pub mod metrics;
 pub mod owner;
-pub mod query;
+mod query;
 pub mod runtime;
 pub mod store;
 pub mod txn;
