@@ -171,8 +171,19 @@ back are one operation, and only the read back counts as confirmation.
 ## 7. Recovering a blocked `main`
 
 Symptom: a pull request is mergeable-ready but sits on `Expected — Waiting for
-status to be reported`, and no run of that name exists. Rule out a fork pull
-request waiting for approval first (§4), then:
+status to be reported`, and no run of that name exists. Rule out these first:
+
+- a fork pull request waiting for approval (§4);
+- a required context renamed or removed by the pull request itself (§4);
+- a queued matrix job that never acquired a runner. This one looks identical to
+  a broken configuration and is not one: on 2026-11-18 the `macos-latest` job
+  was cancelled twice after exactly 15 minutes in the queue with an empty
+  `runner_name`, while the same job on the previous commit of the same pull
+  request had acquired a runner and passed. Check
+  `gh api repos/YougLin-dev/zenui/actions/runs/<id>/jobs --jq '.jobs[] | {name, runner_name, started_at}'`
+  before changing anything; re-run the job and wait for the pool.
+
+Then, if the context is genuinely gone:
 
 ```bash
 # a. drop only the required checks; other protection stays in place
