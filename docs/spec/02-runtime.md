@@ -77,6 +77,7 @@ Application
 | 无障碍节点 | AccessKit 节点 ID | 平台 adapter | 由 `ViewId` 稳定派生 |
 
 - **MUST NOT** 用一个裸 `u64` / `usize` 同时充当上述任意两个域；MUST NOT 在公开 API 暴露 `taffy::NodeId` 或资源内部句柄（`SPEC-ROUTE-012`）。
+- **澄清**：该禁令覆盖上表列出的身份域；`graph::NodeId` 一类**稠密内部索引**不受 newtype 约束，条件是它不与任何身份域在同一 API 位置互换、不进入 trace、不跨 epoch 持久化。P1 把 `graph::NodeId` 从 crate 根导出属于 fixture 便利，不是生产身份面（[ADR-0017](../decisions/adr-0017-p2-runtime-authority-and-transaction-shape.md)）。
 - **失败模式**：把 `OwnerId` 当 `ViewId` 传入 → 释放错误作用域或静默空操作；裸整数复用让跨域误用在类型检查中不可见，只能靠运行时随机崩溃暴露。
 - **来源**：FINAL §1.1 / §8；`SPEC-ROUTE-031`；`runtime-and-rendering.md` §1。
 
@@ -125,6 +126,7 @@ impl<T> FieldHandle<T> {
 }
 ```
 
+- **澄清**：`get`/`with` 的接收者是持有该 `runtime_id` 的权威（`Runtime`/`Store`），handle 只提供身份；跨 runtime 拒绝由接收者在任何 slot 访问之前比较 `runtime_id` 完成。`FieldHandle<T>` 是 field 级句柄的目标名；A0 交付的是 row 级 `Handle<Row>`（`RowId`），两者共享上列形状与失败语义（[ADR-0017](../decisions/adr-0017-p2-runtime-authority-and-transaction-shape.md)）。
 - lookup MUST 返回 `Result<_, InvalidHandle>`；**MUST NOT** 返回残留旧值、静默转入同 slot 的新对象、或静默丢弃写入。
 - slot 复用 MUST 分配新 generation；跨 runtime 传递的 handle MUST 被拒绝。
 - `Copy` 不等于永久有效，也不表示访问免费（`SPEC-ROUTE-025`）。
@@ -137,6 +139,7 @@ impl<T> FieldHandle<T> {
 - **状态**：SPEC
 - **强度**：MUST NOT
 - **要求**：`read_once()` 一类一次性读取 MUST 返回真实 `Result<String, InvalidHandle>`。失败 MUST 取消本次 mount（见 `SPEC-RT-013`），MUST NOT 用空串、默认标题或“上一个合法值”替代。数据 binding 可由 runtime adapter 把 `Result` 交给统一 sink（`SPEC-RT-057`），但 MUST NOT 隐式降级为旧值。
+- **澄清**：`read_once()` 的接收者是权威，返回 `Result<String, InvalidHandle>`；失败不增加 `io_reads`。取消 mount 是 mount 执行器的职责（`SPEC-RT-013`），不是该读取方法自身的返回值语义（[ADR-0017](../decisions/adr-0017-p2-runtime-authority-and-transaction-shape.md)）。
 - **失败模式**：无效 handle 被渲染成空白标题，用户看到“字段消失”而无任何错误记录；`Result` 被塞进 text 节点显示 `Err(InvalidHandle)`。
 - **来源**：FINAL §1.2 / §3.2。
 
@@ -305,6 +308,7 @@ struct MountPlan {
 - **状态**：SPEC
 - **强度**：MUST / MUST NOT
 - **要求**：`batch` MUST 记录嵌套深度，只有最外层离开时才结算并提交一次。内层 MUST NOT 泄漏中间值；MUST NOT 在 binding 事务中同步 flush。
+- **澄清**：「泄漏中间值」指把未提交值**发布**到帧外（patch、下游通知、第二次提交）；事务内 tracked 读看见自己刚写的值是合法且必需的（Topo/Binding 在帧内运行，见 `SPEC-RT-050`）（[ADR-0017](../decisions/adr-0017-p2-runtime-authority-and-transaction-shape.md)）。
 - **失败模式**：现有 flat PoC 在嵌套 batch 中实际产生过 `true` 中间值、随后才到 `false`（FINAL §9 A0 已记录）；一次交互提交两次。
 - **来源**：FINAL §3.1 / §9 A0。
 
@@ -346,6 +350,7 @@ struct MountPlan {
 - **状态**：SPEC
 - **强度**：MUST
 - **要求**：只有事件与业务命令可以写 Signal/Store。Memo、binding、measure、layout 阶段的写 MUST 被判定为领域错误（`WriteDuringCompute`、memo cycle、phase violation）并以 typed 错误返回；MUST NOT 让 `RefCell` borrow 文案泄漏给用户，MUST NOT panic。运行时的内部 privileged 更新路径 MUST 与用户写权限分离。
+- **澄清**：本条的「事件与业务命令」等于 `SPEC-RT-050` 阶段表中的 `Outside`；`Mark` 允许暂存写，其余阶段对用户代码只读。`SPEC-RT-021.5` 允许 cleanup 向事务 journal 写入删除意图，但不构成对 Signal/Store 的写许可（[ADR-0017](../decisions/adr-0017-p2-runtime-authority-and-transaction-shape.md)）。
 - **失败模式**：布局测量中写 → 无限重排；用户看到 `already borrowed: BorrowMutError` 而非可执行的领域错误。
 - **来源**：FINAL §3.1；`runtime-and-rendering.md` §2。
 
@@ -439,6 +444,7 @@ Derived    layout scratch → GeometrySnapshot → retained paint → present（
 ```
 
 - **MUST NOT** 跳过 preflight 直接改树，MUST NOT 在阶段之间插入用户回调。
+- **澄清**：嵌套事务只允许在 `Outside` / `Mark` 打开；`Commit` 只允许在 depth == 1 时发生，使「单一提交点」与「单一 apply 阶段」重合（[ADR-0017](../decisions/adr-0017-p2-runtime-authority-and-transaction-shape.md)）。
 - **失败模式**：任一阶段被观测到部分提交；事件回调在 Commit 前运行导致读到临时代。
 - **来源**：FINAL §3；`runtime-and-rendering.md` §3；渲染尾部细节见 `SPEC-RENDER-001`。
 
@@ -447,6 +453,7 @@ Derived    layout scratch → GeometrySnapshot → retained paint → present（
 - **状态**：SPEC
 - **强度**：MUST
 - **要求**：preflight MUST 把字段、key/order、resource/generation ticket、owner/focus/IME、`ViewId → LayoutNodeId` 映射、widget state 队列、style patch 全部写入 journal，并在权威树之外演算。映射的**所有权**属于布局 adapter，事务只保证这些变更与其一起原子提交。
+- **澄清**：journal 记录**目标值**（stage），不记录逆操作；提交是换入，回滚是丢弃。唯一允许的急切权威变更是 slot/generation 预留：`insert` 返回的句柄在提交后必须有效，而失败事务中铸造的句柄不得别名到之后的行，因此回滚 MUST 释放预留并推进 generation（[ADR-0017](../decisions/adr-0017-p2-runtime-authority-and-transaction-shape.md)）。
 - **失败模式**：先改树后失败 → 无 journal 可回滚，只能整树重建。
 - **来源**：FINAL §3.2；`SPEC-RENDER-002`（映射归属）。
 
@@ -455,6 +462,7 @@ Derived    layout scratch → GeometrySnapshot → retained paint → present（
 - **状态**：SPEC
 - **强度**：MUST
 - **要求**：`CommitPlan` MUST 一次性推进 model scratch、view scratch 与 owner/resource epoch；提交完成后，pending snapshot、geometry epoch、focus pointer、ID 映射 MUST 与 journal 逐项一致。
+- **澄清**：model scratch 与 view scratch MUST 都以 draft 构造，逐项校验完成后一次性换入；换入之后 MUST NOT 再存在失败路径（[ADR-0017](../decisions/adr-0017-p2-runtime-authority-and-transaction-shape.md)）。
 - **失败模式**：model 已提交而 view 未提交 → 下一帧读到悬空 handle；已提交 view 指向旧 geometry epoch → 命中错位。
 - **来源**：FINAL §3.2 / §9 A0。
 
@@ -463,6 +471,7 @@ Derived    layout scratch → GeometrySnapshot → retained paint → present（
 - **状态**：SPEC
 - **强度**：MUST NOT
 - **要求**：任一 preflight 失败（duplicate key、`InvalidGeneration`、`InvalidHandle`、read failure、phase violation）MUST 丢弃本事务的全部 model/derived scratch 与 View journal。pending snapshot、geometry epoch、focus pointer、ID 映射 MUST 与上一已提交状态**完全一致**；MUST NOT 只回滚一部分。
+- **澄清**：上面「完全一致」的比较集只含权威状态——模型内容与顺序、视图节点与顺序、pending snapshot、geometry epoch、focus pointer、caret、`ViewId → LayoutNodeId` 映射、视图与 owner 的 id 高水位、live owner 集合。单调诊断计数器（`io_reads`、`string_clones`、`query_evals`、`id_materializations`、`memo_recomputes`）不在比较集内，失败事务中的读遥测可以前进；`io_writes` 与 `commits` 只在提交时推进，失败事务不推进（[ADR-0017](../decisions/adr-0017-p2-runtime-authority-and-transaction-shape.md)）。
 - **失败模式**：失败后残留半更新的 focus pointer → 下一次点击命中“幽灵”节点；ID 映射残留 → 布局访问已释放节点。
 - **来源**：FINAL §3.2 / §9 A0。
 

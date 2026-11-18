@@ -57,6 +57,7 @@ replaces: []
 | [ADR-0014](adr-0014-baseline-defects-are-gate-criteria.md) | baseline / intrinsic / synthesis 缺陷写成 Gate 硬判据，不以"探针绿"关闭 | `SPEC-GATE-B-01`…`-03`；`SPEC-TEXT-001`…`-003`、`-006` | normative |
 | [ADR-0015](adr-0015-render-ownership-splits.md) | 渲染线三处归属切分：生命周期归 `SPEC-RT`、声明形态归 `SPEC-STYLE`、坐标单位归 `SPEC-TEXT` | `SPEC-RENDER-011`、`-016`；`SPEC-TEXT-015`；`SPEC-RT-024`、`-026`；`SPEC-STYLE-002`、`-004`、`-052`、`-055` | normative |
 | [ADR-0016](adr-0016-release-order.md) | 释放顺序：Owner 后序（子先父）+ 同 owner 逆注册 LIFO；dispose 幂等；cleanup 中禁止 mount/batch/flush | `SPEC-RT-021`、`-022`、`-052` | normative |
+| [ADR-0017](adr-0017-p2-runtime-authority-and-transaction-shape.md) | P2 形状：解析权归权威、值暂存 + 发布屏障、`RuntimeId` 归属与脱敏、A0-06 用 core 内零依赖 `LayoutMap` | `SPEC-RT-002`、`-005`、`-006`、`-033`、`-038`、`-050`…`-053`；`SPEC-GATE-A0-03`、`-06` | normative |
 
 ## 3. 每条的固定结构
 
@@ -76,6 +77,7 @@ replaces: []
 | `archive/research/stack-decisions.md`、`CONCLUSION.md` | 0004、0005、0006、0009 | 版本与生态取舍的论证过程 |
 | 2026-11-18 队长裁决 D-01…D-06 | 0012、0013、0014（0010 同步） | 证据状态词、归档只读、Gate 唯一化、baseline 硬判据 |
 | 渲染线三处归属切分（队长裁决） | 0015 | 生命周期 / 声明形态 / caret 单位的唯一 owner |
+| 2026-11-18 P2 形状评审（API 设计 → 队长采纳） | 0017 | 解析权、事务机制、`RuntimeId` 归属、A0-06 `LayoutMap` |
 | `docs/README.md` 四层治理契约 | 0011 | 文档层的唯一入口与状态词表 |
 
 ## 5. 维护规则
