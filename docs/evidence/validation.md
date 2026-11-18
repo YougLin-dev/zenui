@@ -8,7 +8,7 @@ sources:
   - archive/review/VALIDATION.md
   - archive/research/validation-and-roadmap.md
   - archive/review/text-layout-review.md
-  - examples/（commit 9fae970 的源码，本轮可直接复跑）
+  - examples/（commit e53ae0e 的源码，本轮可直接复跑）
 replaces: []
 ---
 
@@ -37,8 +37,8 @@ replaces: []
 | 主机 | OS | Rust | GPU / adapter | commit | 证据性质 |
 |---|---|---|---|---|---|
 | **H1** | Windows 11，MSVC 工具链 | `1.99.1 x86_64-pc-windows-msvc` | NVIDIA GeForce RTX 4060 Laptop GPU / Vulkan | 未记录 | 上一轮记录（转述） |
-| **H2** | macOS 27.0.1 (26A434)，Apple M4（10 核 GPU，Metal 4） | `1.99.1 (58cf8f9c3 2026-10-13) aarch64-apple-darwin` | Apple M4 / `metal` | `ab5339b`（EVID-VAL-12…19）/ `83b21a4`（EVID-VAL-20/-21）/ `9fae970`（EVID-VAL-23…27） | **本轮实测**（commit 逐条见各条目） |
-| **CI** | GitHub Actions 矩阵：`ubuntu-26.04` / `macos-26-arm64` / `windows-2025-vs2026` | `rustc 1.99.1 (58cf8f9c3 2026-10-13)`，三个 runner 一致（取自 `rust-toolchain.toml` 的 pin） | 无（headless；A0 不需要 GPU） | `9fae970`（main 上的 PR #5 merge commit） | **本轮 CI 实测**，run [`44284925421`](https://github.com/YougLin-dev/zenui/actions/runs/44284925421) |
+| **H2** | macOS 27.0.1 (26A434)，Apple M4（10 核 GPU，Metal 4） | `1.99.1 (58cf8f9c3 2026-10-13) aarch64-apple-darwin` | Apple M4 / `metal` | `ab5339b`（EVID-VAL-12…19）/ `83b21a4`（EVID-VAL-20/-21）/ `e53ae0e`（EVID-VAL-23…27） | **本轮实测**（commit 逐条见各条目） |
+| **CI** | GitHub Actions 矩阵：`ubuntu-26.04` / `macos-26-arm64` / `windows-2025-vs2026` | `rustc 1.99.1 (58cf8f9c3 2026-10-13)`，三个 runner 一致（取自 `rust-toolchain.toml` 的 pin） | 无（headless；A0 不需要 GPU） | `e53ae0e`（main 上的 PR #5 merge commit） | **本轮 CI 实测**，run [`44284925421`](https://github.com/YougLin-dev/zenui/actions/runs/44284925421) |
 
 > H1 的 commit 在原始记录中未写下，这是本轮无法补的缺口；引用 H1 结果时应同时声明"commit 未知"。
 
@@ -346,7 +346,7 @@ $ cargo test --workspace --locked
 ### EVID-VAL-22 三平台 `cargo test --workspace --locked`（CI，commit `213f772`）
 
 - 主机：**CI**（见 §1），不是 H2。三个 runner 分别是 `ubuntu-26.04`、`macos-26-arm64`、`windows-2025-vs2026`。
-- 被测 commit：`9fae970abee84e7eafe21f82937374a2813f7198`（PR #5 的 merge commit，即 workspace 门禁落地的提交）。
+- 被测 commit：`e53ae0ec113127e3c803947142bcdb208d25cbda`（PR #5 的 merge commit，即 workspace 门禁落地的提交）。
 - workflow：[`workspace` run 44284925421](https://github.com/YougLin-dev/zenui/actions/runs/44284925421)，三个 job 全部 `success`；每个 job 的 `Test` 步骤都输出同样的四个 target。
 
 ```text
@@ -402,7 +402,7 @@ $ cargo test --workspace --locked        # ubuntu-26.04 / macos-26-arm64 / windo
 
 ## 9. 数字台账（仅汇总本文件已定义的事实，供 CLAIM 引用）
 
-- H2 实际通过测试：**53** 条（7 + 2 + 4 + 40），来源 EVID-VAL-12/13/14/21；其中 40 条来自新的 headless workspace。这是 commit `9fae970` 的计数。
+- H2 实际通过测试：**53** 条（7 + 2 + 4 + 40），来源 EVID-VAL-12/13/14/21；其中 40 条来自新的 headless workspace。这是 commit `e53ae0e` 的计数。
 - H2 在 P2 之后的通过**执行数**：**145**（53 加上 EVID-VAL-23 的 6、EVID-VAL-24 的 75 与 EVID-VAL-27 的 11）。它是同一批用例在新 commit 上的复跑，**不是** 107 条互不相同的测试；`EVID-VAL-21` 的 40 与 `EVID-VAL-24` 的 50 有重叠（core lib 由 34 增至 44），不得相加当作"新增覆盖"。
 - H2 compile-fail fixture：**9** 条 = EVID-VAL-13 的 3 条 trybuild + EVID-VAL-24 的 6 条 `compile_fail` doctest。
 - 0-test target：根 package，来源 EVID-VAL-17。
@@ -415,11 +415,11 @@ $ cargo test --workspace --locked        # ubuntu-26.04 / macos-26-arm64 / windo
 ## 11. P2 轮（MORT-5）在 H2 的复跑
 
 本节四条记录的是 `feat/MORT-5-transaction-journal` 上的运行，被测代码 commit
-9fae970abee84e7eafe21f82937374a2813f7198。与 §6 一样，**一条记录只对应一条命令**；分支与 commit 相同不构成合并记录的许可。
+e53ae0ec113127e3c803947142bcdb208d25cbda。与 §6 一样，**一条记录只对应一条命令**；分支与 commit 相同不构成合并记录的许可。
 
 ### EVID-VAL-23 A0 gate 夹具（H2）
 
-- 分支：`feat/MORT-5-transaction-journal`；被测代码 commit 9fae970abee84e7eafe21f82937374a2813f7198。
+- 分支：`feat/MORT-5-transaction-journal`；被测代码 commit e53ae0ec113127e3c803947142bcdb208d25cbda。
 - 主机：H2（macOS 27.0.1 / Apple M4）；`rustc 1.99.1 (58cf8f9c3 2026-10-13) aarch64-apple-darwin`。
 
 ```text
@@ -502,7 +502,7 @@ $ cargo clippy --workspace --all-targets --locked -- -D warnings
 
 ## 12. 失败帧、ADR-0017 审计与 ADR-0019 的回归（H2）
 
-被测代码 commit `9fae970abee84e7eafe21f82937374a2813f7198`。三件事集中在这一节：ADR-0017 的对抗审计、评审方独立复现的两条「失败帧之后」缺陷、
+被测代码 commit `e53ae0ec113127e3c803947142bcdb208d25cbda`。三件事集中在这一节：ADR-0017 的对抗审计、评审方独立复现的两条「失败帧之后」缺陷、
 以及 ADR-0019 对错误形状的裁决。
 
 ### EVID-VAL-27 回归夹具（H2）

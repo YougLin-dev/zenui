@@ -33,7 +33,7 @@
       "toolchain": "1.99.1 (58cf8f9c3 2026-10-13)",
       "adapter": "Apple M4 (10-core GPU, Metal 4) / metal",
       "commit": "9fae970abee84e7eafe21f82937374a2813f7198",
-      "commitNote": "EVID-VAL-12…19 记录于 ab5339b；EVID-VAL-20/21 记录于 83b21a4；EVID-VAL-23…27 记录于 9fae970",
+      "commitNote": "EVID-VAL-12…19 记录于 ab5339b；EVID-VAL-20/21 记录于 83b21a4；EVID-VAL-23…27 记录于 e53ae0e",
       "evidenceClass": "A-observed-this-round"
     },
     {
@@ -418,7 +418,7 @@
       "kind": "test",
       "command": "cargo test -p zenui-core --test gates --locked",
       "exit": 0,
-      "commit": "9fae970abee84e7eafe21f82937374a2813f7198",
+      "commit": "e53ae0ec113127e3c803947142bcdb208d25cbda",
       "tests": {
         "passed": 6,
         "failed": 0,
@@ -434,15 +434,15 @@
       "kind": "test",
       "command": "cargo test -p zenui-core --locked",
       "exit": 0,
-      "commit": "9fae970abee84e7eafe21f82937374a2813f7198",
+      "commit": "e53ae0ec113127e3c803947142bcdb208d25cbda",
       "tests": {
         "passed": 75,
         "failed": 0,
         "ignored": 0
       },
       "compileFailFixtures": 6,
-      "proves": "zenui-core lib 44 + gate 夹具 4 + 2 条 compile_fail doctest；含 A0-05 的 diamond/长链无 glitch 与 WriteDuringCompute 领域错误、A0-06 的 LayoutMap preflight 单测",
-      "doesNotProve": "zenui-app 的 golden 测试不在本命令内；单测数量不等于 gate 覆盖数"
+      "proves": "zenui-core：lib 52 + gate 夹具 6 + 回归夹具 11 + 6 条 compile_fail doctest，合计 75；含 A0-05 的 diamond/长链无 glitch、compute 阶段（Topo/Binding）的写返回 `ValueError::Phase(PhaseViolation)` 并毒化且帧返回锁存的 `Fatal::PhaseViolation`、自读 memo 环返回 `Fatal::GraphCycle`、A0-06 的 LayoutMap preflight 单测、cleanup 在换入之后的 `Phase::Cleanup` 下运行",
+      "doesNotProve": "zenui-app 的 golden 测试不在本命令内；单测数量不等于 gate 覆盖数；相位机未走完 SPEC-RT-050 的八阶段"
     },
     {
       "id": "EVID-VAL-25",
@@ -451,7 +451,7 @@
       "kind": "runtime",
       "command": "cargo run -p zenui-app --example todolist_headless --locked",
       "exit": 0,
-      "commit": "9fae970abee84e7eafe21f82937374a2813f7198",
+      "commit": "e53ae0ec113127e3c803947142bcdb208d25cbda",
       "traceSha256": "fb16d571748949225b46a5eb78abc72e5badd13e3e2b6cede7b6b7aefd392f21",
       "proves": "把全部模型/memo/view/owner/layout 写入搬进单帧事务后，A0-01 的 9 步 trace 仍与 commit 83b21a4 逐字节相同；golden 未重新录制",
       "doesNotProve": "事务层正确性；trace 不含 staging 计数，也不含 A0-02…A0-11 的 gate 级信息"
@@ -463,7 +463,7 @@
       "kind": "lint",
       "command": "cargo clippy --workspace --all-targets --locked -- -D warnings",
       "exit": 0,
-      "commit": "9fae970abee84e7eafe21f82937374a2813f7198",
+      "commit": "e53ae0ec113127e3c803947142bcdb208d25cbda",
       "proves": "本机全 workspace（含 all-targets）零 clippy 警告；同轮 cargo fmt --all -- --check 通过",
       "doesNotProve": "不是 CI 日志；SPEC-GATE-C-04 要求的 CI 记录仍缺失，C-04 保持 OPEN"
     },
@@ -474,14 +474,14 @@
       "kind": "test",
       "command": "cargo test -p zenui-core --test regressions --locked",
       "exit": 0,
-      "commit": "9fae970abee84e7eafe21f82937374a2813f7198",
+      "commit": "e53ae0ec113127e3c803947142bcdb208d25cbda",
       "tests": {
         "passed": 11,
         "failed": 0,
         "ignored": 0
       },
-      "proves": "失败帧之后的两条数据一致性缺陷与 9 条审计缺陷各有回归夹具：嵌套失败中毒、discard 不回退 row key、removal 压过 staged 值、同帧 insert+remove 归还槽位、局部 view order 被拒、mount 指向已删行被拒、focus 指向将被卸载的 view 被拒、失败帧不烧 LayoutNodeId",
-      "doesNotProve": "审计仍有未修项：memo cycle 无检测、Cleanup 阶段的 unmount 意图未单独验证、A0-05 的 per-epoch 计数只在单测层"
+      "proves": "失败帧之后的两条数据一致性缺陷与 9 条审计缺陷各有回归夹具：嵌套失败错误被锁存、discard 不回退 row key、reorder 后的 insert 不被丢弃、removal 压过 staged 值、同帧 insert+remove 归还槽位、局部 view order 被拒、mount 指向已删行被拒、focus 指向将被卸载的 view 被拒、失败帧不烧 LayoutNodeId、空写不推进 epoch",
+      "doesNotProve": "只覆盖自读 memo 环；cleanup 的「只入 journal」以「拒绝 + 下一帧可提交」表达，不是同帧排队；单线程 headless"
     }
   ],
   "contracts": [
