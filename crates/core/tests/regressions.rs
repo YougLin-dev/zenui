@@ -331,3 +331,30 @@ fn a_frame_internal_view_read_sees_staged_mounts() {
     assert_eq!(after.len(), 1);
     assert_eq!(after[0].1, b);
 }
+
+/// `metrics::Counters::io_writes`: a write that changes nothing is not a
+/// write, so it must not advance the epoch or the write counter. Comparing
+/// against the staged value alone made this fail.
+#[test]
+fn a_no_op_write_does_not_advance_the_epoch() {
+    let mut runtime = Runtime::new();
+    let row: RowId = runtime.frame(|tx| tx.insert("A")).expect("insert");
+
+    let before = runtime.committed().epoch();
+    let writes_before = runtime.committed().counters().io_writes;
+
+    runtime
+        .frame(|tx| {
+            tx.set_completed(row, false).expect("no-op write");
+            Ok(())
+        })
+        .expect("frame");
+
+    assert_eq!(runtime.committed().epoch(), before, "epoch must not move");
+    assert_eq!(
+        runtime.committed().counters().io_writes,
+        writes_before,
+        "a no-op is not a write"
+    );
+    assert!(!runtime.committed().rows().next().unwrap().completed());
+}

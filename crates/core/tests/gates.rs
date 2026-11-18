@@ -22,6 +22,9 @@ fn runtime_keys(tx: &mut Tx<'_>) -> Vec<zenui_core::RowKey> {
 ///
 /// Monotonic diagnostics are deliberately excluded: a failed frame's reads
 /// really happened, and `SPEC-RT-056`'s rule for external I/O applies to them.
+/// Keys and values that went out with one publication.
+type Published = (Vec<u64>, Vec<(u64, bool)>);
+
 #[derive(Debug, PartialEq, Eq)]
 struct Authority {
     titles: Vec<String>,
@@ -50,6 +53,9 @@ struct Authority {
     commits: u64,
     /// Pending snapshots. A failed frame publishes nothing.
     publications: usize,
+    /// The last published snapshot itself: keys and the committed values that
+    /// went out with it (`SPEC-RT-053` names it; a count is not a snapshot).
+    published: Option<Published>,
 }
 
 fn authority(runtime: &Runtime) -> Authority {
@@ -88,6 +94,16 @@ fn authority(runtime: &Runtime) -> Authority {
         io_writes: store.counters().io_writes,
         commits: runtime.txn().commits(),
         publications: runtime.txn().publications().len(),
+        published: runtime.txn().publications().last().map(|publication| {
+            (
+                publication.keys.iter().map(|key| key.raw()).collect(),
+                publication
+                    .values
+                    .iter()
+                    .map(|(key, done)| (key.raw(), *done))
+                    .collect(),
+            )
+        }),
     }
 }
 
@@ -172,6 +188,33 @@ fn a0_06_rejected_commit_restores_the_previous_commit() {
         .expect("seed");
 
     let a_row: RowId = runtime.frame(|tx| tx.insert("C")).expect("insert C");
+
+    // `SPEC-GATE-A0-06` asks for an `InvalidGeneration` injection. Under
+    // ADR-0017 decision 7 a stale handle is a *value* error, so the frame
+    // commits and the injection is pinned by "the rejected write leaves the
+    // authority identical", not by a rollback.
+    let doomed_row: RowId = runtime.frame(|tx| tx.insert("Z")).expect("insert Z");
+    runtime
+        .frame(|tx| {
+            fatal(tx.remove(doomed_row))?;
+            Ok(())
+        })
+        .expect("remove Z");
+    runtime
+        .frame(|tx| {
+            let rejected = tx.toggle(doomed_row);
+            assert!(
+                matches!(rejected, Err(ValueError::Handle(_))),
+                "a stale generation must be rejected, got {rejected:?}"
+            );
+            Ok(())
+        })
+        .expect("the frame still commits");
+    assert_eq!(
+        runtime.committed().len(),
+        3,
+        "the rejected write wrote nothing"
+    );
 
     // Mount every row and focus the first one, so the frame below has real
     // view, owner, layout and focus state to roll back.

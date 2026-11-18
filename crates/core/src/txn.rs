@@ -580,6 +580,12 @@ impl<'a> Tx<'a> {
     fn stage_completed(&mut self, row: Handle<Row>, value: bool) -> Result<(), ValueError> {
         self.require_staged(WriteKind::ModelWrite)?;
         let key = self.effective_key(row)?;
+        // Compare against the *effective* value, not just the staged one: a
+        // no-op write must not advance `io_writes` or the epoch
+        // (`metrics::Counters::io_writes`).
+        if self.effective_completed(row)? == value {
+            return Ok(());
+        }
         let entry = self.txn.model.rows.entry(key).or_insert(StagedRow {
             runtime: self.store.runtime_id(),
             slot: row.slot(),
