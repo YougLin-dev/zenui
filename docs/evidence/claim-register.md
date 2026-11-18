@@ -97,10 +97,10 @@ replaces: []
 | CLAIM-004 | macro workspace 另有 1 个 trybuild runner，内含 3 个 compile-fail fixture | VERIFIED | EVID-VAL-02/13 | A1 | runner 本身不是第 14 个能力测试 |
 | CLAIM-005 | H1 记录中的 13 + 3 执行主机是 Windows 11 + NVIDIA RTX 4060 Laptop + Vulkan | VERIFIED | EVID-VAL-01..06 的记录头 | — | H2 另有 macOS/Metal 复跑，见 CLAIM-003/006 |
 | CLAIM-006 | 本台账作者本轮只做静态核对，未亲自执行 cargo；H2 的测试与 GPU 复跑由 Test/CI 记录（`EVID-VAL-12..19`） | VERIFIED | 本会话 `uname -m`/`sw_vers`；`evidence/validation.md` §1、§6 | — | `native_poc` 输出中的 `SCOPE: ... Windows ...` 是硬编码字符串，主机以 validation.md §1 为准 |
-| CLAIM-007 | 根 `Cargo.toml` 无 dependencies，`src/main.rs` 仅打印 hello-world | VERIFIED | CODE `Cargo.toml:1-7`、`src/main.rs:1-3` | — | 生产 runtime 不在此包 |
-| CLAIM-008 | 所有已记录的渲染执行都是 headless 离屏 RGBA readback | VERIFIED | EVID-VAL-05/06、15/16；CODE `examples/native_poc/src/gpu.rs`、`examples/desktop_poc/src/main.rs` | C | 无真实 surface/present |
+| CLAIM-007 | 根 `Cargo.toml` 无 dependencies，`src/main.rs` 仅打印 hello-world | VERIFIED | SRC `Cargo.toml:1-7`、`src/main.rs:1-3` | — | 生产 runtime 不在此包 |
+| CLAIM-008 | 所有已记录的渲染执行都是 headless 离屏 RGBA readback | VERIFIED | EVID-VAL-05/06、15/16；SRC `examples/native_poc/src/gpu.rs`、`examples/desktop_poc/src/main.rs` | C | 无真实 surface/present |
 | CLAIM-009 | 仓库源码中不存在 winit、AccessKit、WindowEvent 或 Surface 的使用 | VERIFIED | CODE 全仓 grep（排除 `target/`） | A1/C | 窗口路径完全缺位 |
-| CLAIM-010 | 根 manifest 设置 `autoexamples = false`，设计稿不会被当作二进制构建 | VERIFIED | CODE `Cargo.toml:5` | — | 防止"0-test 绿"掩盖产品错误 |
+| CLAIM-010 | 根 manifest 设置 `autoexamples = false`，设计稿不会被当作二进制构建 | VERIFIED | SRC `Cargo.toml:5` | — | 防止"0-test 绿"掩盖产品错误 |
 | CLAIM-011 | 目标命令 `cargo run --bin todolist --features windows-desktop --locked` 当前不存在可执行的 bin/feature | VERIFIED | CODE（无 `[[bin]]`、无 features）；EVID-VAL-19 | A1 | 规划命令 |
 | CLAIM-012 | MSRV 1.89 只是理论下限，尚未验证 | OPEN | `archive/research/README.md:32` | C | 本机 rustc 1.99.1 不等于 MSRV |
 
@@ -108,18 +108,18 @@ replaces: []
 
 | ID | 断言 | 状态 | 证据 | 关联 Gate | 备注 |
 |---|---|---|---|---|---|
-| CLAIM-013 | 探针宏只接受 `view` / `text` / `button` 三种 tag | VERIFIED | CODE `examples/macro_poc/macro/src/lib.rs:46-50` | A1 | 其他 tag 编译错误 |
-| CLAIM-014 | 探针宏只接受 `class` 与 `on:click/change/input` 属性 | VERIFIED | CODE `macro/src/lib.rs:60-84` | A1 | 属性面远小于目标语法 |
-| CLAIM-015 | `aria:`、`style:`、`role`、`disabled` 等属性在探针宏中直接编译错误 | VERIFIED | CODE `macro/src/lib.rs:77-84` | A1 | 目标 Todo 示例大量使用这些属性 |
-| CLAIM-016 | 生成代码硬编码绝对路径 `::zenui_macro_runtime`，renamed dependency 未解决 | VERIFIED | CODE `macro/src/lib.rs:112`、`frontend/src/lib.rs:3`；`macro_poc/README.md:27` | A1 | 独立 rename fixture 尚不存在 |
-| CLAIM-017 | 未知 class 的诊断当前覆盖整个 class 字面量并给 byte offset，而不是子 token span | VERIFIED | CODE `macro/src/lib.rs:204-213`；`compile_fail/unknown_class.stderr` | A1 | 与目标"精确 span"有差距 |
+| CLAIM-013 | 探针宏只接受 `view` / `text` / `button` 三种 tag | VERIFIED | SRC `examples/macro_poc/macro/src/lib.rs:46-50` | A1 | 其他 tag 编译错误 |
+| CLAIM-014 | 探针宏只接受 `class` 与 `on:click/change/input` 属性 | VERIFIED | SRC `macro/src/lib.rs:60-84` | A1 | 属性面远小于目标语法 |
+| CLAIM-015 | `aria:`、`style:`、`role`、`disabled` 等属性在探针宏中直接编译错误 | VERIFIED | SRC `macro/src/lib.rs:77-84` | A1 | 目标 Todo 示例大量使用这些属性 |
+| CLAIM-016 | 生成代码硬编码绝对路径 `::zenui_macro_runtime`，renamed dependency 未解决 | VERIFIED | SRC `macro/src/lib.rs:112`、`frontend/src/lib.rs:3`；`macro_poc/README.md:27` | A1 | 独立 rename fixture 尚不存在 |
+| CLAIM-017 | 未知 class 的诊断当前覆盖整个 class 字面量并给 byte offset，而不是子 token span | VERIFIED | SRC `macro/src/lib.rs:204-213`；`compile_fail/unknown_class.stderr` | A1 | 与目标"精确 span"有差距 |
 | CLAIM-018 | 3 个 compile-fail case 分别是 `html_element`、`script_event`、`unknown_class` | VERIFIED | EVID-VAL-02/13 | A1 | 不覆盖缺 key / 事件 payload |
-| CLAIM-019 | 探针 `Node` 是可独立 `evaluate_content()` / `fire()` 的 inspection record，不是生产 MountPlan | VERIFIED | CODE `runtime/src/lib.rs:98-160` | A1 | 改名不能变成生产权威 |
+| CLAIM-019 | 探针 `Node` 是可独立 `evaluate_content()` / `fire()` 的 inspection record，不是生产 MountPlan | VERIFIED | SRC `runtime/src/lib.rs:98-160` | A1 | 改名不能变成生产权威 |
 | CLAIM-020 | 探针中显式 `move` 闭包绑定在 mount 时不执行，只在显式求值时读取一次 | VERIFIED | EVID-VAL-02/13；`frontend/tests.rs:33-36` | A1 | 只有探针范围 |
 | CLAIM-021 | 探针中 `on:*` handler 在 mount 时不执行 | VERIFIED | EVID-VAL-02/13；`frontend/tests.rs:29-44` | A1 | 事件仅在 dispatch 时跑 |
-| CLAIM-022 | 探针事件类型是 `Vec<(&'static str, Box<dyn FnMut()>)>`，不承载 typed payload | VERIFIED | CODE `runtime/src/lib.rs:103-110,138-147` | A1 | TextInput/String/SubmitEvent 均未实现 |
-| CLAIM-023 | 同名事件存在多个 handler 时，`fire` 只执行第一个匹配项 | VERIFIED | CODE `runtime/src/lib.rs:142-147` | A1 | 与 typed registry 目标冲突 |
-| CLAIM-024 | PascalCase 组件、props、slot、For/Show/Index 在探针宏中均未实现 | VERIFIED | CODE `macro/src/lib.rs:46`；`archive/research/validation-and-roadmap.md:10` | A1 | 目标语法不可用 |
+| CLAIM-022 | 探针事件类型是 `Vec<(&'static str, Box<dyn FnMut()>)>`，不承载 typed payload | VERIFIED | SRC `runtime/src/lib.rs:103-110,138-147` | A1 | TextInput/String/SubmitEvent 均未实现 |
+| CLAIM-023 | 同名事件存在多个 handler 时，`fire` 只执行第一个匹配项 | VERIFIED | SRC `runtime/src/lib.rs:142-147` | A1 | 与 typed registry 目标冲突 |
+| CLAIM-024 | PascalCase 组件、props、slot、For/Show/Index 在探针宏中均未实现 | VERIFIED | SRC `macro/src/lib.rs:46`；`archive/research/validation-and-roadmap.md:10` | A1 | 目标语法不可用 |
 | CLAIM-025 | 普通 Rust `Result<MountPlan, MountError>` 函数体可写 `?`，且 Copy handle 可被 move closure 持有 | PROBE | EVID-VAL-07 | A0 | C 类、仓库外夹具；validation.md 将条目本身标 OPEN，不能升级为产品证据 |
 | CLAIM-026 | 该夹具不证明 `#[component]` 宏降级、Plan 构建、错误路径或 runtime commit | VERIFIED | EVID-VAL-07；`evidence/validation.md` §5 | A1 | 仅为类型形状 |
 | CLAIM-027 | `zenui-final-contract` 首次复跑编译失败：`WriteError` 缺 `Debug`（E0277）、`dyn Command` 按值调用（E0161） | PROBE | EVID-VAL-09；`evidence/validation.md` §5 | A0 | C 类记录，不称"先前通过" |
@@ -130,15 +130,15 @@ replaces: []
 | ID | 断言 | 状态 | 证据 | 关联 Gate | 备注 |
 |---|---|---|---|---|---|
 | CLAIM-029 | `desktop_poc` lib 有 7 个通过测试（4 reactive + 3 typed-style） | VERIFIED | EVID-VAL-01/12 | A0/B | 见 `evidence/validation.md` §3/§6 |
-| CLAIM-030 | 现 `Signal::with` 在 owner dispose 后仍返回旧值 | VERIFIED | CODE `project_signals.rs:26-45`（最后无条件 `get(&value)`） | A0 | 失效只影响订阅登记 |
-| CLAIM-031 | 现 `Signal::set` 在失效时静默 `return`，调用方得到 `()` | VERIFIED | CODE `project_signals.rs:47-50` | A0 | 无 `InvalidHandle` |
-| CLAIM-032 | 现依赖图只有平坦 source→sink 边，没有 Memo、拓扑稳定、Store 或子 Owner | VERIFIED | CODE `project_signals.rs:59-186`；`evidence/validation.md` §3/§6 | A0 | 与生产目标差一整层 |
-| CLAIM-033 | 现 `flush` 没有 evaluation budget 或重入 phase，sink 在计算期自写可再次入队 | VERIFIED | CODE `project_signals.rs:128-162`；`round1-experts.md:242-245` | A0 | 无 `WriteDuringCompute` |
-| CLAIM-034 | 现 `batch` 没有嵌套深度，内层调用立即 flush | VERIFIED | CODE `project_signals.rs:164-170` | A0 | 事务原子性未成立 |
-| CLAIM-035 | 嵌套 batch 实际泄露中间值 `true`；现 PoC 的 batch 无嵌套深度 | VERIFIED | EVID-VAL-08；CODE `project_signals.rs:164-170` | A0 | 记录与源码互证 |
-| CLAIM-036 | `detach` 只从 observer 集合删除，不移除变空的 source bucket | VERIFIED | CODE `project_signals.rs:75-84` | A0 | 长命 Owner 会积累幽灵桶 |
-| CLAIM-037 | `subscriber_count()` 返回 `subscribers.len()`，会把空桶计入订阅数 | VERIFIED | CODE `project_signals.rs:183-185` | A0 | 指标会掩盖泄漏 |
-| CLAIM-038 | `dispose` 只翻转每源一个 `bool` liveness，不存在 ViewId/OwnerId generation | VERIFIED | CODE `project_signals.rs:86-120,171-180` | A0 | 无法拒绝迟到命令 |
+| CLAIM-030 | 现 `Signal::with` 在 owner dispose 后仍返回旧值 | VERIFIED | SRC `project_signals.rs:26-45`（最后无条件 `get(&value)`） | A0 | 失效只影响订阅登记 |
+| CLAIM-031 | 现 `Signal::set` 在失效时静默 `return`，调用方得到 `()` | VERIFIED | SRC `project_signals.rs:47-50` | A0 | 无 `InvalidHandle` |
+| CLAIM-032 | 现依赖图只有平坦 source→sink 边，没有 Memo、拓扑稳定、Store 或子 Owner | VERIFIED | SRC `project_signals.rs:59-186`；`evidence/validation.md` §3/§6 | A0 | 与生产目标差一整层 |
+| CLAIM-033 | 现 `flush` 没有 evaluation budget 或重入 phase，sink 在计算期自写可再次入队 | VERIFIED | SRC `project_signals.rs:128-162`；`round1-experts.md:242-245` | A0 | 无 `WriteDuringCompute` |
+| CLAIM-034 | 现 `batch` 没有嵌套深度，内层调用立即 flush | VERIFIED | SRC `project_signals.rs:164-170` | A0 | 事务原子性未成立 |
+| CLAIM-035 | 嵌套 batch 实际泄露中间值 `true`；现 PoC 的 batch 无嵌套深度 | VERIFIED | EVID-VAL-08；SRC `project_signals.rs:164-170` | A0 | 记录与源码互证 |
+| CLAIM-036 | `detach` 只从 observer 集合删除，不移除变空的 source bucket | VERIFIED | SRC `project_signals.rs:75-84` | A0 | 长命 Owner 会积累幽灵桶 |
+| CLAIM-037 | `subscriber_count()` 返回 `subscribers.len()`，会把空桶计入订阅数 | VERIFIED | SRC `project_signals.rs:183-185` | A0 | 指标会掩盖泄漏 |
+| CLAIM-038 | `dispose` 只翻转每源一个 `bool` liveness，不存在 ViewId/OwnerId generation | VERIFIED | SRC `project_signals.rs:86-120,171-180` | A0 | 无法拒绝迟到命令 |
 | CLAIM-039 | 生产 Signal/Store/Memo/Owner、事务 journal 与 MountPlan 尚未实现 | VERIFIED | 源码树无对应 crate；`FINAL.md:305-309` | A0 | 目标而非现状 |
 | CLAIM-040 | A0 的 headless trace、query/mount/materialization 计数尚未存在 | OPEN | `FINAL.md:268` | A0 | 规划命令 `tolist_headless` |
 
@@ -147,7 +147,7 @@ replaces: []
 | ID | 断言 | 状态 | 证据 | 关联 Gate | 备注 |
 |---|---|---|---|---|---|
 | CLAIM-041 | 生产 Store 类型、RowSet、QueryMemo、字段 handle 均未实现 | VERIFIED | CODE 源码树；`FINAL.md:305-307` | A0 | 只有目标示例中的名字 |
-| CLAIM-042 | 现有 PoC 没有字段反向边、成员索引或查询缓存 | VERIFIED | CODE `project_signals.rs`（仅 source→sink） | A0 | 无法支撑 Active/Done |
+| CLAIM-042 | 现有 PoC 没有字段反向边、成员索引或查询缓存 | VERIFIED | SRC `project_signals.rs`（仅 source→sink） | A0 | 无法支撑 Active/Done |
 | CLAIM-043 | Active/Done 的 `completed` 字段变化必须使对应 filter query cache 标脏，即使该行当前不是 member | SPEC | `FINAL.md:79-80` | A0 | 候选索引必须覆盖可能进入 filter 的行 |
 | CLAIM-044 | All 的 membership revision 不因单项 `completed` 改变 | SPEC | `FINAL.md:80,265` | A0 | 与 Active 行为不同 |
 | CLAIM-045 | 每个 `(store_epoch, filter)` 在拓扑稳定后至多共享物化一次 RowSet | SPEC | `FINAL.md:82` | A0 | 第二个消费者只共享快照 |
@@ -165,12 +165,12 @@ replaces: []
 | ID | 断言 | 状态 | 证据 | 关联 Gate | 备注 |
 |---|---|---|---|---|---|
 | CLAIM-054 | `native_poc` lib 有 4 个通过测试 | VERIFIED | EVID-VAL-03/14 | B/A | 见 `evidence/validation.md` §3/§6 |
-| CLAIM-055 | 该组覆盖 Parley CJK shaping + CPU 像素、ICU 词边界、Taffy 测量/失效、premultiplied alpha | VERIFIED | EVID-VAL-03/14；CODE `native_poc/src/lib.rs:20-72` | B | 固定测试文本；两主机 |
-| CLAIM-056 | `Paragraph::measure()` 内部计算了 `first_baseline()` | VERIFIED | CODE `native_poc/src/layout.rs:18-30` | B | — |
-| CLAIM-057 | `compute_leaf_layout` 的 measure 回调只返回 `.size`，baselines 被丢弃 | VERIFIED | CODE `layout.rs:95-107`（`paragraph.measure(known.width).size`） | B | 与 FINAL/E2 描述一致 |
-| CLAIM-058 | 叶子测量只使用 `known.width`，没有区分 available space 与 min/max-content | VERIFIED | CODE `layout.rs:104` | B | 不能证明 intrinsic |
+| CLAIM-055 | 该组覆盖 Parley CJK shaping + CPU 像素、ICU 词边界、Taffy 测量/失效、premultiplied alpha | VERIFIED | EVID-VAL-03/14；SRC `native_poc/src/lib.rs:20-72` | B | 固定测试文本；两主机 |
+| CLAIM-056 | `Paragraph::measure()` 内部计算了 `first_baseline()` | VERIFIED | SRC `native_poc/src/layout.rs:18-30` | B | — |
+| CLAIM-057 | `compute_leaf_layout` 的 measure 回调只返回 `.size`，baselines 被丢弃 | VERIFIED | SRC `layout.rs:95-107`（`paragraph.measure(known.width).size`） | B | 与 FINAL/E2 描述一致 |
+| CLAIM-058 | 叶子测量只使用 `known.width`，没有区分 available space 与 min/max-content | VERIFIED | SRC `layout.rs:104` | B | 不能证明 intrinsic |
 | CLAIM-059 | Parley 0.13.0 官方文档声明 `calculate_content_widths()` 对 mixed-direction text 可能返回错误结果 | VERIFIED | URL: https://docs.rs/parley/0.13.0/parley/struct.Layout.html | B | 必须留 canary/fallback |
-| CLAIM-060 | glyph 绘制未读取或转发 Parley `run.synthesis()`，不存在 faux bold/oblique | VERIFIED | CODE `native_poc/src/text.rs:34-63`（全文件无 synthesis） | B | cache key 也未含合成参数 |
+| CLAIM-060 | glyph 绘制未读取或转发 Parley `run.synthesis()`，不存在 faux bold/oblique | VERIFIED | SRC `native_poc/src/text.rs:34-63`（全文件无 synthesis） | B | cache key 也未含合成参数 |
 | CLAIM-061 | 缺失中文/日文 ICU segmentation model 曾导致运行期错误；启用 `complex-scripts` 后词边界断言通过 | VERIFIED | EVID-VAL-03/14；`research/validation-and-roadmap.md:34` | B | 发布 artifact 必须带词典 |
 | CLAIM-062 | 仓库没有锁定字体/ICU artifact 清单或 hash | VERIFIED | CODE 目录无 assets/fonts 清单 | B/C | 发布门要求齐备 |
 | CLAIM-063 | emoji、混合 bidi、font fallback 的真实渲染尚未验证 | OPEN | `evidence/validation.md` §8 | B | 只有 CJK 小样 |
@@ -182,11 +182,11 @@ replaces: []
 | CLAIM-064 | `native_poc` 实跑 vello_gpu 0.4 + vello_cpu 0.4 + parley 0.13 + glifo 0.5 + wgpu 30.0.2 的 headless 图 | VERIFIED | EVID-VAL-05/15 | B/A | H1 Vulkan 与 H2 Metal 两个数据点 |
 | CLAIM-065 | 该实跑的半透明红 GPU 像素 `[128,0,0,128]` 与 CPU reference 相等 | VERIFIED | EVID-VAL-05/15 | B/A | premultiplied；两主机同值 |
 | CLAIM-066 | `desktop_poc` 实跑 Classic vello 0.12 underlay + foreign wgpu `LoadOp::Load` + straight-alpha overlay | VERIFIED | EVID-VAL-06/16 | D | 仅连通性 |
-| CLAIM-067 | Classic 线使用 straight-alpha source-over，sparse-strips 使用 premultiplied，两者不可共享默认 | VERIFIED | CODE `desktop_poc/src/compositor.wgsl:11-19` vs `native_poc/src/gpu.rs`；`evidence/validation.md` §4 | B/D | 换后端会错色 |
-| CLAIM-068 | 两个 GPU 探针都把目标格式硬编码为 `Rgba8Unorm` | VERIFIED | CODE `gpu.rs:47,170`；`desktop_poc/src/main.rs:6` | B/C | 无 BGRA/sRGB 路径 |
-| CLAIM-069 | 两个探针都用 `request_adapter(Default)` / `request_device(Default)`，无 features/limits/surface capability 检查 | VERIFIED | CODE `gpu.rs:17-28`；`desktop_poc/src/main.rs:189-198` | B/C | 不支持只会 panic |
-| CLAIM-070 | 外部纹理当前是固定绿色 `Clear(0,1,0,1)` 的占位 | VERIFIED | CODE `gpu.rs:176-198` | D | 不是模型/视频内容 |
-| CLAIM-071 | 该探针的 depth 是 renderer 内部 depth view，不是独立 3D depth | VERIFIED | CODE `gpu.rs:52-55` | D | 3D 需独立 Depth32Float |
+| CLAIM-067 | Classic 线使用 straight-alpha source-over，sparse-strips 使用 premultiplied，两者不可共享默认 | VERIFIED | SRC `desktop_poc/src/compositor.wgsl:11-19` vs `native_poc/src/gpu.rs`；`evidence/validation.md` §4 | B/D | 换后端会错色 |
+| CLAIM-068 | 两个 GPU 探针都把目标格式硬编码为 `Rgba8Unorm` | VERIFIED | SRC `gpu.rs:47,170`；`desktop_poc/src/main.rs:6` | B/C | 无 BGRA/sRGB 路径 |
+| CLAIM-069 | 两个探针都用 `request_adapter(Default)` / `request_device(Default)`，无 features/limits/surface capability 检查 | VERIFIED | SRC `gpu.rs:17-28`；`desktop_poc/src/main.rs:189-198` | B/C | 不支持只会 panic |
+| CLAIM-070 | 外部纹理当前是固定绿色 `Clear(0,1,0,1)` 的占位 | VERIFIED | SRC `gpu.rs:176-198` | D | 不是模型/视频内容 |
+| CLAIM-071 | 该探针的 depth 是 renderer 内部 depth view，不是独立 3D depth | VERIFIED | SRC `gpu.rs:52-55` | D | 3D 需独立 Depth32Float |
 | CLAIM-072 | 仓库没有 glTF 依赖、vertex/index buffer、camera、uniform 或 PBR 管线 | VERIFIED | CODE manifests + `gpu.rs`；`CONCLUSION.md:75` | D | 绿色占位≠加载模型 |
 | CLAIM-073 | GPU readback 成功不证明 retained paint cache、窗口 present 或跨平台正确性 | VERIFIED | `evidence/validation.md` §4/§8 | B/C | 只证明当次输出 |
 | CLAIM-074 | `RenderCapabilities` / 能力矩阵尚未实现 | OPEN | `FINAL.md:220` | B/C | 需按 adapter 实际枚举 |
@@ -209,7 +209,7 @@ replaces: []
 | ID | 断言 | 状态 | 证据 | 关联 Gate | 备注 |
 |---|---|---|---|---|---|
 | CLAIM-083 | 宏探针把 `w-72` 映射为 288 logical points 等少量 literal class 字段 | VERIFIED | EVID-VAL-02/13；`frontend/tests.rs:27-34` | B | 不是 Tailwind 覆盖率 |
-| CLAIM-084 | 当前 typed style 只覆盖少量 property 与 hover 条件 | VERIFIED | EVID-VAL-01/12（3 个 style 测试）；CODE `desktop_poc/src/lib/style.rs:195-253` | B | 无 theme/variant 全表 |
+| CLAIM-084 | 当前 typed style 只覆盖少量 property 与 hover 条件 | VERIFIED | EVID-VAL-01/12（3 个 style 测试）；SRC `desktop_poc/src/lib/style.rs:195-253` | B | 无 theme/variant 全表 |
 | CLAIM-085 | 固定 commit `ac7fd400…` 的 Tailwind 命名 aria 变体只生成 `[aria-pressed="true"]`，没有简单的 false 变体 | VERIFIED | URL: https://github.com/tailwindlabs/tailwindcss/blob/ac7fd4007178123269cc6c8e03c8d957646331fa/packages/tailwindcss/src/variants.ts | B | 与 `style-system`/研究结论一致 |
 | CLAIM-086 | 普通 author inline 胜过同字段普通 class/hover 属于 CSS origin 规则，不是 Tailwind 特有 specificity | VERIFIED | URL: https://www.w3.org/TR/css-cascade-5/#cascade-sort | B | hover 是否命中不改变 origin |
 | CLAIM-087 | 固定版本 N/D/R/X manifest 与差分测试尚未生成 | OPEN | `FINAL.md:191`；`tailwind-coverage.md:21,150` | B | 无可报告覆盖率 |
