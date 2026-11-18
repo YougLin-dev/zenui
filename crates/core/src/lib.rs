@@ -11,10 +11,10 @@
 //! - **No third-party dependencies.** `[dependencies]` stays empty; the crate is
 //!   pure `std`.
 //! - **No `unsafe`.**
-//! - Semantics that belong to `SPEC-GATE-A0-02`…`-11` are deliberately naive.
-//!   Every such place carries a `TODO(A0-xx)` comment naming the gate that owns
-//!   it, so P2/P3 can pick them up without guessing. Nothing in this crate
-//!   claims those gates pass.
+//! - Where the A0 implementation is narrower than a later gate, a `TODO(A0-xx)`
+//!   comment names the gate that owns the gap. The fixtures that decide the A0
+//!   gates live in `crates/core/tests/`; nothing in this crate claims a gate
+//!   passes — `docs/spec/08-gates.md` is the status ledger.
 //!
 //! There is no proc macro, no windowing, no GPU and no platform backend here;
 //! those are M1+ (`docs/product/roadmap.md`).

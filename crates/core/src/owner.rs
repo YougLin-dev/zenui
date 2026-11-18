@@ -6,9 +6,13 @@
 //! scope that is currently disposing is rejected rather than silently growing a
 //! tree during teardown.
 //!
-//! TODO(A0-11): P1 counts live owners but does not verify that every edge and
-//! subscription bucket returns to baseline after churn. Empty subscriber buckets
-//! are not yet modelled at all.
+//! Churn accounting is verified end to end by the `SPEC-GATE-A0-11` fixture in
+//! `crates/core/tests/lifecycle.rs`: live owners, graph edges, active sources,
+//! layout pairs and committed rows all return to their baseline after 1200
+//! interleaved operations.
+//!
+//! TODO(A0-11): subscriber buckets are not modelled at all, so "an empty
+//! bucket is not an active subscription" has nothing to hold of yet.
 
 use std::collections::BTreeMap;
 use std::fmt;

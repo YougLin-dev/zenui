@@ -5,11 +5,16 @@
 //! P1 keeps the smallest tree that can express the A0-01 scenario: a root, row
 //! views keyed by `RowKey`, one focus pointer and per-row caret offsets.
 //!
-//! TODO(A0-09): reorder preserves `ViewId` here, but duplicate-key rejection and
-//! the "no unmount/setup on reorder" accounting are P3 work.
-//! TODO(A0-10): focus settlement records a `FocusIntent` (next → previous) and
-//! settles it once after the structure mutation. The full order (toolbar/input
-//! fallback) and cancellation by a user focus move are unimplemented.
+//! `SPEC-GATE-A0-09`: a reorder preserves `ViewId`, owner, caret and focus, and
+//! the zero-mount/unmount accounting is pinned in
+//! `crates/core/tests/lifecycle.rs`; duplicate keys are refused by
+//! `Tx::mount_row` and again by the commit preflight.
+//!
+//! `SPEC-GATE-A0-10`: focus settlement records a `FocusIntent` (next →
+//! previous) before the structure changes, settles it once after the commit,
+//! and is cancelled by a user focus move or an explicit clear in the same
+//! frame. The full fallback order (focusable input, toolbar) has no A0 node to
+//! land on.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -129,13 +134,11 @@ impl ViewTree {
         self.next = next;
     }
 
-    /// Mount one row view. A remount never reuses an id in P1, so a stale
-    /// `ViewId` can never point at a different row.
-    ///
-    /// TODO(A0-03): monotonic ids are a *stronger* guarantee than the gate
-    /// requires and deliberately skip generation reuse. A0-03 also wants a
-    /// remounted scope to receive a new generation while the id stays stable,
-    /// plus a stale-click dispatch fixture; both are P2 work.
+    /// Mount one row view. Ids are monotonic, so a stale `ViewId` can never
+    /// point at a different row — a stronger guarantee than `SPEC-GATE-A0-03`
+    /// requires, and it deliberately skips generation reuse. The dispatch
+    /// fixtures (stale handle, cross-runtime access) live in
+    /// `crates/core/tests/gates.rs`.
     pub fn mount_row(&mut self, row: RowKey, owner: OwnerId, title_len: u32) -> ViewId {
         let id = ViewId::from_index(self.next);
         self.next += 1;
@@ -157,8 +160,11 @@ impl ViewTree {
     /// Set the row order. Unknown ids are ignored; the epoch only advances when
     /// the order actually changed.
     pub fn reorder(&mut self, order: &[ViewId]) {
-        // TODO(A0-09): duplicates and unknown ids must be rejected before any
-        // patch is applied; P1 filters instead of failing.
+        // Every public path validates the permutation first: `Txn::preflight`
+        // rejects anything that is not exactly the live view set with
+        // `Fatal::ViewOrderNotAPermutation`, before the swap. This method still
+        // filters defensively — the unit tests call it directly with arbitrary
+        // orders.
         let mut next = Vec::with_capacity(order.len());
         for id in order {
             if self.nodes.contains_key(id) && !next.contains(id) {

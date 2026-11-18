@@ -249,13 +249,14 @@ impl MemoGraph {
 
     /// Recompute `node` if dirty; otherwise return the cached value.
     ///
-    /// TODO(A0-05): there is no topological scheduler. A memo is evaluated on
-    /// demand, and a diamond may recompute a shared dependency more than once
-    /// per epoch. Values published here are consistent because reads are lazy,
-    /// but the "stable value before publication + observable-count per epoch"
-    /// contract is unverified. Cycles *are* detected (see
-    /// [`GraphError::Cycle`]); writes during compute are refused by the phase
-    /// guard on the write API, not here.
+    /// Evaluation is lazy and demand-driven: there is no topological
+    /// scheduler, and a memo is pulled when read. A dirty node whose dependency
+    /// revisions still match its observation serves the cached value, so both
+    /// arms of a diamond see one epoch and a memo is observable at most once per
+    /// epoch (`a_diamond_never_observes_two_epochs`), and a long chain keeps its
+    /// head consistent (`a_long_chain_keeps_the_final_value_consistent`).
+    /// Cycles are a domain error ([`GraphError::Cycle`]); a write during compute
+    /// is refused by the phase guard on the write API, not here.
     pub fn compute<F>(&mut self, node: NodeId, f: F) -> Result<Value, GraphError>
     where
         F: FnOnce(&mut DepReader<'_>) -> Value,
