@@ -64,6 +64,8 @@ replaces: []
 | [ADR-0021](adr-0021-trybuild-pins-error-codes.md) | 错误码判据只由 trybuild `.stderr` 快照钉住；`compile_fail` doctest 只证明「不编译」，不得作 gate 证据 | `SPEC-GATE-A0-02`、`-03`；`SPEC-ROUTE-001`、`-004` | normative |
 | [ADR-0022](adr-0022-counters-are-observation.md) | 计数器是观测而非第二权威：删除记账 API、`Tx::rows` 经 `RowView`/缓存取行、缓存键含 order revision、`QueryCache` 移出公共面 | `SPEC-RT-043`、`-044`、`-047`；`SPEC-GATE-A0-07`、`-08` | normative |
 | [ADR-0023](adr-0023-row-set-projection-scope.md) | A0 的共享行集投影由缓存快照承担；可订阅的 `Memo<RowSet>` 随 `For` 在 A1 落地且只从 revision 对派生；粗粒度 membership 掩码以「结构写同时推进 order revision」为前提 | `SPEC-GATE-A0-07`；`SPEC-MACRO-011`；`SPEC-RT-043`；`ADR-0022` | normative |
+| [ADR-0024](adr-0024-gate-close-predicate.md) | Gate `closed` 是证据层脚本计算的结构谓词（子句映射 + `notApplicable` + 证据五要素），不新增状态词；删除恒为 0 的 `criteriaVerified` | `SPEC-GATE-A0-01`…`-11`；`SPEC-GATE-*` 全部 | normative |
+| [ADR-0025](adr-0025-a0-not-applicable-handover.md) | A0 七条无执行对象子句逐条移交 A1：click、多节点环、native/IME/resource、memo/per-row 边、For/订阅、input/toolbar、subscriber bucket | `SPEC-GATE-A0-03`、`-05`、`-06`、`-07`、`-09`、`-10`、`-11`；`SPEC-GATE-A1-01`…`-08` | normative |
 
 ## 3. 每条的固定结构
 
@@ -89,6 +91,8 @@ replaces: []
 | 2026-11-18 P3 验收驳回·判据承载（队长） | 0021 | `compile_fail` 不校验错误码（实测），错误码只由 trybuild 快照钉住 |
 | 2026-11-18 P3 验收驳回·计数权威（队长） | 0022 | 计数器与测试夹具不得活在运行时之外的平行实现里 |
 | 2026-11-18 P3.2 收口·行集投影边界（队长） | 0023 | `Memo<RowSet>` 归 A1；粗粒度掩码的前提与撤销条件 |
+| 2026-11-19 M0 收口·关闭谓词（队长） | 0024 | `closed` 由证据层计算；`criteriaVerified` 恒为 0，不再作论据 |
+| 2026-11-19 M0 收口·无对象子句移交（队长） | 0025 | 七条 A0 子句的对象在 A0 不存在，逐条移交 A1 |
 | `docs/README.md` 四层治理契约 | 0011 | 文档层的唯一入口与状态词表 |
 
 ## 5. 维护规则
