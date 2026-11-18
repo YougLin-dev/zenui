@@ -126,7 +126,7 @@ pub use handle::{
 };
 pub use metrics::Counters;
 pub use owner::{OwnerError, OwnerTree};
-pub use query::{Filter, QueryCache, RowSet};
+pub use query::{Filter, RowSet};
 pub use runtime::Runtime;
 pub use store::{Row, RowId, Store, StoreError};
 pub use txn::{Fatal, Nodes, Phase, PhaseViolation, Publication, Tx, Txn, ValueError, WriteKind};

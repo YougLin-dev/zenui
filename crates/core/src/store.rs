@@ -11,6 +11,7 @@ use std::fmt;
 use crate::arena::Slots;
 use crate::handle::{Generation, Handle, HandleError, InvalidHandle, RowKey, RuntimeId, SlotIndex};
 use crate::metrics::Counters;
+use crate::query::{Filter, RowView, filter_index};
 
 /// Generation-checked handle to one store row (`SPEC-RT-005`).
 pub type RowId = Handle<Row>;
@@ -82,8 +83,13 @@ pub struct Store {
     next_key: u64,
     epoch: u64,
     /// Per-filter membership epochs (`SPEC-GATE-A0-07`). A write that cannot
-    /// change a filter's membership must not invalidate its cache.
+    /// change a filter's membership set must not move its epoch; the set, not
+    /// the display order, is what this counter tracks.
     filter_epoch: [u64; 3],
+    /// Display-order epoch. Independent of membership: a `reorder` moves the
+    /// order and nothing else, so a cache keyed on membership alone would
+    /// serve the old order forever.
+    order_epoch: u64,
     completed: usize,
     io_reads: u64,
     io_writes: u64,
@@ -107,8 +113,12 @@ pub(crate) struct StoreDraft {
     next_key: u64,
     epoch: u64,
     io_writes: u64,
-    /// Which filter memberships this commit changed.
-    filter_mask: [bool; 3],
+    /// Absolute cache revisions this commit installs (`SPEC-GATE-A0-07`).
+    /// Target values, not deltas: the transaction advanced them while it was
+    /// staging, and the swap adopts the transaction's last state, which is the
+    /// state the frame's cache was already keyed on.
+    filter_epochs: [u64; 3],
+    order_epoch: u64,
 }
 
 impl StoreDraft {
@@ -146,21 +156,14 @@ impl StoreDraft {
         self.order = order;
     }
 
-    /// Mark a filter's membership as changed by this commit.
-    pub(crate) fn touch_filter(&mut self, filter: crate::query::Filter) {
-        self.filter_mask[filter_index(filter)] = true;
+    /// The cache revisions this commit installs.
+    pub(crate) fn set_revisions(&mut self, filter_epochs: [u64; 3], order_epoch: u64) {
+        self.filter_epochs = filter_epochs;
+        self.order_epoch = order_epoch;
     }
 
     pub(crate) fn set_completed_count(&mut self, completed: usize) {
         self.completed = completed;
-    }
-}
-
-const fn filter_index(filter: crate::query::Filter) -> usize {
-    match filter {
-        crate::query::Filter::All => 0,
-        crate::query::Filter::Active => 1,
-        crate::query::Filter::Completed => 2,
     }
 }
 
@@ -178,6 +181,7 @@ impl Store {
             next_key: 1,
             epoch: 0,
             filter_epoch: [0; 3],
+            order_epoch: 0,
             completed: 0,
             io_reads: 0,
             io_writes: 0,
@@ -199,7 +203,9 @@ impl Store {
         assert!(self.rows.fill(slot, row), "fresh reservation must be empty");
         self.order.push(slot);
         self.record_write();
-        self.touch_filters([true, true, true]);
+        // A new row joins `All` and `Active`; it is never born completed.
+        self.touch_filters([true, true, false]);
+        self.order_epoch += 1;
         Handle::new(self.runtime, slot, generation)
     }
 
@@ -256,7 +262,9 @@ impl Store {
             self.completed -= 1;
         }
         self.record_write();
-        self.touch_filters([true, true, true]);
+        // The row leaves `All` and exactly one of `Active`/`Completed`.
+        self.touch_filters([true, !was_completed, was_completed]);
+        self.order_epoch += 1;
         Ok(removed)
     }
 
@@ -285,7 +293,9 @@ impl Store {
             // One `clear_completed` call is one write, however many rows it
             // removed (`metrics::Counters::io_writes`).
             self.record_write();
-            self.touch_filters([true, true, true]);
+            // Only completed rows are removed: `Active` membership is intact.
+            self.touch_filters([true, false, true]);
+            self.order_epoch += 1;
         }
         removed
     }
@@ -311,6 +321,8 @@ impl Store {
         }
         self.order = slots;
         self.record_write();
+        // Membership is untouched: only the display order moved.
+        self.order_epoch += 1;
         Ok(())
     }
 
@@ -394,29 +406,36 @@ impl Store {
         self.next_key = draft.next_key;
         self.epoch = draft.epoch;
         self.io_writes = draft.io_writes;
-        self.touch_filters(draft.filter_mask);
+        self.filter_epoch = draft.filter_epochs;
+        self.order_epoch = draft.order_epoch;
     }
 
     /// The membership epoch of one filter (`SPEC-GATE-A0-07`).
-    pub const fn epoch_for(&self, filter: crate::query::Filter) -> u64 {
+    pub const fn epoch_for(&self, filter: Filter) -> u64 {
         self.filter_epoch[filter_index(filter)]
+    }
+
+    /// The display-order epoch (`SPEC-GATE-A0-07`: the reverse edge is
+    /// `(row, completed)` for membership and the row list for order, so a
+    /// reorder has to move a revision of its own).
+    pub(crate) const fn order_epoch(&self) -> u64 {
+        self.order_epoch
     }
 
     /// True when the filter matches no row, answered from the membership
     /// counters without scanning (`SPEC-GATE-A0-08`).
-    pub const fn is_empty_for(&self, filter: crate::query::Filter) -> bool {
+    pub const fn is_empty_for(&self, filter: Filter) -> bool {
         match filter {
-            crate::query::Filter::All => self.order.is_empty(),
-            crate::query::Filter::Active => self.completed == self.order.len(),
-            crate::query::Filter::Completed => self.completed == 0,
+            Filter::All => self.order.is_empty(),
+            Filter::Active => self.completed == self.order.len(),
+            Filter::Completed => self.completed == 0,
         }
     }
 
-    /// Rows a filter scan would visit.
-    pub const fn scan_cost(&self) -> usize {
-        self.order.len()
-    }
-
+    /// Advance one membership epoch per changed filter. The committed path
+    /// installs absolute revisions instead (`StoreDraft::set_revisions`); this
+    /// helper exists for the direct mutations the unit tests drive.
+    #[cfg(test)]
     pub(crate) fn touch_filters(&mut self, mask: [bool; 3]) {
         for (index, dirty) in mask.iter().enumerate() {
             if *dirty {
@@ -563,6 +582,32 @@ impl fmt::Debug for Store {
             .field("completed", &self.completed)
             .field("epoch", &self.epoch)
             .finish()
+    }
+}
+
+/// The committed model as a query sees it.
+///
+/// The frame-side overlay is the other implementation. Both expose the same
+/// two revisions, so the cache cannot tell a committed read from a staged one —
+/// and, more importantly, it cannot quietly serve one for the other unless the
+/// revisions really are equal.
+impl RowView for Store {
+    fn membership_revision(&self, filter: Filter) -> u64 {
+        self.epoch_for(filter)
+    }
+
+    fn order_revision(&self) -> u64 {
+        self.order_epoch
+    }
+
+    fn is_empty_for(&self, filter: Filter) -> bool {
+        Store::is_empty_for(self, filter)
+    }
+
+    fn visit_rows(&self, visit: &mut dyn FnMut(RowKey, bool)) {
+        for row in self.rows() {
+            visit(row.key(), row.completed());
+        }
     }
 }
 

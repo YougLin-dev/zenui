@@ -10,12 +10,13 @@ use std::ops::AddAssign;
 /// One snapshot of the monotonic counters a headless run exposes.
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub struct Counters {
-    /// `query` cache evaluations (one per `(store_epoch, filter)` miss).
+    /// Query-cache evaluations: one per `(membership revision, order revision,
+    /// filter)` miss, empty results included.
     pub query_evals: u64,
     /// `RowSet` materializations (stable-id collections).
     pub id_materializations: u64,
-    /// Row-set constructions from a store scan (`SPEC-GATE-A0-07`). A cache
-    /// hit costs nothing; an empty result costs nothing either, because it is
+    /// Row-set constructions from a row scan (`SPEC-GATE-A0-07`). A cache hit
+    /// costs nothing; an empty result costs nothing either, because it is
     /// answered from the membership counters.
     pub cache_builds: u64,
     /// Rows scanned while building a row set (`SPEC-GATE-A0-08`). This is the

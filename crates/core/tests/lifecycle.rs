@@ -56,12 +56,30 @@ fn a0_09_a_duplicate_key_is_refused_before_any_patch() {
     );
     assert_eq!(runtime.row_views(), visible_before, "no patch was applied");
 
-    // The same key twice inside one frame is refused too.
-    let result = runtime.frame(|tx| {
-        runtime_keys(tx);
-        Ok(())
+    // The same key twice inside *one* frame is refused by the *staged* check,
+    // not by the preflight that would also catch it at commit. The first mount
+    // is legal because the committed view is already staged for unmount.
+    //
+    // The refusal is asserted at the call site and the frame is then aborted on
+    // purpose: a fixture that only inspects the frame's result cannot tell the
+    // two checks apart, because preflight rejects the duplicate with the same
+    // variant.
+    let result: Result<(), Fatal> = runtime.frame(|tx| {
+        tx.unmount(visible_before[0].0)?;
+        tx.mount_row(key, 1)?;
+        let second = tx.mount_row(key, 1);
+        assert!(
+            matches!(second, Err(Fatal::DuplicateViewKey { .. })),
+            "the second mount must be refused before the commit, got {second:?}"
+        );
+        Err(Fatal::Aborted)
     });
-    assert!(result.is_ok());
+    assert!(result.is_err(), "the frame was discarded");
+    assert_eq!(
+        runtime.row_views(),
+        visible_before,
+        "the aborted frame applied no patch"
+    );
 }
 
 /// `SPEC-GATE-A0-09`: reorder keeps identity and moves no mount counter.
@@ -132,15 +150,19 @@ fn a0_09_a_reorder_preserves_identity_and_moves_no_counter() {
         caret_before
     );
     assert_eq!(runtime.live_owner_ids(), owners_before);
-    let mut identities_after: Vec<(u32, RowKey)> = runtime
+    // Compared *unsorted*: the identities must survive, and they must survive
+    // in the new order. A sorted comparison would pass even if the reorder had
+    // silently done nothing.
+    let identities_after: Vec<(u32, RowKey)> = runtime
         .row_views()
         .into_iter()
         .map(|(view, key)| (view.index(), key))
         .collect();
-    let mut expected = identities_before.clone();
-    identities_after.sort();
-    expected.sort();
-    assert_eq!(identities_after, expected, "the same ViewIds survived");
+    let expected: Vec<(u32, RowKey)> = identities_before.iter().rev().copied().collect();
+    assert_eq!(
+        identities_after, expected,
+        "the same ViewIds, in the reversed display order"
+    );
 }
 
 /// `SPEC-GATE-A0-10`: the intent is recorded before the structural change and
@@ -166,6 +188,7 @@ fn a0_10_deleting_the_focused_row_settles_one_intent() {
 
     let focus_before = runtime.focused();
     let moves_before = runtime.counters().focus_moves;
+    let carets_before = runtime.counters().caret_ops;
 
     let row = runtime_row(&runtime, "A");
     runtime
@@ -186,6 +209,57 @@ fn a0_10_deleting_the_focused_row_settles_one_intent() {
         runtime.counters().focus_moves,
         moves_before + 1,
         "exactly one settlement"
+    );
+    // A settlement that ran twice would land on the same view (no second move)
+    // but would place the caret a second time: the caret counter is what makes
+    // "settled once" checkable rather than merely satisfiable.
+    assert_eq!(
+        runtime.counters().caret_ops,
+        carets_before + 1,
+        "one settlement places the caret once"
+    );
+}
+
+/// `SPEC-GATE-A0-10`: `clear_focus` is a user choice too. The recorded intent
+/// must not pull focus back after the user cleared it in the same frame.
+#[test]
+fn a0_10_a_user_clear_cancels_the_intent() {
+    let mut runtime = Runtime::new();
+    runtime
+        .frame(|tx| {
+            tx.insert("A")?;
+            tx.insert("B")?;
+            tx.insert("C")?;
+            Ok(())
+        })
+        .expect("seed");
+    let views = mount_all(&mut runtime);
+    runtime
+        .frame(|tx| {
+            tx.focus(views[0])?;
+            Ok(())
+        })
+        .expect("focus A");
+
+    let moves_before = runtime.counters().focus_moves;
+    let row = runtime_row(&runtime, "A");
+    runtime
+        .frame(|tx| {
+            tx.remove(row).map_err(|_| Fatal::Aborted)?;
+            tx.unmount(views[0])?;
+            tx.clear_focus()?;
+            Ok(())
+        })
+        .expect("delete + clear focus");
+
+    assert!(
+        runtime.focused().is_none(),
+        "the user's clear must not be overridden by the intent"
+    );
+    assert_eq!(
+        runtime.counters().focus_moves,
+        moves_before + 1,
+        "only the clear moved focus; no settlement followed it"
     );
 }
 
@@ -228,9 +302,16 @@ fn a0_10_a_user_focus_move_cancels_the_intent() {
     );
 }
 
-/// `SPEC-GATE-A0-10`: a bulk clear settles once, not once per removed row.
+/// `SPEC-GATE-A0-10`: when the clear removes every candidate, the result is
+/// "no focus", and only one move is counted.
+///
+/// Scope, stated honestly: in this shape the recorded intent and the generic
+/// "focus left on an unmounted view" cleanup produce the same observables, so
+/// deleting the intent path keeps this fixture green. It pins the fallback
+/// *result*; the fixture below, where a sibling survives, is the one that pins
+/// the intent itself.
 #[test]
-fn a0_10_a_bulk_clear_settles_one_intent() {
+fn a0_10_a_bulk_clear_with_no_candidate_leaves_no_focus() {
     let mut runtime = Runtime::new();
     runtime
         .frame(|tx| {
@@ -260,7 +341,6 @@ fn a0_10_a_bulk_clear_settles_one_intent() {
         .expect("focus A");
 
     let moves_before = runtime.counters().focus_moves;
-    let focused_before_clear = runtime.focused();
     runtime
         .frame(|tx| {
             tx.clear_completed()?;
@@ -271,13 +351,6 @@ fn a0_10_a_bulk_clear_settles_one_intent() {
         })
         .expect("clear");
 
-    eprintln!(
-        "focus before={:?} after={:?} moves {} -> {}",
-        focused_before_clear,
-        runtime.focused(),
-        moves_before,
-        runtime.counters().focus_moves
-    );
     assert_eq!(
         runtime.counters().focus_moves,
         moves_before + 1,
@@ -289,12 +362,79 @@ fn a0_10_a_bulk_clear_settles_one_intent() {
     );
 }
 
+/// `SPEC-GATE-A0-10`: the same clear, with a surviving sibling.
+///
+/// This is the variant that can tell one settlement from two: the fallback
+/// lands on a live view, so a second settlement re-places the caret and
+/// `caret_ops` moves. In the fixture above every candidate is gone and a
+/// repeated settlement is indistinguishable — the reason both cases exist.
+#[test]
+fn a0_10_a_bulk_clear_settles_once_for_the_surviving_sibling() {
+    let mut runtime = Runtime::new();
+    runtime
+        .frame(|tx| {
+            tx.insert("A")?;
+            tx.insert("B")?;
+            tx.insert("C")?;
+            Ok(())
+        })
+        .expect("seed");
+    let views = mount_all(&mut runtime);
+
+    for title in ["A", "B"] {
+        let row = runtime_row(&runtime, title);
+        runtime
+            .frame(|tx| {
+                tx.set_completed(row, true).map_err(|_| Fatal::Aborted)?;
+                Ok(())
+            })
+            .expect("complete");
+    }
+    // Focus the *middle* removed row: its next sibling (C) survives, so the
+    // intent has a live target.
+    runtime
+        .frame(|tx| {
+            tx.focus(views[1])?;
+            Ok(())
+        })
+        .expect("focus B");
+
+    let moves_before = runtime.counters().focus_moves;
+    let carets_before = runtime.counters().caret_ops;
+    runtime
+        .frame(|tx| {
+            tx.clear_completed()?;
+            for view in &views[..2] {
+                tx.unmount(*view)?;
+            }
+            Ok(())
+        })
+        .expect("clear");
+
+    assert_eq!(
+        runtime.focused(),
+        Some(views[2]),
+        "the surviving next sibling takes focus"
+    );
+    assert_eq!(
+        runtime.counters().focus_moves,
+        moves_before + 1,
+        "one intent for the whole clear, not one per removed row"
+    );
+    assert_eq!(
+        runtime.counters().caret_ops,
+        carets_before + 1,
+        "the settlement ran once"
+    );
+}
+
 /// `SPEC-GATE-A0-11`: 1000+ interleaved operations return to baseline.
 #[test]
 fn a0_11_churn_returns_to_the_baseline() {
     let mut runtime = Runtime::new();
-    // Warm the static wiring first (the three filter memos depend on the store
-    // node), so the baseline is "after one full frame", not "before any read".
+    // Warm the static wiring first (the two remaining memos depend on the store
+    // node, and the query cache fills its slots), so the baseline is "after one
+    // full frame", not "before any read".
     runtime
         .frame(|tx| {
             for filter in [Filter::All, Filter::Active, Filter::Completed] {
@@ -311,7 +451,8 @@ fn a0_11_churn_returns_to_the_baseline() {
     let mut operations = 0u32;
     let mut mounted: Vec<(ViewId, RowKey)> = Vec::new();
     let mut orphaned: Vec<RowKey> = Vec::new();
-    for round in 0..300u32 {
+    // `SPEC-GATE-A0-11` asks for 1000+ interleaved operations, not 250.
+    for round in 0..1200u32 {
         let filter = match round % 3 {
             0 => Filter::All,
             1 => Filter::Active,
@@ -371,7 +512,10 @@ fn a0_11_churn_returns_to_the_baseline() {
             })
             .expect("drain remove");
     }
-    assert!(operations >= 250);
+    assert_eq!(
+        operations, 1200,
+        "`SPEC-GATE-A0-11` asks for 1000+ operations"
+    );
 
     assert_eq!(runtime.live_owners(), baseline_owners, "owners leaked");
     assert_eq!(runtime.edge_count(), baseline_edges, "edges leaked");
@@ -382,6 +526,11 @@ fn a0_11_churn_returns_to_the_baseline() {
         "layout leaked"
     );
     assert_eq!(runtime.row_views().len(), 0, "no view survived");
+    assert_eq!(
+        runtime.committed().len(),
+        0,
+        "the model is back to empty, not just the view tree"
+    );
 }
 
 fn runtime_row(runtime: &Runtime, title: &str) -> RowId {
@@ -393,14 +542,16 @@ fn runtime_row(runtime: &Runtime, title: &str) -> RowId {
         .unwrap_or_else(|| panic!("row {title} exists"))
 }
 
-fn runtime_keys(tx: &mut Tx<'_>) -> Vec<RowKey> {
-    tx.rows(Filter::All).iter().collect()
-}
-
-/// `SPEC-GATE-A0-02`: a mount reads the owned title exactly once, and a borrow
-/// read costs no I/O.
+/// `SPEC-GATE-A0-02`: `read_once` is the only owned read and it counts one
+/// I/O; a borrow read costs none.
+///
+/// This is the *primitive*. The mount executor that consumes it lives in
+/// `zenui-app`, and the criterion "one owned read per mount, and a mount that
+/// fails is cancelled" is pinned against that real path in
+/// `crates/app/tests/mount_path.rs` — a fixture that calls `read_once` itself
+/// would only prove the fixture.
 #[test]
-fn a0_02_a_mount_reads_the_title_exactly_once() {
+fn a0_02_an_owned_read_counts_once_and_a_borrow_read_is_free() {
     let mut runtime = Runtime::new();
     runtime
         .frame(|tx| {
@@ -412,22 +563,20 @@ fn a0_02_a_mount_reads_the_title_exactly_once() {
         .expect("seed");
 
     let before = runtime.committed().counters().io_reads;
-    let views = runtime
+    runtime
         .frame(|tx| {
             let all = keys(tx);
-            let mut views = Vec::new();
             for key in &all {
                 let handle = tx.handle_for(*key).expect("row");
                 let title = tx.read_once(handle).expect("owned read");
-                views.push(tx.mount_row(*key, title.chars().count() as u32)?);
+                assert!(!title.is_empty(), "read_once returns the title");
             }
-            tx.reorder_views(&views)?;
-            Ok(views)
+            Ok(())
         })
-        .expect("mount all");
+        .expect("owned reads");
 
     let after = runtime.committed().counters().io_reads;
-    assert_eq!(after - before, 3, "one owned read per mounted row");
+    assert_eq!(after - before, 3, "one owned read per handle");
 
     // A borrow read is free.
     runtime
@@ -445,5 +594,4 @@ fn a0_02_a_mount_reads_the_title_exactly_once() {
         after,
         "a borrow read is not I/O"
     );
-    assert_eq!(views.len(), 3);
 }

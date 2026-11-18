@@ -15,16 +15,19 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use crate::metrics::Counters;
-use crate::query::RowSet;
 
 /// Dense internal index of a graph node. Not an identity domain: it is never
 /// exposed outside the runtime and never printed in a trace.
 pub type NodeId = u32;
 
 /// A memo value. Equality drives `SPEC-RT-032` suppression.
+///
+/// There is no row-set variant: a `RowSet` is cached by the query cache, keyed
+/// on the revisions this graph would otherwise have to track
+/// (`SPEC-GATE-A0-07`). Two memos over the same value would be two
+/// invalidation authorities.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Value {
-    Rows(RowSet),
     Count(u32),
     Flag(bool),
 }
@@ -32,7 +35,6 @@ pub enum Value {
 impl Value {
     const fn kind(&self) -> &'static str {
         match self {
-            Value::Rows(_) => "rows",
             Value::Count(_) => "count",
             Value::Flag(_) => "flag",
         }
@@ -178,6 +180,7 @@ impl GraphScratch {
     }
 
     /// The node whose body closed a cycle, if one was seen.
+    #[cfg(test)]
     pub(crate) const fn cycle(&self) -> Option<NodeId> {
         self.cycle
     }
@@ -610,15 +613,6 @@ impl fmt::Debug for MemoGraph {
 mod tests {
     use super::*;
 
-    fn rows(order: &[u64]) -> Value {
-        Value::Rows(RowSet::from_keys(
-            order
-                .iter()
-                .map(|raw| crate::handle::RowKey::from_raw(*raw))
-                .collect(),
-        ))
-    }
-
     #[test]
     fn memo_recomputes_only_when_dirty() {
         let mut graph = MemoGraph::new();
@@ -754,15 +748,20 @@ mod tests {
         assert_eq!(leaf_value, Value::Count(3));
     }
 
-    /// Removing the `dirty` handling in `commit_scratch` makes this fail: the
-    /// memo would keep its old value and be treated as clean.
     /// `SPEC-RT-038`: a memo body reading a node that is still computing is a
     /// cycle, reported as a domain error instead of converging on a stale
     /// value. Removing the `computing` check makes this fail.
-    /// `SPEC-GATE-A0-05`: a two-node cycle is detected too, not just a memo
-    /// reading itself. Removing the compute-stack check makes this fail.
+    ///
+    /// Scope, stated honestly: the stack is put into its mid-compute state with
+    /// the test-only `begin_computing` hook. At A0 a memo body cannot *run* a
+    /// nested compute — `DepReader` is read-only — so a genuine A→B→A cycle is
+    /// not expressible, and the only cycle the runtime itself can reach is the
+    /// self-reading form (`a_self_reading_memo_is_a_cycle`, and
+    /// `Tx::probe_cycle` for the transaction-level path). This test pins the
+    /// stack check itself; it is not evidence that a two-memo cycle was
+    /// constructed.
     #[test]
-    fn a_two_node_cycle_is_detected() {
+    fn the_compute_stack_reports_a_read_into_a_cycle() {
         let mut graph = MemoGraph::new();
         let first = graph.memo("first");
         let second = graph.memo("second");
@@ -803,6 +802,8 @@ mod tests {
         assert_eq!(scratch.cycle(), Some(node));
     }
 
+    /// Removing the `dirty` handling in `commit_scratch` makes this fail: the
+    /// memo would keep its old value and be treated as clean.
     #[test]
     fn a_write_only_frame_leaves_the_memo_dirty() {
         let mut graph = MemoGraph::new();
@@ -969,11 +970,5 @@ mod tests {
                 "chain node {index} saw a stale predecessor"
             );
         }
-    }
-
-    #[test]
-    fn row_values_compare_by_content() {
-        assert_eq!(rows(&[1, 2]), rows(&[1, 2]));
-        assert_ne!(rows(&[1, 2]), rows(&[2, 1]));
     }
 }

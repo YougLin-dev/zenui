@@ -172,8 +172,10 @@ impl std::fmt::Debug for TodoApp {
 
 /// Bind the current query result to the retained view tree.
 ///
-/// TODO(A0-09): duplicate-key rejection in the view layer and a dedicated
-/// setup/identity fixture are still missing.
+/// One row key maps to one view: the duplicate is refused by `Tx::mount_row`
+/// and again by the commit preflight (`SPEC-GATE-A0-09`), and the identity /
+/// caret / focus behaviour of a reorder is pinned in
+/// `crates/core/tests/lifecycle.rs`.
 pub fn render(tx: &mut Tx<'_>, ui: &mut UiState) -> Result<(), Fatal> {
     let want = tx.rows(ui.filter);
     let want_keys: Vec<RowKey> = want.iter().collect();

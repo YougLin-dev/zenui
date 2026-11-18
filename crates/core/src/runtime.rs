@@ -155,7 +155,7 @@ impl Runtime {
     ) -> Result<R, Fatal> {
         let next_view = self.views.next_id();
         let next_owner = self.owners.next_id();
-        self.txn.begin_frame(next_view, next_owner);
+        self.txn.begin_frame(&self.store, next_view, next_owner);
         let mut tx = self.tx();
         match f(&mut tx) {
             Ok(value) => {
