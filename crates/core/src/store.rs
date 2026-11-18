@@ -94,6 +94,10 @@ pub struct Store {
     io_reads: u64,
     io_writes: u64,
     string_clones: u64,
+    /// Rows enumerated through [`RowView::rows_for`]. Not part of `Counters`:
+    /// it is the view's own scan count, which the query cache turns into
+    /// `row_visits` (`ADR-0022` decision 2).
+    scanned: u64,
 }
 
 /// The whole model as it will look once this commit lands (`SPEC-RT-052`).
@@ -186,6 +190,7 @@ impl Store {
             io_reads: 0,
             io_writes: 0,
             string_clones: 0,
+            scanned: 0,
         }
     }
 
@@ -592,6 +597,23 @@ impl fmt::Debug for Store {
 /// and, more importantly, it cannot quietly serve one for the other unless the
 /// revisions really are equal.
 impl RowView for Store {
+    fn rows_for(&mut self, filter: Filter) -> Vec<(RowKey, bool)> {
+        let rows: Vec<(RowKey, bool)> = self
+            .rows()
+            .map(|row| (row.key(), row.completed()))
+            .collect();
+        // The filter is applied after the enumeration, so the scan cost is the
+        // whole model, not the size of the answer.
+        self.scanned += rows.len() as u64;
+        rows.into_iter()
+            .filter(|(_, completed)| filter.matches(*completed))
+            .collect()
+    }
+
+    fn is_empty_for(&mut self, filter: Filter) -> bool {
+        Store::is_empty_for(self, filter)
+    }
+
     fn membership_revision(&self, filter: Filter) -> u64 {
         self.epoch_for(filter)
     }
@@ -600,14 +622,8 @@ impl RowView for Store {
         self.order_epoch
     }
 
-    fn is_empty_for(&self, filter: Filter) -> bool {
-        Store::is_empty_for(self, filter)
-    }
-
-    fn visit_rows(&self, visit: &mut dyn FnMut(RowKey, bool)) {
-        for row in self.rows() {
-            visit(row.key(), row.completed());
-        }
+    fn scan_cost(&self) -> u64 {
+        self.scanned
     }
 }
 

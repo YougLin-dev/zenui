@@ -810,8 +810,8 @@ impl<'a> Tx<'a> {
     /// counters the commit installs, so a snapshot built here is still valid —
     /// and still shared — after the frame lands.
     pub fn rows(&mut self, filter: Filter) -> RowSet {
-        let view = StagedView::new(self.store, self.txn);
-        self.query.rows(&view, filter)
+        let mut view = StagedView::new(self.store, self.txn);
+        self.query.rows(&mut view, filter)
     }
 
     /// Rows still active, from the membership counters.
@@ -1496,14 +1496,19 @@ impl<'a> Tx<'a> {
 
 /// The committed model with one frame's journal applied on top.
 ///
-/// This is the second `RowView` implementation (`SPEC-GATE-A0-07`). The cache
-/// cannot tell it apart from `Store`, and nothing else can produce a third
-/// view: a fixture that wants row counts has to drive a real frame.
+/// This is the second `RowView` implementation (`ADR-0022` decision 2). The
+/// cache cannot tell it apart from `Store`, and nothing outside this crate can
+/// produce a third view: a fixture that wants row counts has to drive a real
+/// frame.
 struct StagedView<'a> {
     store: &'a Store,
     journal: &'a ModelJournal,
     membership: [u64; 3],
     order: u64,
+    /// Rows this view has enumerated. The cache turns the difference across one
+    /// evaluation into `row_visits`, so no enumeration is free — including one
+    /// performed to answer `is_empty_for`.
+    scanned: u64,
 }
 
 impl<'a> StagedView<'a> {
@@ -1513,11 +1518,15 @@ impl<'a> StagedView<'a> {
             journal: &txn.model,
             membership: txn.staged_membership,
             order: txn.staged_order,
+            scanned: 0,
         }
     }
 
     /// Final row set: committed rows with staged inserts, updates and removals
     /// applied, in the staged order when one exists.
+    ///
+    /// This is the commit path's view of the model (preflight, publication); it
+    /// does not count scans, because it is not a query evaluation.
     fn effective_rows(&self) -> Vec<(RowKey, bool)> {
         let mut rows: Vec<(RowKey, bool)> = self
             .store
@@ -1571,7 +1580,7 @@ impl<'a> StagedView<'a> {
     }
 
     /// Live and completed row counts: the store's counters plus the journal's
-    /// own entries, never a scan of the row list (`SPEC-GATE-A0-08`).
+    /// own entries, never a scan of the row list (`SPEC-RT-044`).
     ///
     /// The journal is as long as the frame is wide, not as the store is; a
     /// frame that writes one row costs one step here whatever `len()` is.
@@ -1632,28 +1641,38 @@ impl<'a> StagedView<'a> {
         self.store.completed_at(slot)
     }
 
-    /// Every live row in display order. Streaming: no intermediate buffer for
-    /// the common case where no reorder is staged.
-    fn each_live(&self, visit: &mut dyn FnMut(RowKey, bool)) {
-        for row in self.store.rows() {
+    /// Every live row in display order, counting each row it enumerates.
+    fn each_live(&mut self, visit: &mut dyn FnMut(RowKey, bool)) {
+        if self.journal.order.is_some() {
+            let rows = self.effective_rows();
+            self.scanned += rows.len() as u64;
+            for (key, completed) in rows {
+                visit(key, completed);
+            }
+            return;
+        }
+
+        let store = self.store;
+        let journal = self.journal;
+        for row in store.rows() {
             let key = row.key();
-            if self.journal.removals.contains(&key) {
+            if journal.removals.contains(&key) {
                 continue;
             }
-            let completed = self
-                .journal
+            self.scanned += 1;
+            let completed = journal
                 .rows
                 .get(&key)
                 .and_then(|staged| staged.completed)
                 .unwrap_or_else(|| row.completed());
             visit(key, completed);
         }
-        for key in &self.journal.inserted {
-            if self.journal.removals.contains(key) {
+        for key in &journal.inserted {
+            if journal.removals.contains(key) {
                 continue;
             }
-            let completed = self
-                .journal
+            self.scanned += 1;
+            let completed = journal
                 .rows
                 .get(key)
                 .and_then(|staged| staged.completed)
@@ -1664,15 +1683,17 @@ impl<'a> StagedView<'a> {
 }
 
 impl RowView for StagedView<'_> {
-    fn membership_revision(&self, filter: Filter) -> u64 {
-        self.membership[filter_index(filter)]
+    fn rows_for(&mut self, filter: Filter) -> Vec<(RowKey, bool)> {
+        let mut rows = Vec::new();
+        self.each_live(&mut |key, completed| {
+            if filter.matches(completed) {
+                rows.push((key, completed));
+            }
+        });
+        rows
     }
 
-    fn order_revision(&self) -> u64 {
-        self.order
-    }
-
-    fn is_empty_for(&self, filter: Filter) -> bool {
+    fn is_empty_for(&mut self, filter: Filter) -> bool {
         let (live, completed) = self.live_counts();
         match filter {
             Filter::All => live == 0,
@@ -1681,15 +1702,16 @@ impl RowView for StagedView<'_> {
         }
     }
 
-    fn visit_rows(&self, visit: &mut dyn FnMut(RowKey, bool)) {
-        match &self.journal.order {
-            None => self.each_live(visit),
-            Some(_) => {
-                for (key, completed) in self.effective_rows() {
-                    visit(key, completed);
-                }
-            }
-        }
+    fn membership_revision(&self, filter: Filter) -> u64 {
+        self.membership[filter_index(filter)]
+    }
+
+    fn order_revision(&self) -> u64 {
+        self.order
+    }
+
+    fn scan_cost(&self) -> u64 {
+        self.scanned
     }
 }
 

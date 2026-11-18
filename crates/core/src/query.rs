@@ -93,10 +93,18 @@ impl fmt::Debug for RowSet {
 /// The model as one query sees it: the committed store, or a frame's staged
 /// overlay on top of it.
 ///
-/// Two implementations exist — `Store` and the transaction's overlay — and the
-/// cache knows nothing about either. That is what keeps the cache from growing
-/// a second code path that only fixtures exercise.
+/// The contract is the five members fixed by `ADR-0022` decision 2. Two
+/// implementations exist — `Store` and `StagedView` — and the cache knows
+/// nothing about either.
 pub(crate) trait RowView {
+    /// The rows `filter` matches, in display order, paired with the effective
+    /// `completed` flag.
+    fn rows_for(&mut self, filter: Filter) -> Vec<(RowKey, bool)>;
+
+    /// True when `filter` matches nothing, answered from counters rather than a
+    /// scan (`SPEC-RT-044`).
+    fn is_empty_for(&mut self, filter: Filter) -> bool;
+
     /// Revision of `filter`'s *membership set*. A write that cannot change the
     /// set must not move it (`SPEC-GATE-A0-07`).
     fn membership_revision(&self, filter: Filter) -> u64;
@@ -108,15 +116,14 @@ pub(crate) trait RowView {
     /// alone would serve a stale order after a reorder.
     fn order_revision(&self) -> u64;
 
-    /// True when `filter` matches nothing, answered from counters rather than a
-    /// scan (`SPEC-GATE-A0-08`).
-    fn is_empty_for(&self, filter: Filter) -> bool;
-
-    /// Visit every live row in display order as `(key, completed)`.
+    /// Rows this view has enumerated since it was created.
     ///
-    /// The cache counts one `row_visits` per call, so an implementation cannot
-    /// report a scan it did not perform.
-    fn visit_rows(&self, visit: &mut dyn FnMut(RowKey, bool));
+    /// The cache charges `row_visits` with the difference across one
+    /// evaluation, so a row the view enumerates *anywhere* — including inside
+    /// `is_empty_for` — is counted. That is what makes the `ADR-0022`
+    /// decision-6 mutation (answer emptiness by counting `rows_for(All)`)
+    /// visible to a fixture instead of silently free.
+    fn scan_cost(&self) -> u64;
 }
 
 pub(crate) const fn filter_index(filter: Filter) -> usize {
@@ -170,7 +177,7 @@ impl QueryCache {
     /// evaluation; a non-empty result also pays one build, one materialization
     /// and one visit per scanned row. An empty result is answered from the
     /// membership counters and pays none of the three (`SPEC-GATE-A0-08`).
-    pub(crate) fn rows<V: RowView + ?Sized>(&mut self, view: &V, filter: Filter) -> RowSet {
+    pub(crate) fn rows<V: RowView + ?Sized>(&mut self, view: &mut V, filter: Filter) -> RowSet {
         let index = filter_index(filter);
         let revision = Revision {
             membership: view.membership_revision(filter),
@@ -184,29 +191,24 @@ impl QueryCache {
 
         self.evals += 1;
 
-        if view.is_empty_for(filter) {
+        // The view owns the scan counter; the cache charges the difference, so
+        // no enumeration performed to answer this evaluation can be free.
+        let scanned = view.scan_cost();
+        let rows = if view.is_empty_for(filter) {
             // Zero materialization: the membership counters already answer it.
-            let empty = RowSet::empty();
-            self.slots[index] = Slot {
-                revision: Some(revision),
-                rows: Some(empty.clone()),
-            };
-            return empty;
-        }
+            RowSet::empty()
+        } else {
+            self.builds += 1;
+            self.materializations += 1;
+            let keys: Vec<RowKey> = view
+                .rows_for(filter)
+                .into_iter()
+                .map(|(key, _)| key)
+                .collect();
+            RowSet::from_keys(keys)
+        };
+        self.visits += view.scan_cost() - scanned;
 
-        let mut keys = Vec::new();
-        let mut visited = 0u64;
-        view.visit_rows(&mut |key, completed| {
-            visited += 1;
-            if filter.matches(completed) {
-                keys.push(key);
-            }
-        });
-        self.visits += visited;
-        self.builds += 1;
-        self.materializations += 1;
-
-        let rows = RowSet::from_keys(keys);
         self.slots[index] = Slot {
             revision: Some(revision),
             rows: Some(rows.clone()),
@@ -252,6 +254,7 @@ mod tests {
         membership: [u64; 3],
         order: u64,
         rows: Vec<(RowKey, bool)>,
+        scanned: u64,
     }
 
     impl TestView {
@@ -263,11 +266,28 @@ mod tests {
                     .iter()
                     .map(|(raw, completed)| (RowKey::from_raw(*raw), *completed))
                     .collect(),
+                scanned: 0,
             }
         }
     }
 
     impl RowView for TestView {
+        fn rows_for(&mut self, filter: Filter) -> Vec<(RowKey, bool)> {
+            self.scanned += self.rows.len() as u64;
+            self.rows
+                .iter()
+                .filter(|(_, completed)| filter.matches(*completed))
+                .copied()
+                .collect()
+        }
+
+        fn is_empty_for(&mut self, filter: Filter) -> bool {
+            !self
+                .rows
+                .iter()
+                .any(|(_, completed)| filter.matches(*completed))
+        }
+
         fn membership_revision(&self, filter: Filter) -> u64 {
             self.membership[filter_index(filter)]
         }
@@ -276,27 +296,18 @@ mod tests {
             self.order
         }
 
-        fn is_empty_for(&self, filter: Filter) -> bool {
-            !self
-                .rows
-                .iter()
-                .any(|(_, completed)| filter.matches(*completed))
-        }
-
-        fn visit_rows(&self, visit: &mut dyn FnMut(RowKey, bool)) {
-            for (key, completed) in &self.rows {
-                visit(*key, *completed);
-            }
+        fn scan_cost(&self) -> u64 {
+            self.scanned
         }
     }
 
     #[test]
     fn second_consumer_shares_the_snapshot() {
-        let view = TestView::new(&[(1, false), (2, false)]);
+        let mut view = TestView::new(&[(1, false), (2, false)]);
 
         let mut cache = QueryCache::new();
-        let first = cache.rows(&view, Filter::All);
-        let second = cache.rows(&view, Filter::All);
+        let first = cache.rows(&mut view, Filter::All);
+        let second = cache.rows(&mut view, Filter::All);
 
         assert!(first.shares_with(&second));
         assert_eq!(cache.counters().query_evals, 1);
@@ -310,19 +321,19 @@ mod tests {
         let mut view = TestView::new(&[(1, false), (2, true)]);
         let mut cache = QueryCache::new();
 
-        let _ = cache.rows(&view, Filter::All);
-        let _ = cache.rows(&view, Filter::Active);
-        let _ = cache.rows(&view, Filter::Completed);
+        let _ = cache.rows(&mut view, Filter::All);
+        let _ = cache.rows(&mut view, Filter::Active);
+        let _ = cache.rows(&mut view, Filter::Completed);
         assert_eq!(cache.counters().query_evals, 3);
 
         // A completed write cannot move `All`'s membership set.
         view.membership[filter_index(Filter::Active)] += 1;
         view.membership[filter_index(Filter::Completed)] += 1;
 
-        let _ = cache.rows(&view, Filter::All);
+        let _ = cache.rows(&mut view, Filter::All);
         assert_eq!(cache.counters().query_evals, 3, "All stayed fresh");
-        let _ = cache.rows(&view, Filter::Active);
-        let _ = cache.rows(&view, Filter::Completed);
+        let _ = cache.rows(&mut view, Filter::Active);
+        let _ = cache.rows(&mut view, Filter::Completed);
         assert_eq!(cache.counters().query_evals, 5);
     }
 
@@ -333,7 +344,7 @@ mod tests {
         let mut view = TestView::new(&[(1, false), (2, false)]);
         let mut cache = QueryCache::new();
 
-        let before = cache.rows(&view, Filter::All);
+        let before = cache.rows(&mut view, Filter::All);
         assert_eq!(
             before.as_slice(),
             &[RowKey::from_raw(1), RowKey::from_raw(2)]
@@ -342,7 +353,7 @@ mod tests {
         view.rows.reverse();
         view.order += 1;
 
-        let after = cache.rows(&view, Filter::All);
+        let after = cache.rows(&mut view, Filter::All);
         assert_eq!(
             after.as_slice(),
             &[RowKey::from_raw(2), RowKey::from_raw(1)]
@@ -353,10 +364,10 @@ mod tests {
 
     #[test]
     fn an_empty_filter_costs_no_materialization_and_no_visit() {
-        let view = TestView::new(&[(1, false)]);
+        let mut view = TestView::new(&[(1, false)]);
         let mut cache = QueryCache::new();
 
-        let rows = cache.rows(&view, Filter::Completed);
+        let rows = cache.rows(&mut view, Filter::Completed);
         assert!(rows.is_empty());
         assert_eq!(cache.counters().query_evals, 1);
         assert_eq!(cache.counters().cache_builds, 0);
@@ -371,12 +382,12 @@ mod tests {
         let mut view = TestView::new(&[(1, false)]);
         let mut cache = QueryCache::new();
 
-        let _ = cache.rows(&view, Filter::Active);
+        let _ = cache.rows(&mut view, Filter::Active);
 
         // Same rows, both revisions moved: the cached slot must not answer.
         view.membership = [1, 1, 1];
         view.order = 1;
-        assert_eq!(cache.rows(&view, Filter::Active).len(), 1);
+        assert_eq!(cache.rows(&mut view, Filter::Active).len(), 1);
         assert_eq!(cache.counters().query_evals, 2, "a moved pair re-evaluates");
     }
 
@@ -395,11 +406,11 @@ mod tests {
         store.insert("B");
         let mut cache = QueryCache::new();
 
-        let all = cache.rows(&store, Filter::All);
+        let all = cache.rows(&mut store, Filter::All);
         assert_eq!(all.len(), 2);
         assert_eq!(cache.counters().row_visits, 2);
 
-        let completed = cache.rows(&store, Filter::Completed);
+        let completed = cache.rows(&mut store, Filter::Completed);
         assert!(completed.is_empty());
         assert_eq!(
             cache.counters().row_visits,
@@ -408,16 +419,16 @@ mod tests {
         );
 
         store.toggle(a).expect("live row");
-        let completed = cache.rows(&store, Filter::Completed);
+        let completed = cache.rows(&mut store, Filter::Completed);
         assert_eq!(completed.len(), 1);
         assert_eq!(completed.as_slice(), &[store.key_of(a).expect("key")]);
-        assert!(cache.rows(&store, Filter::Active).len() == 1);
+        assert!(cache.rows(&mut store, Filter::Active).len() == 1);
 
         // An order move is a new state for the committed view too.
         let keys: Vec<RowKey> = store.keys().collect();
         store.reorder(&[keys[1], keys[0]]).expect("reorder");
         assert_eq!(
-            cache.rows(&store, Filter::All).as_slice(),
+            cache.rows(&mut store, Filter::All).as_slice(),
             &[keys[1], keys[0]]
         );
     }
