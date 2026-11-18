@@ -87,6 +87,15 @@ impl OwnerTree {
         self.next = next;
     }
 
+    /// Live owner ids in creation order (`SPEC-RT-053` compares the set).
+    pub(crate) fn live_ids(&self) -> Vec<crate::handle::OwnerId> {
+        self.nodes
+            .iter()
+            .filter(|(_, node)| !node.disposed)
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
     pub(crate) const fn next_id(&self) -> u32 {
         self.next
     }

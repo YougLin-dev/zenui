@@ -4,6 +4,7 @@
 //! The store owns model entities only. It never renders, never diffs a second
 //! UI tree, and never creates views.
 
+#[cfg(test)]
 use std::collections::BTreeSet;
 use std::fmt;
 
@@ -86,6 +87,65 @@ pub struct Store {
     string_clones: u64,
 }
 
+/// The whole model as it will look once this commit lands (`SPEC-RT-052`).
+///
+/// The draft records target values, never inverse operations (`SPEC-RT-051`).
+/// Building it is where every fallible slot lookup happens; `Store::install`
+/// then performs a single swap.
+#[derive(Debug, Default)]
+pub(crate) struct StoreDraft {
+    fills: Vec<(SlotIndex, RowKey, String, bool)>,
+    updates: Vec<(SlotIndex, Option<String>, Option<bool>)>,
+    removals: Vec<SlotIndex>,
+    /// Reservations cancelled before they were ever filled.
+    releases: Vec<SlotIndex>,
+    order: Vec<SlotIndex>,
+    completed: usize,
+    next_key: u64,
+    epoch: u64,
+    io_writes: u64,
+}
+
+impl StoreDraft {
+    pub(crate) fn new(next_key: u64, epoch: u64, io_writes: u64) -> Self {
+        Self {
+            next_key,
+            epoch,
+            io_writes,
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn fill(&mut self, slot: SlotIndex, key: RowKey, title: String, completed: bool) {
+        self.fills.push((slot, key, title, completed));
+    }
+
+    pub(crate) fn update(
+        &mut self,
+        slot: SlotIndex,
+        title: Option<String>,
+        completed: Option<bool>,
+    ) {
+        self.updates.push((slot, title, completed));
+    }
+
+    pub(crate) fn remove(&mut self, slot: SlotIndex) {
+        self.removals.push(slot);
+    }
+
+    pub(crate) fn release(&mut self, slot: SlotIndex) {
+        self.releases.push(slot);
+    }
+
+    pub(crate) fn set_order(&mut self, order: Vec<SlotIndex>) {
+        self.order = order;
+    }
+
+    pub(crate) fn set_completed_count(&mut self, completed: usize) {
+        self.completed = completed;
+    }
+}
+
 impl Store {
     /// Build a store owned by `id`.
     ///
@@ -107,7 +167,8 @@ impl Store {
     }
 
     /// Insert a row at the end of the display order.
-    pub fn insert(&mut self, title: impl Into<String>) -> RowId {
+    #[cfg(test)]
+    pub(crate) fn insert(&mut self, title: impl Into<String>) -> RowId {
         let key = RowKey::from_raw(self.next_key);
         self.next_key += 1;
         let row = Row {
@@ -123,7 +184,8 @@ impl Store {
     }
 
     /// Flip `completed` and return the new value.
-    pub fn toggle(&mut self, row: RowId) -> Result<bool, InvalidHandle> {
+    #[cfg(test)]
+    pub(crate) fn toggle(&mut self, row: RowId) -> Result<bool, InvalidHandle> {
         let completed = {
             let row = self.entry_mut(row)?;
             row.completed = !row.completed;
@@ -139,7 +201,8 @@ impl Store {
     }
 
     /// Set `completed` explicitly.
-    pub fn set_completed(&mut self, row: RowId, value: bool) -> Result<(), InvalidHandle> {
+    #[cfg(test)]
+    pub(crate) fn set_completed(&mut self, row: RowId, value: bool) -> Result<(), InvalidHandle> {
         let was_completed = {
             let row = self.entry_mut(row)?;
             let previous = row.completed;
@@ -161,7 +224,8 @@ impl Store {
     }
 
     /// Remove one row and return it.
-    pub fn remove(&mut self, row: RowId) -> Result<Row, InvalidHandle> {
+    #[cfg(test)]
+    pub(crate) fn remove(&mut self, row: RowId) -> Result<Row, InvalidHandle> {
         let slot = row.slot();
         let was_completed = self.entry(row)?.completed;
         let removed = self.rows.free(slot).ok_or(HandleError::Vacant { slot })?;
@@ -177,7 +241,8 @@ impl Store {
     ///
     /// TODO(A0-10): bulk clear must settle exactly one `FocusRemovalIntent`.
     /// P1 removes the rows and leaves focus settlement to the caller.
-    pub fn clear_completed(&mut self) -> Vec<RowKey> {
+    #[cfg(test)]
+    pub(crate) fn clear_completed(&mut self) -> Vec<RowKey> {
         let doomed: Vec<SlotIndex> = self
             .order
             .iter()
@@ -202,7 +267,8 @@ impl Store {
     }
 
     /// Reorder the display list. Every live row must appear exactly once.
-    pub fn reorder(&mut self, keys: &[RowKey]) -> Result<(), StoreError> {
+    #[cfg(test)]
+    pub(crate) fn reorder(&mut self, keys: &[RowKey]) -> Result<(), StoreError> {
         let mut seen = BTreeSet::new();
         let mut slots = Vec::with_capacity(keys.len());
         for key in keys {
@@ -235,7 +301,8 @@ impl Store {
     /// that cancels the mount on failure. P1 returns the `Result` and the caller
     /// records the error in the sink, but mount atomicity (`SPEC-RT-013`) is not
     /// verified here.
-    pub fn read_owned_title(&mut self, row: RowId) -> Result<String, InvalidHandle> {
+    #[cfg(test)]
+    pub(crate) fn read_owned_title(&mut self, row: RowId) -> Result<String, InvalidHandle> {
         let title = self.entry(row)?.title.clone();
         self.io_reads += 1;
         self.string_clones += 1;
@@ -249,22 +316,8 @@ impl Store {
         self.rows.reserve()
     }
 
-    /// Fill a reserved slot at commit. Returns false if the reservation was lost.
-    pub(crate) fn fill_reserved(
-        &mut self,
-        slot: SlotIndex,
-        key: RowKey,
-        title: String,
-        completed: bool,
-    ) -> bool {
-        self.rows.fill(
-            slot,
-            Row {
-                key,
-                title,
-                completed,
-            },
-        )
+    pub(crate) const fn next_key(&self) -> u64 {
+        self.next_key
     }
 
     /// Drop a reservation and burn its generation (`SPEC-RT-053`).
@@ -279,38 +332,44 @@ impl Store {
         Some((slot, self.rows.generation(slot)?))
     }
 
-    /// Apply a committed field update. Never fails: the caller preflighted.
-    pub(crate) fn apply_set(
-        &mut self,
-        slot: SlotIndex,
-        title: Option<&str>,
-        completed: Option<bool>,
-    ) -> Option<(bool, bool)> {
-        let row = self.rows.get_mut(slot, self.rows.generation(slot)?).ok()?;
-        let (changed_title, changed_completed) =
-            (title.is_some(), completed == Some(!row.completed));
-        if let Some(title) = title {
-            row.title = title.to_owned();
+    /// Swap a finished model draft in (`SPEC-RT-052`).
+    ///
+    /// Infallible by construction: every lookup that can fail happened while
+    /// the draft was being built, so a commit cannot stop half way.
+    pub(crate) fn install(&mut self, draft: StoreDraft) {
+        for (slot, key, title, completed) in draft.fills {
+            let _ = self.rows.fill(
+                slot,
+                Row {
+                    key,
+                    title,
+                    completed,
+                },
+            );
         }
-        if let Some(completed) = completed {
-            row.completed = completed;
+        for (slot, title, completed) in draft.updates {
+            if let Some(generation) = self.rows.generation(slot)
+                && let Ok(row) = self.rows.get_mut(slot, generation)
+            {
+                if let Some(title) = title {
+                    row.title = title;
+                }
+                if let Some(completed) = completed {
+                    row.completed = completed;
+                }
+            }
         }
-        Some((changed_title, changed_completed))
-    }
-
-    pub(crate) fn apply_remove(&mut self, slot: SlotIndex) -> bool {
-        self.rows.free(slot).is_some()
-    }
-
-    pub(crate) fn apply_order(&mut self, order: Vec<SlotIndex>) {
-        self.order = order;
-    }
-
-    /// Write the committed counters computed by the draft.
-    pub(crate) fn apply_counters(&mut self, completed: usize, epoch: u64, io_writes: u64) {
-        self.completed = completed;
-        self.epoch = epoch;
-        self.io_writes = io_writes;
+        for slot in draft.removals {
+            let _ = self.rows.free(slot);
+        }
+        for slot in draft.releases {
+            self.rows.release(slot);
+        }
+        self.order = draft.order;
+        self.completed = draft.completed;
+        self.next_key = draft.next_key;
+        self.epoch = draft.epoch;
+        self.io_writes = draft.io_writes;
     }
 
     pub(crate) fn key_of(&self, row: Handle<Row>) -> Option<RowKey> {
@@ -326,14 +385,6 @@ impl Store {
     pub(crate) fn note_read(&mut self) {
         self.io_reads += 1;
         self.string_clones += 1;
-    }
-
-    pub(crate) const fn next_key(&self) -> u64 {
-        self.next_key
-    }
-
-    pub(crate) const fn set_next_key(&mut self, next: u64) {
-        self.next_key = next;
     }
 
     /// Resolve a stable key back to a live handle.
@@ -407,6 +458,7 @@ impl Store {
 
     /// Record one committed model mutation: exactly one epoch advance and one
     /// write for one successful mutating call (`metrics::Counters::io_writes`).
+    #[cfg(test)]
     fn record_write(&mut self) {
         self.epoch += 1;
         self.io_writes += 1;
@@ -419,6 +471,7 @@ impl Store {
             .map_err(InvalidHandle::from)
     }
 
+    #[cfg(test)]
     fn entry_mut(&mut self, row: RowId) -> Result<&mut Row, InvalidHandle> {
         self.check_runtime(row)?;
         self.rows

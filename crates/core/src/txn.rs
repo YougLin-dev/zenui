@@ -33,7 +33,7 @@ use crate::handle::{
 use crate::layout::LayoutMap;
 use crate::owner::OwnerTree;
 use crate::query::{Filter, QueryCache, RowSet};
-use crate::store::{Row, Store, StoreError};
+use crate::store::{Row, Store, StoreDraft, StoreError};
 use crate::view::{FocusIntent, ViewTree};
 
 /// The fixed stage order of one frame (`SPEC-RT-050`).
@@ -114,6 +114,16 @@ pub enum Fatal {
     OrderNotAPermutation,
     /// The layout mapping would be left inconsistent.
     LayoutMapInconsistent,
+    /// The staged view order is not a permutation of the views live at commit.
+    ViewOrderNotAPermutation,
+    /// A mount targets a row the same transaction removed.
+    MountForMissingRow {
+        view: ViewId,
+    },
+    /// The staged focus target will not be live when the commit lands.
+    FocusTargetNotLive {
+        view: ViewId,
+    },
     /// The caller chose to abort the frame.
     Aborted,
 }
@@ -137,6 +147,11 @@ impl fmt::Display for Fatal {
             }
             Fatal::OrderNotAPermutation => f.write_str("staged order is not a permutation"),
             Fatal::LayoutMapInconsistent => f.write_str("layout map would be inconsistent"),
+            Fatal::ViewOrderNotAPermutation => {
+                f.write_str("staged view order is not a permutation")
+            }
+            Fatal::MountForMissingRow { .. } => f.write_str("mount targets a removed row"),
+            Fatal::FocusTargetNotLive { .. } => f.write_str("focus target will not be live"),
             Fatal::Aborted => f.write_str("transaction aborted by the caller"),
         }
     }
@@ -152,11 +167,22 @@ impl std::error::Error for Fatal {}
 pub enum ValueError {
     Handle(InvalidHandle),
     Store(StoreError),
+    /// A write attempted in a phase that does not permit it. The type is the
+    /// same domain error as the fatal path, but the transaction is also
+    /// poisoned, so the frame cannot commit (`SPEC-RT-038`).
+    Phase(PhaseViolation),
 }
 
 impl From<InvalidHandle> for ValueError {
     fn from(error: InvalidHandle) -> Self {
         Self::Handle(error)
+    }
+}
+
+impl ValueError {
+    /// True when the value error also poisoned the transaction.
+    pub const fn is_fatal(&self) -> bool {
+        matches!(self, Self::Phase(_))
     }
 }
 
@@ -171,6 +197,11 @@ impl fmt::Display for ValueError {
         match self {
             ValueError::Handle(error) => write!(f, "{error}"),
             ValueError::Store(error) => write!(f, "{error}"),
+            ValueError::Phase(violation) => write!(
+                f,
+                "write {:?} is not allowed in phase {:?}",
+                violation.attempted, violation.phase
+            ),
         }
     }
 }
@@ -188,6 +219,8 @@ enum Outcome {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Publication {
     pub keys: Vec<RowKey>,
+    /// The committed value of each touched row at the moment of publishing.
+    pub values: Vec<(RowKey, bool)>,
     pub commit_seq: u64,
 }
 
@@ -262,6 +295,8 @@ pub struct Txn {
     staged_rev: u64,
     publishes: Vec<Publication>,
     commits: u64,
+    /// Set when a nested level failed; `commit` refuses to publish.
+    poisoned: bool,
 }
 
 impl Txn {
@@ -276,6 +311,7 @@ impl Txn {
             staged_rev: 0,
             publishes: Vec::new(),
             commits: 0,
+            poisoned: false,
         }
     }
 
@@ -283,6 +319,7 @@ impl Txn {
         self.depth = 1;
         self.phase = Phase::Outside;
         self.outcome = Outcome::Live;
+        self.poisoned = false;
         self.view.next_view = next_view;
         self.view.next_owner = next_owner;
     }
@@ -417,6 +454,28 @@ impl<'a> Tx<'a> {
         }
     }
 
+    /// Phase guard for a stager whose error channel is `ValueError`.
+    ///
+    /// A phase violation is a domain error that poisons the transaction: the
+    /// caller sees a typed error at the call site, and `commit` refuses to
+    /// publish (`SPEC-RT-038`, `ADR-0017` decision 7).
+    /// Test-only: force the phase a frame runs in.
+    #[cfg(test)]
+    pub(crate) fn force_phase(&mut self, phase: Phase) {
+        self.txn.force_phase(phase);
+    }
+
+    fn require_staged(&mut self, kind: WriteKind) -> Result<(), ValueError> {
+        if self.txn.phase.permits(kind) {
+            return Ok(());
+        }
+        self.txn.poisoned = true;
+        Err(ValueError::Phase(PhaseViolation {
+            phase: self.txn.phase,
+            attempted: kind,
+        }))
+    }
+
     fn bump(&mut self) {
         self.txn.staged_rev = self.txn.staged_rev.saturating_add(1);
         self.graph
@@ -462,7 +521,7 @@ impl<'a> Tx<'a> {
     }
 
     pub fn remove(&mut self, row: Handle<Row>) -> Result<RowKey, ValueError> {
-        debug_assert!(self.txn.phase.permits(WriteKind::ModelWrite));
+        self.require_staged(WriteKind::ModelWrite)?;
         let key = self.effective_key(row)?;
         if self.txn.model.removals.insert(key) {
             self.txn.model.writes += 1;
@@ -487,7 +546,7 @@ impl<'a> Tx<'a> {
     }
 
     pub fn reorder(&mut self, keys: &[RowKey]) -> Result<(), ValueError> {
-        debug_assert!(self.txn.phase.permits(WriteKind::ModelWrite));
+        self.require_staged(WriteKind::ModelWrite)?;
         let mut seen = BTreeSet::new();
         let rows = self.effective_rows();
         let live: BTreeSet<RowKey> = rows.iter().map(|(key, _)| *key).collect();
@@ -512,7 +571,7 @@ impl<'a> Tx<'a> {
     }
 
     fn stage_completed(&mut self, row: Handle<Row>, value: bool) -> Result<(), ValueError> {
-        debug_assert!(self.txn.phase.permits(WriteKind::ModelWrite));
+        self.require_staged(WriteKind::ModelWrite)?;
         let key = self.effective_key(row)?;
         let entry = self.txn.model.rows.entry(key).or_insert(StagedRow {
             runtime: self.store.runtime_id(),
@@ -545,18 +604,15 @@ impl<'a> Tx<'a> {
                 },
             )));
         }
-        if let Some(staged) = self.staged_by_handle(row) {
-            if let Some(title) = &staged.title {
-                return Ok(f(title));
-            }
-            if self
-                .staged_key(row)
-                .is_some_and(|key| self.txn.model.removals.contains(&key))
-            {
-                return Err(ValueError::Handle(InvalidHandle::from(
-                    crate::handle::HandleError::Vacant { slot: row.slot() },
-                )));
-            }
+        if self.removed_key(row).is_some() {
+            return Err(ValueError::Handle(InvalidHandle::from(
+                crate::handle::HandleError::Vacant { slot: row.slot() },
+            )));
+        }
+        if let Some(staged) = self.staged_by_handle(row)
+            && let Some(title) = &staged.title
+        {
+            return Ok(f(title));
         }
         self.store.with_title(row, f).map_err(ValueError::from)
     }
@@ -566,8 +622,33 @@ impl<'a> Tx<'a> {
         self.effective_completed(row)
     }
 
-    pub fn read_once(&mut self, row: Handle<Row>) -> Result<String, ValueError> {
-        let title = self.with_title(row, str::to_owned)?;
+    /// Owned title read (`SPEC-RT-006`, `ADR-0017` decision 3).
+    ///
+    /// The receiver is the authority, the failure type is `InvalidHandle`, and
+    /// a failed read does not count as I/O. Cancelling the mount is the mount
+    /// executor's job (`SPEC-RT-013`), not this method's return semantics.
+    pub fn read_once(&mut self, row: Handle<Row>) -> Result<String, InvalidHandle> {
+        if row.runtime() != self.store.runtime_id() {
+            return Err(InvalidHandle::from(
+                crate::handle::HandleError::ForeignRuntime {
+                    expected: self.store.runtime_id(),
+                    found: row.runtime(),
+                },
+            ));
+        }
+        if self.removed_key(row).is_some() {
+            return Err(InvalidHandle::from(crate::handle::HandleError::Vacant {
+                slot: row.slot(),
+            }));
+        }
+        let staged_title = self
+            .staged_by_handle(row)
+            .and_then(|staged| staged.title.clone());
+        if let Some(title) = staged_title {
+            self.store.note_read();
+            return Ok(title);
+        }
+        let title = self.store.with_title(row, str::to_owned)?;
         self.store.note_read();
         Ok(title)
     }
@@ -730,25 +811,22 @@ impl<'a> Tx<'a> {
         Ok(view_id)
     }
 
-    pub fn unmount(&mut self, view: ViewId) {
-        if self.txn.phase != Phase::Outside {
-            return;
-        }
+    pub fn unmount(&mut self, view: ViewId) -> Result<(), Fatal> {
+        self.require(WriteKind::ViewPatch)?;
         if !self.txn.view.unmounts.contains(&view) {
             self.txn.view.unmounts.push(view);
         }
+        Ok(())
     }
 
-    pub fn reorder_views(&mut self, order: &[ViewId]) {
-        if self.txn.phase == Phase::Outside {
-            self.txn.view.order = Some(order.to_vec());
-        }
+    pub fn reorder_views(&mut self, order: &[ViewId]) -> Result<(), Fatal> {
+        self.require(WriteKind::ViewPatch)?;
+        self.txn.view.order = Some(order.to_vec());
+        Ok(())
     }
 
-    pub fn focus(&mut self, view: ViewId) {
-        if self.txn.phase != Phase::Outside {
-            return;
-        }
+    pub fn focus(&mut self, view: ViewId) -> Result<(), Fatal> {
+        self.require(WriteKind::FocusChange)?;
         let caret = self
             .views
             .node(view)
@@ -764,12 +842,13 @@ impl<'a> Tx<'a> {
             .unwrap_or(0);
         self.txn.view.focus = Some(Some(view));
         self.txn.view.caret = Some((view, caret));
+        Ok(())
     }
 
-    pub fn clear_focus(&mut self) {
-        if self.txn.phase == Phase::Outside {
-            self.txn.view.focus = Some(None);
-        }
+    pub fn clear_focus(&mut self) -> Result<(), Fatal> {
+        self.require(WriteKind::FocusChange)?;
+        self.txn.view.focus = Some(None);
+        Ok(())
     }
 
     // ---- commit ----
@@ -787,6 +866,12 @@ impl<'a> Tx<'a> {
                 found: self.txn.phase,
             });
         }
+        if self.txn.poisoned {
+            // A nested level failed and the caller swallowed the error; the
+            // stage still cannot be published (`ADR-0017` decision 8).
+            self.discard();
+            return Err(Fatal::Aborted);
+        }
 
         if let Err(fatal) = self.preflight() {
             self.discard();
@@ -803,8 +888,10 @@ impl<'a> Tx<'a> {
         let scratch = std::mem::take(&mut self.txn.graph);
         self.graph.commit_scratch(scratch, revision);
 
+        let values = self.effective_rows();
         self.txn.publishes.push(Publication {
             keys,
+            values,
             commit_seq: self.txn.commits,
         });
         self.txn.commits += 1;
@@ -839,6 +926,41 @@ impl<'a> Tx<'a> {
             }
         }
 
+        let live_rows: BTreeSet<RowKey> = self
+            .effective_rows()
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect();
+        for mount in &self.txn.view.mounts {
+            if !live_rows.contains(&mount.row) {
+                return Err(Fatal::MountForMissingRow { view: mount.id });
+            }
+        }
+
+        let mut live_views: BTreeSet<ViewId> = self
+            .views
+            .row_views()
+            .into_iter()
+            .map(|(view, _)| view)
+            .collect();
+        for view in &self.txn.view.unmounts {
+            live_views.remove(view);
+        }
+        for mount in &self.txn.view.mounts {
+            live_views.insert(mount.id);
+        }
+        if let Some(order) = &self.txn.view.order {
+            let listed: BTreeSet<ViewId> = order.iter().copied().collect();
+            if listed != live_views || listed.len() != order.len() {
+                return Err(Fatal::ViewOrderNotAPermutation);
+            }
+        }
+        if let Some(Some(view)) = self.txn.view.focus
+            && !live_views.contains(&view)
+        {
+            return Err(Fatal::FocusTargetNotLive { view });
+        }
+
         let mounts: Vec<ViewId> = self.txn.view.mounts.iter().map(|m| m.id).collect();
         self.layout
             .preflight(&mounts, &self.txn.view.unmounts)
@@ -847,28 +969,40 @@ impl<'a> Tx<'a> {
         Ok(())
     }
 
+    /// Build the model draft, then swap it in with one call (`SPEC-RT-052`).
+    ///
+    /// Nothing is mutated while the draft is built: it records target values
+    /// (`SPEC-RT-051`), and `Store::install` cannot fail afterwards.
     fn apply_model(&mut self) {
         let base_writes = self.store.counters().io_writes;
         let base_epoch = self.store.epoch();
-
-        // The final order is authoritative and already overlay-aware: it is the
-        // committed order with staged inserts, removals and reorder applied.
-        let final_order: Vec<RowKey> = self
-            .effective_rows()
-            .into_iter()
-            .map(|(key, _)| key)
-            .collect();
+        let final_rows = self.effective_rows();
         let journal = std::mem::take(&mut self.txn.model);
+
+        let epoch = if journal.writes > 0 {
+            base_epoch + 1
+        } else {
+            base_epoch
+        };
+        let mut draft = StoreDraft::new(journal.next_key, epoch, base_writes + journal.writes);
 
         for key in &journal.inserted {
             if let Some(staged) = journal.rows.get(key)
                 && let Some(reservation) = journal.reserved.get(key)
             {
-                let title = staged.title.clone().unwrap_or_default();
-                let completed = staged.completed.unwrap_or(false);
-                let _ = self
-                    .store
-                    .fill_reserved(reservation.slot, *key, title, completed);
+                if journal.removals.contains(key) {
+                    // Inserted and removed in the same frame: the reservation
+                    // is released, never filled, so no slot leaks and the
+                    // generation is burned (`SPEC-RT-051`).
+                    draft.release(reservation.slot);
+                    continue;
+                }
+                draft.fill(
+                    reservation.slot,
+                    *key,
+                    staged.title.clone().unwrap_or_default(),
+                    staged.completed.unwrap_or(false),
+                );
             }
         }
 
@@ -880,46 +1014,50 @@ impl<'a> Tx<'a> {
                 continue;
             }
             if let Some((slot, _)) = self.store.slot_for(*key) {
-                self.store
-                    .apply_set(slot, staged.title.as_deref(), staged.completed);
+                draft.update(slot, staged.title.clone(), staged.completed);
             }
         }
 
         for key in &journal.removals {
             if let Some((slot, _)) = self.store.slot_for(*key) {
-                self.store.apply_remove(slot);
+                draft.remove(slot);
             }
         }
 
-        let slots: Vec<SlotIndex> = final_order
-            .iter()
-            .filter_map(|key| self.store.slot_for(*key).map(|(slot, _)| slot))
-            .collect();
-        self.store.apply_order(slots);
+        let mut order = Vec::with_capacity(final_rows.len());
+        for (key, _) in &final_rows {
+            let slot = journal
+                .reserved
+                .get(key)
+                .map(|reservation| reservation.slot)
+                .or_else(|| self.store.slot_for(*key).map(|(slot, _)| slot));
+            if let Some(slot) = slot {
+                order.push(slot);
+            }
+        }
+        draft.set_order(order);
+        draft.set_completed_count(final_rows.iter().filter(|(_, done)| *done).count());
 
-        let completed = self.store.rows().filter(|row| row.completed()).count();
-        let epoch = if journal.writes > 0 {
-            base_epoch + 1
-        } else {
-            base_epoch
-        };
-        self.store
-            .apply_counters(completed, epoch, base_writes + journal.writes);
-        self.store.set_next_key(journal.next_key);
+        self.store.install(draft);
         self.txn.model = ModelJournal::new(journal.next_key);
     }
 
     fn apply_views(&mut self) {
         let draft = std::mem::take(&mut self.txn.view);
 
+        // Unmount the views first, but do not run owner cleanup yet: the
+        // Cleanup stage comes after the swap (`SPEC-RT-050`), so a cleanup
+        // closure never observes a half-built tree.
+        let mut disposals = Vec::new();
         for view in &draft.unmounts {
             if let Some(node) = self.views.unmount(*view) {
-                self.owners.dispose(node.owner);
+                disposals.push(node.owner);
             }
         }
         for (owner, parent) in &draft.owners {
-            let inserted = self.owners.insert_staged(*owner, *parent);
-            debug_assert!(inserted, "planned owner id must be free");
+            // Owner ids are minted by the runtime high-water mark, so a
+            // collision is structurally impossible; never assert after a swap.
+            let _ = self.owners.insert_staged(*owner, *parent);
         }
         for mount in &draft.mounts {
             self.views
@@ -950,16 +1088,30 @@ impl<'a> Tx<'a> {
         self.views.set_next(draft.next_view);
         self.owners.set_next(draft.next_owner);
         self.layout.commit(&draft.unmounts);
+
+        // Cleanup: release the owners the unmounts orphaned. No mount, no
+        // flush, no user write — the transaction is already published
+        // (`SPEC-RT-050`, `SPEC-RT-054`).
+        self.txn.phase = Phase::Cleanup;
+        for owner in disposals {
+            self.owners.dispose(owner);
+        }
+        self.txn.phase = Phase::Commit;
     }
 
     fn discard(&mut self) {
         // No user code, no panic: drop the stage and burn the reservations.
+        let next_key = self.txn.model.next_key;
         let journal = std::mem::take(&mut self.txn.model);
         for reservation in journal.reserved.values() {
             self.store.release_reserved(reservation.slot);
         }
         self.query.invalidate();
         self.layout.discard();
+        // Re-seed the journal from the high-water mark: a discarded frame must
+        // not rewind the key allocator, or the same `RowKey` would be minted
+        // twice and alias two rows (`SPEC-RT-002`).
+        self.txn.model = ModelJournal::new(next_key);
         self.txn.reset();
     }
 
@@ -1000,6 +1152,14 @@ impl<'a> Tx<'a> {
             .map(|(key, _)| *key)
     }
 
+    /// The key this handle resolves to in the merged overlay, if the row has
+    /// been staged for removal in any open level. A removal always wins over a
+    /// staged value (`ADR-0017` decision 4).
+    fn removed_key(&self, row: Handle<Row>) -> Option<RowKey> {
+        let key = self.staged_key(row).or_else(|| self.store.key_of(row))?;
+        self.txn.model.removals.contains(&key).then_some(key)
+    }
+
     fn effective_key(&self, row: Handle<Row>) -> Result<RowKey, ValueError> {
         if row.runtime() != self.store.runtime_id() {
             return Err(ValueError::Handle(InvalidHandle::from(
@@ -1020,17 +1180,16 @@ impl<'a> Tx<'a> {
     }
 
     fn effective_completed(&self, row: Handle<Row>) -> Result<bool, ValueError> {
-        if let Some(key) = self.staged_key(row) {
-            if self.txn.model.removals.contains(&key) {
-                return Err(ValueError::Handle(InvalidHandle::from(
-                    crate::handle::HandleError::Vacant { slot: row.slot() },
-                )));
-            }
-            if let Some(staged) = self.txn.model.rows.get(&key)
-                && let Some(completed) = staged.completed
-            {
-                return Ok(completed);
-            }
+        if self.removed_key(row).is_some() {
+            return Err(ValueError::Handle(InvalidHandle::from(
+                crate::handle::HandleError::Vacant { slot: row.slot() },
+            )));
+        }
+        if let Some(key) = self.staged_key(row)
+            && let Some(staged) = self.txn.model.rows.get(&key)
+            && let Some(completed) = staged.completed
+        {
+            return Ok(completed);
         }
         self.store.completed_of(row).map_err(ValueError::from)
     }
@@ -1115,6 +1274,10 @@ impl<'a> Tx<'a> {
             f(&mut inner)
         };
         self.txn.depth = self.txn.depth.saturating_sub(1);
+        if result.is_err() {
+            // No savepoints: the failure belongs to the whole transaction.
+            self.txn.poisoned = true;
+        }
         result
     }
 }

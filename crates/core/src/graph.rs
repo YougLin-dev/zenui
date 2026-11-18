@@ -716,7 +716,7 @@ mod tests {
                     Value::Count(epoch)
                 })
                 .expect("right");
-            let (joined, _) = graph
+            let (joined, recomputed) = graph
                 .compute_staged(join, &mut scratch, revision, |reader| {
                     let left_value = read_count(reader.read(left));
                     let right_value = read_count(reader.read(right));
@@ -728,6 +728,20 @@ mod tests {
                 })
                 .expect("join");
             assert_eq!(joined, Value::Count(epoch * 2));
+            assert!(
+                recomputed,
+                "epoch {epoch}: the join must recompute exactly once"
+            );
+
+            // Same revision: observable at most once per epoch.
+            let (cached, recomputed_again) = graph
+                .compute_staged(join, &mut scratch, revision, |_| Value::Count(0))
+                .expect("join again");
+            assert_eq!(cached, Value::Count(epoch * 2));
+            assert!(
+                !recomputed_again,
+                "epoch {epoch}: a second observation must hit the stage, not recompute"
+            );
         }
     }
 

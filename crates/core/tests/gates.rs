@@ -5,12 +5,17 @@
 //! Each one is written so that deleting the implementation it covers makes it
 //! fail: a fixture that stays green when the feature is removed proves nothing.
 
-use zenui_core::{Fatal, RowId, Runtime, Tx, ValueError, ViewId};
+use zenui_core::{Fatal, RowId, Runtime, StoreError, Tx, ValueError, ViewId};
 
 /// A value error never aborts a transaction; a fixture that wants to abort on
 /// one has to say so explicitly.
 fn fatal<T>(result: Result<T, ValueError>) -> Result<T, Fatal> {
     result.map_err(|_| Fatal::Aborted)
+}
+
+/// Every row key visible through the frame's own overlay.
+fn runtime_keys(tx: &mut Tx<'_>) -> Vec<zenui_core::RowKey> {
+    tx.rows(zenui_core::Filter::All).iter().collect()
 }
 
 /// Authority state that a rollback must leave untouched (`SPEC-RT-053`).
@@ -20,6 +25,8 @@ fn fatal<T>(result: Result<T, ValueError>) -> Result<T, Fatal> {
 #[derive(Debug, PartialEq, Eq)]
 struct Authority {
     titles: Vec<String>,
+    /// Model content includes the per-row flag, not just the title.
+    completed: Vec<bool>,
     order: Vec<u64>,
     epoch: u64,
     remaining: usize,
@@ -30,6 +37,19 @@ struct Authority {
     geometry_epoch: u64,
     live_owners: usize,
     layout_nodes: usize,
+    /// The mapping itself, item by item (`SPEC-RT-053`).
+    layout_pairs: Vec<(u32, u32)>,
+    /// The live owner set, not its size.
+    owner_ids: Vec<u32>,
+    /// Id high-water marks: a discarded frame must not leave a gap that shows
+    /// up as `focus=view#N` later (`SPEC-RT-053`).
+    next_view: u32,
+    next_owner: u32,
+    /// `io_writes` and `commits` advance only on commit.
+    io_writes: u64,
+    commits: u64,
+    /// Pending snapshots. A failed frame publishes nothing.
+    publications: usize,
 }
 
 fn authority(runtime: &Runtime) -> Authority {
@@ -42,6 +62,7 @@ fn authority(runtime: &Runtime) -> Authority {
     let focused = runtime.focused();
     Authority {
         titles: store.titles().map(str::to_owned).collect(),
+        completed: store.rows().map(|row| row.completed()).collect(),
         order: store.keys().map(|key| key.raw()).collect(),
         epoch: store.epoch(),
         remaining: store.remaining(),
@@ -52,6 +73,21 @@ fn authority(runtime: &Runtime) -> Authority {
         geometry_epoch: runtime.geometry_epoch(),
         live_owners: runtime.live_owners(),
         layout_nodes: runtime.layout_len(),
+        layout_pairs: runtime
+            .layout_pairs()
+            .into_iter()
+            .map(|(view, node)| (view.index(), node.index()))
+            .collect(),
+        owner_ids: runtime
+            .live_owner_ids()
+            .into_iter()
+            .map(|owner| owner.index())
+            .collect(),
+        next_view: runtime.next_view(),
+        next_owner: runtime.next_owner(),
+        io_writes: store.counters().io_writes,
+        commits: runtime.txn().commits(),
+        publications: runtime.txn().publications().len(),
     }
 }
 
@@ -111,6 +147,14 @@ fn a0_04_nested_batch_publishes_once_with_the_outer_value() {
         !store.rows().nth(1).expect("b row").completed(),
         "the published value is the outer one, not the intermediate `true`"
     );
+    // The publish barrier itself must carry the outer value: exactly one row
+    // (a) is completed in the snapshot, never a `true` for b.
+    assert_eq!(
+        published.values.iter().filter(|(_, done)| *done).count(),
+        1,
+        "the published snapshot must contain no intermediate value: {:?}",
+        published.values
+    );
 }
 
 /// `SPEC-GATE-A0-06`: a failure **after** staging must leave every authority
@@ -128,13 +172,42 @@ fn a0_06_rejected_commit_restores_the_previous_commit() {
         .expect("seed");
 
     let a_row: RowId = runtime.frame(|tx| tx.insert("C")).expect("insert C");
+
+    // Mount every row and focus the first one, so the frame below has real
+    // view, owner, layout and focus state to roll back.
+    runtime
+        .frame(|tx| {
+            let keys: Vec<_> = runtime_keys(tx);
+            let mut views = Vec::with_capacity(keys.len());
+            for key in &keys {
+                views.push(tx.mount_row(*key, 1)?);
+            }
+            tx.reorder_views(&views)?;
+            tx.focus(views[0])?;
+            Ok(())
+        })
+        .expect("mount all");
+    assert_eq!(runtime.row_views().len(), 3);
+    assert!(runtime.layout_pairs().len() == 3);
+
     let before = authority(&runtime);
 
-    // Stage a non-empty batch: an insert, a legal reorder, an update on `C`,
-    // and then a removal of `C`. Preflight must reject the update/removal
-    // conflict — not before staging, which would make the rollback vacuous.
+    // Stage a non-empty batch — a row insert, a view mount, a layout plan, a
+    // focus move, an unmount, a legal reorder, an update on `C`, then a
+    // removal of `C`. Preflight must reject the update/removal conflict after
+    // all of that is staged; otherwise the rollback comparison is vacuous.
+    let existing: Vec<ViewId> = runtime.row_views().into_iter().map(|(v, _)| v).collect();
     let result = runtime.frame(|tx| {
-        tx.insert("D")?;
+        let known: Vec<_> = runtime_keys(tx);
+        let new_row = tx.insert("D")?;
+        let new_key = runtime_keys(tx)
+            .into_iter()
+            .find(|key| !known.contains(key) && tx.handle_for(*key) == Some(new_row))
+            .expect("staged key");
+        let new_view = tx.mount_row(new_key, 1)?;
+        tx.reorder_views(&[new_view, existing[1], existing[2]])?;
+        tx.focus(new_view)?;
+        tx.unmount(existing[0])?;
         let keys: Vec<_> = runtime_keys(tx);
         tx.reorder(&keys).map_err(|_| Fatal::OrderNotAPermutation)?;
         fatal(tx.set_completed(a_row, true))?;
@@ -160,9 +233,81 @@ fn a0_06_rejected_commit_restores_the_previous_commit() {
     assert!(runtime.committed().titles().any(|title| title == "E"));
 }
 
-fn runtime_keys(tx: &mut Tx<'_>) -> Vec<zenui_core::RowKey> {
-    let rows: Vec<_> = tx.rows(zenui_core::Filter::All).iter().collect();
-    rows
+/// `SPEC-GATE-A0-06`: a duplicate key is a *value* error, not an abort
+/// (`ADR-0017` decision 7). The frame continues and commits; the model does
+/// not move and `io_writes` does not advance.
+#[test]
+fn a0_06_a_duplicate_key_is_a_value_error_that_keeps_the_frame_alive() {
+    let mut runtime = Runtime::new();
+
+    runtime
+        .frame(|tx| {
+            tx.insert("A")?;
+            tx.insert("B")?;
+            Ok(())
+        })
+        .expect("seed");
+
+    let before = authority(&runtime);
+
+    runtime
+        .frame(|tx| {
+            let keys: Vec<_> = runtime_keys(tx);
+            let duplicate = tx.reorder(&[keys[0], keys[0]]);
+            assert!(
+                matches!(
+                    duplicate,
+                    Err(ValueError::Store(StoreError::DuplicateKey(_)))
+                ),
+                "a repeated key must be rejected as a value error, got {duplicate:?}"
+            );
+            // The transaction is still alive: a rejected write is not fatal.
+            tx.insert("C")?;
+            Ok(())
+        })
+        .expect("the frame must still commit");
+
+    let after = authority(&runtime);
+    assert_eq!(
+        after.titles,
+        vec!["A".to_owned(), "B".to_owned(), "C".to_owned()]
+    );
+    assert_eq!(after.commits, before.commits + 1, "the frame committed");
+    assert_eq!(
+        after.io_writes,
+        before.io_writes + 1,
+        "only the insert wrote"
+    );
+    assert_eq!(after.publications, before.publications + 1);
+}
+
+/// `ADR-0017` decision 3: a failed `read_once` does not count as I/O.
+#[test]
+fn a0_03_a_failed_read_does_not_advance_io_reads() {
+    let mut runtime = Runtime::new();
+
+    let stale: RowId = runtime.frame(|tx| tx.insert("A")).expect("insert A");
+    runtime
+        .frame(|tx| {
+            fatal(tx.remove(stale))?;
+            Ok(())
+        })
+        .expect("remove A");
+
+    let reads_before = runtime.committed().counters().io_reads;
+    runtime
+        .frame(|tx| {
+            let result = tx.read_once(stale);
+            assert!(result.is_err(), "a stale handle must not read");
+            Ok(())
+        })
+        .expect("frame");
+
+    assert_eq!(
+        runtime.committed().counters().io_reads,
+        reads_before,
+        "a rejected read must not be counted as an owned read"
+    );
 }
 
 /// `SPEC-GATE-A0-03`: after a slot is recycled, the old handle resolves to
@@ -171,8 +316,7 @@ fn runtime_keys(tx: &mut Tx<'_>) -> Vec<zenui_core::RowKey> {
 fn a0_03_stale_handle_does_not_alias_the_reused_slot() {
     let mut runtime = Runtime::new();
 
-    let old = runtime.frame(|tx| tx.insert("A")).expect("insert A");
-    let old_key = runtime.committed().keys().next().expect("key");
+    let old: RowId = runtime.frame(|tx| tx.insert("A")).expect("insert A");
 
     runtime
         .frame(|tx| {
@@ -181,33 +325,32 @@ fn a0_03_stale_handle_does_not_alias_the_reused_slot() {
         })
         .expect("remove A");
 
-    let new = runtime.frame(|tx| tx.insert("B")).expect("insert B");
-
+    let new: RowId = runtime.frame(|tx| tx.insert("B")).expect("insert B");
     assert_ne!(old, new, "a recycled slot must mint a new generation");
 
     runtime
         .frame(|tx| {
             assert!(
-                tx.with_title(old, |_| ()).is_err(),
-                "the old handle must not read the row that reused its slot"
+                matches!(
+                    tx.with_title(old, str::to_owned),
+                    Err(ValueError::Handle(_))
+                ),
+                "a stale handle must not read the recycled slot"
             );
-            assert!(tx.completed(old).is_err());
             assert!(
-                tx.set_completed(old, true).is_err(),
-                "the old handle must not write either"
+                matches!(tx.completed(old), Err(ValueError::Handle(_))),
+                "a stale handle must not read a field"
             );
-            assert_eq!(fatal(tx.with_title(new, str::to_owned))?, "B");
+            assert!(
+                matches!(tx.toggle(old), Err(ValueError::Handle(_))),
+                "a stale handle must not write"
+            );
+            assert_eq!(tx.with_title(new, str::to_owned).expect("live row"), "B");
             Ok(())
         })
-        .expect("probe");
+        .expect("frame");
 
-    assert_eq!(
-        runtime.committed().titles().collect::<Vec<_>>(),
-        vec!["B"],
-        "the rejected write left B untouched"
-    );
-    assert!(!runtime.committed().has_completed());
-    let _ = old_key;
+    assert_eq!(runtime.committed().titles().collect::<Vec<_>>(), vec!["B"]);
 }
 
 /// `SPEC-GATE-A0-03`: a handle from another runtime is rejected on read and on
@@ -217,23 +360,25 @@ fn a0_03_cross_runtime_access_is_rejected() {
     let mut first = Runtime::new();
     let mut second = Runtime::new();
 
-    let row = first.frame(|tx| tx.insert("A")).expect("insert");
+    let row: RowId = first.frame(|tx| tx.insert("A")).expect("insert");
 
     second
         .frame(|tx| {
-            assert!(matches!(
-                tx.with_title(row, |_| ()),
-                Err(ValueError::Handle(_))
-            ));
+            assert!(
+                matches!(tx.with_title(row, |_| ()), Err(ValueError::Handle(_))),
+                "a foreign handle must not resolve"
+            );
+            assert!(tx.read_once(row).is_err());
+            assert!(matches!(tx.completed(row), Err(ValueError::Handle(_))));
             assert!(matches!(tx.toggle(row), Err(ValueError::Handle(_))));
             Ok(())
         })
-        .expect("probe");
+        .expect("frame");
 
+    assert_eq!(second.committed().len(), 0, "the foreign store stays empty");
     assert_eq!(
-        second.committed().len(),
-        0,
-        "the foreign store is untouched"
+        first.committed().titles().collect::<Vec<_>>(),
+        vec!["A"],
+        "the owning store is untouched"
     );
-    assert_eq!(first.committed().remaining(), 1);
 }

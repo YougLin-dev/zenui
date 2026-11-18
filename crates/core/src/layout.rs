@@ -35,6 +35,11 @@ impl LayoutMap {
             .copied()
     }
 
+    /// Committed pairs, in `ViewId` order.
+    pub fn pairs(&self) -> Vec<(ViewId, LayoutNodeId)> {
+        self.entries.iter().map(|(view, id)| (*view, *id)).collect()
+    }
+
     pub fn len(&self) -> usize {
         self.entries.len()
     }
@@ -48,8 +53,9 @@ impl LayoutMap {
         if self.get(view).is_some() {
             return;
         }
-        let id = LayoutNodeId::from_index(self.next);
-        self.next += 1;
+        // The allocator advances only on commit: a discarded frame must not
+        // burn a layout id (`SPEC-RT-051`).
+        let id = LayoutNodeId::from_index(self.next + self.planned.len() as u32);
         self.planned.insert(view, id);
     }
 
@@ -85,7 +91,9 @@ impl LayoutMap {
         for view in unmounts {
             self.entries.remove(view);
         }
-        for (view, id) in std::mem::take(&mut self.planned) {
+        let planned = std::mem::take(&mut self.planned);
+        self.next += planned.len() as u32;
+        for (view, id) in planned {
             self.entries.insert(view, id);
         }
     }

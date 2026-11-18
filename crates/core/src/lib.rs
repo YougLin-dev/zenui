@@ -40,6 +40,48 @@
 //!     takes_row_key(node); // E0308: LayoutNodeId is not RowKey
 //! }
 //! ```
+//!
+//! The separation is mutual (`SPEC-GATE-A0-03`):
+//!
+//! ```compile_fail
+//! use zenui_core::{RowKey, ViewId};
+//!
+//! fn takes_a_view(_view: ViewId) {}
+//!
+//! fn pass_a_key(key: RowKey) {
+//!     takes_a_view(key); // E0308: RowKey is not ViewId
+//! }
+//! ```
+//!
+//! ```compile_fail
+//! use zenui_core::{LayoutNodeId, RowKey};
+//!
+//! fn takes_a_layout_node(_node: LayoutNodeId) {}
+//!
+//! fn pass_a_key(key: RowKey) {
+//!     takes_a_layout_node(key); // E0308: RowKey is not LayoutNodeId
+//! }
+//! ```
+//!
+//! ```compile_fail
+//! use zenui_core::{LayoutNodeId, ViewId};
+//!
+//! fn takes_a_layout_node(_node: LayoutNodeId) {}
+//!
+//! fn pass_a_view(view: ViewId) {
+//!     takes_a_layout_node(view); // E0308: ViewId is not LayoutNodeId
+//! }
+//! ```
+//!
+//! ```compile_fail
+//! use zenui_core::{LayoutNodeId, ViewId};
+//!
+//! fn takes_a_view(_view: ViewId) {}
+//!
+//! fn pass_a_layout_node(node: LayoutNodeId) {
+//!     takes_a_view(node); // E0308: LayoutNodeId is not ViewId
+//! }
+//! ```
 
 #![forbid(unsafe_code)]
 

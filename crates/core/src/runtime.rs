@@ -114,6 +114,32 @@ impl Runtime {
         self.owners.cleanup_runs()
     }
 
+    /// Next view id the frame will hand out (`SPEC-RT-053` high-water mark).
+    pub const fn next_view(&self) -> u32 {
+        self.views.next_id()
+    }
+
+    /// Next owner id the frame will hand out (`SPEC-RT-053` high-water mark).
+    pub const fn next_owner(&self) -> u32 {
+        self.owners.next_id()
+    }
+
+    /// The committed `ViewId -> LayoutNodeId` pairs, in view order.
+    pub fn layout_pairs(&self) -> Vec<(crate::handle::ViewId, crate::handle::LayoutNodeId)> {
+        self.layout.pairs()
+    }
+
+    /// The committed layout node assigned to a view.
+    pub fn layout_of(&self, view: crate::handle::ViewId) -> Option<crate::handle::LayoutNodeId> {
+        self.layout.get(view)
+    }
+
+    /// Live owner ids, in creation order. The *set* matters for rollback
+    /// comparison (`SPEC-RT-053`), not just the count.
+    pub fn live_owner_ids(&self) -> Vec<crate::handle::OwnerId> {
+        self.owners.live_ids()
+    }
+
     pub fn layout_len(&self) -> usize {
         self.layout.len()
     }
@@ -242,6 +268,34 @@ mod tests {
             })
             .expect("recovery frame");
         assert_eq!(runtime.committed().titles().collect::<Vec<_>>(), vec!["B"]);
+    }
+
+    /// `SPEC-RT-038`: a model write outside the write phases is a typed domain
+    /// error, and the frame cannot publish afterwards.
+    #[test]
+    fn a_write_outside_the_write_phase_is_typed_and_never_commits() {
+        use crate::txn::{Phase, ValueError};
+
+        let mut runtime = Runtime::new();
+        let row = runtime.frame(|tx| tx.insert("A")).expect("insert");
+        let commits_before = runtime.txn().commits();
+
+        let result = runtime.frame(|tx| {
+            tx.force_phase(Phase::Binding);
+            let error = tx.remove(row).expect_err("a Binding-phase write must fail");
+            assert!(
+                matches!(error, ValueError::Phase(violation) if violation.phase == Phase::Binding),
+                "expected a typed phase error, got {error:?}"
+            );
+            Ok(())
+        });
+
+        assert!(
+            result.is_err(),
+            "a poisoned frame must not publish, got {result:?}"
+        );
+        assert_eq!(runtime.txn().commits(), commits_before);
+        assert_eq!(runtime.committed().len(), 1, "the row survives");
     }
 
     #[test]

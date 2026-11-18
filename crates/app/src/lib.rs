@@ -188,7 +188,7 @@ pub fn render(tx: &mut Tx<'_>, ui: &mut UiState) -> Result<(), Fatal> {
             if tx.focused() == Some(view) && ui.focus_intent.is_none() {
                 ui.focus_intent = tx.focus_intent_for(view);
             }
-            tx.unmount(view);
+            tx.unmount(view)?;
         }
     }
 
@@ -206,8 +206,8 @@ pub fn render(tx: &mut Tx<'_>, ui: &mut UiState) -> Result<(), Fatal> {
             }
         }
     }
-    tx.reorder_views(&order);
-    settle_focus(tx, ui);
+    tx.reorder_views(&order)?;
+    settle_focus(tx, ui)?;
 
     ui.remaining = tx.remaining();
     ui.has_completed = tx.has_completed();
@@ -238,9 +238,9 @@ fn mount_row(tx: &mut Tx<'_>, ui: &mut UiState, key: RowKey) -> Result<Option<Vi
 
 /// TODO(A0-10): settle order is next → previous only. Input/toolbar fallback
 /// and cancellation by a later user focus move are not implemented.
-fn settle_focus(tx: &mut Tx<'_>, ui: &mut UiState) {
+fn settle_focus(tx: &mut Tx<'_>, ui: &mut UiState) -> Result<(), Fatal> {
     let Some(intent) = ui.focus_intent.take() else {
-        return;
+        return Ok(());
     };
     let target = intent
         .next
@@ -413,7 +413,7 @@ pub fn todolist_trace() -> String {
         }
         render(tx, ui)?;
         let view = tx.view_of_row(a_key).expect("A is mounted");
-        tx.focus(view);
+        tx.focus(view)?;
         Ok(())
     })
     .expect("frame 05");
@@ -467,6 +467,7 @@ fn error_kind(error: &ValueError) -> &'static str {
     match error {
         ValueError::Handle(handle) => handle.reason_kind(),
         ValueError::Store(_) => "store",
+        ValueError::Phase(_) => "phase",
     }
 }
 
