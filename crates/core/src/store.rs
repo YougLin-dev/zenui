@@ -87,9 +87,14 @@ pub struct Store {
 }
 
 impl Store {
-    pub fn new() -> Self {
+    /// Build a store owned by `id`.
+    ///
+    /// `pub(crate)` on purpose: a public constructor taking a `Copy` id would
+    /// let two stores share one id and defeat cross-runtime rejection. The only
+    /// public minting point is `Runtime::new` (`SPEC-RT-005`).
+    pub(crate) fn with_runtime(id: RuntimeId) -> Self {
         Self {
-            runtime: RuntimeId::allocate(),
+            runtime: id,
             rows: Slots::new(),
             order: Vec::new(),
             next_key: 1,
@@ -340,12 +345,6 @@ impl Store {
     }
 }
 
-impl Default for Store {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl fmt::Debug for Store {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Store")
@@ -357,12 +356,20 @@ impl fmt::Debug for Store {
 }
 
 #[cfg(test)]
+impl Store {
+    /// Test-only store with its own runtime identity.
+    pub(crate) fn for_test() -> Self {
+        Self::with_runtime(RuntimeId::allocate())
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn removed_row_rejects_its_old_handle() {
-        let mut store = Store::new();
+        let mut store = Store::for_test();
         let row = store.insert("A");
         assert!(store.with_title(row, str::len).is_ok());
 
@@ -376,7 +383,7 @@ mod tests {
 
     #[test]
     fn remaining_and_has_completed_follow_toggle() {
-        let mut store = Store::new();
+        let mut store = Store::for_test();
         let a = store.insert("A");
         let b = store.insert("B");
         assert_eq!(store.remaining(), 2);
@@ -394,7 +401,7 @@ mod tests {
 
     #[test]
     fn reorder_rejects_duplicate_keys_before_mutating() {
-        let mut store = Store::new();
+        let mut store = Store::for_test();
         store.insert("A");
         store.insert("B");
         let keys: Vec<RowKey> = store.keys().collect();
@@ -411,7 +418,7 @@ mod tests {
 
     #[test]
     fn clear_completed_removes_only_completed_rows() {
-        let mut store = Store::new();
+        let mut store = Store::for_test();
         let a = store.insert("A");
         let b = store.insert("B");
         store.toggle(b).expect("live row");
@@ -425,8 +432,8 @@ mod tests {
 
     #[test]
     fn handle_from_another_store_is_rejected() {
-        let mut first = Store::new();
-        let second = Store::new();
+        let mut first = Store::for_test();
+        let second = Store::for_test();
         let row = first.insert("A");
 
         let error = second
@@ -441,7 +448,7 @@ mod tests {
 
     #[test]
     fn one_mutation_is_one_write() {
-        let mut store = Store::new();
+        let mut store = Store::for_test();
         let a = store.insert("A");
         let b = store.insert("B");
         assert_eq!(store.counters().io_writes, 2);
@@ -471,7 +478,7 @@ mod tests {
 
     #[test]
     fn set_completed_updates_counters_in_both_directions() {
-        let mut store = Store::new();
+        let mut store = Store::for_test();
         let row = store.insert("A");
         assert_eq!(store.remaining(), 1);
         assert!(!store.has_completed());
@@ -493,8 +500,8 @@ mod tests {
 
     #[test]
     fn write_through_a_foreign_handle_is_rejected() {
-        let mut first = Store::new();
-        let mut second = Store::new();
+        let mut first = Store::for_test();
+        let mut second = Store::for_test();
         let row = first.insert("A");
 
         let error = second
@@ -509,7 +516,7 @@ mod tests {
 
     #[test]
     fn removing_a_completed_row_decrements_the_counter() {
-        let mut store = Store::new();
+        let mut store = Store::for_test();
         let a = store.insert("A");
         let b = store.insert("B");
         store.set_completed(a, true).expect("live row");
@@ -525,7 +532,7 @@ mod tests {
 
     #[test]
     fn owned_title_read_counts_once() {
-        let mut store = Store::new();
+        let mut store = Store::for_test();
         let row = store.insert("A");
         let title = store.read_owned_title(row).expect("live row");
         assert_eq!(title, "A");

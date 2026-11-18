@@ -29,6 +29,7 @@ pub mod handle;
 pub mod metrics;
 pub mod owner;
 pub mod query;
+pub mod runtime;
 pub mod store;
 pub mod view;
 
@@ -40,5 +41,6 @@ pub use handle::{
 pub use metrics::Counters;
 pub use owner::{OwnerError, OwnerTree};
 pub use query::{Filter, QueryCache, RowSet};
+pub use runtime::Runtime;
 pub use store::{Row, RowId, Store, StoreError};
 pub use view::{FocusIntent, ViewKind, ViewNode, ViewTree};

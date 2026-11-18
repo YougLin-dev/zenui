@@ -173,7 +173,7 @@ mod tests {
 
     #[test]
     fn second_consumer_shares_the_snapshot() {
-        let mut store = Store::new();
+        let mut store = Store::for_test();
         store.insert("A");
         store.insert("B");
 
@@ -188,7 +188,7 @@ mod tests {
 
     #[test]
     fn a_write_forces_exactly_one_reevaluation_per_epoch() {
-        let mut store = Store::new();
+        let mut store = Store::for_test();
         let row = store.insert("A");
         let mut cache = QueryCache::new();
         let before = cache.rows(&store, Filter::All);

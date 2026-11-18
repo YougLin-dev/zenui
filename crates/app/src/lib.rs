@@ -9,7 +9,7 @@
 
 use zenui_core::{
     Counters, Filter, FocusIntent, InvalidHandle, MemoGraph, NodeId, OwnerId, OwnerTree,
-    QueryCache, RowId, RowKey, RowSet, Store, StoreError, Value, ViewId, ViewTree,
+    QueryCache, RowId, RowKey, RowSet, Runtime, StoreError, Value, ViewId, ViewTree,
 };
 
 /// Memo graph nodes owned by the fixture.
@@ -61,7 +61,7 @@ pub struct Snapshot {
 
 /// The headless Todo application.
 pub struct TodoApp {
-    store: Store,
+    runtime: Runtime,
     query: QueryCache,
     graph: MemoGraph,
     views: ViewTree,
@@ -90,7 +90,7 @@ impl TodoApp {
         };
 
         Self {
-            store: Store::new(),
+            runtime: Runtime::new(),
             query: QueryCache::new(),
             graph,
             views,
@@ -124,31 +124,31 @@ impl TodoApp {
     }
 
     pub fn insert(&mut self, title: &str) -> RowId {
-        let row = self.store.insert(title);
+        let row = self.runtime.store_mut().insert(title);
         self.graph.bump_source(self.nodes.store);
         row
     }
 
     pub fn toggle(&mut self, row: RowId) -> Result<bool, InvalidHandle> {
-        let value = self.store.toggle(row)?;
+        let value = self.runtime.store_mut().toggle(row)?;
         self.graph.bump_source(self.nodes.store);
         Ok(value)
     }
 
     pub fn delete(&mut self, row: RowId) -> Result<(), InvalidHandle> {
-        self.store.remove(row)?;
+        self.runtime.store_mut().remove(row)?;
         self.graph.bump_source(self.nodes.store);
         Ok(())
     }
 
     pub fn reorder(&mut self, keys: &[RowKey]) -> Result<(), StoreError> {
-        self.store.reorder(keys)?;
+        self.runtime.store_mut().reorder(keys)?;
         self.graph.bump_source(self.nodes.store);
         Ok(())
     }
 
     pub fn clear_completed(&mut self) -> Vec<RowKey> {
-        let removed = self.store.clear_completed();
+        let removed = self.runtime.store_mut().clear_completed();
         if !removed.is_empty() {
             self.graph.bump_source(self.nodes.store);
         }
@@ -156,9 +156,9 @@ impl TodoApp {
     }
 
     pub fn row_by_title(&self, title: &str) -> Option<(RowKey, RowId)> {
-        let row = self.store.rows().find(|row| row.title() == title)?;
+        let row = self.runtime.store().rows().find(|row| row.title() == title)?;
         let key = row.key();
-        Some((key, self.store.handle_for(key)?))
+        Some((key, self.runtime.store().handle_for(key)?))
     }
 
     /// Move focus to the mounted view of a row. Returns false if it is not
@@ -217,10 +217,11 @@ impl TodoApp {
         let Self {
             graph,
             query,
-            store,
+            runtime,
             sink,
             ..
         } = self;
+        let store = runtime.store();
         match graph.compute(node, |reader| {
             reader.read(store_node);
             Value::Rows(query.rows(store, filter))
@@ -241,8 +242,9 @@ impl TodoApp {
         let store_node = self.nodes.store;
         let node = self.nodes.remaining;
         let Self {
-            graph, store, sink, ..
+            graph, runtime, sink, ..
         } = self;
+        let store = runtime.store();
         match graph.compute(node, |reader| {
             reader.read(store_node);
             Value::Count(store.remaining() as u32)
@@ -263,8 +265,9 @@ impl TodoApp {
         let store_node = self.nodes.store;
         let node = self.nodes.has_completed;
         let Self {
-            graph, store, sink, ..
+            graph, runtime, sink, ..
         } = self;
+        let store = runtime.store();
         match graph.compute(node, |reader| {
             reader.read(store_node);
             Value::Flag(store.has_completed())
@@ -288,12 +291,12 @@ impl TodoApp {
     /// error goes to the sink and the caller simply omits the row for this
     /// frame.
     fn mount_row(&mut self, key: RowKey) -> Option<ViewId> {
-        let Some(row) = self.store.handle_for(key) else {
+        let Some(row) = self.runtime.store().handle_for(key) else {
             self.sink
                 .push(format!("mount skipped: row key {} is gone", key.raw()));
             return None;
         };
-        let title = match self.store.read_owned_title(row) {
+        let title = match self.runtime.store_mut().read_owned_title(row) {
             Ok(title) => title,
             Err(error) => {
                 self.sink
@@ -355,14 +358,14 @@ impl TodoApp {
             .row_views()
             .iter()
             .filter_map(|(_, key)| {
-                let handle = self.store.handle_for(*key)?;
-                self.store.with_title(handle, str::to_owned).ok()
+                let handle = self.runtime.store().handle_for(*key)?;
+                self.runtime.store().with_title(handle, str::to_owned).ok()
             })
             .collect()
     }
 
     fn counters(&self) -> Counters {
-        let mut total = self.store.counters();
+        let mut total = self.runtime.store().counters();
         total += self.query.counters();
         total += self.graph.counters();
         total += self.views.counters();
@@ -375,10 +378,10 @@ impl TodoApp {
         let remaining = self.remaining();
         let has_completed = self.has_completed();
 
-        let store_titles = if self.store.is_empty() {
+        let store_titles = if self.runtime.store().is_empty() {
             String::from("-")
         } else {
-            self.store.titles().collect::<Vec<_>>().join(",")
+            self.runtime.store().titles().collect::<Vec<_>>().join(",")
         };
         let visible = self.visible_titles();
         let visible_titles = if visible.is_empty() {
@@ -401,7 +404,7 @@ impl TodoApp {
 
         Snapshot {
             counters: self.counters(),
-            store_rows: self.store.len(),
+            store_rows: self.runtime.store().len(),
             visible_rows: self.views.row_views().len(),
             remaining,
             has_completed,
@@ -429,7 +432,7 @@ impl Default for TodoApp {
 impl std::fmt::Debug for TodoApp {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TodoApp")
-            .field("store", &self.store)
+            .field("runtime", &self.runtime)
             .field("views", &self.views)
             .finish()
     }
@@ -643,7 +646,7 @@ mod tests {
         let (view, _) = app.views.row_views()[0];
         // Remove the row and the view behind the query cache's back, so the
         // cached RowSet still lists the key while nothing can resolve it.
-        app.store.remove(row).expect("live row");
+        app.runtime.store_mut().remove(row).expect("live row");
         app.views.unmount(view);
 
         app.render();
