@@ -2,8 +2,10 @@
 //! Observable counters reported by the headless trace.
 //!
 //! `SPEC-RT-047` requires query-contract acceptance to be counted, not judged by
-//! type names or boolean returns. P1 only *reports* the counters; the numeric
-//! pass criteria belong to `SPEC-GATE-A0-07` / `-08` and are not claimed.
+//! type names or boolean returns. This module defines the counters and the
+//! arithmetic over them; the numeric criteria of `SPEC-GATE-A0-07` / `-08` are
+//! asserted by the fixtures in `crates/core/tests/queries.rs`, and every one of
+//! them has a mutation that turns it red (`EVID-VAL-42`).
 
 use std::ops::AddAssign;
 

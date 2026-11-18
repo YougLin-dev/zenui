@@ -73,9 +73,10 @@ impl std::error::Error for StoreError {}
 
 /// Row storage plus the display order.
 ///
-/// P1 keeps the display order inside the store because the scenario reorders
-/// rows as a model operation. Whether ordering belongs to the store or to the
-/// `For` adapter is a P3 question (`SPEC-GATE-A0-09`) and is not settled here.
+/// The display order lives in the store because the scenario reorders rows as a
+/// model operation, and `Tx::reorder` is the public path that maintains it
+/// (`SPEC-GATE-A0-09`). Whether ordering belongs here or to the `For` adapter
+/// is still open and becomes answerable when `For` exists (A1).
 pub struct Store {
     runtime: RuntimeId,
     rows: Slots<Row>,
