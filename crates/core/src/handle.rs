@@ -8,11 +8,12 @@
 //! P1 scope: the shape is in place and the store rejects stale or foreign
 //! handles.
 //!
-//! TODO(A0-03): the handle-side `get`/`with` API of `SPEC-RT-005` is not built.
-//! P1 resolves through the owning store (`Store::with_title` and friends),
-//! which cannot be reached from a bare `Copy` handle without a runtime
-//! registry. That shape decision, plus the gate-level fixture that dispatches a
-//! stale click/read/write, belongs to P2 and is not claimed here.
+//! The handle-side `get`/`with` API of `SPEC-RT-005` is not built, by design:
+//! a bare `Copy` handle cannot reach a title without a runtime registry, so
+//! resolution goes through the owner (`Store::with_title`, `Tx::with_title`,
+//! `Tx::read_once`). The dispatch fixtures live in `crates/core/tests/gates.rs`
+//! (stale handle, cross-runtime access) and `crates/core/tests/ui/` (the
+//! identity domains do not convert).
 
 use std::fmt;
 use std::marker::PhantomData;
@@ -82,9 +83,11 @@ static NEXT_RUNTIME: AtomicU64 = AtomicU64::new(1);
 impl RuntimeId {
     /// Mint a fresh runtime identity.
     ///
-    /// TODO(A0-03): whether the allocator belongs to the process or to an
-    /// explicit runtime object is a P2 API question. What A0-03 verifies is the
-    /// rejection behaviour, which is independent of where the id comes from.
+    /// The allocator is a process-global counter: uniqueness only has to hold
+    /// within the process, and the value never reaches a trace. Whether it
+    /// should hang off an explicit runtime object instead is unsettled, and
+    /// does not change what `SPEC-GATE-A0-03` verifies — the rejection
+    /// behaviour is independent of where the id comes from.
     pub(crate) fn allocate() -> Self {
         Self(NEXT_RUNTIME.fetch_add(1, Ordering::Relaxed))
     }

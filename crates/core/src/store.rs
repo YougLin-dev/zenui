@@ -273,8 +273,10 @@ impl Store {
 
     /// Remove every completed row in one write.
     ///
-    /// TODO(A0-10): bulk clear must settle exactly one `FocusRemovalIntent`.
-    /// P1 removes the rows and leaves focus settlement to the caller.
+    /// Focus is not this helper's business: `Tx::clear_completed` records
+    /// exactly one `FocusRemovalIntent` before the rows go, and the commit
+    /// settles it once (`SPEC-GATE-A0-10`). This is the slot-table half, used
+    /// by the store's own tests.
     #[cfg(test)]
     pub(crate) fn clear_completed(&mut self) -> Vec<RowKey> {
         let doomed: Vec<SlotIndex> = self
@@ -333,12 +335,13 @@ impl Store {
         Ok(f(self.entry(row)?.title()))
     }
 
-    /// Owned title read, used by a UI mount (`SPEC-RT-045`).
+    /// Owned title read over the committed store (`SPEC-RT-045`).
     ///
-    /// TODO(A0-02): the normative shape is `read_once() -> Result<String, InvalidHandle>`
-    /// that cancels the mount on failure. P1 returns the `Result` and the caller
-    /// records the error in the sink, but mount atomicity (`SPEC-RT-013`) is not
-    /// verified here.
+    /// The runtime entry point is `Tx::read_once`, returning
+    /// `Result<String, InvalidHandle>`, and the mount executor cancels the
+    /// mount when it fails (`zenui-app::mount_row`, pinned in
+    /// `crates/app/tests/mount_path.rs`). This helper is the store-level
+    /// equivalent the unit tests use, accounting the same I/O and clone.
     #[cfg(test)]
     pub(crate) fn read_owned_title(&mut self, row: RowId) -> Result<String, InvalidHandle> {
         let title = self.entry(row)?.title.clone();
@@ -468,8 +471,10 @@ impl Store {
 
     /// Resolve a stable key back to a live handle.
     ///
-    /// TODO(A0-08): linear scan. The counter-backed index that makes empty-state
-    /// checks cost-free is P3 work (`SPEC-RT-044`).
+    /// Still a linear scan, and not on the empty-state path: those answers come
+    /// from the membership counters (`is_empty_for`, and the staged view's
+    /// `live_counts`), which is what `SPEC-RT-044` requires. A key index would
+    /// be a lookup optimisation, not a gate requirement.
     pub fn handle_for(&self, key: RowKey) -> Option<RowId> {
         self.order.iter().find_map(|slot| {
             let row = self.rows.get_ref(*slot)?;
@@ -560,12 +565,11 @@ impl Store {
 
     /// Reject a handle minted by another runtime.
     ///
-    /// TODO(A0-03): this is one slice of the gate. A0-03 also requires that a
-    /// stale handle dispatched through the runtime yields exactly one
-    /// `InvalidHandle` with no default value and no stale-value patch, and that
-    /// `ViewId`/`RowKey`/`LayoutNodeId` cannot be passed to each other. The
-    /// newtypes make cross-domain passing a compile error by construction, but
-    /// the gate-level dispatch fixture is P2 work.
+    /// One slice of `SPEC-GATE-A0-03`. The rest is pinned elsewhere: a stale
+    /// handle dispatched after slot reuse and a cross-runtime access are
+    /// fixtures in `crates/core/tests/gates.rs`, and the identity domains
+    /// cannot be passed to each other by construction — six `E0308` cases in
+    /// `crates/core/tests/ui/`.
     fn check_runtime(&self, row: RowId) -> Result<(), InvalidHandle> {
         if row.runtime() != self.runtime {
             return Err(InvalidHandle::from(HandleError::ForeignRuntime {
