@@ -427,9 +427,9 @@
   "coverage": {
     "criteriaTotal": 42,
     "criteriaVerified": 0,
-    "criteriaProbe": 1,
-    "criteriaOpen": 41,
-    "note": "唯一 PROBE 项为 SPEC-GATE-B-05（3 条 style 探针，无 manifest/provenance）。total 为 42 是巧合，不代表任何覆盖率百分比。"
+    "criteriaProbe": 2,
+    "criteriaOpen": 40,
+    "note": "PROBE 项为 SPEC-GATE-B-05（3 条 style 探针，无 manifest/provenance）与 SPEC-GATE-A0-01（EVID-VAL-20 的命令与 trace）。total 为 42 是巧合，不代表任何覆盖率百分比。"
   },
 
   "counts": {

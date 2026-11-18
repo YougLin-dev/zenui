@@ -25,7 +25,7 @@ Zenui **MUST** 是纯 Rust 的桌面 GUI 框架：一个 library + proc macro，
 
 - **MUST NOT** 在运行时嵌入 WebView、加载 HTML/CSS/JS，或以系统浏览器作为渲染后端。
 - 失败模式：任何能力只能通过 WebView/CSS 引擎实现时，必须返回 typed `Unsupported` 并登记为 `OPEN`；不得静默降级成 web 渲染，也不得在文档里描述为「支持」。
-- 状态：`SPEC`（框架本体不存在，规划中的 workspace 尚无 crate）。
+- 状态：`SPEC`（框架本体不存在；`crates/core` 目前只有 A0-01 所需的 headless 骨架，见 `CLAIM-039`）。
 
 ### SPEC-SCOPE-002 平台范围＝三桌面平台，不含 web / mobile
 
@@ -104,5 +104,5 @@ A1 与 C Gate **MUST** 使用同一个 locked Todo 应用（列表 / filter / Te
 ## 5. 当前状态（本文件自身的证据边界）
 
 - 本文件全部条目为 `SPEC`（要求），不含 `VERIFIED`。
-- 现有可运行资产仅限探针级（`PROBE`），见 `../evidence/probes.md`（规划）与 `../evidence/validation.md`（规划）；其范围**不构成本文件任何条目的满足**。
-- 生产 workspace、`crates/core`、launcher 均不存在；`archive/review/VALIDATION.md` §7 与 `archive/review/FINAL.md` §10 的记录仍然是唯一现状依据。
+- 现有可运行资产仅限探针级（`PROBE`），见 `../evidence/probes.md` 与 `../evidence/validation.md`；其范围**不构成本文件任何条目的满足**。
+- 生产 workspace 与 launcher 尚不存在；`crates/core`/`crates/app` 只有 Gate A0 的 headless 骨架（`CLAIM-039`），没有窗口、GPU 或平台后端代码。
