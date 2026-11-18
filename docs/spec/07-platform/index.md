@@ -91,6 +91,21 @@ replaces: []
 - **依据**：`SPEC-GATE-C`；`CLAIM` 台账中 H1（Windows/NVIDIA/Vulkan 转述）与 H2（macOS/Metal 实测）的分列。
 - **失败模式**：在三平台文档里写"跨平台已验证"，实际只有一台机器跑过一次 headless。
 
+### SPEC-PLAT-016 ID 命名空间：跨平台不变量与平台分册分开编号
+
+- **状态**：SPEC
+- **强度**：MUST
+- **要求**：跨平台不变量用 `SPEC-PLAT-0NN`（本文件）；平台分册用 **子命名空间** `SPEC-PLAT-WIN-NNN` / `SPEC-PLAT-MACOS-NNN` / `SPEC-PLAT-LINUX-NNN`。三者 MUST NOT 共用裸 `SPEC-PLAT-NNN` 编号，避免"哪一条属于哪个平台"靠记忆判断。
+- **失败模式**：三份分册各自从 001 起编号且不带平台前缀 → 交叉引用静默指向错误条目。
+
+### SPEC-PLAT-017 平台默认行为可以不同，但必须显式声明且可覆盖
+
+- **状态**：SPEC
+- **强度**：MUST
+- **要求**：确实属于平台习惯的默认行为差异（当前已知：macOS 关窗不退出、Dock 重新激活接回同一 runtime；Windows 关最后一个窗口即退出）MUST 由平台分册**显式声明为默认值**，并在公开 API 文档中标注；应用层 MUST 能覆盖该默认。框架核心 MUST NOT 把任一平台的语义硬编码成跨平台默认。
+- **失败模式**：在 macOS 上照搬 Windows 的"关窗即退出"，用户关窗后应用消失；或反过来在 Windows 上关窗后进程残留且无入口。
+- **分册**：`SPEC-PLAT-MACOS-011`、`SPEC-PLAT-WIN-013`。
+
 ## 3. Gate C 的共同结构
 
 每个平台分册的第 4 节给出该平台的最小证据清单，共同骨架是：
