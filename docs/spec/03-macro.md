@@ -1,7 +1,7 @@
 ---
 doc-id: SPEC-MACRO
 layer: spec
-status: draft
+status: normative
 date: 2026-11-18
 owner: API 人体工学师
 sources:

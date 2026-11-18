@@ -1,7 +1,7 @@
 ---
 doc-id: SPEC-RT
 layer: spec
-status: draft
+status: normative
 date: 2026-11-18
 owner: 顶级 Rust 开发工程师（10 年+）
 sources:

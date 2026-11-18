@@ -67,7 +67,7 @@ replaces: [research/README.md, review/README.md]
 | `CLAIM-*` | 单一事实声明台账 | `evidence/claim-register.md` |
 | `ADR-*` | 架构决策记录 | `decisions/` |
 
-条目写法：`### SPEC-RT-001 单一 UI 权威：一棵 View 树 + 一张响应式图`。在 `docs/` 内引用写作 `[SPEC-RT-001](spec/02-runtime.md#spec-rt-001)`（同目录内则用文件名），锚点为小写 ID。**禁止在别处复述该条内容超过一句**，只引用。
+条目写法：`### SPEC-RT-001 单一 UI 权威：一棵 View 树 + 一张响应式图`。在 `docs/` 内引用写作 `[SPEC-RT-001](spec/02-runtime.md)`（同目录内则用文件名），**链接只指向文件，条目用 ID 文本定位**——标题里带正文，GitHub 生成的锚点不是裸 ID，写 `#spec-rt-001` 会断。**禁止在别处复述该条内容超过一句**，只引用。
 
 ## 4. 文件头契约（每份文档必须有）
 
@@ -85,6 +85,17 @@ replaces: []           # 本文件取代的旧文档
 ```
 
 归档文件**不补 frontmatter**：原文逐字保留，失效声明与权威替代关系统一维护在 `archive/README.md` §3–§4（见 `ADR-0013`）。
+
+`status` 四个取值的判定规则（按"冲突时谁说了算"区分，不是按完成度）：
+
+| 状态 | 含义 | 与实现冲突时 | 能否作为验收依据 |
+|---|---|---|---|
+| `draft` | 草稿，仍在修订 | 以实现为准，回头改文档 | 不能 |
+| `normative` | 现行规范，对实现有约束力 | 以文档为准，实现即为缺陷；改文档需走 `ADR-*` | 能 |
+| `frozen` | 冻结定稿 | 只能新开 ADR supersede，不能就地修订 | 能，变更门槛最高 |
+| `historical` | 历史归档 | 无权威，仅供追溯 | 不能 |
+
+因此 `spec/` 全部为 `normative`：规范层的任务是"定义要求"，不是"证明已实现"；实现进度一律看 `CLAIM-*` 与 `SPEC-GATE-*`。
 
 ## 5. 目标目录树
 
@@ -150,7 +161,7 @@ docs/
 
 | 层 | 文件 | 规模 | 状态 |
 |---|---|---|---|
-| 规范 | `spec/` 12 篇（含 `07-platform/` 4 篇） | `SPEC-SCOPE/ROUTE/RT/MACRO/STYLE/TEXT/RENDER/PLAT/GATE` | 4 篇 `normative`（`00`/`01`/`08`/`07-platform/windows`），8 篇 `draft`，整体冻结待定 |
+| 规范 | `spec/` 12 篇（含 `07-platform/` 4 篇） | `SPEC-SCOPE/ROUTE/RT/MACRO/STYLE/TEXT/RENDER/PLAT/GATE` | `normative`（2026-11-18 整体冻结为现行规范） |
 | 证据 | `evidence/` 5 篇 | `EVID-VAL-01…19`、`EVID-PROBE-01…05`、`EVID-MATRIX` | `normative` |
 | 事实台账 | `evidence/claim-register.md` | 100 条 `CLAIM-*` | `draft` |
 | 决策 | `decisions/` 17 个文件 | `ADR-0001…0016` + `index.md` | `normative` |

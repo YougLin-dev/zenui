@@ -1,7 +1,7 @@
 ---
 doc-id: SPEC-PLAT-MACOS
 layer: spec
-status: draft
+status: normative
 date: 2026-11-18
 owner: macOS 平台工程师（10 年+）
 sources:

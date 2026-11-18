@@ -1,7 +1,7 @@
 ---
 doc-id: SPEC-PLAT
 layer: spec
-status: draft
+status: normative
 date: 2026-11-18
 owner: Crew 队长（架构）
 sources:

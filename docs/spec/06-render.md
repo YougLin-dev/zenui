@@ -1,7 +1,7 @@
 ---
 doc-id: SPEC-RENDER
 layer: spec
-status: draft
+status: normative
 date: 2026-11-18
 owner: 渲染与 GPU 抽象负责人
 sources:

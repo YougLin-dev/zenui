@@ -1,7 +1,7 @@
 ---
 doc-id: SPEC-STYLE
 layer: spec
-status: draft
+status: normative
 date: 2026-11-18
 owner: 顶级 Rust 开发工程师（10 年+）
 sources:
@@ -467,7 +467,7 @@ enum StyleCondition {
 
 ## 9. 与其他规范的关系
 
-- 版本 pin 与上游 oracle：只引用 [SPEC-ROUTE-001](01-route.md#spec-route-001)，本文不重复。
+- 版本 pin 与上游 oracle：只引用 [SPEC-ROUTE-001](01-route.md)，本文不重复。
 - 能力边界与宣称纪律：`SPEC-SCOPE-010/011/012/020/021`。
 - 宏侧 `class`/`style:*`/`aria:*` 的语法与诊断：[spec/03-macro.md](03-macro.md)（`SPEC-MACRO-013`–`-017`、`-018/019`）。
 - 状态来源、epoch 与事务：[spec/02-runtime.md](02-runtime.md)（`SPEC-RT-006`、`-030`、`-058`）。
