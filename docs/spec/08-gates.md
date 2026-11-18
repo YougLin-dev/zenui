@@ -45,7 +45,7 @@ blocked 的记录形状（机器可读，写入 `artifacts/desktop/<os>-<display
 
 | Gate | 目标 | 方法 | 阻塞合并 | 当前状态 |
 |---|---|---|---|---|
-| **A0** | 纯 Rust core + Todo reducer（headless，无宏/无窗口/无 GPU） | 编译期 + 运行时 trace | 是 | `OPEN`（`A0-01`、`A0-03`…`A0-06` 已达 `PROBE`，证据见 `EVID-VAL-20`…`-24`、`-27`；`A0-02` 与 `A0-07`…`A0-11` 仍 `OPEN`） |
+| **A0** | 纯 Rust core + Todo reducer（headless，无宏/无窗口/无 GPU） | 编译期 + 运行时 trace | 是 | `OPEN`（gate 汇总；逐行 11 条全部为 `PROBE`，以逐行单元格为准。证据见 `EVID-VAL-20`…`-24`、`-27`、`-33`…`-36`、`-41`、`-42`、`-49`；关闭谓词见 `EVID-MATRIX.criteria[].closed`） |
 | **A1** | 单 Windows Todo 真实窗口 | 真机 + 运行时 | 是（针对"桌面可用"宣称） | `OPEN` |
 | **B** | layout / text / style 差分基线 | 运行时 golden | 是（针对样式与文字能力宣称） | `SPEC`（有 3 条 style 探针，见 `EVID-VAL-12`） |
 | **C** | 三平台真实发布门 | 真机 + AT + package | 发布阻断 | `OPEN`（缺 runner） |
@@ -92,13 +92,13 @@ graph LR
 
 | ID | 通过判据（MUST） | 需要的证据 | 当前状态 |
 |---|---|---|---|
-| `SPEC-GATE-A1-01` | 应用由 `zenui::run(Application)` 启动真实窗口；目标命令 `cargo run --bin todolist --features windows-desktop --locked` 可执行 | Windows 真机命令 + 截图/日志 + 主机元数据 | `OPEN`（目标示例当前 40 个编译错误，`EVID-VAL-19`） |
+| `SPEC-GATE-A1-01` | 应用由 `zenui::run(Application)` 启动真实窗口；目标命令 `cargo run --bin todolist --features windows-desktop --locked` 可执行；拒绝的 TreeCommit 后 native 树/id 映射/focus/geometry 与上次提交逐字段一致；surface/resource 预检失败后资源计数回基线 | Windows 真机命令 + 截图/日志 + 主机元数据 | `OPEN`（目标示例当前 40 个编译错误，`EVID-VAL-19`） |
 | `SPEC-GATE-A1-02` | MountPlan 只含 descriptor/binding slots/children factories；不产生第二棵可求值树；`macro_poc::Node` 改名不算实现 | IR golden；生产树不暴露 `evaluate_content`/`fire` | `OPEN` |
 | `SPEC-GATE-A1-03` | `view!` 与 typed builder 生成相同 golden；`?` 与 `Result<MountPlan>` 在宏降级后仍成立；独立 renamed facade crate 可编译 | IR golden 差异为空；trybuild 覆盖未知 class / For 缺 key / 错误 payload / 错误 props | `OPEN`（现宏写死 `::zenui_macro_runtime`，`EVID-VAL-13` 不覆盖） |
-| `SPEC-GATE-A1-04` | For/Show/typed listener/TextEdit 专属 epoch adapter 在原定 feature 范围内工作；`{expr}` 是 mount 值、`{move \|\| expr}` 是绑定、事件不建立订阅 | 计数：mount 时 `binding_reads`/`event_reads` 符合定义；事件后不新增订阅 | `OPEN` |
+| `SPEC-GATE-A1-04` | For/Show/typed listener/TextEdit 专属 epoch adapter 在原定 feature 范围内工作；`{expr}` 是 mount 值、`{move \|\| expr}` 是绑定、事件不建立订阅；真实 A→B→A 环返回 `GraphCycle`（不使用 `begin_computing` 手工构造）；`Memo<RowSet>` 只随 (membership revision, order revision) 失效；per-row 失效；same-owner reorder 后订阅不增不减；空 subscriber bucket 不计活跃订阅 | 计数：mount 时 `binding_reads`/`event_reads` 符合定义；事件后不新增订阅 | `OPEN` |
 | `SPEC-GATE-A1-05` | Windows semantic dump：Tasks 固定 `list`、行 `listitem`、filter 为三个 toggle 组成的 group；空 Store 与"筛选无匹配"是两个独立提示，且 Store 非空时 list 容器不消失 | semantic dump 快照 + 两个空态的场景记录 | `OPEN` |
-| `SPEC-GATE-A1-06` | 键盘与可见域：Tab/Shift+Tab、Space、Delete click、filter、Add、wheel 可操作；clip 外不可 hit、不可成为 a11y focus | Windows 真机交互 trace + 缩窗场景 | `OPEN` |
-| `SPEC-GATE-A1-07` | 中文 IME 候选 Enter 只确认不 submit；随后普通 Enter 或鼠标 Add 各只提交一次；`SubmitEvent` 携带 origin/command_id/generation/default_prevented | IME trace：ime_consumed / input_commit / submit / insert / clear 各恰一条 | `OPEN` |
+| `SPEC-GATE-A1-06` | 键盘与可见域：Tab/Shift+Tab、Space、Delete click、filter、Add、wheel 可操作；clip 外不可 hit、不可成为 a11y focus；旧 generation 派发 click 只得到 `InvalidHandle`，不产生 patch；无 input 候选时焦点回退到 filter toolbar 并只结算一次 | Windows 真机交互 trace + 缩窗场景 | `OPEN` |
+| `SPEC-GATE-A1-07` | 中文 IME 候选 Enter 只确认不 submit；随后普通 Enter 或鼠标 Add 各只提交一次；`SubmitEvent` 携带 origin/command_id/generation/default_prevented；IME preflight 失败后候选与组合状态回滚；无同 kind 后继时焦点回退到可聚焦 input 并只结算一次 | IME trace：ime_consumed / input_commit / submit / insert / clear 各恰一条 | `OPEN` |
 | `SPEC-GATE-A1-08` | Add 的 insert 与 draft clear 同事务：全成（各 1）或全不成（各 0），失败保留已提交值并进 sink | 失败注入测试两种分支 | `OPEN` |
 | `SPEC-GATE-A1-09` | 该 Todo 所需的 source rect / clip / alpha / logical size / resize 上，CPU reference 与 GPU 像素在声明容差内一致 | 像素对比报告 + 固定字体 artifact hash | `OPEN` |
 

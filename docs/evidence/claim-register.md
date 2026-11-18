@@ -51,10 +51,10 @@ replaces: []
 
 ### 0.1 证据键（权威定义见 `docs/evidence/validation.md` §2）
 
-`EVID-VAL-*` 编号已与该文件的 48 条索引对齐。主机定义：
+`EVID-VAL-*` 编号已与该文件的 49 条索引对齐。主机定义：
 
 - **H1**：Windows 11 / MSVC / Rust 1.99.1 / NVIDIA RTX 4060 Laptop / Vulkan；上一轮记录，**commit 未记录**。
-- **H2**：macOS 27.0.1 / Apple M4 / Metal 4 / Rust 1.99.1；commit `ab5339b`（EVID-VAL-12…19）/ `83b21a4`（EVID-VAL-20/-21）/ `e53ae0e`、`f7a2d62`、`7d78cdc`（EVID-VAL-23…40）、`a24faed`（EVID-VAL-41…46）、`89b651c`（EVID-VAL-48）；本轮 Test/CI 实测。
+- **H2**：macOS 27.0.1 / Apple M4 / Metal 4 / Rust 1.99.1；commit `ab5339b`（EVID-VAL-12…19）/ `83b21a4`（EVID-VAL-20/-21）/ `e53ae0e`、`f7a2d62`、`7d78cdc`（EVID-VAL-23…40）、`a24faed`（EVID-VAL-41…46）、`89b651c`（EVID-VAL-48）、`6182928`（EVID-VAL-49）；本轮 Test/CI 实测。
 
 | 键 | 类别 | 命令 / 位置 | 记录结果 |
 |---|---|---|---|
@@ -106,6 +106,7 @@ replaces: []
 | EVID-VAL-46 | A | `cargo clippy --workspace --all-targets --locked -- -D warnings`（H2，commit `a24faed`） | exit 0（本机，不是 CI 日志） |
 | EVID-VAL-47 | D | `cargo test --workspace --locked`（CI 矩阵 ubuntu/macos/windows，commit `61de7b5`） | 102 passed × 3 平台；trybuild 快照三平台逐字匹配 |
 | EVID-VAL-48 | A | `rustdoc --test --crate-name probe --edition 2024`（H2，commit `89b651c`，8 条用例） | 6 ok / 2 对照组 `FAILED`（合法代码标 `compile_fail`）；错误码后缀不产生约束 |
+| EVID-VAL-49 | A | `cargo test --workspace --locked`（H2，commit `6182928`） | 114 passed（含 #22 的 generation / prev / caches 三条夹具） |
 | SRC | — | 仓库源码/清单，`path:line` | 本轮静态核对，可直接复查 |
 
 > **已裁决（C-18/D-02，ADR-0012）**：`docs/README.md` §6 现已承认第三种证据前缀 `SRC path:line`，
@@ -169,7 +170,7 @@ replaces: []
 | CLAIM-037 | `subscriber_count()` 返回 `subscribers.len()`，会把空桶计入订阅数 | VERIFIED | SRC `project_signals.rs:183-185` | A0 | 指标会掩盖泄漏 |
 | CLAIM-038 | `dispose` 只翻转每源一个 `bool` liveness，不存在 ViewId/OwnerId generation | VERIFIED | SRC `project_signals.rs:86-120,171-180` | A0 | 无法拒绝迟到命令 |
 | CLAIM-039 | 生产运行时中 `MountPlan` 与平台后端尚未实现（原句里的「事务 journal」已由 P2 落地，见 CLAIM-101） | VERIFIED | SRC `crates/core/src/`（无 `MountPlan`、无平台后端模块）；`FINAL.md:305-309` | A0 | 只保留仍然成立的两项；journal 一项由 CLAIM-101 覆盖 |
-| CLAIM-040 | A0 的 headless trace 与 query/mount/materialization 计数已存在，可用 `cargo run -p zenui-app --example todolist_headless --locked` 复跑 | VERIFIED | EVID-VAL-20 | A0 | 只覆盖 A0-01；A0-02…11 仍 OPEN |
+| CLAIM-040 | A0 的 headless trace 与 query/mount/materialization 计数已存在，可用 `cargo run -p zenui-app --example todolist_headless --locked` 复跑 | VERIFIED | EVID-VAL-20 | A0 | 只覆盖 A0-01；A0-02…11 现为 `PROBE`，结构 `closed` 见 `EVID-MATRIX` |
 
 ### 1.4 Store / Query / For / 焦点生命周期（CLAIM-041 – CLAIM-053）
 
