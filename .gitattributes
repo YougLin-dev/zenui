@@ -1,0 +1,8 @@
+# Check every text file out with LF on every platform.
+#
+# crates/app/tests/golden_trace.rs compares the generated trace with
+# crates/app/tests/golden/todolist_headless.trace through `include_str!`, and
+# EVID-VAL-20 pins the sha256 of that file. A CRLF checkout on Windows would
+# change both the bytes and the hash without any source change.
+* text=auto eol=lf
+*.trace text eol=lf

@@ -1,0 +1,8 @@
+# Machine projection of the toolchain pin in SPEC-ROUTE-001, the single source
+# of version pins in this repository. Do not treat this file as a second
+# authority: a toolchain change must go through the spec (and its ADR) first,
+# then be mirrored here so local builds and CI resolve the same compiler.
+[toolchain]
+channel = "1.99.1"
+profile = "default"
+components = ["clippy", "rustfmt"]

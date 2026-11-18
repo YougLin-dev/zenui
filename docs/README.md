@@ -46,7 +46,7 @@ replaces: [research/README.md, review/README.md]
 
 `CLAIM-*` 台账是**事实断言表**而非规范条文：一条断言可以处于 `SPEC`（还没证据）或 `WITHDRAWN`（已被推翻），这描述的是**断言的可信度**，不是要求在 spec 层书写。方向性规则只有一条：**spec 层永不出现 `VERIFIED`**。
 
-禁止使用的模糊措辞：“基本完成”“大部分支持”“接近生产”“应该可以”。需要表达覆盖度时，给出**分子/分母与来源**（例如：`3/42 个 utility family 有 probe 级验证，来源 EVID-PROBE-02`）。
+禁止使用的模糊措辞：“基本完成”“大部分支持”“接近生产”“应该可以”。需要表达覆盖度时，给出**分子/分母与来源**（例如：`2/42 条 Gate 判据处于 PROBE 级，来源 EVID-MATRIX.coverage`）。
 
 ## 3. 文档 ID 与命名
 
@@ -88,6 +88,7 @@ replaces: [research/README.md, review/README.md]
 | 产品定位与版本路线 | [product/positioning.md](product/positioning.md)、[product/roadmap.md](product/roadmap.md) | 框架产品经理 | 路线 `M0–M4` ↔ Gate `A0/A1/B/C/D` |
 | 历史结论与已撤销方案 | [archive/README.md](archive/README.md) | Crew 队长（架构） | 只读；`§3` 权威替代表、`§4` 已知过期物 |
 | 文档本身怎么改 | 本节、[§4 文件头](#4-文件头契约每份文档必须有)、`templates/` | Crew 队长（架构） | `scripts/check_docs.py`（CI 强制） |
+| 产物与文档各用什么语言 | [decisions/adr-0018-docs-language-scope.md](decisions/adr-0018-docs-language-scope.md) | 测试与 CI/发布负责人 | 无（语言无法机械校验，靠评审执行） |
 
 新增主题时必须同时在 `spec/`/`evidence/` 落一条并更新本表；只改表不改文档、或只加文档不改表，都算未完成。
 
@@ -157,7 +158,7 @@ docs/
 
 | ID | 断言 | 状态 | 证据 | 关联 Gate | 备注 |
 |---|---|---|---|---|---|
-| CLAIM-001 | rstml 能把目标节点形状解析为目标 AST | PROBE | EVID-VAL-02 | A0 | 仅 parse-only |
+| CLAIM-0NN | 一句可判真假的断言 | PROBE | EVID-VAL-NN | A0 | 备注 |
 
 规则：
 
@@ -192,9 +193,9 @@ docs/
 | 规范 | `spec/` 12 篇（含 `07-platform/` 4 篇） | `SPEC-SCOPE/ROUTE/RT/MACRO/STYLE/TEXT/RENDER/PLAT/GATE` | `normative`（2026-11-18 整体冻结为现行规范） |
 | 证据 | `evidence/` 5 篇 | `EVID-VAL-01…21`、`EVID-PROBE-01…05`、`EVID-MATRIX` | `normative` |
 | 事实台账 | `evidence/claim-register.md` | 100 条 `CLAIM-*` | `draft` |
-| 决策 | `decisions/` 18 个文件 | `ADR-0001…0017` + `index.md` | `normative` |
+| 决策 | `decisions/` 19 个文件 | `ADR-0001…0018` + `index.md` | `normative` |
 | 产品 | `product/` 2 篇 | 定位、路线（M0–M4 ↔ A0/A1/B/C/D） | `draft` |
-| 历史 | `archive/` 17 个文件 | 原 `research/` 8 篇 + `review/` 9 个 | 逐字只读（无 frontmatter，见 `ADR-0013`） |
+| 历史 | `archive/` 18 个文件 | `README.md` + 原 `research/` 8 篇 + `review/` 9 个 | 逐字只读（无 frontmatter，见 `ADR-0013`） |
 
 收敛检查（本轮实际执行）：相对链接 **0 断链**（含 archive 内部）、`SPEC-*`/`ADR-*`/`CLAIM-*` 定义 **0 重复**、`spec/` 内 **0 处版本号复述**、**0 处** "已实现/已通过" 型未证据宣称。
 

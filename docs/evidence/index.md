@@ -42,7 +42,7 @@ replaces: []
 
 ### 2.1 前置
 
-- Rust `1.99.1`（`rust-toolchain.toml` 尚未建立；在此之前以本文件记录的工具链为准）。
+- 工具链：pin 只在 `SPEC-ROUTE-001` 定义；根 `rust-toolchain.toml` 是该 pin 的机器投影，本地与 CI 因此解析到同一个编译器。
 - 根 `Cargo.toml` 自 M0 P1 起是 workspace（members `crates/core`、`crates/app`，`resolver = "3"`）；根 package `zenui` 仍是 workspace 成员。
 - **三个 PoC 示例各自是独立 workspace**（各自有 `Cargo.toml` 的 `[workspace]`），因此对 PoC 的命令必须带 `--manifest-path`，缓存也按 workspace 分开；workspace 内的 crate 用 `-p` 选择。
 - 根 `Cargo.toml` 设 `autoexamples = false`：`examples/todolist/main.rs` 是 design-only，**不应该**被当成可构建目标。
@@ -110,7 +110,7 @@ run_fail rustc --edition 2024 --crate-type lib --emit=metadata --out-dir "$tmp" 
 - 引用探针的能力边界：`[EVID-PROBE-04](probes.md)`（"这份代码能/不能证明什么"），**不要**用 `EVID-VAL-*` 代替——后者只说明某次运行的结果。
 - 引用 JSON：`EVID-MATRIX.runs[i]` / `EVID-MATRIX.contracts[i]`。
 - 一句断言（"某能力成立/不成立"）只能在 `claim-register.md` 里落 `CLAIM-*`，然后**由它**引用 `EVID-*`。spec 与 product 文档只引用 `CLAIM-*` 或 `EVID-*`，不自行复述数字。
-- 报告覆盖度必须给**分子/分母 + 来源**，例如 `1/42 条 Gate 判据处于 PROBE 级，来源 EVID-MATRIX.coverage`。
+- 报告覆盖度必须给**分子/分母 + 来源**，例如 `2/42 条 Gate 判据处于 PROBE 级，来源 EVID-MATRIX.coverage`。
 
 ## 5. 新增一条 EVID-VAL 的流程
 
@@ -133,7 +133,7 @@ run_fail rustc --edition 2024 --crate-type lib --emit=metadata --out-dir "$tmp" 
 
 ## 7. 与 Gate 的对应
 
-Gate 判据（`SPEC-GATE-*`）在 `docs/spec/08-gates.md`。当前映射：42 条判据中 **0 条 VERIFIED、1 条 PROBE、41 条 OPEN**（`EVID-MATRIX.coverage`）。
+Gate 判据（`SPEC-GATE-*`）在 `docs/spec/08-gates.md`。当前映射：42 条判据中 **0 条 VERIFIED、2 条 PROBE、40 条 OPEN**（`EVID-MATRIX.coverage`）。
 
 最容易被误读的两处已在该文件显式标注：
 

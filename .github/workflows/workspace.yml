@@ -1,0 +1,66 @@
+name: workspace
+
+# The L1 layer of the gate ladder in docs/spec/08-gates.md §7: the pure-Rust
+# workspace builds, lints and tests with no GPU, no window and no display.
+# A0 code is platform-independent by construction, so the matrix here buys
+# real cross-platform compile evidence for the cost of three short jobs.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "crates/**"
+      - "src/**"
+      - ".github/workflows/workspace.yml"
+      - ".gitattributes"
+  pull_request:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "crates/**"
+      - "src/**"
+      - ".github/workflows/workspace.yml"
+      - ".gitattributes"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: workspace-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gates:
+    name: gates (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # rust-toolchain.toml is the single source of the pinned toolchain; the
+      # first cargo invocation makes rustup install it (and its components).
+      - name: Install pinned toolchain
+        run: |
+          cargo --version
+          rustc --version --verbose
+          rustup component add clippy rustfmt
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace --locked
