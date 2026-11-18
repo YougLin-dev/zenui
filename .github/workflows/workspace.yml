@@ -4,27 +4,16 @@ name: workspace
 # workspace builds, lints and tests with no GPU, no window and no display.
 # A0 code is platform-independent by construction, so the matrix here buys
 # real cross-platform compile evidence for the cost of three short jobs.
+#
+# No `paths:` filter, on purpose. A required status check that a path filter
+# can skip leaves the pull request waiting for a check that will never be
+# created, so filtering and branch protection cannot coexist. Running on every
+# push to main and every pull request costs about half a minute.
 
 on:
   push:
     branches: [main]
-    paths:
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "rust-toolchain.toml"
-      - "crates/**"
-      - "src/**"
-      - ".github/workflows/workspace.yml"
-      - ".gitattributes"
   pull_request:
-    paths:
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "rust-toolchain.toml"
-      - "crates/**"
-      - "src/**"
-      - ".github/workflows/workspace.yml"
-      - ".gitattributes"
 
 permissions:
   contents: read
