@@ -297,6 +297,26 @@ struct ViewDraft {
     caret: Option<(ViewId, usize)>,
 }
 
+/// Test-only: why a focus intent was recorded (`SPEC-GATE-A0-10`).
+///
+/// The settlement is observable only to this module: `FocusIntent` stays a
+/// two-neighbour struct, so the public shape does not grow an A0-only field.
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum FocusSettlementCause {
+    Unmount,
+    BulkClear,
+}
+
+/// Test-only: which fallback rule settled a recorded intent.
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum FocusSettlementRule {
+    Next,
+    Previous,
+    Cleared,
+}
+
 /// Transaction state owned by the runtime.
 pub struct Txn {
     depth: u32,
@@ -326,6 +346,13 @@ pub struct Txn {
     /// Test-only: what the Cleanup stage observed when it released an owner.
     #[cfg(test)]
     cleanup_log: Vec<(crate::handle::OwnerId, Phase, usize)>,
+    /// Test-only: `(cause, rule, target)` for every settled focus intent.
+    #[cfg(test)]
+    focus_settlements: Vec<(FocusSettlementCause, FocusSettlementRule, Option<ViewId>)>,
+    /// Test-only: the cause of each recorded intent, aligned with
+    /// `focus_intents` (both are cleared together).
+    #[cfg(test)]
+    intent_causes: Vec<FocusSettlementCause>,
     /// Latched fatal error: set by a phase violation or a nested failure.
     /// `commit` returns it even when the frame body returned `Ok`
     /// (`ADR-0019` decision 6).
@@ -351,6 +378,10 @@ impl Txn {
             user_focused: false,
             #[cfg(test)]
             cleanup_log: Vec::new(),
+            #[cfg(test)]
+            focus_settlements: Vec::new(),
+            #[cfg(test)]
+            intent_causes: Vec::new(),
         }
     }
 
@@ -388,6 +419,14 @@ impl Txn {
         &self.cleanup_log
     }
 
+    /// Test-only: the settlement log `SPEC-GATE-A0-10` asks for.
+    #[cfg(test)]
+    pub(crate) fn focus_settlements(
+        &self,
+    ) -> &[(FocusSettlementCause, FocusSettlementRule, Option<ViewId>)] {
+        &self.focus_settlements
+    }
+
     pub fn publications(&self) -> &[Publication] {
         &self.publishes
     }
@@ -401,6 +440,8 @@ impl Txn {
         self.phase = Phase::Outside;
         self.outcome = Outcome::Committed;
         self.focus_intents.clear();
+        #[cfg(test)]
+        self.intent_causes.clear();
         self.user_focused = false;
         self.model = ModelJournal::new(self.model.next_key);
         self.graph = GraphScratch::new();
@@ -666,6 +707,8 @@ impl<'a> Tx<'a> {
                 && let Some(intent) = self.views.focus_intent_for(focused)
             {
                 self.txn.focus_intents.push(intent);
+                #[cfg(test)]
+                self.txn.intent_causes.push(FocusSettlementCause::BulkClear);
             }
             self.txn.model.writes += 1;
             self.bump();
@@ -991,6 +1034,8 @@ impl<'a> Tx<'a> {
                 && let Some(intent) = self.views.focus_intent_for(view)
             {
                 self.txn.focus_intents.push(intent);
+                #[cfg(test)]
+                self.txn.intent_causes.push(FocusSettlementCause::Unmount);
             }
         }
         Ok(())
@@ -1307,10 +1352,26 @@ impl<'a> Tx<'a> {
             && focused.is_none()
             && let Some(intent) = self.txn.focus_intents.last().copied()
         {
-            let target = intent
-                .next
-                .filter(|view| self.views.is_live(*view))
-                .or_else(|| intent.previous.filter(|view| self.views.is_live(*view)));
+            let next = intent.next.filter(|view| self.views.is_live(*view));
+            let previous = intent.previous.filter(|view| self.views.is_live(*view));
+            let target = next.or(previous);
+            // Test-only observation point: the cause recorded with the intent,
+            // the rule that actually won, and the settled target. `FocusIntent`
+            // keeps its public shape.
+            #[cfg(test)]
+            self.txn.focus_settlements.push((
+                self.txn
+                    .intent_causes
+                    .last()
+                    .copied()
+                    .unwrap_or(FocusSettlementCause::Unmount),
+                match (next, target) {
+                    (Some(_), _) => FocusSettlementRule::Next,
+                    (None, Some(_)) => FocusSettlementRule::Previous,
+                    (None, None) => FocusSettlementRule::Cleared,
+                },
+                target,
+            ));
             match target {
                 Some(view) => self.views.focus(view),
                 None => self.views.clear_focus(),
@@ -1998,5 +2059,243 @@ mod tests {
             end, start,
             "a reorder that moves nothing must not advance the order revision"
         );
+    }
+
+    // ---- SPEC-GATE-A0-10: the settlement log ------------------------------
+
+    /// Mount every committed row and return the views in display order.
+    fn mount_all(runtime: &mut Runtime) -> Vec<ViewId> {
+        runtime
+            .frame(|tx| {
+                let keys: Vec<RowKey> = tx.rows(Filter::All).iter().collect();
+                let mut views = Vec::with_capacity(keys.len());
+                for key in keys {
+                    views.push(tx.mount_row(key, 1)?);
+                }
+                tx.reorder_views(&views)?;
+                Ok(views)
+            })
+            .expect("mount every row")
+    }
+
+    fn last_settlement(
+        runtime: &Runtime,
+    ) -> (FocusSettlementCause, FocusSettlementRule, Option<ViewId>) {
+        *runtime
+            .txn()
+            .focus_settlements()
+            .last()
+            .expect("a settlement must have been recorded")
+    }
+
+    /// `SPEC-GATE-A0-10`: deleting the focused row with a live successor
+    /// settles through `Unmount` + `Next` and names the successor.
+    ///
+    /// Red-ability: drop the `intent.next` arm in `Tx::commit` and the settled
+    /// target moves to the previous sibling or none.
+    #[test]
+    fn a0_10_settlement_records_next_for_a_live_successor() {
+        let mut runtime = Runtime::new();
+        let (a, _b, _c) = runtime
+            .frame(|tx| Ok((tx.insert("A")?, tx.insert("B")?, tx.insert("C")?)))
+            .expect("seed");
+        let views = mount_all(&mut runtime);
+        runtime
+            .frame(|tx| {
+                tx.focus(views[0])?;
+                Ok(())
+            })
+            .expect("focus A");
+
+        let before = runtime.txn().focus_settlements().len();
+        runtime
+            .frame(|tx| {
+                tx.remove(a).map_err(|_| Fatal::Aborted)?;
+                tx.unmount(views[0])?;
+                Ok(())
+            })
+            .expect("delete the focused row");
+
+        assert_eq!(
+            runtime.txn().focus_settlements().len(),
+            before + 1,
+            "exactly one settlement"
+        );
+        assert_eq!(
+            last_settlement(&runtime),
+            (
+                FocusSettlementCause::Unmount,
+                FocusSettlementRule::Next,
+                Some(views[1])
+            ),
+            "a live next sibling wins and the cause is the unmount"
+        );
+    }
+
+    /// `SPEC-GATE-A0-10`: deleting the last row takes `Previous`.
+    ///
+    /// Red-ability: hard-code `FocusSettlementRule::Next` in `Tx::commit` (or
+    /// return `Some` from the next arm unconditionally) and this fails.
+    #[test]
+    fn a0_10_settlement_records_previous_at_the_end() {
+        let mut runtime = Runtime::new();
+        let (_a, _b, c) = runtime
+            .frame(|tx| Ok((tx.insert("A")?, tx.insert("B")?, tx.insert("C")?)))
+            .expect("seed");
+        let views = mount_all(&mut runtime);
+        runtime
+            .frame(|tx| {
+                tx.focus(views[2])?;
+                Ok(())
+            })
+            .expect("focus C");
+
+        runtime
+            .frame(|tx| {
+                tx.remove(c).map_err(|_| Fatal::Aborted)?;
+                tx.unmount(views[2])?;
+                Ok(())
+            })
+            .expect("delete the last focused row");
+
+        assert_eq!(
+            last_settlement(&runtime),
+            (
+                FocusSettlementCause::Unmount,
+                FocusSettlementRule::Previous,
+                Some(views[1])
+            ),
+            "no next sibling exists, so the previous sibling settles"
+        );
+    }
+
+    /// `SPEC-GATE-A0-10`: a bulk clear records **one** intent with cause
+    /// `BulkClear`, not one per removed row.
+    ///
+    /// Red-ability: push a settlement inside the removal loop (or per removed
+    /// row) and the `before + 1` assertion fails.
+    #[test]
+    fn a0_10_bulk_clear_settles_one_intent() {
+        let mut runtime = Runtime::new();
+        let (a, b, _c) = runtime
+            .frame(|tx| Ok((tx.insert("A")?, tx.insert("B")?, tx.insert("C")?)))
+            .expect("seed");
+        let views = mount_all(&mut runtime);
+        runtime
+            .frame(|tx| {
+                tx.set_completed(a, true).map_err(|_| Fatal::Aborted)?;
+                tx.set_completed(b, true).map_err(|_| Fatal::Aborted)?;
+                Ok(())
+            })
+            .expect("complete A and B");
+        runtime
+            .frame(|tx| {
+                tx.focus(views[1])?;
+                Ok(())
+            })
+            .expect("focus B");
+
+        let before = runtime.txn().focus_settlements().len();
+        runtime
+            .frame(|tx| {
+                tx.clear_completed()?;
+                for view in &views[..2] {
+                    tx.unmount(*view)?;
+                }
+                Ok(())
+            })
+            .expect("bulk clear");
+
+        let log = runtime.txn().focus_settlements();
+        assert_eq!(
+            log.len(),
+            before + 1,
+            "one intent for the whole clear, not one per removed row"
+        );
+        assert_eq!(
+            *log.last().expect("settlement"),
+            (
+                FocusSettlementCause::BulkClear,
+                FocusSettlementRule::Next,
+                Some(views[2])
+            ),
+            "the clear is one intent and a surviving sibling settles it"
+        );
+    }
+
+    /// `SPEC-GATE-A0-10`: a user focus move in the same frame cancels the
+    /// recorded intent, so no settlement is appended and the user's target
+    /// stays.
+    ///
+    /// Red-ability: drop the `focused.is_none()` guard and the recorded intent
+    /// settles over the user's target.
+    #[test]
+    fn a0_10_a_user_focus_move_cancels_the_settlement() {
+        let mut runtime = Runtime::new();
+        let (a, _b, _c) = runtime
+            .frame(|tx| Ok((tx.insert("A")?, tx.insert("B")?, tx.insert("C")?)))
+            .expect("seed");
+        let views = mount_all(&mut runtime);
+        runtime
+            .frame(|tx| {
+                tx.focus(views[0])?;
+                Ok(())
+            })
+            .expect("focus A");
+
+        let before = runtime.txn().focus_settlements().len();
+        runtime
+            .frame(|tx| {
+                tx.remove(a).map_err(|_| Fatal::Aborted)?;
+                tx.unmount(views[0])?;
+                tx.focus(views[2])?;
+                Ok(())
+            })
+            .expect("user moved focus");
+
+        assert_eq!(
+            runtime.txn().focus_settlements().len(),
+            before,
+            "a user focus move must cancel the recorded intent"
+        );
+        assert_eq!(runtime.focused(), Some(views[2]));
+    }
+
+    /// `SPEC-GATE-A0-10`: clearing focus is a user choice too; the recorded
+    /// intent must not pull focus back after the user cleared it.
+    ///
+    /// Red-ability: drop `!self.txn.user_focused` from the settlement guard and
+    /// this test fails — the intent settles on the next sibling instead of
+    /// leaving focus cleared.
+    #[test]
+    fn a0_10_a_user_clear_cancels_the_settlement() {
+        let mut runtime = Runtime::new();
+        let (a, _b, _c) = runtime
+            .frame(|tx| Ok((tx.insert("A")?, tx.insert("B")?, tx.insert("C")?)))
+            .expect("seed");
+        let views = mount_all(&mut runtime);
+        runtime
+            .frame(|tx| {
+                tx.focus(views[0])?;
+                Ok(())
+            })
+            .expect("focus A");
+
+        let before = runtime.txn().focus_settlements().len();
+        runtime
+            .frame(|tx| {
+                tx.remove(a).map_err(|_| Fatal::Aborted)?;
+                tx.unmount(views[0])?;
+                tx.clear_focus()?;
+                Ok(())
+            })
+            .expect("user cleared focus");
+
+        assert_eq!(
+            runtime.txn().focus_settlements().len(),
+            before,
+            "a user clear must cancel the recorded intent"
+        );
+        assert_eq!(runtime.focused(), None);
     }
 }
