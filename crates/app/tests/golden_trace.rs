@@ -50,7 +50,7 @@ fn scenario_keeps_the_expected_order() {
         "[step 05 reorder]",
         "[step 06 delete-focused]",
         "[step 07 bulk-clear]",
-        "[step 08 invalid-rollback]",
+        "[step 08 rejected-handle]",
         "[step 09 insert-d]",
     ];
 

@@ -2,8 +2,10 @@
 
 use zenui_core::{Counters, Fatal, Filter, RowId, RowKey, Runtime, Tx, ValueError, ViewId};
 
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UiState {
     pub filter: Filter,
+    pub draft: String,
     pub sink: Vec<String>,
     pub remaining: u32,
     pub has_completed: bool,
@@ -13,12 +15,33 @@ impl Default for UiState {
     fn default() -> Self {
         Self {
             filter: Filter::All,
+            draft: String::new(),
             sink: Vec::new(),
             remaining: 0,
             has_completed: false,
         }
     }
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UiResetFault;
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum AddError {
+    Model(Fatal),
+    UiReset(UiResetFault),
+}
+
+impl std::fmt::Display for AddError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Model(error) => write!(f, "model add failed: {error}"),
+            Self::UiReset(_) => f.write_str("UI draft reset failed after the model committed"),
+        }
+    }
+}
+
+impl std::error::Error for AddError {}
 
 #[derive(Debug)]
 pub struct Snapshot {
@@ -47,6 +70,12 @@ pub struct Snapshot {
 pub struct TodoApp {
     runtime: Runtime,
     ui: UiState,
+    pending_add: Option<PendingAdd>,
+}
+
+struct PendingAdd {
+    row: RowId,
+    title: String,
 }
 
 impl TodoApp {
@@ -54,6 +83,7 @@ impl TodoApp {
         Self {
             runtime: Runtime::new(),
             ui: UiState::default(),
+            pending_add: None,
         }
     }
 
@@ -61,12 +91,89 @@ impl TodoApp {
         &mut self,
         f: impl FnOnce(&mut Tx<'_>, &mut UiState) -> Result<R, Fatal>,
     ) -> Result<R, Fatal> {
-        let Self { runtime, ui } = self;
-        runtime.frame(|tx| f(tx, ui))
+        let Self { runtime, ui, .. } = self;
+        // 闭包内的 UI 修改是暂存值；Err 时与 Runtime 的暂存状态一起丢弃。
+        let previous = ui.clone();
+        let result = runtime.frame(|tx| f(tx, ui));
+        if result.is_err() {
+            *ui = previous;
+        }
+        result
     }
 
     pub fn render(&mut self) -> Result<(), Fatal> {
         self.frame(render)
+    }
+
+    pub fn set_draft(&mut self, draft: impl Into<String>) {
+        self.ui.draft = draft.into();
+    }
+
+    pub fn draft(&self) -> &str {
+        &self.ui.draft
+    }
+
+    /// 模型先独立提交；草稿 reset 是随后独立的 UI 状态更新，不从模型事务回滚。
+    pub fn add_todo(&mut self) -> Result<(), AddError> {
+        self.add_todo_with_ui_reset(|ui| {
+            ui.draft.clear();
+            Ok(())
+        })
+    }
+
+    fn add_todo_with_ui_reset(
+        &mut self,
+        reset: impl FnOnce(&mut UiState) -> Result<(), UiResetFault>,
+    ) -> Result<(), AddError> {
+        if let Some(pending) = self.pending_add.take() {
+            let committed = self
+                .runtime
+                .committed()
+                .with_title(pending.row, |_| ())
+                .is_ok();
+            if committed && self.ui.draft.trim() == pending.title {
+                if let Err(fault) = Self::apply_ui_reset(&mut self.ui, reset) {
+                    self.pending_add = Some(pending);
+                    return Err(AddError::UiReset(fault));
+                }
+                return Ok(());
+            }
+            // A changed draft is a new Add; the committed pending row is not repeated.
+        }
+
+        let title = self.ui.draft.trim().to_owned();
+        if title.is_empty() {
+            return Ok(());
+        }
+        let row = self
+            .frame(|tx, ui| {
+                let row = tx.insert(title.clone())?;
+                render(tx, ui)?;
+                Ok(row)
+            })
+            .map_err(AddError::Model)?;
+        if let Err(fault) = Self::apply_ui_reset(&mut self.ui, reset) {
+            self.pending_add = Some(PendingAdd {
+                row,
+                title: title.clone(),
+            });
+            return Err(AddError::UiReset(fault));
+        }
+        Ok(())
+    }
+
+    fn apply_ui_reset(
+        ui: &mut UiState,
+        reset: impl FnOnce(&mut UiState) -> Result<(), UiResetFault>,
+    ) -> Result<(), UiResetFault> {
+        let before = ui.clone();
+        match reset(ui) {
+            Ok(()) => Ok(()),
+            Err(fault) => {
+                *ui = before;
+                Err(fault)
+            }
+        }
     }
 
     pub const fn runtime(&self) -> &Runtime {
@@ -376,18 +483,18 @@ pub fn todolist_trace() -> String {
     .expect("frame 07");
     recorder.step(&app.snapshot(), "bulk-clear", "clear completed");
 
-    let rollback = app
+    let rejected = app
         .frame(|tx, ui| {
             let result = tx.toggle(a_row);
             render(tx, ui)?;
             Ok(result)
         })
         .expect("frame 08");
-    let detail = match rollback {
+    let detail = match rejected {
         Ok(_) => String::from("result=unexpected-ok"),
         Err(error) => format!("result=InvalidHandle({})", error_kind(&error)),
     };
-    recorder.step(&app.snapshot(), "invalid-rollback", &detail);
+    recorder.step(&app.snapshot(), "rejected-handle", &detail);
 
     app.frame(|tx, ui| {
         tx.insert("D")?;
@@ -440,6 +547,80 @@ mod tests {
         assert!(mounted.is_none(), "a ghost key must not mount a view");
         assert_eq!(app.ui().sink.len(), 1);
         assert!(app.ui().sink[0].contains("mount skipped"));
+    }
+
+    #[test]
+    fn a_ui_reset_fault_preserves_the_committed_add_and_previous_draft() {
+        let mut app = TodoApp::new();
+        app.set_draft("Write tests");
+
+        let commits_before = app.runtime().txn().commits();
+        let result = app.add_todo_with_ui_reset(|ui| {
+            ui.filter = Filter::Completed;
+            ui.draft.clear();
+            ui.sink.push(String::from("abandoned reset output"));
+            ui.remaining = 99;
+            ui.has_completed = true;
+            Err(UiResetFault)
+        });
+
+        assert_eq!(
+            result,
+            Err(AddError::UiReset(UiResetFault)),
+            "the fault must be reported through the command boundary"
+        );
+        assert_eq!(
+            app.runtime().txn().commits(),
+            commits_before + 1,
+            "the model Add committed before the independent UI reset"
+        );
+        assert_eq!(app.runtime().committed().len(), 1);
+        assert_eq!(
+            app.runtime().committed().titles().collect::<Vec<_>>(),
+            vec!["Write tests"]
+        );
+        assert_eq!(app.snapshot().visible_titles, "Write tests");
+        assert_eq!(
+            app.ui(),
+            &UiState {
+                filter: Filter::All,
+                draft: String::from("Write tests"),
+                sink: Vec::new(),
+                remaining: 1,
+                has_completed: false,
+            },
+            "a partial UI reset is discarded; committed model-derived UI stays"
+        );
+
+        app.add_todo()
+            .expect("retrying the command finishes the pending UI reset");
+
+        assert_eq!(
+            app.runtime().committed().len(),
+            1,
+            "the retry must not insert the preserved draft again"
+        );
+        assert_eq!(app.snapshot().visible_titles, "Write tests");
+        assert_eq!(app.ui().draft, "", "the retry commits the draft reset");
+    }
+
+    #[test]
+    fn a_changed_draft_after_a_fault_is_added_without_reusing_the_pending_row() {
+        let mut app = TodoApp::new();
+        app.set_draft("Write tests");
+        let _ = app.add_todo_with_ui_reset(|_| Err(UiResetFault));
+
+        app.set_draft("Second task");
+        app.add_todo().expect("the changed draft is added normally");
+        app.set_draft("Write tests");
+        app.add_todo().expect("the old title is no longer pending");
+
+        assert_eq!(
+            app.runtime().committed().titles().collect::<Vec<_>>(),
+            vec!["Write tests", "Second task", "Write tests"],
+            "the pending Add is neither repeated nor allowed to swallow later input"
+        );
+        assert_eq!(app.ui().draft, "");
     }
 
     #[test]
