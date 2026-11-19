@@ -93,10 +93,18 @@ impl LayoutMap {
 mod tests {
     use super::*;
 
+    fn view(raw: u32) -> ViewId {
+        ViewId::new(
+            crate::handle::RuntimeId::allocate(),
+            crate::handle::SlotIndex::from_index(raw),
+            crate::handle::Generation::FIRST,
+        )
+    }
+
     #[test]
     fn planned_ids_are_installed_on_commit_and_dropped_on_discard() {
         let mut map = LayoutMap::new();
-        let view = ViewId::from_index(1);
+        let view = view(1);
 
         map.plan(view);
         assert_eq!(map.len(), 0, "planning alone does not commit");
@@ -115,7 +123,7 @@ mod tests {
     #[test]
     fn preflight_rejects_a_view_that_is_both_mounted_and_unmounted() {
         let mut map = LayoutMap::new();
-        let view = ViewId::from_index(2);
+        let view = view(2);
         map.plan(view);
         assert!(map.preflight(&[view], &[view]).is_err());
     }
@@ -123,7 +131,7 @@ mod tests {
     #[test]
     fn preflight_rejects_a_mount_without_a_planned_node() {
         let map = LayoutMap::new();
-        let view = ViewId::from_index(3);
+        let view = view(3);
         assert!(map.preflight(&[view], &[]).is_err());
     }
 }

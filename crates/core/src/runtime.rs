@@ -28,7 +28,7 @@ impl Runtime {
         let mut graph = MemoGraph::new();
         let nodes = Nodes::build(&mut graph);
         let owners = OwnerTree::new();
-        let views = ViewTree::new(owners.root());
+        let views = ViewTree::new(id, owners.root());
         let txn = Txn::new(store.next_key());
 
         Self {
@@ -65,7 +65,10 @@ impl Runtime {
     }
 
     pub fn caret(&self, view: crate::handle::ViewId) -> Option<usize> {
-        self.views.caret(view)
+        self.views
+            .require(view)
+            .ok()
+            .and_then(|()| self.views.caret(view))
     }
 
     pub fn counters(&self) -> crate::metrics::Counters {
@@ -110,7 +113,10 @@ impl Runtime {
     }
 
     pub fn layout_of(&self, view: crate::handle::ViewId) -> Option<crate::handle::LayoutNodeId> {
-        self.layout.get(view)
+        self.views
+            .require(view)
+            .ok()
+            .and_then(|()| self.layout.get(view))
     }
 
     pub fn live_owner_ids(&self) -> Vec<crate::handle::OwnerId> {
@@ -423,6 +429,37 @@ mod tests {
         assert_eq!(runtime.row_views().len(), 0);
     }
 
+    #[test]
+    fn exhausted_transaction_mount_reserves_no_identity_or_layout() {
+        let mut runtime = Runtime::new();
+        runtime
+            .frame(|tx| {
+                tx.insert("A")?;
+                Ok(())
+            })
+            .expect("seed");
+        let key = runtime.committed().keys().next().expect("seeded key");
+        runtime.views.set_next(u32::MAX);
+        let next_owner = runtime.next_owner();
+        let next_layout = runtime.layout.next_id();
+
+        let result = runtime.frame(|tx| tx.mount_row(key, 1));
+
+        assert!(
+            matches!(
+                result,
+                Err(Fatal::InvalidViewHandle(crate::handle::InvalidHandle {
+                    reason: crate::handle::HandleError::Exhausted { .. },
+                }))
+            ),
+            "allocation must stop before wrapping: {result:?}"
+        );
+        assert_eq!(runtime.next_view(), u32::MAX);
+        assert_eq!(runtime.next_owner(), next_owner);
+        assert_eq!(runtime.layout.next_id(), next_layout);
+        assert!(runtime.row_views().is_empty());
+        assert!(runtime.layout_pairs().is_empty());
+    }
     #[test]
     fn a_failed_frame_leaves_the_committed_state_untouched() {
         let mut runtime = Runtime::new();

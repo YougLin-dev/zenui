@@ -436,6 +436,144 @@ fn stale_handle_does_not_alias_the_reused_slot() {
 }
 
 #[test]
+fn a_view_from_an_equal_index_runtime_cannot_be_focused() {
+    let mut owner = Runtime::new();
+    let mut other = Runtime::new();
+    let foreign_view: ViewId = owner
+        .frame(|tx| {
+            tx.insert("owner")?;
+            let key = runtime_keys(tx)[0];
+            let view = tx.mount_row(key, 3)?;
+            Ok(view)
+        })
+        .expect("mount owner View");
+    let own_view = other
+        .frame(|tx| {
+            tx.insert("other")?;
+            let key = runtime_keys(tx)[0];
+            let view = tx.mount_row(key, 4)?;
+            tx.reorder_views(&[view])?;
+            Ok(view)
+        })
+        .expect("mount other View");
+
+    assert_eq!(foreign_view.index(), own_view.index());
+
+    let result = other.frame(|tx| tx.focus(foreign_view));
+
+    assert!(
+        matches!(result, Err(Fatal::InvalidViewHandle(_))),
+        "the foreign View must be rejected, got {result:?}"
+    );
+    assert_eq!(other.focused(), None);
+    assert_eq!(other.caret(foreign_view), None);
+}
+
+#[test]
+fn a_foreign_view_cannot_change_structure_or_existing_focus() {
+    let mut owner = Runtime::new();
+    let mut other = Runtime::new();
+    let foreign = owner
+        .frame(|tx| {
+            tx.insert("owner")?;
+            let key = runtime_keys(tx)[0];
+            tx.mount_row(key, 3)
+        })
+        .expect("foreign view");
+    let owned = other
+        .frame(|tx| {
+            tx.insert("other")?;
+            let key = runtime_keys(tx)[0];
+            let view = tx.mount_row(key, 4)?;
+            tx.focus(view)?;
+            Ok(view)
+        })
+        .expect("own view");
+    assert_eq!(foreign.index(), owned.index());
+    assert_eq!(other.caret(foreign), None);
+    assert_eq!(other.layout_of(foreign), None);
+
+    let unmount = other.frame(|tx| {
+        assert!(!tx.is_live(foreign));
+        assert_eq!(tx.caret(foreign), None);
+        tx.unmount(foreign)
+    });
+    assert!(matches!(unmount, Err(Fatal::InvalidViewHandle(_))));
+    let reorder = other.frame(|tx| tx.reorder_views(&[foreign]));
+    assert!(matches!(reorder, Err(Fatal::InvalidViewHandle(_))));
+    assert_eq!(other.row_views().len(), 1);
+    assert_eq!(other.live_owners(), 2);
+    assert_eq!(other.focused(), Some(owned));
+    assert_eq!(other.caret(owned), Some(4));
+    assert_eq!(
+        owner.row_views(),
+        vec![(foreign, owner.committed().keys().next().unwrap())]
+    );
+}
+
+#[test]
+fn a_disposed_view_cannot_target_its_replacement() {
+    let mut runtime = Runtime::new();
+    let key = runtime
+        .frame(|tx| {
+            tx.insert("A")?;
+            Ok(runtime_keys(tx)[0])
+        })
+        .expect("key");
+    let retired = runtime
+        .frame(|tx| {
+            let view = tx.mount_row(key, 2)?;
+            tx.reorder_views(&[view])?;
+            Ok(view)
+        })
+        .expect("mount to retire");
+    runtime
+        .frame(|tx| tx.unmount(retired))
+        .expect("retire view");
+    let replacement = runtime
+        .frame(|tx| tx.mount_row(key, 3))
+        .expect("replacement");
+    assert_ne!(retired, replacement);
+
+    for result in [
+        runtime.frame(|tx| tx.focus(retired)),
+        runtime.frame(|tx| tx.unmount(retired)),
+    ] {
+        assert!(matches!(result, Err(Fatal::InvalidViewHandle(_))));
+    }
+    runtime
+        .frame(|tx| {
+            tx.reorder_views(&[replacement])?;
+            tx.focus(replacement)
+        })
+        .expect("the replacement accepts legal focus");
+    assert_eq!(runtime.focused(), Some(replacement));
+    assert_eq!(runtime.caret(retired), None);
+    assert_eq!(runtime.layout_of(retired), None);
+}
+
+#[test]
+fn an_unordered_staged_view_has_no_neighbors_without_being_invalid() {
+    let mut runtime = Runtime::new();
+    let key = runtime
+        .frame(|tx| {
+            tx.insert("A")?;
+            Ok(runtime_keys(tx)[0])
+        })
+        .expect("key");
+
+    runtime
+        .frame(|tx| {
+            let view = tx.mount_row(key, 1)?;
+            tx.reorder_views(&[view])?;
+            assert!(tx.is_live(view), "staged view identity should be known");
+            assert_eq!(tx.focus_intent_for(view), None);
+            Ok(())
+        })
+        .expect("staged reorder");
+}
+
+#[test]
 fn cross_runtime_access_is_rejected() {
     let mut first = Runtime::new();
     let mut second = Runtime::new();

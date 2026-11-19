@@ -31,7 +31,10 @@ macro_rules! identity_newtype {
     };
 }
 
-identity_newtype!(ViewId, OwnerId, SignalId, MemoId, QueryId, LayoutNodeId,);
+identity_newtype!(OwnerId, SignalId, MemoId, QueryId, LayoutNodeId);
+
+pub struct View;
+pub type ViewId = Handle<View>;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RuntimeId(u64);
@@ -119,6 +122,10 @@ pub enum HandleError {
         current: Generation,
         handle: Generation,
     },
+
+    Exhausted {
+        slot: SlotIndex,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -132,6 +139,7 @@ impl InvalidHandle {
             HandleError::ForeignRuntime { .. } => "foreign_runtime",
             HandleError::Vacant { .. } => "vacant",
             HandleError::StaleGeneration { .. } => "stale_generation",
+            HandleError::Exhausted { .. } => "exhausted",
         }
     }
 }
@@ -155,6 +163,9 @@ impl fmt::Display for InvalidHandle {
                 f,
                 "stale handle at slot {slot:?}: live generation {current:?}, handle has {handle:?}"
             ),
+            HandleError::Exhausted { slot } => {
+                write!(f, "identity allocation exhausted at slot {slot:?}")
+            }
         }
     }
 }
@@ -177,6 +188,10 @@ impl<T> Handle<T> {
             generation,
             _marker: PhantomData,
         }
+    }
+
+    pub const fn index(self) -> u32 {
+        self.slot.index()
     }
 
     pub(crate) const fn runtime(self) -> RuntimeId {
@@ -210,6 +225,22 @@ impl<T> PartialEq for Handle<T> {
 
 impl<T> Eq for Handle<T> {}
 
+impl<T> PartialOrd for Handle<T> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl<T> Ord for Handle<T> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (self.runtime, self.slot, self.generation).cmp(&(
+            other.runtime,
+            other.slot,
+            other.generation,
+        ))
+    }
+}
+
 impl<T> std::hash::Hash for Handle<T> {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.runtime.hash(state);
@@ -218,7 +249,7 @@ impl<T> std::hash::Hash for Handle<T> {
     }
 }
 
-impl<T> fmt::Debug for Handle<T> {
+impl fmt::Debug for Handle<crate::Row> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Handle")
             .field("runtime", &self.runtime)
@@ -228,15 +259,38 @@ impl<T> fmt::Debug for Handle<T> {
     }
 }
 
+impl fmt::Debug for ViewId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "ViewId({})", self.index())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn view_id_index_is_stable_for_trace_output() {
-        let view = ViewId::from_index(3);
+        let view = ViewId::new(
+            RuntimeId::allocate(),
+            SlotIndex::from_index(3),
+            Generation::FIRST,
+        );
         assert_eq!(view.index(), 3);
         assert_eq!(format!("{view:?}"), "ViewId(3)");
+    }
+
+    #[test]
+    fn row_id_debug_retains_the_identity_triple() {
+        let row = Handle::<crate::Row>::new(
+            RuntimeId::allocate(),
+            SlotIndex::from_index(3),
+            Generation::FIRST,
+        );
+        assert_eq!(
+            format!("{row:?}"),
+            "Handle { runtime: RuntimeId(..), slot: SlotIndex(3), generation: Generation(0) }"
+        );
     }
 
     #[test]
@@ -287,25 +341,9 @@ mod tests {
         assert_eq!(handle.runtime(), runtime_a);
         assert_eq!(handle.slot(), slot);
         assert_eq!(handle.generation(), generation);
-        assert_eq!(
-            handle,
-            Handle::<u32>::new(runtime_a, slot, generation),
-            "the same triple is the same handle"
-        );
-        assert_ne!(
-            handle,
-            Handle::<u32>::new(runtime_b, slot, generation),
-            "runtime_id separates handles"
-        );
-        assert_ne!(
-            handle,
-            Handle::<u32>::new(runtime_a, SlotIndex::from_index(1), generation),
-            "slot separates handles"
-        );
-        assert_ne!(
-            handle,
-            Handle::<u32>::new(runtime_a, slot, generation.next()),
-            "generation separates handles"
-        );
+        assert!(handle == Handle::<u32>::new(runtime_a, slot, generation));
+        assert!(handle != Handle::<u32>::new(runtime_b, slot, generation));
+        assert!(handle != Handle::<u32>::new(runtime_a, SlotIndex::from_index(1), generation));
+        assert!(handle != Handle::<u32>::new(runtime_a, slot, generation.next()));
     }
 }
