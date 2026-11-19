@@ -43,7 +43,7 @@ scenario=todolist-headless
   delta query_evals=1 id_materializations=1 mounts=0 unmounts=0 memo_recomputes=2 commits=1 focus_moves=0 caret_ops=0 io_reads=0 io_writes=1 string_clones=0
   graph edges=2 active_sources=1 geometry_epoch=8 live_owners=2 cleanup_runs=2 sink=0
 
-[step 08 invalid-rollback]
+[step 08 rejected-handle]
   detail=result=InvalidHandle(vacant)
   state store_rows=1 visible_rows=1 remaining=1 has_completed=false filter=active store_titles=C visible_titles=C focus=view#3 caret=view#3:1
   delta query_evals=0 id_materializations=0 mounts=0 unmounts=0 memo_recomputes=0 commits=1 focus_moves=0 caret_ops=0 io_reads=0 io_writes=0 string_clones=0
