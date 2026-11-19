@@ -189,20 +189,25 @@ impl ViewTree {
     }
 
     pub fn row_views(&self) -> Vec<(ViewId, RowKey)> {
-        self.order
+        let mut rows: Vec<_> = self
+            .order
             .iter()
             .filter_map(|id| {
                 let node = self.nodes.get(id)?;
                 Some((*id, node.row?))
             })
-            .collect()
+            .collect();
+        // A mount can commit without a reorder; that live node is not discarded.
+        rows.extend(self.nodes.iter().filter_map(|(id, node)| {
+            (!self.order.contains(id)).then(|| node.row.map(|key| (*id, key)))?
+        }));
+        rows
     }
 
     pub fn view_of_row(&self, row: RowKey) -> Option<ViewId> {
-        self.order
-            .iter()
-            .copied()
-            .find(|id| self.nodes.get(id).is_some_and(|node| node.row == Some(row)))
+        self.row_views()
+            .into_iter()
+            .find_map(|(view, key)| (key == row).then_some(view))
     }
 
     pub(crate) fn claiming_view(&self, row: RowKey) -> Option<ViewId> {
