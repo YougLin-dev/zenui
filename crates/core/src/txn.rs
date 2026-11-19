@@ -228,6 +228,7 @@ struct PlannedMount {
 struct ViewDraft {
     next_view: u32,
     next_owner: u32,
+    next_layout: u32,
     mounts: Vec<PlannedMount>,
     owners: Vec<(OwnerId, OwnerId)>,
     unmounts: Vec<ViewId>,
@@ -307,7 +308,13 @@ impl Txn {
         }
     }
 
-    pub(crate) fn begin_frame(&mut self, store: &Store, next_view: u32, next_owner: u32) {
+    pub(crate) fn begin_frame(
+        &mut self,
+        store: &Store,
+        next_view: u32,
+        next_owner: u32,
+        next_layout: u32,
+    ) {
         self.depth = 1;
         self.phase = Phase::Outside;
         self.outcome = Outcome::Live;
@@ -321,6 +328,7 @@ impl Txn {
         self.staged_order = store.order_epoch();
         self.view.next_view = next_view;
         self.view.next_owner = next_owner;
+        self.view.next_layout = next_layout;
     }
 
     pub const fn phase(&self) -> Phase {
@@ -775,7 +783,9 @@ impl<'a> Tx<'a> {
             .filter(|(view, _)| !self.txn.view.unmounts.contains(view))
             .collect();
         for mount in &self.txn.view.mounts {
-            if !rows.iter().any(|(view, _)| *view == mount.id) {
+            if !self.txn.view.unmounts.contains(&mount.id)
+                && !rows.iter().any(|(view, _)| *view == mount.id)
+            {
                 rows.push((mount.id, mount.row));
             }
         }
@@ -797,11 +807,15 @@ impl<'a> Tx<'a> {
     }
 
     pub fn view_of_row(&self, row: RowKey) -> Option<ViewId> {
-        self.views.view_of_row(row)
+        self.row_views()
+            .into_iter()
+            .find_map(|(view, key)| (key == row).then_some(view))
     }
 
     pub fn is_live(&self, view: ViewId) -> bool {
-        self.views.is_live(view) && !self.txn.view.unmounts.contains(&view)
+        self.row_views()
+            .iter()
+            .any(|(candidate, _)| *candidate == view)
     }
 
     pub fn handle_for(&self, key: RowKey) -> Option<Handle<Row>> {
@@ -864,7 +878,21 @@ impl<'a> Tx<'a> {
 
     pub fn unmount(&mut self, view: ViewId) -> Result<(), Fatal> {
         self.require(WriteKind::ViewPatch)?;
-        if !self.txn.view.unmounts.contains(&view) {
+        if let Some(position) = self
+            .txn
+            .view
+            .mounts
+            .iter()
+            .position(|mount| mount.id == view)
+        {
+            let mount = self.txn.view.mounts.swap_remove(position);
+            let owner = mount.owner;
+            self.txn
+                .view
+                .owners
+                .retain(|(candidate, _)| *candidate != owner);
+            self.txn.view.unmounts.push(view);
+        } else if !self.txn.view.unmounts.contains(&view) {
             self.txn.view.unmounts.push(view);
             if self.views.focused() == Some(view)
                 && self.txn.focus_intents.is_empty()
@@ -1213,6 +1241,7 @@ impl<'a> Tx<'a> {
             self.store.release_reserved(reservation.slot);
         }
         self.query.invalidate();
+        self.layout.set_next(self.txn.view.next_layout);
         self.layout.discard();
 
         self.txn.model = ModelJournal::new(next_key);
@@ -1996,7 +2025,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unordered_view_still_claims_its_key() {
+    fn an_unordered_view_still_claims_its_key_without_being_unrecoverable() {
         let mut runtime = Runtime::new();
         runtime
             .frame(|tx| {
@@ -2006,16 +2035,13 @@ mod tests {
             .expect("seed");
         let key = runtime.committed().keys().next().expect("the seeded row");
 
-        runtime
-            .frame(|tx| {
-                tx.mount_row(key, 1)?;
-                Ok(())
-            })
+        let view = runtime
+            .frame(|tx| tx.mount_row(key, 1))
             .expect("a mount without a reorder");
         assert_eq!(
-            runtime.row_views().len(),
-            0,
-            "the fixture needs a view outside the display order"
+            runtime.row_views(),
+            vec![(view, key)],
+            "a mounted row stays observable when no explicit order is supplied"
         );
         assert_eq!(
             runtime.live_owner_ids().len(),
@@ -2027,7 +2053,7 @@ mod tests {
             let second = tx.mount_row(key, 1);
             assert!(
                 matches!(second, Err(Fatal::DuplicateViewKey { key: claimed }) if claimed == key),
-                "the unordered view must still own its key, got {second:?}"
+                "the one visible view must still own its key, got {second:?}"
             );
             Err(Fatal::Aborted)
         });
@@ -2037,6 +2063,21 @@ mod tests {
             2,
             "the aborted frame minted no second owner"
         );
+
+        runtime
+            .frame(|tx| {
+                assert!(tx.is_live(view), "the live row is staged as live");
+                assert_eq!(tx.view_of_row(key), Some(view));
+                tx.reorder_views(&[view])?;
+                tx.focus(view)?;
+                Ok(())
+            })
+            .expect("a subsequent reorder and focus accepts the mounted view");
+        runtime
+            .frame(|tx| tx.unmount(view))
+            .expect("the mounted row can be removed");
+        assert_eq!(runtime.row_views(), Vec::<(ViewId, RowKey)>::new());
+        assert_eq!(runtime.live_owner_ids().len(), 1);
     }
 
     fn stage_mount(tx: &mut Tx<'_>, row: RowKey, title_len: u32) -> ViewId {

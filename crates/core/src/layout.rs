@@ -33,12 +33,21 @@ impl LayoutMap {
         self.entries.len()
     }
 
+    pub(crate) const fn next_id(&self) -> u32 {
+        self.next
+    }
+
+    pub(crate) fn set_next(&mut self, next: u32) {
+        self.next = next;
+    }
+
     pub(crate) fn plan(&mut self, view: ViewId) {
         if self.get(view).is_some() {
             return;
         }
 
-        let id = LayoutNodeId::from_index(self.next + self.planned.len() as u32);
+        let id = LayoutNodeId::from_index(self.next);
+        self.next = self.next.saturating_add(1);
         self.planned.insert(view, id);
     }
 
@@ -67,9 +76,9 @@ impl LayoutMap {
     pub(crate) fn commit(&mut self, unmounts: &[ViewId]) {
         for view in unmounts {
             self.entries.remove(view);
+            self.planned.remove(view);
         }
         let planned = std::mem::take(&mut self.planned);
-        self.next += planned.len() as u32;
         for (view, id) in planned {
             self.entries.insert(view, id);
         }
