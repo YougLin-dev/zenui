@@ -135,7 +135,7 @@ run_fail rustc --edition 2024 --crate-type lib --emit=metadata --out-dir "$tmp" 
 
 ## 7. 与 Gate 的对应
 
-Gate 判据（`SPEC-GATE-*`）在 `docs/spec/08-gates.md`。当前映射：42 条判据中 **12 条 PROBE（其中 11 条 closed）、30 条 OPEN**（`EVID-MATRIX.coverage`）。`closed` 是 `ADR-0024` 的结构谓词，不是状态词，也不回答 M0 是否出口。
+Gate 判据（`SPEC-GATE-*`）在 `docs/spec/08-gates.md`。当前映射：42 条判据中 **12 条 PROBE（其中 6 条 closed）、30 条 OPEN**（`EVID-MATRIX.coverage`）。`closed` 是 `ADR-0024` 的结构谓词，不是状态词，也不回答 M0 是否出口。
 
 最容易被误读的两处已在该文件显式标注：
 

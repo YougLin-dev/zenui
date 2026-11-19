@@ -1044,7 +1044,7 @@
       "blocking": true,
       "status": "OPEN",
       "criteria": 11,
-      "closed": true
+      "closed": false
     },
     {
       "id": "SPEC-GATE-A1",
@@ -1206,7 +1206,25 @@
       "obligations": [
         {
           "source": "criterion",
-          "text": "`{runtime_id, slot, generation}` 分离",
+          "text": "`{runtime_id",
+          "ref": "a0_03_cross_runtime_access_is_rejected",
+          "evidence": [
+            "EVID-VAL-23",
+            "EVID-VAL-49"
+          ]
+        },
+        {
+          "source": "criterion",
+          "text": ", slot",
+          "ref": "recycled_slot_rejects_the_previous_generation",
+          "evidence": [
+            "EVID-VAL-24",
+            "EVID-VAL-49"
+          ]
+        },
+        {
+          "source": "criterion",
+          "text": ", generation}` 分离",
           "ref": "recycled_slot_rejects_the_previous_generation",
           "evidence": [
             "EVID-VAL-24",
@@ -1262,9 +1280,9 @@
         }
       ],
       "evidence": [
-        "EVID-VAL-24",
-        "EVID-VAL-49",
         "EVID-VAL-23",
+        "EVID-VAL-49",
+        "EVID-VAL-24",
         "EVID-VAL-41",
         "EVID-VAL-47"
       ],
@@ -1360,11 +1378,7 @@
         {
           "source": "evidence",
           "text": "运行时 trace：发布值 + 每 epoch 可观测次数",
-          "ref": "a_diamond_never_observes_two_epochs",
-          "evidence": [
-            "EVID-VAL-24",
-            "EVID-VAL-49"
-          ]
+          "note": "待 Core 的发布路径可观测夹具（commit_scratch 后的 publication 计数）；现有单元测试从不 commit，不能作 witness"
         },
         {
           "source": "evidence",
@@ -1380,7 +1394,7 @@
         "EVID-VAL-24",
         "EVID-VAL-49"
       ],
-      "closed": true
+      "closed": false
     },
     {
       "id": "SPEC-GATE-A0-06",
@@ -1390,11 +1404,7 @@
         {
           "source": "criterion",
           "text": "TreeCommit 先完整 preflight（key",
-          "ref": "a0_06_a_duplicate_key_is_a_value_error_that_keeps_the_frame_alive",
-          "evidence": [
-            "EVID-VAL-23",
-            "EVID-VAL-49"
-          ]
+          "note": "待 Core 的 TreeCommit 层重复 key preflight 夹具；不以 duplicate-key 值错误夹具或 StaleStagedRow 回滚夹具占位"
         },
         {
           "source": "criterion",
@@ -1408,9 +1418,8 @@
         {
           "source": "criterion",
           "text": "/focus",
-          "ref": "a0_06_rejected_commit_restores_the_previous_commit",
+          "ref": "a_focus_on_an_unmounted_view_is_rejected",
           "evidence": [
-            "EVID-VAL-23",
             "EVID-VAL-49"
           ]
         },
@@ -1486,11 +1495,12 @@
         {
           "source": "evidence",
           "text": "注入 `InvalidGeneration`/`DuplicateKey` 后逐字段比对",
-          "ref": "a0_06_a_duplicate_key_is_a_value_error_that_keeps_the_frame_alive",
+          "ref": "a0_06_rejected_commit_restores_the_previous_commit",
           "evidence": [
             "EVID-VAL-23",
             "EVID-VAL-49"
-          ]
+          ],
+          "note": "夹具实际注入的是 StaleStagedRow（暂存同 key 的 update+remove），不是 Fatal::InvalidGeneration 变体；ADR-0017 决定 7 使旧 generation 成为值错误"
         },
         {
           "source": "evidence",
@@ -1507,7 +1517,7 @@
         "EVID-VAL-49",
         "EVID-VAL-24"
       ],
-      "closed": true
+      "closed": false
     },
     {
       "id": "SPEC-GATE-A0-07",
@@ -1570,29 +1580,15 @@
         },
         {
           "source": "evidence",
-          "text": "；两个消费者",
-          "ref": "second_consumer_shares_the_snapshot",
-          "evidence": [
-            "EVID-VAL-42",
-            "EVID-VAL-49"
-          ]
-        },
-        {
-          "source": "evidence",
-          "text": " String clones = 0",
-          "ref": "a0_07_binding_a_filter_clones_no_titles",
-          "evidence": [
-            "EVID-VAL-36",
-            "EVID-VAL-49"
-          ]
+          "text": "；两个消费者 String clones = 0",
+          "note": "待 Core 的两消费者夹具（string_clones 增量 = 0）；现有夹具断言三个 mount read，不能顶替"
         }
       ],
       "evidence": [
         "EVID-VAL-42",
-        "EVID-VAL-49",
-        "EVID-VAL-36"
+        "EVID-VAL-49"
       ],
-      "closed": true
+      "closed": false
     },
     {
       "id": "SPEC-GATE-A0-08",
@@ -1668,11 +1664,7 @@
         {
           "source": "criterion",
           "text": "/owner",
-          "ref": "a0_09_a_reorder_preserves_identity_and_moves_no_counter",
-          "evidence": [
-            "EVID-VAL-34",
-            "EVID-VAL-49"
-          ]
+          "note": "待 Core 的逐 (view, owner) 比对夹具；live_owner_ids() 集合在 owner 互换时仍相等"
         },
         {
           "source": "criterion",
@@ -1735,7 +1727,7 @@
         "EVID-VAL-34",
         "EVID-VAL-49"
       ],
-      "closed": true
+      "closed": false
     },
     {
       "id": "SPEC-GATE-A0-10",
@@ -1802,11 +1794,7 @@
         {
           "source": "evidence",
           "text": "reducer trace：每次焦点转移的原因与后继",
-          "ref": "a0_10_deleting_the_focused_row_settles_one_intent",
-          "evidence": [
-            "EVID-VAL-34",
-            "EVID-VAL-49"
-          ]
+          "note": "待 Core 在 txn 内记录结算三元组（cause/rule/target）并用单元测试断言；现有夹具只断言结果与计数"
         },
         {
           "source": "evidence",
@@ -1822,7 +1810,7 @@
         "EVID-VAL-34",
         "EVID-VAL-49"
       ],
-      "closed": true
+      "closed": false
     },
     {
       "id": "SPEC-GATE-A0-11",
@@ -2576,12 +2564,12 @@
   ],
   "coverage": {
     "criteriaTotal": 42,
-    "criteriaClosed": 11,
+    "criteriaClosed": 6,
     "criteriaSpec": 0,
     "criteriaProbe": 12,
     "criteriaOpen": 30,
     "criteriaWithdrawn": 0,
-    "note": "四状态词构成划分（criteriaSpec + criteriaProbe + criteriaOpen + criteriaWithdrawn = criteriaTotal）；criteriaClosed 单独报告且 criteriaClosed ≤ criteriaProbe。closed 由 criteria[].obligations[] 按 ADR-0024 计算，不可手填。A0 的 11 条判据全部 closed；gate 汇总状态不由谓词改写，仍为 OPEN。"
+    "note": "四状态词构成划分（criteriaSpec + criteriaProbe + criteriaOpen + criteriaWithdrawn = criteriaTotal）；criteriaClosed 单独报告且 criteriaClosed ≤ criteriaProbe。closed 由 criteria[].obligations[] 按 ADR-0024 计算，不可手填。A0 现有 6 条 closed；A0-05/-06/-07/-09/-10 各有一条约义务等待 Core 的夹具，故为 false。gate 汇总状态不由谓词改写，仍为 OPEN。"
   },
   "counts": {
     "testsPassedH2": 808,
