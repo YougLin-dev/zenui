@@ -192,8 +192,8 @@ fn a0_06_rejected_commit_restores_the_previous_commit() {
 
     // `SPEC-GATE-A0-06` asks for an `InvalidGeneration` injection. Under
     // ADR-0017 decision 7 a stale handle is a *value* error, so the frame
-    // commits and the injection is pinned by "the rejected write leaves the
-    // authority identical", not by a rollback.
+    // commits and the injection is pinned by a field-by-field comparison of
+    // the authority before and after, not by a rollback.
     let doomed_row: RowId = runtime.frame(|tx| tx.insert("Z")).expect("insert Z");
     runtime
         .frame(|tx| {
@@ -201,6 +201,7 @@ fn a0_06_rejected_commit_restores_the_previous_commit() {
             Ok(())
         })
         .expect("remove Z");
+    let before_stale = authority(&runtime);
     runtime
         .frame(|tx| {
             let rejected = tx.toggle(doomed_row);
@@ -211,6 +212,37 @@ fn a0_06_rejected_commit_restores_the_previous_commit() {
             Ok(())
         })
         .expect("the frame still commits");
+    let mut after_stale = authority(&runtime);
+    // The frame commits, so the two monotonic counters are the only state
+    // fields allowed to move. `published` records the commit's changed keys:
+    // a rejected write publishes none, so its values are compared first and
+    // the journal entry is then normalised away.
+    assert_eq!(
+        after_stale
+            .published
+            .as_ref()
+            .map(|snapshot| snapshot.1.clone()),
+        before_stale
+            .published
+            .as_ref()
+            .map(|snapshot| snapshot.1.clone()),
+        "the published snapshot values must not move"
+    );
+    assert_eq!(
+        after_stale
+            .published
+            .as_ref()
+            .map(|snapshot| snapshot.0.len()),
+        Some(0),
+        "a rejected write publishes no changed keys"
+    );
+    after_stale.commits = before_stale.commits;
+    after_stale.publications = before_stale.publications;
+    after_stale.published = before_stale.published.clone();
+    assert_eq!(
+        before_stale, after_stale,
+        "a rejected stale generation must not move any authority field"
+    );
     assert_eq!(
         runtime.committed().len(),
         3,

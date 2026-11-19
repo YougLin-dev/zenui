@@ -1416,7 +1416,8 @@
           "evidence": [
             "EVID-VAL-23",
             "EVID-VAL-49"
-          ]
+          ],
+          "note": "preflight 拒绝的是同 key 的 update+remove（Fatal::StaleStagedRow），不是 duplicate-key 值错误；后者按 ADR-0017 决定 7 是调用点值错误"
         },
         {
           "source": "criterion",
@@ -1511,7 +1512,8 @@
           "evidence": [
             "EVID-VAL-23",
             "EVID-VAL-49"
-          ]
+          ],
+          "note": "旧 generation 以 stale handle 注入（ADR-0017 决定 7：值错误）；夹具在帧后做 before/after Authority 全字段比较，只归一 commits/publications"
         },
         {
           "source": "evidence",
@@ -1519,7 +1521,8 @@
           "ref": "a0_06_a_duplicate_key_leaves_every_authority_field_identical",
           "evidence": [
             "EVID-VAL-50"
-          ]
+          ],
+          "note": "注入 duplicate key 后做 before/after Authority 全字段比较，只归一 commits/publications"
         },
         {
           "source": "evidence",
