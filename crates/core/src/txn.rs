@@ -2452,4 +2452,126 @@ mod tests {
             "a refused commit publishes nothing"
         );
     }
+
+    // ---- SPEC-GATE-A0-10: the two settlement branches without a witness -----
+
+    /// `SPEC-GATE-A0-10`: "a next sibling that is no longer affected must not be
+    /// settled onto" — with the next sibling unmounted in the same frame, the
+    /// settlement must fall through to `Previous`.
+    ///
+    /// Red-ability: turn `let next = intent.next.filter(|view| self.views.is_live(*view));`
+    /// into `let next = intent.next;` and the settlement records `Next` with a
+    /// dead target; the pointer then lands nowhere, the trailing dead-pointer
+    /// guard clears focus, and both the tuple and the `focused` assertion fail.
+    #[test]
+    fn a0_10_settlement_skips_a_next_sibling_unmounted_in_the_same_frame() {
+        let mut runtime = Runtime::new();
+        runtime
+            .frame(|tx| {
+                tx.insert("A")?;
+                tx.insert("B")?;
+                tx.insert("C")?;
+                Ok(())
+            })
+            .expect("seed");
+        let views = mount_all(&mut runtime);
+        runtime
+            .frame(|tx| {
+                tx.focus(views[1])?;
+                Ok(())
+            })
+            .expect("focus B");
+
+        let before = runtime.txn().focus_settlements().len();
+        runtime
+            .frame(|tx| {
+                // B and its next sibling C both leave the tree.
+                tx.unmount(views[1])?;
+                tx.unmount(views[2])?;
+                Ok(())
+            })
+            .expect("unmount B and C");
+
+        assert_eq!(
+            runtime.txn().focus_settlements().len(),
+            before + 1,
+            "exactly one settlement"
+        );
+        assert_eq!(
+            last_settlement(&runtime),
+            (
+                FocusSettlementCause::Unmount,
+                FocusSettlementRule::Previous,
+                Some(views[0])
+            ),
+            "a dead next sibling must be skipped, not reported"
+        );
+        assert_eq!(
+            runtime.focused(),
+            Some(views[0]),
+            "focus lands on the surviving previous sibling"
+        );
+    }
+
+    /// `SPEC-GATE-A0-10`: a bulk clear that removes every candidate settles to
+    /// `Cleared` with no target, once, and names the clear as the cause.
+    ///
+    /// Red-ability: map `(None, None)` to any other rule (`Next` or `Previous`)
+    /// and the exact-slice assertion fails; drop the settlement push and the
+    /// count assertion fails. The `focused().is_none()` half is a result
+    /// assertion, not the witness for the arm's own `clear_focus()`: the
+    /// trailing dead-pointer guard would clear the pointer even if the arm
+    /// omitted it, so this fixture does not depend on that redundancy.
+    #[test]
+    fn a0_10_a_bulk_clear_with_no_live_candidate_records_cleared() {
+        let mut runtime = Runtime::new();
+        let (a, b, _c) = runtime
+            .frame(|tx| Ok((tx.insert("A")?, tx.insert("B")?, tx.insert("C")?)))
+            .expect("seed");
+        let views = mount_all(&mut runtime);
+        for row in [a, b] {
+            runtime
+                .frame(|tx| {
+                    tx.set_completed(row, true).map_err(|_| Fatal::Aborted)?;
+                    Ok(())
+                })
+                .expect("complete a row");
+        }
+        runtime
+            .frame(|tx| {
+                tx.focus(views[0])?;
+                Ok(())
+            })
+            .expect("focus A");
+
+        let before = runtime.txn().focus_settlements().len();
+        runtime
+            .frame(|tx| {
+                tx.clear_completed()?;
+                for view in &views[..2] {
+                    tx.unmount(*view)?;
+                }
+                Ok(())
+            })
+            .expect("clear");
+
+        assert_eq!(
+            runtime.txn().focus_settlements().len(),
+            before + 1,
+            "one settlement for the clear, not one per removed row"
+        );
+        assert_eq!(
+            last_settlement(&runtime),
+            (
+                FocusSettlementCause::BulkClear,
+                FocusSettlementRule::Cleared,
+                None
+            ),
+            "every candidate is gone, so the rule is Cleared and the target is none"
+        );
+        assert!(
+            runtime.focused().is_none(),
+            "no candidate survives the clear"
+        );
+    }
 }
