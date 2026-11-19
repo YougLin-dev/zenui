@@ -270,3 +270,48 @@ fn a_frame_reads_its_own_staged_writes() {
         vec!["B", "C"]
     );
 }
+
+#[test]
+fn the_committed_query_cache_is_readable_outside_a_frame() {
+    let mut runtime = Runtime::new();
+    seed(&mut runtime, &["A", "B", "C"]);
+    let b = key_of(&runtime, "B");
+
+    let before = runtime.counters();
+    let first = runtime.rows(Filter::All);
+    let second = runtime.rows(Filter::All);
+    assert!(first.shares_with(&second), "consumers share one projection");
+    assert_eq!(delta(&runtime, before).query_evals, 1);
+
+    let active = runtime.rows(Filter::Active);
+    runtime
+        .frame(|tx| {
+            let handle = tx.handle_for(b).expect("row B");
+            tx.set_completed(handle, true).map_err(|_| Fatal::Aborted)?;
+            Ok(())
+        })
+        .expect("complete B");
+    let after_hiding = runtime.rows(Filter::Active);
+    assert_eq!(active.len(), 3);
+    assert_eq!(after_hiding.len(), 2, "B leaves the active filter");
+
+    runtime
+        .frame(|tx| {
+            let handle = tx.handle_for(b).expect("row B");
+            tx.set_completed(handle, false)
+                .map_err(|_| Fatal::Aborted)?;
+            Ok(())
+        })
+        .expect("reactivate B");
+    let returned = runtime.rows(Filter::Active);
+    assert_eq!(returned.len(), 3);
+    assert!(
+        returned.iter().any(|key| key == b),
+        "the candidate row returns to the active filter"
+    );
+    assert_eq!(
+        delta(&runtime, before).query_evals,
+        4,
+        "All builds once and Active rebuilds on each membership move"
+    );
+}

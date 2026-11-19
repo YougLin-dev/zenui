@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/core", "crates/app"]
+members = ["crates/core", "crates/app", "crates/macro"]
 resolver = "3"
 
 [package]
@@ -10,3 +10,9 @@ autoexamples = false
 publish = false
 
 [dependencies]
+zenui-core = { path = "crates/core" }
+zenui-macro = { path = "crates/macro" }
+
+[[example]]
+name = "minimal_todo"
+path = "examples/minimal_todo.rs"

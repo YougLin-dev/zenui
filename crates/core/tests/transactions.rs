@@ -654,3 +654,25 @@ fn a_title_write_is_committed_and_rejects_a_stale_handle() {
         .expect("frame");
     assert_eq!(runtime.committed().len(), 0);
 }
+
+#[test]
+fn key_of_rejects_a_removed_handle() {
+    let mut runtime = Runtime::new();
+    let row: RowId = runtime.frame(|tx| tx.insert("A")).expect("insert");
+    runtime
+        .frame(|tx| {
+            tx.remove(row).map_err(|_| Fatal::Aborted)?;
+            Ok(())
+        })
+        .expect("remove");
+
+    runtime
+        .frame(|tx| {
+            assert!(
+                matches!(tx.key_of(row), Err(ValueError::Handle(_))),
+                "a removed handle has no stable key"
+            );
+            Ok(())
+        })
+        .expect("frame");
+}

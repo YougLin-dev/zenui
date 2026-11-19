@@ -1,0 +1,1150 @@
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet};
+use std::rc::Rc;
+use std::sync::atomic::{AtomicU32, Ordering};
+
+use zenui_core::{Counters, RowSet};
+
+use crate::context::{self, ContextFault, DepKey, Phase, with_state};
+use crate::signal::{Memo, MemoCell, SignalCell};
+use crate::store::{TodoId, WriteError};
+use crate::view::{
+    Attr, AttrValue, ChildrenFactory, Event, Key, KeyEvent, MountError, MountPlan, MountResult,
+    PlanNode, ResultBoolValue, SubmitEvent, TextSlot,
+};
+
+pub(crate) enum Resource {
+    Signal(u32),
+    Memo(u32),
+    Event(usize),
+}
+
+pub(crate) struct OwnerRecord {
+    parent: Option<u32>,
+    children: Vec<u32>,
+    resources: Vec<Resource>,
+    disposed: bool,
+}
+
+static NEXT_RUNTIME: AtomicU32 = AtomicU32::new(1);
+
+pub(crate) struct State {
+    pub(crate) id: u32,
+    pub(crate) read_only: u32,
+    pub(crate) write_error: Option<WriteError>,
+    pub(crate) core: zenui_core::Runtime,
+    pub(crate) phase: Phase,
+    pub(crate) fault: Option<ContextFault>,
+    pub(crate) signals: Vec<SignalCell>,
+    pub(crate) memos: Vec<MemoCell>,
+    pub(crate) reverse: BTreeMap<DepKey, BTreeSet<u32>>,
+    pub(crate) computing: Vec<(u32, Vec<DepKey>)>,
+    pub(crate) once_reads: u64,
+    owners: BTreeMap<u32, OwnerRecord>,
+    next_owner: u32,
+    current_owner: Option<u32>,
+    events: Vec<Event>,
+    elements: Vec<MountedElement>,
+    components: Vec<MountedComponent>,
+    tree: Option<Vec<MountedNode>>,
+    setup_counts: BTreeMap<&'static str, u64>,
+    next_instance: u64,
+    unmounts: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ItemInfo {
+    pub todo: TodoId,
+    pub instance: u64,
+    pub owner: u32,
+}
+
+impl State {
+    fn new() -> Self {
+        let mut owners = BTreeMap::new();
+        owners.insert(
+            0,
+            OwnerRecord {
+                parent: None,
+                children: Vec::new(),
+                resources: Vec::new(),
+                disposed: false,
+            },
+        );
+        Self {
+            id: NEXT_RUNTIME.fetch_add(1, Ordering::Relaxed),
+            read_only: 0,
+            write_error: None,
+            core: zenui_core::Runtime::new(),
+            phase: Phase::Idle,
+            fault: None,
+            signals: Vec::new(),
+            memos: Vec::new(),
+            reverse: BTreeMap::new(),
+            computing: Vec::new(),
+            once_reads: 0,
+            owners,
+            next_owner: 1,
+            current_owner: None,
+            events: Vec::new(),
+            elements: Vec::new(),
+            components: Vec::new(),
+            tree: None,
+            setup_counts: BTreeMap::new(),
+            next_instance: 1,
+            unmounts: 0,
+        }
+    }
+
+    pub(crate) fn attach_to_owner(&mut self, resource: Resource) {
+        if let Some(owner) = self.current_owner
+            && let Some(record) = self.owners.get_mut(&owner)
+        {
+            record.resources.push(resource);
+        }
+    }
+
+    fn create_owner(&mut self, parent: Option<u32>) -> u32 {
+        let id = self.next_owner;
+        self.next_owner += 1;
+        self.owners.insert(
+            id,
+            OwnerRecord {
+                parent,
+                children: Vec::new(),
+                resources: Vec::new(),
+                disposed: false,
+            },
+        );
+        if let Some(parent) = parent
+            && let Some(record) = self.owners.get_mut(&parent)
+        {
+            record.children.push(id);
+        }
+        id
+    }
+
+    /// 先释放本 Owner 的订阅/信号/Memo/事件，再递归释放子 Owner；
+    /// 这样已卸载分支的旧回调不会命中新一代界面。
+    fn dispose_owner(&mut self, id: u32) {
+        let Some(record) = self.owners.get_mut(&id) else {
+            return;
+        };
+        if record.disposed {
+            return;
+        }
+        record.disposed = true;
+        let children = record.children.clone();
+        let resources = std::mem::take(&mut record.resources);
+        let parent = record.parent;
+
+        self.release_resources(resources);
+        for child in children {
+            self.dispose_owner(child);
+        }
+        if let Some(parent) = parent
+            && let Some(record) = self.owners.get_mut(&parent)
+        {
+            record.children.retain(|child| *child != id);
+        }
+    }
+
+    fn release_resources(&mut self, resources: Vec<Resource>) {
+        for resource in resources {
+            match resource {
+                Resource::Signal(signal) => {
+                    if let Some(cell) = self.signals.get_mut(signal as usize) {
+                        cell.disposed = true;
+                    }
+                }
+                Resource::Memo(memo) => {
+                    if let Some(cell) = self.memos.get_mut(memo as usize) {
+                        cell.disposed = true;
+                        cell.compute = None;
+                        cell.value = None;
+                        cell.dirty = true;
+                    }
+                }
+                Resource::Event(event) => {
+                    if let Some(cell) = self.events.get_mut(event) {
+                        *cell = Event::Click(Box::new(|| {}));
+                    }
+                }
+            }
+        }
+    }
+
+    fn release_root_resources(&mut self) {
+        let resources = self
+            .owners
+            .get_mut(&0)
+            .map(|record| std::mem::take(&mut record.resources))
+            .unwrap_or_default();
+        self.release_resources(resources);
+    }
+
+    fn context_error(fault: ContextFault) -> MountError {
+        MountError::Context {
+            operation: fault.operation,
+            phase: fault.phase,
+        }
+    }
+
+    fn find_element(&self, target: &FindTarget) -> Option<usize> {
+        self.tree
+            .as_ref()
+            .and_then(|tree| find_element(self, tree, target))
+    }
+
+    /// handler 在 State 借用之外执行，因此先用占位事件换出，调用后再放回原槽位。
+    fn take_event(&mut self, kind: EventKind, target: &FindTarget) -> Option<(usize, Event)> {
+        let element = self.find_element(target)?;
+        let event = self.elements[element]
+            .events
+            .iter()
+            .copied()
+            .find(|id| event_kind(&self.events[*id]) == kind)?;
+        Some((
+            event,
+            std::mem::replace(&mut self.events[event], Event::Click(Box::new(|| {}))),
+        ))
+    }
+
+    fn put_event(&mut self, id: usize, event: Event) {
+        self.events[id] = event;
+    }
+
+    fn update_local(&mut self, target: &FindTarget, value: LocalUpdate) {
+        if let Some(element) = self.find_element(target) {
+            match (&mut self.elements[element].local, value) {
+                (LocalState::TextInput { caret, selection }, LocalUpdate::Input(value)) => {
+                    *caret = value.chars().count();
+                    *selection = None;
+                }
+                (LocalState::Checkbox { checked }, LocalUpdate::Change(value)) => {
+                    *checked = value;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn text_input(&self, target: &FindTarget) -> Option<usize> {
+        let element = self.find_element(target)?;
+        match self.elements[element].local {
+            LocalState::TextInput { caret, .. } => Some(caret),
+            _ => None,
+        }
+    }
+
+    fn set_text_input_caret(&mut self, target: &FindTarget, offset: usize) -> bool {
+        let Some(element) = self.find_element(target) else {
+            return false;
+        };
+        if let LocalState::TextInput { caret, selection } = &mut self.elements[element].local {
+            *caret = offset;
+            *selection = Some((offset, offset));
+            true
+        } else {
+            false
+        }
+    }
+}
+
+pub enum MountedNode {
+    Text(MountedText),
+    Element(usize),
+    Component(usize),
+    Show(MountedShow),
+    For(MountedFor),
+}
+
+pub struct MountedText {
+    slot: TextSlot,
+    value: String,
+}
+
+pub struct MountedElement {
+    owner: u32,
+    attrs: Vec<MountedAttr>,
+    events: Vec<usize>,
+    local: LocalState,
+    children: Vec<MountedNode>,
+}
+
+pub struct MountedAttr {
+    name: &'static str,
+    value: AttrValue,
+    current: Option<AttrCurrent>,
+}
+
+#[derive(Clone)]
+enum AttrCurrent {
+    Text(String),
+    Bool(bool),
+}
+
+enum LocalState {
+    None,
+    TextInput {
+        caret: usize,
+        selection: Option<(usize, usize)>,
+    },
+    Checkbox {
+        checked: bool,
+    },
+}
+
+enum LocalUpdate {
+    Input(String),
+    Change(bool),
+}
+
+pub struct MountedComponent {
+    owner: u32,
+    children: Vec<MountedNode>,
+}
+
+pub struct MountedShow {
+    owner: u32,
+    when: Memo<bool>,
+    then: ChildrenFactory,
+    fallback: Option<ChildrenFactory>,
+    active: Option<MountedBranch>,
+}
+
+pub struct MountedBranch {
+    which: bool,
+    owner: u32,
+    children: Vec<MountedNode>,
+}
+
+pub struct MountedFor {
+    owner: u32,
+    each: Memo<RowSet>,
+    key: Box<dyn Fn(TodoId) -> TodoId>,
+    item: Box<dyn Fn(TodoId) -> MountResult<MountPlan>>,
+    items: BTreeMap<TodoId, MountedItem>,
+    order: Vec<TodoId>,
+}
+
+pub struct MountedItem {
+    owner: u32,
+    todo: TodoId,
+    instance: u64,
+    children: Vec<MountedNode>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EventKind {
+    Click,
+    Input,
+    Change,
+    Submit,
+    KeyDown,
+}
+
+fn event_kind(event: &Event) -> EventKind {
+    match event {
+        Event::Click(_) => EventKind::Click,
+        Event::Input(_) => EventKind::Input,
+        Event::Change(_) => EventKind::Change,
+        Event::Submit(_) => EventKind::Submit,
+        Event::KeyDown(_) => EventKind::KeyDown,
+    }
+}
+
+enum FindTarget {
+    Label(String),
+    Text(String),
+}
+
+/// factory 在挂载期间创建的资源归 slot/分支自己的 Owner，而不是上一个组件。
+fn with_owner<R>(owner: u32, f: impl FnOnce() -> R) -> R {
+    let previous = with_state(|state| {
+        let previous = state.current_owner;
+        state.current_owner = Some(owner);
+        previous
+    });
+    let result = f();
+    with_state(|state| state.current_owner = previous);
+    result
+}
+
+fn find_element(state: &State, nodes: &[MountedNode], target: &FindTarget) -> Option<usize> {
+    for node in nodes {
+        match node {
+            MountedNode::Text(_) => {}
+            MountedNode::Element(id) => {
+                let element = &state.elements[*id];
+                let matches = match target {
+                    FindTarget::Label(label) => element
+                        .attrs
+                        .iter()
+                        .find(|attr| attr.name == "aria:label")
+                        .and_then(|attr| attr.current.as_ref())
+                        .is_some_and(
+                            |current| matches!(current, AttrCurrent::Text(text) if text == label),
+                        ),
+                    FindTarget::Text(text) => element.children.iter().any(
+                        |child| matches!(child, MountedNode::Text(node) if node.value == *text),
+                    ),
+                };
+                if matches {
+                    return Some(*id);
+                }
+                if let Some(found) = find_element(state, &element.children, target) {
+                    return Some(found);
+                }
+            }
+            MountedNode::Component(id) => {
+                if let Some(found) = find_element(state, &state.components[*id].children, target) {
+                    return Some(found);
+                }
+            }
+            MountedNode::Show(show) => {
+                if let Some(branch) = &show.active
+                    && let Some(found) = find_element(state, &branch.children, target)
+                {
+                    return Some(found);
+                }
+            }
+            MountedNode::For(for_node) => {
+                for key in &for_node.order {
+                    if let Some(item) = for_node.items.get(key)
+                        && let Some(found) = find_element(state, &item.children, target)
+                    {
+                        return Some(found);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+pub struct Runtime {
+    state: Rc<RefCell<State>>,
+}
+
+impl Runtime {
+    pub fn new() -> Self {
+        Self {
+            state: Rc::new(RefCell::new(State::new())),
+        }
+    }
+
+    pub fn mount(
+        &mut self,
+        root: impl FnOnce() -> MountResult<MountPlan> + 'static,
+    ) -> Result<(), MountError> {
+        if self.state.borrow().tree.is_some() {
+            return Err(MountError::Component("root is already mounted"));
+        }
+        let state = self.state.clone();
+        context::install(&state, || {
+            let plan = match with_owner(0, root) {
+                Ok(plan) => plan,
+                Err(error) => {
+                    with_state(State::release_root_resources);
+                    return Err(error);
+                }
+            };
+            let mut tree = match self.mount_plan(plan, 0) {
+                Ok(tree) => tree,
+                Err(error) => {
+                    with_state(State::release_root_resources);
+                    return Err(error);
+                }
+            };
+            if let Some(fault) = with_state(|state| state.fault.take()) {
+                self.release_nodes(&mut tree);
+                return Err(State::context_error(fault));
+            }
+            with_state(|state| {
+                state.tree = Some(tree);
+                state.phase = Phase::Idle;
+            });
+            self.refresh()
+        })
+    }
+
+    pub fn refresh(&mut self) -> Result<(), MountError> {
+        let state = self.state.clone();
+        context::install(&state, || {
+            let Some(mut tree) = with_state(|state| {
+                state.fault = None;
+                state.phase = Phase::Binding;
+                state.tree.take()
+            }) else {
+                return Err(MountError::Component("root is not mounted"));
+            };
+            let result = self.refresh_nodes(&mut tree);
+            let fault = with_state(|state| {
+                state.tree = Some(tree);
+                state.phase = Phase::Idle;
+                state.fault
+            });
+            result?;
+            if let Some(fault) = fault {
+                return Err(State::context_error(fault));
+            }
+            Ok(())
+        })
+    }
+
+    fn mount_plan(&mut self, plan: MountPlan, parent: u32) -> Result<Vec<MountedNode>, MountError> {
+        let mut nodes = Vec::with_capacity(plan.nodes.len());
+        for node in plan.nodes {
+            let result = match node {
+                PlanNode::Children(children) => with_owner(parent, || children.mount())
+                    .and_then(|plan| self.mount_plan(plan, parent)),
+                PlanNode::Factory(factory) => with_owner(parent, || factory.mount())
+                    .and_then(|plan| self.mount_plan(plan, parent)),
+                node => self.mount_node(node, parent).map(|node| vec![node]),
+            };
+            match result {
+                Ok(mut mounted) => nodes.append(&mut mounted),
+                Err(error) => {
+                    self.release_nodes(&mut nodes);
+                    return Err(error);
+                }
+            }
+        }
+        Ok(nodes)
+    }
+
+    fn mount_node(&mut self, node: PlanNode, parent: u32) -> Result<MountedNode, MountError> {
+        match node {
+            PlanNode::Text(slot) => Ok(MountedNode::Text(MountedText {
+                value: String::new(),
+                slot,
+            })),
+            PlanNode::Children(_) | PlanNode::Factory(_) => {
+                unreachable!("slots are spliced by mount_plan")
+            }
+            PlanNode::Element(plan) => {
+                let owner = with_state(|state| state.create_owner(Some(parent)));
+                let children = match self.mount_plan(MountPlan::new(plan.children), owner) {
+                    Ok(children) => children,
+                    Err(error) => {
+                        with_state(|state| state.dispose_owner(owner));
+                        return Err(error);
+                    }
+                };
+                let tag = plan.tag;
+                let id = with_state(|state| {
+                    let mut attrs = Vec::new();
+                    let mut events = Vec::new();
+                    for attr in plan.attrs {
+                        match attr {
+                            Attr::Value { name, value } => attrs.push(MountedAttr {
+                                name,
+                                value,
+                                current: None,
+                            }),
+                            Attr::Event(event) => {
+                                let id = state.events.len();
+                                state.events.push(event);
+                                events.push(id);
+                                if let Some(record) = state.owners.get_mut(&owner) {
+                                    record.resources.push(Resource::Event(id));
+                                }
+                            }
+                        }
+                    }
+                    let local = match tag {
+                        "text-input" => LocalState::TextInput {
+                            caret: 0,
+                            selection: None,
+                        },
+                        "checkbox" => LocalState::Checkbox { checked: false },
+                        _ => LocalState::None,
+                    };
+                    let id = state.elements.len();
+                    state.elements.push(MountedElement {
+                        owner,
+                        attrs,
+                        events,
+                        local,
+                        children,
+                    });
+                    id
+                });
+                Ok(MountedNode::Element(id))
+            }
+            PlanNode::Component(plan) => {
+                let label = plan.label;
+                let owner = with_state(|state| state.create_owner(Some(parent)));
+                let previous = with_state(|state| {
+                    let previous = (state.current_owner, state.phase);
+                    state.current_owner = Some(owner);
+                    state.phase = Phase::Setup;
+                    previous
+                });
+                let mounted = (plan.mount)();
+                let fault = with_state(|state| {
+                    state.current_owner = previous.0;
+                    state.phase = previous.1;
+                    state.fault.take()
+                });
+                let plan = match mounted {
+                    Ok(plan) => plan,
+                    Err(error) => {
+                        with_state(|state| state.dispose_owner(owner));
+                        return Err(error);
+                    }
+                };
+                if let Some(fault) = fault {
+                    with_state(|state| state.dispose_owner(owner));
+                    return Err(State::context_error(fault));
+                }
+                let children = match self.mount_plan(plan, owner) {
+                    Ok(children) => children,
+                    Err(error) => {
+                        with_state(|state| state.dispose_owner(owner));
+                        return Err(error);
+                    }
+                };
+                let id = with_state(|state| {
+                    *state.setup_counts.entry(label).or_default() += 1;
+                    let id = state.components.len();
+                    state.components.push(MountedComponent { owner, children });
+                    id
+                });
+                Ok(MountedNode::Component(id))
+            }
+            PlanNode::Show(plan) => {
+                let owner = with_state(|state| state.create_owner(Some(parent)));
+                let mut node = MountedShow {
+                    owner,
+                    when: plan.when,
+                    then: plan.then,
+                    fallback: plan.fallback,
+                    active: None,
+                };
+                if let Err(error) = self.refresh_show(&mut node) {
+                    with_state(|state| state.dispose_owner(owner));
+                    return Err(error);
+                }
+                Ok(MountedNode::Show(node))
+            }
+            PlanNode::For(plan) => {
+                let owner = with_state(|state| state.create_owner(Some(parent)));
+                let mut node = MountedFor {
+                    owner,
+                    each: plan.each,
+                    key: plan.key,
+                    item: plan.item,
+                    items: BTreeMap::new(),
+                    order: Vec::new(),
+                };
+                if let Err(error) = self.refresh_for(&mut node) {
+                    with_state(|state| state.dispose_owner(owner));
+                    return Err(error);
+                }
+                Ok(MountedNode::For(node))
+            }
+        }
+    }
+
+    fn release_nodes(&mut self, nodes: &mut Vec<MountedNode>) {
+        let nodes = std::mem::take(nodes);
+        for node in nodes {
+            let owner = with_state(|state| match node {
+                MountedNode::Text(_) => None,
+                MountedNode::Element(id) => Some(state.elements[id].owner),
+                MountedNode::Component(id) => Some(state.components[id].owner),
+                MountedNode::Show(show) => Some(show.owner),
+                MountedNode::For(for_node) => Some(for_node.owner),
+            });
+            if let Some(owner) = owner {
+                with_state(|state| {
+                    state.dispose_owner(owner);
+                    state.unmounts += 1;
+                });
+            }
+        }
+    }
+
+    fn refresh_nodes(&mut self, nodes: &mut [MountedNode]) -> Result<(), MountError> {
+        for node in nodes {
+            self.refresh_node(node)?;
+        }
+        Ok(())
+    }
+
+    fn refresh_node(&mut self, node: &mut MountedNode) -> Result<(), MountError> {
+        match node {
+            MountedNode::Text(text) => {
+                text.value = text.slot.evaluate();
+                Ok(())
+            }
+            MountedNode::Element(id) => {
+                self.refresh_element(*id);
+                let mut children =
+                    with_state(|state| std::mem::take(&mut state.elements[*id].children));
+                let result = self.refresh_nodes(&mut children);
+                with_state(|state| state.elements[*id].children = children);
+                result
+            }
+            MountedNode::Component(id) => {
+                let mut children =
+                    with_state(|state| std::mem::take(&mut state.components[*id].children));
+                let result = self.refresh_nodes(&mut children);
+                with_state(|state| state.components[*id].children = children);
+                result
+            }
+            MountedNode::Show(show) => self.refresh_show(show),
+            MountedNode::For(for_node) => self.refresh_for(for_node),
+        }
+    }
+
+    fn refresh_element(&mut self, id: usize) {
+        let mut attrs = with_state(|state| std::mem::take(&mut state.elements[id].attrs));
+        for attr in &mut attrs {
+            attr.current = match &attr.value {
+                AttrValue::Text(slot) => Some(AttrCurrent::Text(slot.evaluate())),
+                AttrValue::Bool(slot) => Some(AttrCurrent::Bool(slot.evaluate())),
+                AttrValue::ResultBool(ResultBoolValue::Field(field)) => {
+                    field.get().ok().map(AttrCurrent::Bool)
+                }
+                AttrValue::ResultBool(ResultBoolValue::Memo(memo)) => {
+                    memo.get().ok().map(AttrCurrent::Bool)
+                }
+            };
+        }
+        with_state(|state| {
+            let element = &mut state.elements[id];
+            if let LocalState::Checkbox { checked } = &mut element.local
+                && let Some(AttrCurrent::Bool(value)) = attrs
+                    .iter()
+                    .find(|attr| attr.name == "checked")
+                    .and_then(|attr| attr.current.clone())
+            {
+                *checked = value;
+            }
+            element.attrs = attrs;
+        });
+    }
+
+    fn refresh_show(&mut self, show: &mut MountedShow) -> Result<(), MountError> {
+        let active = show.when.get();
+        let wanted = if active {
+            Some(true)
+        } else if show.fallback.is_some() {
+            Some(false)
+        } else {
+            None
+        };
+        if show.active.as_ref().map(|branch| branch.which) == wanted {
+            if let Some(branch) = &mut show.active {
+                return self.refresh_nodes(&mut branch.children);
+            }
+            return Ok(());
+        }
+
+        let replacement = match wanted {
+            Some(which) => {
+                let owner = with_state(|state| state.create_owner(Some(show.owner)));
+                let factory = if which {
+                    &show.then
+                } else {
+                    show.fallback.as_ref().expect("fallback is present")
+                };
+                let plan = match with_owner(owner, || factory.mount()) {
+                    Ok(plan) => plan,
+                    Err(error) => {
+                        with_state(|state| state.dispose_owner(owner));
+                        return Err(error);
+                    }
+                };
+                let children = match self.mount_plan(plan, owner) {
+                    Ok(children) => children,
+                    Err(error) => {
+                        with_state(|state| state.dispose_owner(owner));
+                        return Err(error);
+                    }
+                };
+                Some(MountedBranch {
+                    which,
+                    owner,
+                    children,
+                })
+            }
+            None => None,
+        };
+
+        if let Some(branch) = show.active.take() {
+            with_state(|state| {
+                state.dispose_owner(branch.owner);
+                state.unmounts += 1;
+            });
+        }
+        show.active = replacement;
+        if let Some(branch) = &mut show.active {
+            self.refresh_nodes(&mut branch.children)?;
+        }
+        Ok(())
+    }
+
+    fn refresh_for(&mut self, for_node: &mut MountedFor) -> Result<(), MountError> {
+        let rows: RowSet = for_node.each.get();
+        let mut entries = Vec::with_capacity(rows.len());
+        let mut seen = BTreeSet::new();
+        for key in rows.iter() {
+            let todo = TodoId::from_key(key);
+            let mapped = (for_node.key)(todo);
+            if !seen.insert(mapped) {
+                return Err(MountError::DuplicateKey);
+            }
+            entries.push((mapped, todo));
+        }
+
+        let mut fresh = Vec::new();
+        for (mapped, todo) in &entries {
+            if for_node.items.contains_key(mapped) {
+                continue;
+            }
+            let owner = with_state(|state| state.create_owner(Some(for_node.owner)));
+            let plan = match with_owner(owner, || (for_node.item)(*todo)) {
+                Ok(plan) => plan,
+                Err(error) => {
+                    with_state(|state| state.dispose_owner(owner));
+                    self.release_items(&mut fresh);
+                    return Err(error);
+                }
+            };
+            let children = match self.mount_plan(plan, owner) {
+                Ok(children) => children,
+                Err(error) => {
+                    with_state(|state| state.dispose_owner(owner));
+                    self.release_items(&mut fresh);
+                    return Err(error);
+                }
+            };
+            let instance = with_state(|state| {
+                let instance = state.next_instance;
+                state.next_instance += 1;
+                instance
+            });
+            fresh.push((
+                *mapped,
+                MountedItem {
+                    owner,
+                    todo: *todo,
+                    instance,
+                    children,
+                },
+            ));
+        }
+
+        let keep: BTreeSet<TodoId> = entries.iter().map(|(mapped, _)| *mapped).collect();
+        let removed: Vec<TodoId> = for_node
+            .items
+            .keys()
+            .filter(|key| !keep.contains(key))
+            .copied()
+            .collect();
+        for key in removed {
+            if let Some(item) = for_node.items.remove(&key) {
+                with_state(|state| {
+                    state.dispose_owner(item.owner);
+                    state.unmounts += 1;
+                });
+            }
+        }
+        for (key, item) in fresh {
+            for_node.items.insert(key, item);
+        }
+        for_node.order = entries.iter().map(|(mapped, _)| *mapped).collect();
+        for item in for_node.items.values_mut() {
+            self.refresh_nodes(&mut item.children)?;
+        }
+        Ok(())
+    }
+
+    fn release_items(&mut self, items: &mut Vec<(TodoId, MountedItem)>) {
+        for (_, item) in items.drain(..) {
+            with_state(|state| {
+                state.dispose_owner(item.owner);
+                state.unmounts += 1;
+            });
+        }
+    }
+
+    pub fn click_text(&mut self, text: &str) -> Result<(), MountError> {
+        self.dispatch_click(FindTarget::Text(text.to_owned()))
+    }
+
+    pub fn click_label(&mut self, label: &str) -> Result<(), MountError> {
+        self.dispatch_click(FindTarget::Label(label.to_owned()))
+    }
+
+    fn dispatch_click(&mut self, target: FindTarget) -> Result<(), MountError> {
+        let state = self.state.clone();
+        context::install(&state, || {
+            let Some((event_id, mut event)) = with_state(|state| {
+                state.phase = Phase::Event;
+                state.fault = None;
+                state.write_error = None;
+                state.take_event(EventKind::Click, &target)
+            }) else {
+                return Err(MountError::Component("click target not found"));
+            };
+            if let Event::Click(handler) = &mut event {
+                handler();
+            }
+            with_state(|state| {
+                state.put_event(event_id, event);
+                state.phase = Phase::Idle;
+            });
+            self.finish_command()
+        })
+    }
+
+    pub fn input(&mut self, label: &str, value: &str) -> Result<(), MountError> {
+        let target = FindTarget::Label(label.to_owned());
+        let state = self.state.clone();
+        context::install(&state, || {
+            let Some((event_id, mut event)) = with_state(|state| {
+                state.phase = Phase::Event;
+                state.fault = None;
+                state.write_error = None;
+                state.update_local(&target, LocalUpdate::Input(value.to_owned()));
+                state.take_event(EventKind::Input, &target)
+            }) else {
+                return Err(MountError::Component("input target not found"));
+            };
+            if let Event::Input(handler) = &mut event {
+                handler(value.to_owned());
+            }
+            with_state(|state| {
+                state.put_event(event_id, event);
+                state.phase = Phase::Idle;
+            });
+            self.finish_command()
+        })
+    }
+
+    pub fn change(&mut self, label: &str, value: bool) -> Result<(), MountError> {
+        let target = FindTarget::Label(label.to_owned());
+        let state = self.state.clone();
+        context::install(&state, || {
+            let Some((event_id, mut event)) = with_state(|state| {
+                state.phase = Phase::Event;
+                state.fault = None;
+                state.write_error = None;
+                state.update_local(&target, LocalUpdate::Change(value));
+                state.take_event(EventKind::Change, &target)
+            }) else {
+                return Err(MountError::Component("change target not found"));
+            };
+            if let Event::Change(handler) = &mut event {
+                handler(value);
+            }
+            with_state(|state| {
+                state.put_event(event_id, event);
+                state.phase = Phase::Idle;
+            });
+            self.finish_command()
+        })
+    }
+
+    pub fn submit(&mut self, label: &str) -> Result<(), MountError> {
+        let target = FindTarget::Label(label.to_owned());
+        let state = self.state.clone();
+        context::install(&state, || {
+            let Some((event_id, mut event)) = with_state(|state| {
+                state.phase = Phase::Event;
+                state.fault = None;
+                state.write_error = None;
+                state.take_event(EventKind::Submit, &target)
+            }) else {
+                return Err(MountError::Component("submit target not found"));
+            };
+            if let Event::Submit(handler) = &mut event {
+                handler(SubmitEvent::default());
+            }
+            with_state(|state| {
+                state.put_event(event_id, event);
+                state.phase = Phase::Idle;
+            });
+            self.finish_command()
+        })
+    }
+
+    pub fn keydown(&mut self, label: &str, key: Key) -> Result<(), MountError> {
+        let target = FindTarget::Label(label.to_owned());
+        let state = self.state.clone();
+        context::install(&state, || {
+            let Some((event_id, mut event)) = with_state(|state| {
+                state.phase = Phase::Event;
+                state.fault = None;
+                state.write_error = None;
+                state.take_event(EventKind::KeyDown, &target)
+            }) else {
+                return Err(MountError::Component("keydown target not found"));
+            };
+            if let Event::KeyDown(handler) = &mut event {
+                handler(KeyEvent::new(key));
+            }
+            with_state(|state| {
+                state.put_event(event_id, event);
+                state.phase = Phase::Idle;
+            });
+            self.finish_command()
+        })
+    }
+
+    fn finish_command(&mut self) -> Result<(), MountError> {
+        let fault = with_state(|state| state.fault);
+        if let Some(fault) = fault {
+            return Err(State::context_error(fault));
+        }
+        let write_error = with_state(|state| state.write_error.take());
+        if let Some(error) = write_error {
+            return Err(MountError::Write(error));
+        }
+        self.refresh()
+    }
+
+    pub fn texts(&self) -> Vec<String> {
+        let state = self.state.borrow();
+        let mut texts = Vec::new();
+        if let Some(tree) = &state.tree {
+            collect_texts(&state, tree, &mut texts);
+        }
+        texts
+    }
+
+    pub fn for_items(&self) -> Vec<ItemInfo> {
+        let state = self.state.borrow();
+        let mut items = Vec::new();
+        if let Some(tree) = &state.tree {
+            collect_items(&state, tree, &mut items);
+        }
+        items
+    }
+
+    pub fn setup_count(&self, label: &str) -> u64 {
+        self.state
+            .borrow()
+            .setup_counts
+            .get(label)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    pub fn once_reads(&self) -> u64 {
+        self.state.borrow().once_reads
+    }
+
+    pub fn live_signals(&self) -> usize {
+        self.state
+            .borrow()
+            .signals
+            .iter()
+            .filter(|cell| !cell.disposed)
+            .count()
+    }
+
+    pub fn live_memos(&self) -> usize {
+        self.state
+            .borrow()
+            .memos
+            .iter()
+            .filter(|cell| !cell.disposed)
+            .count()
+    }
+
+    pub fn unmounts(&self) -> u64 {
+        self.state.borrow().unmounts
+    }
+
+    pub fn counters(&self) -> Counters {
+        self.state.borrow().core.counters()
+    }
+
+    pub fn caret(&self, label: &str) -> Option<usize> {
+        self.state
+            .borrow()
+            .text_input(&FindTarget::Label(label.to_owned()))
+    }
+
+    pub fn set_caret(&mut self, label: &str, offset: usize) -> bool {
+        self.state
+            .borrow_mut()
+            .set_text_input_caret(&FindTarget::Label(label.to_owned()), offset)
+    }
+
+    pub fn checked(&self, label: &str) -> Option<bool> {
+        let state = self.state.borrow();
+        let element = state.find_element(&FindTarget::Label(label.to_owned()))?;
+        match state.elements[element].local {
+            LocalState::Checkbox { checked } => Some(checked),
+            _ => None,
+        }
+    }
+}
+
+impl Default for Runtime {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn collect_texts(state: &State, nodes: &[MountedNode], texts: &mut Vec<String>) {
+    for node in nodes {
+        match node {
+            MountedNode::Text(text) => texts.push(text.value.clone()),
+            MountedNode::Element(id) => collect_texts(state, &state.elements[*id].children, texts),
+            MountedNode::Component(id) => {
+                collect_texts(state, &state.components[*id].children, texts);
+            }
+            MountedNode::Show(show) => {
+                if let Some(branch) = &show.active {
+                    collect_texts(state, &branch.children, texts);
+                }
+            }
+            MountedNode::For(for_node) => {
+                for key in &for_node.order {
+                    if let Some(item) = for_node.items.get(key) {
+                        collect_texts(state, &item.children, texts);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn collect_items(state: &State, nodes: &[MountedNode], items: &mut Vec<ItemInfo>) {
+    for node in nodes {
+        match node {
+            MountedNode::Text(_) => {}
+            MountedNode::Element(id) => {
+                collect_items(state, &state.elements[*id].children, items);
+            }
+            MountedNode::Component(id) => {
+                collect_items(state, &state.components[*id].children, items);
+            }
+            MountedNode::Show(show) => {
+                if let Some(branch) = &show.active {
+                    collect_items(state, &branch.children, items);
+                }
+            }
+            MountedNode::For(for_node) => {
+                for key in &for_node.order {
+                    if let Some(item) = for_node.items.get(key) {
+                        items.push(ItemInfo {
+                            todo: item.todo,
+                            instance: item.instance,
+                            owner: item.owner,
+                        });
+                        collect_items(state, &item.children, items);
+                    }
+                }
+            }
+        }
+    }
+}
