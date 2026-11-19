@@ -6,6 +6,7 @@ mod arena;
 
 pub mod graph;
 pub mod handle;
+pub mod ime;
 mod layout;
 pub mod metrics;
 pub mod owner;
@@ -20,6 +21,7 @@ pub use handle::{
     Generation, Handle, HandleError, InvalidHandle, LayoutNodeId, MemoId, OwnerId, QueryId, RowKey,
     RuntimeId, SignalId, SlotIndex, ViewId,
 };
+pub use ime::{CompositionStateMachine, ImeEvent, PreeditCursor};
 pub use metrics::Counters;
 pub use owner::{OwnerError, OwnerTree};
 pub use query::{Filter, RowSet};
