@@ -69,6 +69,7 @@ replaces: []
 | [ADR-0026](adr-0026-adr-0025-evidence-gap-errata.md) | 勘误 ADR-0025「相邻证据缺口」：三处缺口已由 #22 的 generation / prev / caches 夹具关闭；不改变任何决定 | `SPEC-GATE-A0-09`、`-10`、`-11` | normative |
 | [ADR-0027](adr-0027-m0-exit-policy.md) | M0 出口 = A0 全部判据 `closed`（ADR-0024）+ 逐判据执行型证据下限 + 出口时点 workspace/CI 运行；`PROBE` 本身不构成通过；出口前必须完成逐义务见证链复核 | `SPEC-GATE-A0-01`…`-11` | normative |
 | [ADR-0028](adr-0028-command-generation-handover.md) | A0 没有命令派发对象：`SPEC-RT-026` 的 command generation 以 `notApplicable` 移交 A1-07；M0 出口不以该子句为前提 | `SPEC-RT-026`；`SPEC-GATE-A1-07` | normative |
+| [ADR-0029](adr-0029-m0-exit-record.md) | M0 出口记录：候选 `d52f3346` 上 E1/E2/E3 成立；11 条 A0 判据闭合、58 条义务逐条点名、E3a/trace/E3b 已记录 | `SPEC-GATE-A0-01`…`-11` | normative |
 
 ## 3. 每条的固定结构
 
@@ -99,6 +100,7 @@ replaces: []
 | 2026-11-19 M0 收口·ADR-0025 勘误（Release） | 0026 | 三处「有对象、缺夹具」由 #22 夹具关闭；ADR 正文不改 |
 | 2026-11-19 M0 出口政策（产品负责人） | 0027 | A0 全判据闭合 + 执行型证据下限 + 出口时点集成状态；出口前见证链复核 |
 | 2026-11-19 A0 command generation 移交（产品负责人） | 0028 | A0 无命令派发对象；移交 A1-07，出口不以该子句为前提 |
+| 2026-11-19 M0 出口记录（产品负责人） | 0029 | 候选 `d52f3346` 上 E1/E2/E3 成立；出口只解除 M1 宏 lowering 阻塞 |
 | `docs/README.md` 四层治理契约 | 0011 | 文档层的唯一入口与状态词表 |
 
 ## 5. 维护规则
