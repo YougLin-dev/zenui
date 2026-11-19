@@ -42,7 +42,7 @@ replaces: []
 
 - **交付**：规划中的 `crates/core` + `crates/app`；generational field handle、Store row、Query/RowSet、嵌套事务与 staging journal、FocusRemovalIntent；`todolist_headless` trace。
 - **不包含**：proc macro、winit、GPU。
-- **出口**：`SPEC-GATE-A0` 全项通过；嵌套 batch 的中间值泄漏反例转绿。
+- **出口**：`SPEC-GATE-A0` 全项通过（判定口径见 [ADR-0027](../decisions/adr-0027-m0-exit-policy.md)）；嵌套 batch 的中间值泄漏反例转绿。
 - **对外承诺**：无。不发布、不写 user-facing 文档。
 - **风险**：现有 PoC 是平坦 sink 图，`detach` 会遗留空 bucket；重写成本集中在事务与代数（`OPEN`）。
 

@@ -81,7 +81,7 @@ replaces: [research/README.md, review/README.md]
 | 文本/字形布局、TextEdit、IME、选区 | [spec/05-text.md](spec/05-text.md) | 渲染与 GPU 抽象负责人 | `EVID-PROBE-04`，三处缺陷已证实 |
 | 布局投影、绘制、合成、窗口、无障碍、3D | [spec/06-render.md](spec/06-render.md) | 渲染与 GPU 抽象负责人 | `EVID-PROBE-04`、`EVID-VAL-15/16` |
 | 平台后端（Windows/macOS/Linux） | [spec/07-platform/index.md](spec/07-platform/index.md) | 各平台工程师 | 三平台均无真机证据，槽位全 `OPEN` |
-| 验收 Gate A0–D | [spec/08-gates.md](spec/08-gates.md) | 测试与 CI/发布负责人 | 42 条判据中 12 `PROBE`（其中 9 `closed`）、30 `OPEN`（`EVID-MATRIX`） |
+| 验收 Gate A0–D | [spec/08-gates.md](spec/08-gates.md) | 测试与 CI/发布负责人 | 42 条判据中 12 `PROBE`（其中 9 `closed`）、30 `OPEN`（`EVID-MATRIX`）；M0 出口口径见 [ADR-0027](decisions/adr-0027-m0-exit-policy.md) |
 | 事实断言（某句到底算不算数） | [evidence/claim-register.md](evidence/claim-register.md) | 顶级研究员 | 100 条 `CLAIM-*`，逐条带状态与证据 |
 | 真实执行记录与复跑命令 | [evidence/validation.md](evidence/validation.md)、[evidence/index.md](evidence/index.md) | 测试与 CI/发布负责人 | `EVID-VAL-01…50` |
 | 探针能证明什么、不能证明什么 | [evidence/probes.md](evidence/probes.md) | 测试与 CI/发布负责人 | `EVID-PROBE-01…06`，每条含证伪边界 |
@@ -193,7 +193,7 @@ docs/
 | 规范 | `spec/` 12 篇（含 `07-platform/` 4 篇） | `SPEC-SCOPE/ROUTE/RT/MACRO/STYLE/TEXT/RENDER/PLAT/GATE` | `normative`（2026-11-18 整体冻结为现行规范） |
 | 证据 | `evidence/` 5 篇 | `EVID-VAL-01…50`、`EVID-PROBE-01…06`、`EVID-MATRIX` | `normative` |
 | 事实台账 | `evidence/claim-register.md` | 100 条 `CLAIM-*` | `draft` |
-| 决策 | `decisions/` 27 个文件 | `ADR-0001…0026` + `index.md` | `normative` |
+| 决策 | `decisions/` 28 个文件 | `ADR-0001…0027` + `index.md` | `normative` |
 | 产品 | `product/` 2 篇 | 定位、路线（M0–M4 ↔ A0/A1/B/C/D） | `draft` |
 | 历史 | `archive/` 18 个文件 | `README.md` + 原 `research/` 8 篇 + `review/` 9 个 | 逐字只读（无 frontmatter，见 `ADR-0013`） |
 
