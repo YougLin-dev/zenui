@@ -1,0 +1,13 @@
+error[E0308]: mismatched types
+ --> tests/ui/row_key_from_view_id.rs:6:19
+  |
+6 |     takes_row_key(view);
+  |     ------------- ^^^^ expected `RowKey`, found `ViewId`
+  |     |
+  |     arguments to this function are incorrect
+  |
+note: function defined here
+ --> tests/ui/row_key_from_view_id.rs:3:4
+  |
+3 | fn takes_row_key(_key: RowKey) {}
+  |    ^^^^^^^^^^^^^ ------------

@@ -1,0 +1,17 @@
+[package]
+name = "zenui-native-poc"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+vello_gpu = "=0.4.0"
+vello_cpu = "=0.4.0"
+glifo = "=0.5.0"
+parley = { version = "=0.13.0", features = ["complex-scripts"] }
+parley_engine = { version = "=0.13.0", features = ["complex-scripts"] }
+taffy = "=0.15.1"
+wgpu = "=30.0.2"
+pollster = "0.4"

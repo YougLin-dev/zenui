@@ -1,0 +1,5 @@
+error: event handlers must be Rust expressions, never script strings
+ --> tests/compile_fail/script_event.rs:4:37
+  |
+4 |     let _ = view! { <button on:click="alert('no scripts')" /> };
+  |                                     ^^^^^^^^^^^^^^^^^^^^^^

@@ -1,0 +1,5 @@
+error: unsupported native class `p--2` at byte 5 in class literal
+ --> tests/compile_fail/unknown_class.rs:4:33
+  |
+4 |     let _ = view! { <view class="flex p--2" /> };
+  |                                 ^^^^^^^^^^^
