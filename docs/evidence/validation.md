@@ -37,7 +37,7 @@ replaces: []
 | 主机 | OS | Rust | GPU / adapter | commit | 证据性质 |
 |---|---|---|---|---|---|
 | **H1** | Windows 11，MSVC 工具链 | `1.99.1 x86_64-pc-windows-msvc` | NVIDIA GeForce RTX 4060 Laptop GPU / Vulkan | 未记录 | 上一轮记录（转述） |
-| **H2** | macOS 27.0.1 (26A434)，Apple M4（10 核 GPU，Metal 4） | `1.99.1 (58cf8f9c3 2026-10-13) aarch64-apple-darwin` | Apple M4 / `metal` | `ab5339b`（EVID-VAL-12…19）/ `83b21a4`（EVID-VAL-20/-21）/ `e53ae0e`（EVID-VAL-23…27）/ `f7a2d62`（EVID-VAL-28…32）/ `7d78cdc`（EVID-VAL-33…40）/ `a24faed`（EVID-VAL-41…46）/ `89b651c`（EVID-VAL-48）/ `6182928`（EVID-VAL-49） | **本轮实测**（commit 逐条见各条目） |
+| **H2** | macOS 27.0.1 (26A434)，Apple M4（10 核 GPU，Metal 4） | `1.99.1 (58cf8f9c3 2026-10-13) aarch64-apple-darwin` | Apple M4 / `metal` | `ab5339b`（EVID-VAL-12…19）/ `83b21a4`（EVID-VAL-20/-21）/ `e53ae0e`（EVID-VAL-23…27）/ `f7a2d62`（EVID-VAL-28…32）/ `7d78cdc`（EVID-VAL-33…40）/ `a24faed`（EVID-VAL-41…46）/ `89b651c`（EVID-VAL-48）/ `6182928`（EVID-VAL-49）/ `02bb2f4`（EVID-VAL-50）/ `7a97d3f`（EVID-VAL-51） | **本轮实测**（commit 逐条见各条目） |
 | **CI** | GitHub Actions 矩阵：`ubuntu-26.04` / `macos-26-arm64` / `windows-2025-vs2026` | `rustc 1.99.1 (58cf8f9c3 2026-10-13)`，三个 runner 一致（取自 `rust-toolchain.toml` 的 pin） | 无（headless；A0 不需要 GPU） | `213f772`（main 上的 PR #5 merge commit） | **本轮 CI 实测**，run [`44284925421`](https://github.com/YougLin-dev/zenui/actions/runs/44284925421) |
 
 > H1 的 commit 在原始记录中未写下，这是本轮无法补的缺口；引用 H1 结果时应同时声明"commit 未知"。
@@ -96,6 +96,7 @@ replaces: []
 | EVID-VAL-48 | A | `rustdoc --test --crate-name probe` × 8 用例 | **H2** | 6 ok / 2 对照组 **FAILED** | VERIFIED（错误码后缀不产生约束，见条目） |
 | EVID-VAL-49 | A | `cargo test --workspace --locked` | **H2** | 114 passed（67 + 1 + 6 + 11 + 7 + 12 + 2 + 6 + 2） | VERIFIED |
 | EVID-VAL-50 | A | `cargo test --workspace --locked` | **H2** | 117 passed（68 + 1 + 7 + 11 + 7 + 12 + 2 + 6 + 3） | VERIFIED |
+| EVID-VAL-51 | A | `cargo test --workspace --locked` | **H2** | 123 passed（74 + 1 + 7 + 11 + 7 + 12 + 2 + 6 + 3） | VERIFIED |
 
 ## 3. 仓库内测试：H1 原始记录（转述）
 
@@ -431,7 +432,7 @@ $ cargo test --workspace --locked        # ubuntu-26.04 / macos-26-arm64 / windo
 - 0-test target：根 package，来源 EVID-VAL-17。
 - 跨图形后端 GPU 观测：**2** 个数据点（Vulkan/NVIDIA 来自 H1 转述，Metal/Apple M4 来自 EVID-VAL-15），**不是** "GPU 矩阵已通过"。
 - CI 实际通过测试：**426** 次执行 = EVID-VAL-22 的 40 条 × 3 个 runner（120）加 EVID-VAL-47 的 102 条 × 3 个 runner（306）。它是**执行次数**，不是 426 条不同的测试，也不得与 H2 的计数相加；同一批测试在 H2 与 CI 上各跑过。
-- 可复跑性分布（`EVID-VAL-50` 之后共 50 条）：**37 条**（A 类）可在本机原样复跑；**11 条**（B/C 类）依赖上一轮记录或仓库外夹具；**2 条**（D 类，`EVID-VAL-22`、`-47`）在 CI runner 上，重跑 workflow 可复现，本机不能代替。
+- 可复跑性分布（`EVID-VAL-51` 之后共 51 条）：**38 条**（A 类）可在本机原样复跑；**11 条**（B/C 类）依赖上一轮记录或仓库外夹具；**2 条**（D 类，`EVID-VAL-22`、`-47`）在 CI runner 上，重跑 workflow 可复现，本机不能代替。
 - #22 合流后的 workspace 全量：**114** 条（`EVID-VAL-49`，commit `6182928`）。这是该 commit 上互不相同的用例数；与 `EVID-VAL-44` 的 102 不可相加，差值也不只来自 #22 的三条夹具（其间还有其他合并）。
 
 不得使用"基本完成""大部分支持""应该可以"描述以上任何数字。
@@ -1102,3 +1103,45 @@ $ cargo test --workspace --locked
   `a0_07_two_consumers_of_one_filter_clone_no_titles`（`crates/app/tests/mount_path.rs`）。
 - 计数口径：117 是该 commit 上一次全量运行的不同用例数；与 `EVID-VAL-49` 的 114 不可相加（后者是更早 commit 的全量）。
 - **不证明什么**：只证明这三条夹具存在且在本机通过。它不扩大任何判据的语义范围，也不回答 M0 出口。
+
+### EVID-VAL-51 A0-09 owner 与 A0-10 结算的见证夹具（H2）
+
+- 分支：`test/MORT-4-a0-focus-witnesses`（基于 `23e1e04`）；被测代码 commit `7a97d3ffbe3e5991482cc4cadef4a155e0fe1cfc`。
+- 主机：H2（macOS 27.0.1 / Apple M4）；`rustc 1.99.1 (58cf8f9c3 2026-10-13) aarch64-apple-darwin`；`cargo 1.99.1 (5f94df478 2026-08-27)`。
+
+逐 target 结果（把 `Running …` 与 `test result: ok. N passed` 归并为一行）：
+
+```text
+$ cargo test --workspace --locked
+     unittests src/main.rs   (zenui)           0 passed
+     unittests src/lib.rs    (zenui_app)       2 passed
+     tests/golden_trace.rs   (zenui_app)       6 passed
+     tests/mount_path.rs     (zenui_app)       3 passed
+     unittests src/lib.rs    (zenui_core)     74 passed
+     tests/compile_fail.rs   (zenui_core)      1 passed
+     tests/gates.rs          (zenui_core)      7 passed
+     tests/lifecycle.rs      (zenui_core)     11 passed
+     tests/queries.rs        (zenui_core)      7 passed
+     tests/regressions.rs    (zenui_core)     12 passed
+     Doc-tests zenui_app / zenui_core          0 passed
+（合计 123 passed / 0 failed）
+```
+
+- `SPEC-GATE-A0-09` 的 `/owner`：`a_reorder_preserves_each_views_owner`（`crates/core/src/view.rs` 内联单元
+  测试）在 reorder 前后逐 view 读 `nodes` 里的 owner 并比对，不经由 `live_owner_ids()` 的集合比较。判红方式：
+  交换两个 view 的 owner，断言失败；集合相等时旧映射不可辨，这正是本条独立夹具存在的理由。
+- `SPEC-GATE-A0-10` 的「原因与后继」：`#[cfg(test)]` 的结算日志在每次结算时记录 `(cause, rule, target)`
+  三元组，`cause` 取 `Unmount`/`BulkClear`，`rule` 取 `Next`/`Previous`/`Cleared`；相关位置在
+  `crates/core/src/txn.rs`。五个单元测试分别断言：
+  `a0_10_settlement_records_next_for_a_live_successor`（删除后命中同 kind 后继）、
+  `a0_10_settlement_records_previous_at_the_end`（末行删除走 `prev`）、
+  `a0_10_bulk_clear_settles_one_intent`（批量 Clear 只结算一次）、
+  `a0_10_a_user_focus_move_cancels_the_settlement` 与 `a0_10_a_user_clear_cancels_the_settlement`
+  （用户在结算前转移或清除焦点时取消）。判红方式：把 `rule` 硬编码为 `Next`，第二、三、四条失败；
+  给每个被销毁的 view 各记一次结算，第三条失败；去掉 `focused.is_none()` 的取消判据，第五条失败。
+  上述四处 mutation 均在本机执行过，夹具按预期判红后已还原。
+- 计数口径：123 是该 commit 上一次全量运行的不同用例数；与 `EVID-VAL-50` 的 117 不可相加（后者是更早
+  commit 的全量，其间还有其他合并）。
+- **不证明什么**：只证明六条夹具存在、在本机通过，且各自能在对应 mutation 下判红。它不把
+  `SPEC-GATE-A0-09`/`-10` 的状态词升级为 `VERIFIED`，不裁决 M0 出口，也不覆盖 `SPEC-RT-026`
+  「command generation」子句——A0 没有 command 对象，该子句需要单独的 `notApplicable` 决策。

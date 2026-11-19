@@ -939,6 +939,30 @@
       "proves": "P1.1 的三条新夹具在全量中通过（117 passed）：handle 三元组、duplicate key 全字段、两消费者零 clone",
       "doesNotProve": "不证明 A0 之外的能力，也不把任何状态词升级为 VERIFIED",
       "commit": "02bb2f47053abda3b912989800a4e3cced792f51"
+    },
+    {
+      "id": "EVID-VAL-51",
+      "class": "A",
+      "host": "H2",
+      "kind": "test",
+      "command": "cargo test --workspace --locked",
+      "exit": 0,
+      "tests": {
+        "passed": 123,
+        "failed": 0,
+        "ignored": 0
+      },
+      "newFixtures": [
+        "a_reorder_preserves_each_views_owner",
+        "a0_10_settlement_records_next_for_a_live_successor",
+        "a0_10_settlement_records_previous_at_the_end",
+        "a0_10_bulk_clear_settles_one_intent",
+        "a0_10_a_user_focus_move_cancels_the_settlement",
+        "a0_10_a_user_clear_cancels_the_settlement"
+      ],
+      "proves": "workspace 123 条测试全绿：A0-09 逐 (view, owner) 直接读 nodes 比对，A0-10 结算记录 (cause, rule, target) 三元组",
+      "doesNotProve": "只证明六条夹具存在且在本机通过；不证明 PROBE 级证据足以出口 M0，不扩大任何判据的语义范围",
+      "commit": "7a97d3ffbe3e5991482cc4cadef4a155e0fe1cfc"
     }
   ],
   "contracts": [
@@ -1065,7 +1089,7 @@
       "blocking": true,
       "status": "OPEN",
       "criteria": 11,
-      "closed": false
+      "closed": true
     },
     {
       "id": "SPEC-GATE-A1",
@@ -1691,7 +1715,11 @@
         {
           "source": "criterion",
           "text": "/owner",
-          "note": "待 Core 的逐 (view, owner) 比对夹具；live_owner_ids() 集合在 owner 互换时仍相等"
+          "ref": "a_reorder_preserves_each_views_owner",
+          "evidence": [
+            "EVID-VAL-51"
+          ],
+          "note": "逐 (view, owner) 由 view.rs 单元测试直接读 nodes 比对；只比 live_owner_ids() 集合时，owner 互换不可辨"
         },
         {
           "source": "criterion",
@@ -1752,9 +1780,10 @@
       ],
       "evidence": [
         "EVID-VAL-34",
-        "EVID-VAL-49"
+        "EVID-VAL-49",
+        "EVID-VAL-51"
       ],
-      "closed": false
+      "closed": true
     },
     {
       "id": "SPEC-GATE-A0-10",
@@ -1821,7 +1850,11 @@
         {
           "source": "evidence",
           "text": "reducer trace：每次焦点转移的原因与后继",
-          "note": "待 Core 在 txn 内记录结算三元组（cause/rule/target）并用单元测试断言；现有夹具只断言结果与计数"
+          "ref": "a0_10_settlement_records_next_for_a_live_successor",
+          "evidence": [
+            "EVID-VAL-51"
+          ],
+          "note": "结算记录 (cause, rule, target) 三元组；Next、Previous、批量 Clear、用户取消四种场景由 txn.rs 的五个单元测试分别断言"
         },
         {
           "source": "evidence",
@@ -1835,9 +1868,10 @@
       ],
       "evidence": [
         "EVID-VAL-34",
-        "EVID-VAL-49"
+        "EVID-VAL-49",
+        "EVID-VAL-51"
       ],
-      "closed": false
+      "closed": true
     },
     {
       "id": "SPEC-GATE-A0-11",
@@ -2591,23 +2625,23 @@
   ],
   "coverage": {
     "criteriaTotal": 42,
-    "criteriaClosed": 9,
+    "criteriaClosed": 11,
     "criteriaSpec": 0,
     "criteriaProbe": 12,
     "criteriaOpen": 30,
     "criteriaWithdrawn": 0,
-    "note": "四状态词构成划分（criteriaSpec + criteriaProbe + criteriaOpen + criteriaWithdrawn = criteriaTotal）；criteriaClosed 单独报告且 criteriaClosed ≤ criteriaProbe。closed 由 criteria[].obligations[] 按 ADR-0024 计算，不可手填。A0 现有 9 条 closed；A0-09 的 /owner 与 A0-10 的『原因与后继』等待 Core 的夹具。gate 汇总状态不由谓词改写，仍为 OPEN。"
+    "note": "四状态词构成划分（criteriaSpec + criteriaProbe + criteriaOpen + criteriaWithdrawn = criteriaTotal）；criteriaClosed 单独报告且 criteriaClosed ≤ criteriaProbe。closed 由 criteria[].obligations[] 按 ADR-0024 计算，不可手填。A0 现有 11 条 closed；A0-09 的 /owner 与 A0-10 的『原因与后继』现由测试夹具映射。gate 汇总状态不由谓词改写，仍为 OPEN。"
   },
   "counts": {
-    "testsPassedH2": 925,
+    "testsPassedH2": 1048,
     "testsPassedCi": 426,
     "compileFailFixturesH2": 26,
     "zeroTestTargetsH2": [
       "root package zenui"
     ],
     "gpuBackendsObserved": 2,
-    "runsTotal": 50,
-    "runsReproducibleHere": 37,
+    "runsTotal": 51,
+    "runsReproducibleHere": 38,
     "runsTranscribedOrExternal": 11,
     "runsOnCi": 2
   },

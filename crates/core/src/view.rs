@@ -404,4 +404,38 @@ mod tests {
         assert!(!tree.is_live(a));
         assert_eq!(tree.caret(a), None);
     }
+
+    /// `SPEC-GATE-A0-09`: a same-owner reorder preserves **each** view's owner.
+    ///
+    /// The integration fixture compares `live_owner_ids()`, which is a set: two
+    /// views that swap owners leave it equal. This fixture reads the nodes
+    /// directly and compares `(view, owner)` across the reorder.
+    ///
+    /// Red-ability: in `ViewTree::reorder`, swap two reordered nodes' `owner`
+    /// fields; the per-view assertion fails while a set comparison would pass.
+    #[test]
+    fn a_reorder_preserves_each_views_owner() {
+        let mut tree = tree();
+        let a = tree.mount_row(key(1), OwnerId::from_index(1), 1);
+        let b = tree.mount_row(key(2), OwnerId::from_index(2), 1);
+        let c = tree.mount_row(key(3), OwnerId::from_index(3), 1);
+        tree.reorder(&[a, b, c]);
+
+        let owners_before: Vec<(ViewId, OwnerId)> = tree
+            .row_views()
+            .into_iter()
+            .map(|(view, _)| (view, tree.node(view).expect("node").owner))
+            .collect();
+
+        tree.reorder(&[c, b, a]);
+
+        for (view, owner) in &owners_before {
+            assert_eq!(
+                tree.node(*view).expect("node").owner,
+                *owner,
+                "a same-owner reorder must not reassign ownership"
+            );
+        }
+        assert_eq!(tree.order(), &[c, b, a]);
+    }
 }
