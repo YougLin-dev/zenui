@@ -880,6 +880,11 @@ impl<'a> Tx<'a> {
                 .any(|(candidate, _)| *candidate == view)
     }
 
+    /// 把已校验的行句柄解析成稳定业务键；插入后无需扫描行集。
+    pub fn key_of(&self, row: Handle<Row>) -> Result<RowKey, ValueError> {
+        self.effective_key(row)
+    }
+
     pub fn handle_for(&self, key: RowKey) -> Option<Handle<Row>> {
         if let Some(staged) = self.txn.model.rows.get(&key)
             && staged.inserted

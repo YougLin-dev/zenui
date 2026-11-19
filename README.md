@@ -6,20 +6,24 @@ ZenUI 使用 Rust 编写原生桌面界面。它保留控件及其编辑状态�
 
 ## 当前能力
 
-ZenUI 处在开发阶段，公开 SDK 和原生窗口尚未落地。
+ZenUI 处在开发阶段。阶段一 target API 的 headless Todo 已可运行；原生窗口、完整 `view!` SDK 与平台输入尚未落地。
 
 仓库目前提供：
 
 - headless Runtime：模型、行集、代际句柄、Owner、Memo 和事务；
+- 阶段一 target API：Copy Signal/Memo/Store Field、mount-once 组件、`view!` 数据位、`Show`/`For` 与共享 RowSet；
 - 可复现的 Todo 场景：插入、删除、筛选、重排、焦点与拒绝句柄后的恢复；
 - 独立的宏、文本、布局和 GPU 原型；
 - 目标界面语法的预览。
 
-你可以运行 headless Todo 场景：
+你可以运行 headless Todo 场景，或 stage-one target API 的最小 Todo：
 
 ```sh
 cargo run -p zenui-app --example todolist_headless --locked
+cargo run -p zenui --example minimal_todo --locked
 ```
+
+target API 的公开行为测试位于根包 `tests/`；它不声明原生窗口、IME 或 Windows 完成。
 
 根工程的二进制只保留最小入口，不会打开桌面窗口。目标语法的预览文件不参与默认 workspace 构建，因为只有部分所需 API 已经存在。
 

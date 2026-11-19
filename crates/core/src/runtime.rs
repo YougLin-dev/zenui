@@ -4,7 +4,7 @@ use crate::graph::MemoGraph;
 use crate::handle::RuntimeId;
 use crate::layout::LayoutMap;
 use crate::owner::OwnerTree;
-use crate::query::QueryCache;
+use crate::query::{Filter, QueryCache, RowSet};
 use crate::store::Store;
 use crate::txn::{Fatal, Nodes, Publication, Tx, Txn};
 use crate::view::ViewTree;
@@ -58,6 +58,11 @@ impl Runtime {
 
     pub fn row_views(&self) -> Vec<(crate::handle::ViewId, crate::handle::RowKey)> {
         self.views.row_views()
+    }
+
+    /// 只读查询共享已提交 Store 的行集缓存；没有事务时也可用。
+    pub fn rows(&mut self, filter: Filter) -> RowSet {
+        self.query.rows_at(&mut self.store, filter)
     }
 
     pub const fn focused(&self) -> Option<crate::handle::ViewId> {

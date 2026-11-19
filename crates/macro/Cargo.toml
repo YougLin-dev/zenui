@@ -1,0 +1,16 @@
+[package]
+name = "zenui-macro"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Target syntax lowering for the ZenUI minimum SDK"
+license = "MIT OR Apache-2.0"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1"
+quote = "1"
+rstml = "=0.13.1"
+syn = { version = "3", features = ["full"] }
