@@ -271,6 +271,10 @@ impl ViewTree {
         self.nodes.get(&view)
     }
 
+    pub fn owner(&self, view: ViewId) -> Option<OwnerId> {
+        self.node(view).map(|node| node.owner)
+    }
+
     pub const fn geometry_epoch(&self) -> u64 {
         self.geometry_epoch
     }

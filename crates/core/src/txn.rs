@@ -194,6 +194,19 @@ struct StagedRow {
     completed: Option<bool>,
 }
 
+impl StagedRow {
+    fn overlay(runtime: RuntimeId, row: Handle<Row>) -> Self {
+        Self {
+            runtime,
+            slot: row.slot(),
+            generation: row.generation(),
+            inserted: false,
+            title: None,
+            completed: None,
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct ModelJournal {
     rows: BTreeMap<RowKey, StagedRow>,
@@ -586,6 +599,31 @@ impl<'a> Tx<'a> {
         self.stage_completed(row, value)
     }
 
+    pub fn set_title(
+        &mut self,
+        row: Handle<Row>,
+        title: impl Into<String>,
+    ) -> Result<(), ValueError> {
+        self.require_staged(WriteKind::ModelWrite)?;
+        let key = self.effective_key(row)?;
+        let title = title.into();
+        if self.with_title(row, |current| current == title.as_str())? {
+            return Ok(());
+        }
+        // 标题不改变筛选成员或顺序计数；已挂载的 View 只在下次挂载时重新读取。
+        let runtime = self.store.runtime_id();
+        let entry = self
+            .txn
+            .model
+            .rows
+            .entry(key)
+            .or_insert_with(|| StagedRow::overlay(runtime, row));
+        entry.title = Some(title);
+        self.txn.model.writes += 1;
+        self.bump();
+        Ok(())
+    }
+
     pub fn remove(&mut self, row: Handle<Row>) -> Result<RowKey, ValueError> {
         self.require_staged(WriteKind::ModelWrite)?;
         let key = self.effective_key(row)?;
@@ -665,14 +703,13 @@ impl<'a> Tx<'a> {
         if self.effective_completed(row)? == value {
             return Ok(());
         }
-        let entry = self.txn.model.rows.entry(key).or_insert(StagedRow {
-            runtime: self.store.runtime_id(),
-            slot: row.slot(),
-            generation: row.generation(),
-            inserted: false,
-            title: None,
-            completed: None,
-        });
+        let runtime = self.store.runtime_id();
+        let entry = self
+            .txn
+            .model
+            .rows
+            .entry(key)
+            .or_insert_with(|| StagedRow::overlay(runtime, row));
         if entry.completed != Some(value) {
             entry.completed = Some(value);
             self.txn.model.writes += 1;
