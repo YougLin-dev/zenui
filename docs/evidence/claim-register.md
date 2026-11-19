@@ -51,10 +51,10 @@ replaces: []
 
 ### 0.1 证据键（权威定义见 `docs/evidence/validation.md` §2）
 
-`EVID-VAL-*` 编号已与该文件的 51 条索引对齐。主机定义：
+`EVID-VAL-*` 编号已与该文件的 54 条索引对齐。主机定义：
 
 - **H1**：Windows 11 / MSVC / Rust 1.99.1 / NVIDIA RTX 4060 Laptop / Vulkan；上一轮记录，**commit 未记录**。
-- **H2**：macOS 27.0.1 / Apple M4 / Metal 4 / Rust 1.99.1；commit `ab5339b`（EVID-VAL-12…19）/ `83b21a4`（EVID-VAL-20/-21）/ `e53ae0e`、`f7a2d62`、`7d78cdc`（EVID-VAL-23…40）、`a24faed`（EVID-VAL-41…46）、`89b651c`（EVID-VAL-48）、`6182928`（EVID-VAL-49）、`02bb2f4`（EVID-VAL-50）、`7a97d3f`（EVID-VAL-51）；本轮 Test/CI 实测。
+- **H2**：macOS 27.0.1 / Apple M4 / Metal 4 / Rust 1.99.1；commit `ab5339b`（EVID-VAL-12…19）/ `83b21a4`（EVID-VAL-20/-21）/ `e53ae0e`、`f7a2d62`、`7d78cdc`（EVID-VAL-23…40）、`a24faed`（EVID-VAL-41…46）、`89b651c`（EVID-VAL-48）、`6182928`（EVID-VAL-49）、`02bb2f4`（EVID-VAL-50）、`7a97d3f`（EVID-VAL-51）、`b6806a5f`（EVID-VAL-52/-53）；本轮 Test/CI 实测。
 
 | 键 | 类别 | 命令 / 位置 | 记录结果 |
 |---|---|---|---|
@@ -109,6 +109,9 @@ replaces: []
 | EVID-VAL-49 | A | `cargo test --workspace --locked`（H2，commit `6182928`） | 114 passed（含 #22 的 generation / prev / caches 三条夹具） |
 | EVID-VAL-50 | A | `cargo test --workspace --locked`（H2，commit `02bb2f4`） | 117 passed（P1.1 的 triple / duplicate-key 全字段 / 两消费者零 clone） |
 | EVID-VAL-51 | A | `cargo test --workspace --locked`（H2，commit `7a97d3f`） | 123 passed（A0-09 逐 view owner 比对；A0-10 结算三元组五条） |
+| EVID-VAL-52 | A | `cargo test --workspace --locked`（H2，候选 `b6806a5f`） | 123 passed；`--list` 导出 123 条 names 全列 |
+| EVID-VAL-53 | A | `cargo run -p zenui-app --example todolist_headless --locked`（H2，候选 `b6806a5f`） | exit 0；`traceSha256=57a4a142…`，两次一致 |
+| EVID-VAL-54 | D | `cargo test --workspace --locked`（CI 三平台，候选 `b6806a5f`，run 44435623854） | 每平台 123 passed / 0 failed |
 | SRC | — | 仓库源码/清单，`path:line` | 本轮静态核对，可直接复查 |
 
 > **已裁决（C-18/D-02，ADR-0012）**：`docs/README.md` §6 现已承认第三种证据前缀 `SRC path:line`，
