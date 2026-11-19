@@ -79,6 +79,8 @@ pub enum Fatal {
 
     FocusTargetNotLive { view: ViewId },
 
+    InvalidViewHandle(InvalidHandle),
+
     GraphCycle { node: NodeId },
 
     Aborted,
@@ -108,6 +110,7 @@ impl fmt::Display for Fatal {
             Fatal::DuplicateViewKey { .. } => f.write_str("two views claim the same row key"),
             Fatal::MountForMissingRow { .. } => f.write_str("mount targets a removed row"),
             Fatal::FocusTargetNotLive { .. } => f.write_str("focus target will not be live"),
+            Fatal::InvalidViewHandle(error) => write!(f, "invalid view handle: {error}"),
             Fatal::GraphCycle { node } => write!(f, "memo cycle at node {node}"),
             Fatal::Aborted => f.write_str("transaction aborted by the caller"),
         }
@@ -813,9 +816,11 @@ impl<'a> Tx<'a> {
     }
 
     pub fn is_live(&self, view: ViewId) -> bool {
-        self.row_views()
-            .iter()
-            .any(|(candidate, _)| *candidate == view)
+        self.require_view(view).is_ok()
+            && self
+                .row_views()
+                .iter()
+                .any(|(candidate, _)| *candidate == view)
     }
 
     pub fn handle_for(&self, key: RowKey) -> Option<Handle<Row>> {
@@ -831,6 +836,14 @@ impl<'a> Tx<'a> {
         self.store.handle_for(key)
     }
 
+    fn require_view(&self, view: ViewId) -> Result<(), Fatal> {
+        // 暂存 mount 尚不在已提交树中；丢弃事务后，未发布身份可从原 checkpoint 重用。
+        if self.txn.view.mounts.iter().any(|mount| mount.id == view) {
+            return Ok(());
+        }
+        self.views.require(view).map_err(Fatal::InvalidViewHandle)
+    }
+
     pub fn focus_intent_for(&self, view: ViewId) -> Option<FocusIntent> {
         self.views.focus_intent_for(view)
     }
@@ -840,6 +853,7 @@ impl<'a> Tx<'a> {
     }
 
     pub fn caret(&self, view: ViewId) -> Option<usize> {
+        self.require_view(view).ok()?;
         self.txn
             .view
             .caret
@@ -858,12 +872,19 @@ impl<'a> Tx<'a> {
         if already_mounted || self.txn.view.mounts.iter().any(|mount| mount.row == row) {
             return Err(Fatal::DuplicateViewKey { key: row });
         }
-        let view_id = ViewId::from_index(self.txn.view.next_view);
+        let view_id = self.views.mint(self.txn.view.next_view);
+        self.txn.view.next_view = self.txn.view.next_view.checked_add(1).ok_or_else(|| {
+            Fatal::InvalidViewHandle(
+                crate::handle::HandleError::Exhausted {
+                    slot: view_id.slot(),
+                }
+                .into(),
+            )
+        })?;
         let owner_id = OwnerId::from_index(self.txn.view.next_owner);
         let parent = self.owners.root();
 
         let draft = &mut self.txn.view;
-        draft.next_view += 1;
         draft.next_owner += 1;
         draft.owners.push((owner_id, parent));
         draft.mounts.push(PlannedMount {
@@ -878,6 +899,7 @@ impl<'a> Tx<'a> {
 
     pub fn unmount(&mut self, view: ViewId) -> Result<(), Fatal> {
         self.require(WriteKind::ViewPatch)?;
+        self.require_view(view)?;
         if let Some(position) = self
             .txn
             .view
@@ -908,14 +930,18 @@ impl<'a> Tx<'a> {
 
     pub fn reorder_views(&mut self, order: &[ViewId]) -> Result<(), Fatal> {
         self.require(WriteKind::ViewPatch)?;
+        for view in order {
+            self.require_view(*view)?;
+        }
         self.txn.view.order = Some(order.to_vec());
         Ok(())
     }
 
     pub fn focus(&mut self, view: ViewId) -> Result<(), Fatal> {
         self.require(WriteKind::FocusChange)?;
-
+        self.require_view(view)?;
         self.txn.user_focused = true;
+
         let caret = self
             .views
             .node(view)
@@ -1150,7 +1176,7 @@ impl<'a> Tx<'a> {
 
         let mut disposals = Vec::new();
         for view in &draft.unmounts {
-            if let Some(node) = self.views.unmount(*view) {
+            if let Ok(Some(node)) = self.views.unmount(*view) {
                 disposals.push(node.owner);
             }
         }
@@ -1165,11 +1191,15 @@ impl<'a> Tx<'a> {
                 .expect("staged mount requires a live owner");
         }
         if let Some(order) = &draft.order {
-            self.views.reorder(order);
+            self.views
+                .reorder(order)
+                .expect("order was validated before commit");
         }
         let focused = match draft.focus {
             Some(Some(view)) => {
-                self.views.focus(view);
+                self.views
+                    .focus(view)
+                    .expect("focus target was validated before commit");
                 Some(view)
             }
             Some(None) => {
@@ -1181,7 +1211,9 @@ impl<'a> Tx<'a> {
         if let Some((view, offset)) = draft.caret
             && focused != Some(view)
         {
-            self.views.set_caret(view, offset);
+            self.views
+                .set_caret(view, offset)
+                .expect("caret target was validated before commit");
         }
         self.views.set_next(draft.next_view);
         self.owners.set_next(draft.next_owner);
@@ -1210,7 +1242,7 @@ impl<'a> Tx<'a> {
                 target,
             ));
             match target {
-                Some(view) => self.views.focus(view),
+                Some(view) => self.views.focus(view).expect("focused view was validated"),
                 None => self.views.clear_focus(),
             };
         }
@@ -1980,6 +2012,7 @@ mod tests {
                 tx.remove(a).map_err(|_| Fatal::Aborted)?;
                 tx.unmount(views[0])?;
                 tx.focus(views[2])?;
+                assert!(tx.txn.user_focused, "explicit focus sets the frame marker");
                 Ok(())
             })
             .expect("user moved focus");
@@ -2080,8 +2113,45 @@ mod tests {
         assert_eq!(runtime.live_owner_ids().len(), 1);
     }
 
+    #[test]
+    fn an_older_generation_cannot_use_a_live_view_through_runtime_or_tx() {
+        let mut runtime = Runtime::new();
+        runtime
+            .frame(|tx| {
+                tx.insert("A")?;
+                Ok(())
+            })
+            .expect("seed");
+        let key = runtime.committed().keys().next().expect("seeded key");
+        let live = runtime.frame(|tx| tx.mount_row(key, 3)).expect("live view");
+        let stale = ViewId::new(live.runtime(), live.slot(), live.generation().next());
+
+        for result in [
+            runtime.frame(|tx| tx.focus(stale)),
+            runtime.frame(|tx| tx.unmount(stale)),
+            runtime.frame(|tx| tx.reorder_views(&[stale])),
+        ] {
+            assert!(
+                matches!(
+                    result,
+                    Err(Fatal::InvalidViewHandle(InvalidHandle {
+                        reason: crate::handle::HandleError::StaleGeneration { .. },
+                    }))
+                ),
+                "a different generation must be stale: {result:?}"
+            );
+        }
+        assert_eq!(runtime.caret(stale), None);
+        assert_eq!(runtime.layout_of(stale), None);
+        assert_eq!(runtime.focused(), None);
+        runtime
+            .frame(|tx| tx.focus(live))
+            .expect("the live identity remains usable");
+        assert_eq!(runtime.caret(live), Some(3));
+    }
+
     fn stage_mount(tx: &mut Tx<'_>, row: RowKey, title_len: u32) -> ViewId {
-        let view = ViewId::from_index(tx.txn.view.next_view);
+        let view = tx.views.mint(tx.txn.view.next_view);
         let owner = OwnerId::from_index(tx.txn.view.next_owner);
         let parent = tx.owners.root();
         tx.txn.view.next_view += 1;

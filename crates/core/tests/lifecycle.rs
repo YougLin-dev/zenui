@@ -302,6 +302,7 @@ fn a_user_focus_move_cancels_the_intent() {
         })
         .expect("focus A");
 
+    let moves_before = runtime.counters().focus_moves;
     let row = runtime_row(&runtime, "A");
     runtime
         .frame(|tx| {
@@ -317,6 +318,11 @@ fn a_user_focus_move_cancels_the_intent() {
         runtime.focused(),
         Some(views[2]),
         "the user's choice wins over the recorded intent"
+    );
+    assert_eq!(
+        runtime.counters().focus_moves,
+        moves_before + 1,
+        "only the explicit focus moves; automatic settlement must not also run"
     );
 }
 
