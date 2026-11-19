@@ -384,7 +384,7 @@ $ cargo test --workspace --locked        # ubuntu-26.04 / macos-26-arm64 / windo
 - 新事实：同一 commit 的 40 条测试在三个平台各自通过，且 `rustc` 三处都是 `1.99.1`——`rust-toolchain.toml` 的 pin 在三个平台上真的被解析成同一个编译器，而不是各 runner 自带的默认版本。
 - 新事实：`tests/golden_trace.rs` 的逐字节比对在 `windows-2025-vs2026` 上成立。这是 `.gitattributes` 强制 LF 的实证：若 Windows 检出为 CRLF，`include_str!` 的内容与 golden 文件都会变形，测试与 `EVID-VAL-20` 的 sha256 会同时失败。
 - **不证明什么**：任何 GPU / 窗口 / 平台后端能力（A0 是纯 `std` 的 headless core）；`cargo package`、renamed facade 与发布门（`SPEC-GATE-C-04`）——命令集里没有它们，这条记录不能把 C-04 标绿。
-- 计数口径：`testsPassedCi = 426` 是**两次** CI 运行的执行次数之和——本轮 40 条 × 3 个 runner（EVID-VAL-22，120 次）加上合流后 102 条 × 3 个 runner（EVID-VAL-47，306 次）。它不是不同测试的条数（并集为 102 条），也不得与 H2 的 `testsPassedH2` 相加：H2 与 CI 是不同主机，同一批测试在两处各跑一次只说明两处都跑过（见 `EVID-MATRIX.countsNote`）。
+- 计数口径：`testsPassedCi = 426` 是**两次** CI 运行的执行次数之和——本轮 40 条 × 3 个 runner（EVID-VAL-22，120 次）加上合流后 102 条 × 3 个 runner（EVID-VAL-47，306 次）。它是执行次数，不是不同测试的条数；CI 日志没有逐条列出用例名，因此本条不声称两次运行的并集大小，只记录各自那一次报告的数量。它也不得与 H2 的 `testsPassedH2` 相加：H2 与 CI 是不同主机，同一批测试在两处各跑一次只说明两处都跑过（见 `EVID-MATRIX.countsNote`）。
 
 ## 7. 本轮源码核对（不是测试，但可复核）
 

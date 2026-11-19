@@ -342,6 +342,28 @@ def check_duplicate_ids(files: list[str]) -> None:
             failures.append(f"duplicate ID '{doc_id}' defined at {where}")
 
 
+TEMPLATE_RESIDUE = re.compile(r"%[A-Z][A-Z0-9_]*(?:_[A-Z0-9]+)*%")
+# `%TEMP%` and friends are real environment variables, not template tokens.
+TEMPLATE_ALLOWED = {"%TEMP%", "%APPDATA%", "%USERPROFILE%", "%LOCALAPPDATA%"}
+
+
+def check_template_residue(files: list[str]) -> None:
+    """A literal `%COMMIT%` in a ledger is a missing fact, not a placeholder to
+    be filled later: no script renders one, so it reads as a commit that never
+    existed. Fail on it like any other bad record."""
+    for path in files:
+        if is_archive(path):
+            continue
+        for line_no, line in enumerate(read_text(path).splitlines(), 1):
+            for match in TEMPLATE_RESIDUE.finditer(line):
+                if match.group(0) in TEMPLATE_ALLOWED:
+                    continue
+                failures.append(
+                    f"{rel(path)}:{line_no}: unresolved template placeholder "
+                    f"{match.group(0)!r}"
+                )
+
+
 def load_matrix() -> dict | None:
     try:
         return json.loads(read_text(MATRIX))
@@ -577,11 +599,14 @@ def test_manifest() -> set[str]:
 
 def recorded_commands(text: str) -> set[str]:
     """Commands actually recorded in validation.md, as `$ <command>` lines."""
-    return {
-        re.sub(r"\s+#.*$", "", m.group(1)).strip()
-        for m in (RECORDED_CMD.match(line) for line in text.splitlines())
-        if m
-    }
+    commands = set()
+    for match in (RECORDED_CMD.match(line) for line in text.splitlines()):
+        if not match:
+            continue
+        command = re.sub(r"\s+#.*$", "", match.group(1)).strip()
+        if command and not command.startswith("#"):
+            commands.add(command)
+    return commands
 
 
 def adr_documents() -> dict[str, tuple[str, str]]:
@@ -801,9 +826,13 @@ def check_matrix_criteria(matrix: dict, known: set[str]) -> None:
         short = source.split("SPEC-GATE-", 1)[-1]  # ADR-0025 writes "A0-03"
         # The ADR must be about transfers and must name this criterion. Several
         # ADRs mention A0-11 as a counter-argument, so naming alone is not it.
+        # ADR-0024 defines the predicate and ADR-0026 only corrects ADR-0025:
+        # neither is a handover, so neither may authorize a transfer.
         return (
             status == "normative"
+            and adr not in {"ADR-0024", "ADR-0026"}
             and "notApplicable" in body
+            and "acceptedBy" in body
             and (source in body or short in body)
         )
 
@@ -825,7 +854,7 @@ def check_matrix_criteria(matrix: dict, known: set[str]) -> None:
         needle = strip_text(text)
         # A transfer must name an obligation, not a particle: the verbatim
         # substring test would otherwise pass on "的".
-        if len(needle) < 4:
+        if len(needle) < 6:
             return False
         return needle in strip_text(target["must"]) or needle in strip_text(target["evidence"])
 
@@ -873,7 +902,11 @@ def check_matrix_criteria(matrix: dict, known: set[str]) -> None:
             if not backed(obligation, criterion_evidence):
                 ok = False
         if "expectedFailure" in obligation:
-            if not expected_failure_ok(obligation.get("expectedFailure")):
+            # An expected-failure obligation still needs a fixture name; the
+            # run alone is not a witness for "the fixture exists".
+            if "ref" not in obligation:
+                ok = False
+            elif not expected_failure_ok(obligation.get("expectedFailure")):
                 ok = False
         if "ref" not in obligation and "expectedFailure" not in obligation and not not_applicable:
             ok = False
@@ -1116,10 +1149,19 @@ def check_derived_numbers(matrix: dict, max_val: int) -> None:
         if not os.path.exists(path):
             failures.append(f"{name}: missing entry document")
             continue
+        coverage_lines: list[int] = []
         for line_no, line in enumerate(read_text(path).splitlines(), 1):
             mark = COVERAGE_MARK.search(line)
             if mark:
-                labels = {status: int(count) for count, status in COVERAGE_LABEL.findall(line)}
+                coverage_lines.append(line_no)
+                labels: dict[str, int] = {}
+                for count, status in COVERAGE_LABEL.findall(line):
+                    if status in labels:
+                        failures.append(
+                            f"{name}:{line_no}: coverage sentence repeats the "
+                            f"{status} label"
+                        )
+                    labels[status] = int(count)
                 closed_match = COVERAGE_CLOSED.search(line)
                 if "VERIFIED" in labels:
                     failures.append(
@@ -1154,6 +1196,11 @@ def check_derived_numbers(matrix: dict, max_val: int) -> None:
                     failures.append(
                         f"{name}:{line_no}: {key}={value} but runs[] recompute to {derived[key]}"
                     )
+        if len(coverage_lines) != 1:
+            failures.append(
+                f"{name}: expected exactly one coverage sentence, found "
+                f"{len(coverage_lines)} (lines {coverage_lines})"
+            )
 
 
 def check_claim_totals() -> None:
@@ -1228,6 +1275,7 @@ def check_claim_evid_keys() -> None:
 def main() -> int:
     files = markdown_files()
     check_frontmatter(files)
+    check_template_residue(files)
     check_links(files)
     known = defined_ids(files)
     check_ids(files, known)
