@@ -17,7 +17,17 @@ Checks, in order:
   8. matrix.json runs[] and the validation.md index describe the same runs,
      and the claim-register evidence-key table covers every EVID-VAL;
   9. every commit a run cites exists in this repository and is an ancestor of
-     HEAD, because a rewritten commit leaves the id and the numbers behind.
+     HEAD, because a rewritten commit leaves the id and the numbers behind;
+ 10. matrix.json criteria[] carries the ADR-0024 close predicate: every
+     criterion's obligations concatenate back to the exact text of its spec
+     column, every ref resolves to a #[test] in the tree or to a command that
+     appears verbatim in validation.md, every notApplicable obligation names a
+     defined ADR and an acceptedBy target whose text has landed, and both
+     criteria[].closed and gates[].closed equal the recomputation. Nothing is
+     read from a hand-maintained "closed" summary: hand-written booleans drift.
+
+This file only reads. Generation of criteria[] (or any other matrix data) is a
+separate, deliberate step; CI must never rewrite the corpus.
 
 Exit code is the number of failures, capped at 99. Standard library only.
 """
@@ -75,6 +85,16 @@ EVID_RANGE = re.compile(r"EVID-VAL-01\s*(?:…|\.{2,3})\s*(\d+)")
 # sentence is caught instead of silently skipped.
 COVERAGE_MARK = re.compile(r"(\d+)\s*条(?:判据|Gate 判据)")
 COVERAGE_LABEL = re.compile(r"(\d+)\s*条?\s*[`*]*\s*(VERIFIED|PROBE|OPEN)\b")
+# ADR-0024 decision 4: "12 PROBE (of which N closed)" is the entry-document
+# form. `closed` is not a status word; it is parsed separately.
+COVERAGE_CLOSED = re.compile(r"其中\s*(\d+)\s*条?\s*[`*]*closed[`*]*")
+# A test is a `#[test]`-annotated `fn`; the equivalent of `cargo test -- --list`
+# that works without a Rust toolchain (the docs job installs Python only).
+TEST_ATTR = re.compile(r"^\s*#\[test\]\s*$")
+TEST_FN = re.compile(r"^\s*(?:pub\s+)?(?:async\s+)?fn\s+([A-Za-z0-9_]+)")
+OBLIGATION_SOURCES = ("criterion", "evidence")
+# A recorded command is a `$ ...` line in validation.md, not any prose substring.
+RECORDED_CMD = re.compile(r"^\s*\$\s+(.+?)\s*$")
 GATE_ROW = re.compile(r"^\|\s*`?(SPEC-GATE-[A-Z0-9]+-\d{2})`?\s*\|")
 GATE_STATUS = re.compile(r"^`(VERIFIED|PROBE|OPEN|SPEC|WITHDRAWN)`")
 DERIVED_KEYS = ("runsTotal", "testsPassedH2", "runsReproducibleHere", "runsTranscribedOrExternal")
@@ -322,6 +342,28 @@ def check_duplicate_ids(files: list[str]) -> None:
             failures.append(f"duplicate ID '{doc_id}' defined at {where}")
 
 
+TEMPLATE_RESIDUE = re.compile(r"%[A-Z][A-Z0-9_]*(?:_[A-Z0-9]+)*%")
+# `%TEMP%` and friends are real environment variables, not template tokens.
+TEMPLATE_ALLOWED = {"%TEMP%", "%APPDATA%", "%USERPROFILE%", "%LOCALAPPDATA%"}
+
+
+def check_template_residue(files: list[str]) -> None:
+    """A literal `%COMMIT%` in a ledger is a missing fact, not a placeholder to
+    be filled later: no script renders one, so it reads as a commit that never
+    existed. Fail on it like any other bad record."""
+    for path in files:
+        if is_archive(path):
+            continue
+        for line_no, line in enumerate(read_text(path).splitlines(), 1):
+            for match in TEMPLATE_RESIDUE.finditer(line):
+                if match.group(0) in TEMPLATE_ALLOWED:
+                    continue
+                failures.append(
+                    f"{rel(path)}:{line_no}: unresolved template placeholder "
+                    f"{match.group(0)!r}"
+                )
+
+
 def load_matrix() -> dict | None:
     try:
         return json.loads(read_text(MATRIX))
@@ -446,9 +488,9 @@ def check_matrix_counts(matrix: dict) -> None:
         )
 
 
-def spec_criteria() -> dict[str, str]:
-    """Criterion id -> status, read from the status cell of the gate table."""
-    criteria: dict[str, str] = {}
+def spec_rows() -> dict[str, dict[str, str]]:
+    """Criterion id -> gate, both text columns and status, from the gate table."""
+    rows: dict[str, dict[str, str]] = {}
     for line in read_text(GATES).splitlines():
         m = GATE_ROW.match(line)
         if not m:
@@ -458,13 +500,141 @@ def spec_criteria() -> dict[str, str]:
         if not status:
             failures.append(f"{rel(GATES)}: {m.group(1)} has no status word in its last cell")
             continue
-        criteria[m.group(1)] = status.group(1)
-    return criteria
+        rows[m.group(1)] = {
+            "gate": m.group(1).rsplit("-", 1)[0],
+            "must": cells[1],
+            "evidence": cells[2],
+            "status": status.group(1),
+        }
+    return rows
+
+
+def strip_text(text: str) -> str:
+    """ADR-0024: whitespace and the full-width semicolon are separators, not text.
+
+    Backticks and emphasis are kept: they are part of the obligation.
+    """
+    return re.sub(r"[\s；]", "", text)
+
+
+def strip_rust_noise(text: str) -> str:
+    """Blank comments and string/char literals before looking for attributes.
+
+    A `#[test]` inside a block comment or a string is not a test; without this
+    the manifest would accept a name that no test defines. The scan is a single
+    left-to-right pass because treating comments and literals in separate regex
+    passes lets a `"/*"` in a string swallow the rest of the file.
+    """
+    out: list[str] = []
+    index = 0
+    length = len(text)
+    while index < length:
+        char = text[index]
+        if text.startswith("//", index):
+            newline = text.find("\n", index)
+            index = length if newline < 0 else newline
+            continue
+        if text.startswith("/*", index):
+            close = text.find("*/", index + 2)
+            index = length if close < 0 else close + 2
+            continue
+        if char == "r" and not (index and (text[index - 1].isalnum() or text[index - 1] == "_")):
+            cursor, hashes = index + 1, 0
+            while cursor < length and text[cursor] == "#":
+                hashes += 1
+                cursor += 1
+            if cursor < length and text[cursor] == '"':
+                terminator = '"' + "#" * hashes
+                close = text.find(terminator, cursor + 1)
+                index = length if close < 0 else close + len(terminator)
+                continue
+        if char == '"':
+            cursor = index + 1
+            while cursor < length:
+                if text[cursor] == "\\":
+                    cursor += 2
+                    continue
+                if text[cursor] == '"':
+                    cursor += 1
+                    break
+                cursor += 1
+            index = cursor
+            continue
+        if char == "'":
+            literal = re.match(r"'(?:\\.|[^'\\])'", text[index:])
+            if literal:
+                index += literal.end()
+                continue
+        out.append(char)
+        index += 1
+    return "".join(out)
+
+
+def test_manifest() -> set[str]:
+    """Every `#[test]` function name under crates/ and examples/.
+
+    This is the equivalent source listing ADR-0024 allows in place of
+    `cargo test -- --list`: the docs job installs Python but no Rust toolchain,
+    so the predicate must be computable without building the workspace.
+    """
+    names: set[str] = set()
+    # Only the cargo workspace (`crates/`): a `#[test]` in an examples/* PoC is
+    # not in `cargo test --workspace -- --list` and must not back a gate clause.
+    for base in ("crates",):
+        for dirpath, _dirnames, filenames in os.walk(os.path.join(ROOT, base)):
+            for name in filenames:
+                if not name.endswith(".rs"):
+                    continue
+                lines = strip_rust_noise(read_text(os.path.join(dirpath, name))).splitlines()
+                for index, line in enumerate(lines):
+                    if not TEST_ATTR.match(line):
+                        continue
+                    for following in lines[index + 1 : index + 4]:
+                        m = TEST_FN.match(following)
+                        if m:
+                            names.add(m.group(1))
+                            break
+    return names
+
+
+def recorded_commands(text: str) -> set[str]:
+    """Commands actually recorded in validation.md, as `$ <command>` lines."""
+    commands = set()
+    for match in (RECORDED_CMD.match(line) for line in text.splitlines()):
+        if not match:
+            continue
+        command = re.sub(r"\s+#.*$", "", match.group(1)).strip()
+        if command and not command.startswith("#"):
+            commands.add(command)
+    return commands
+
+
+def adr_documents() -> dict[str, tuple[str, str]]:
+    """ADR id -> (frontmatter status, body text).
+
+    A transfer may only cite a normative ADR whose body actually names the
+    criterion it transfers; otherwise any ADR would do.
+    """
+    documents: dict[str, tuple[str, str]] = {}
+    directory = os.path.join(DOCS, "decisions")
+    for name in os.listdir(directory):
+        if not (name.startswith("adr-") and name.endswith(".md")):
+            continue
+        text = read_text(os.path.join(directory, name))
+        fields = parse_frontmatter(text) or {}
+        if fields.get("doc-id"):
+            documents[fields["doc-id"]] = (fields.get("status", ""), text)
+    return documents
 
 
 def check_matrix_coverage(matrix: dict, known: set[str]) -> None:
     gates = [gate for gate in matrix.get("gates") or [] if isinstance(gate, dict)]
     coverage = matrix.get("coverage") or {}
+    if "criteriaVerified" in coverage:
+        failures.append(
+            f"{rel(MATRIX)} coverage still carries 'criteriaVerified'; ADR-0024 "
+            f"decision 4 replaces it with criteriaClosed"
+        )
     declared = sum(
         gate.get("criteria", 0) for gate in gates if isinstance(gate.get("criteria", 0), int)
     )
@@ -473,12 +643,13 @@ def check_matrix_coverage(matrix: dict, known: set[str]) -> None:
             f"{rel(MATRIX)} coverage.criteriaTotal={coverage.get('criteriaTotal')!r} "
             f"but gates[] sum to {declared}"
         )
-    split = sum(
-        coverage.get(key, 0) for key in ("criteriaVerified", "criteriaProbe", "criteriaOpen")
-    )
+    # The four spec status words are a partition; `closed` is deliberately not
+    # one of them (ADR-0024 decisions 1 and 4).
+    partition_keys = ("criteriaSpec", "criteriaProbe", "criteriaOpen", "criteriaWithdrawn")
+    split = sum(coverage.get(key, 0) for key in partition_keys)
     if split != coverage.get("criteriaTotal"):
         failures.append(
-            f"{rel(MATRIX)} coverage splits into {split} criteria but declares "
+            f"{rel(MATRIX)} coverage partitions into {split} criteria but declares "
             f"criteriaTotal={coverage.get('criteriaTotal')!r}"
         )
     # Gate ids (SPEC-GATE-A0) are aliases for a criterion family, so each must
@@ -490,15 +661,23 @@ def check_matrix_coverage(matrix: dict, known: set[str]) -> None:
 
     # The split must match the status column of docs/spec/08-gates.md, which is
     # where a criterion actually changes state; the matrix only projects it.
-    criteria = spec_criteria()
+    criteria = spec_rows()
     if not criteria:
         failures.append(f"{rel(GATES)}: no SPEC-GATE-*-NN criterion rows found")
         return
-    observed = Counter(criteria.values())
+    observed = Counter(row["status"] for row in criteria.values())
+    # VERIFIED is a vocabulary assert, not a measurement: the spec layer never
+    # claims it (08-gates.md:19, ADR-0012 decision 2, ADR-0024 decision 5).
+    if observed.get("VERIFIED", 0):
+        failures.append(
+            f"{rel(GATES)}: {observed['VERIFIED']} criteria are VERIFIED; the spec "
+            f"layer must never assert VERIFIED"
+        )
     projected = {
-        "VERIFIED": coverage.get("criteriaVerified", 0),
+        "SPEC": coverage.get("criteriaSpec", 0),
         "PROBE": coverage.get("criteriaProbe", 0),
         "OPEN": coverage.get("criteriaOpen", 0),
+        "WITHDRAWN": coverage.get("criteriaWithdrawn", 0),
     }
     for status, count in projected.items():
         if observed.get(status, 0) != count:
@@ -521,6 +700,314 @@ def check_matrix_coverage(matrix: dict, known: set[str]) -> None:
                 f"{rel(MATRIX)} gate '{gate_id}' declares {gate.get('criteria')} criteria "
                 f"but {rel(GATES)} defines {actual}"
             )
+
+    # closed is a derived count, never an input. It is a subset of PROBE.
+    rows = [row for row in matrix.get("criteria") or [] if isinstance(row, dict)]
+    stored_closed = sum(1 for row in rows if row.get("closed") is True)
+    closed_count = coverage.get("criteriaClosed")
+    if closed_count != stored_closed:
+        failures.append(
+            f"{rel(MATRIX)} coverage.criteriaClosed={closed_count!r} but criteria[] "
+            f"holds {stored_closed} closed rows"
+        )
+    if not isinstance(closed_count, int) or closed_count > coverage.get("criteriaProbe", 0):
+        failures.append(
+            f"{rel(MATRIX)} coverage.criteriaClosed={closed_count!r} must be an integer "
+            f"and at most criteriaProbe={coverage.get('criteriaProbe')!r}: closed ⊆ PROBE"
+        )
+    for gate in gates:
+        gate_id = gate.get("id")
+        if not gate_id:
+            continue
+        under = [row for row in rows if str(row.get("id", "")).startswith(f"{gate_id}-")]
+        if not under:
+            failures.append(
+                f"{rel(MATRIX)} gate '{gate_id}' has no row in criteria[]"
+            )
+            continue
+        expected = all(row.get("closed") is True for row in under)
+        if "closed" not in gate:
+            failures.append(f"{rel(MATRIX)} gate '{gate_id}' has no 'closed' field")
+        elif gate.get("closed") is not expected:
+            failures.append(
+                f"{rel(MATRIX)} gate '{gate_id}' closed={gate.get('closed')!r} but its "
+                f"criteria recompute to {expected}"
+            )
+
+
+def run_commit_known(run: dict, matrix: dict) -> bool:
+    """ADR-0024: a run-level sha, or the matrix-level commit it inherits.
+
+    An explicit `commit: null` is a recorded unknown, not an absence: it must
+    never inherit the matrix-level commit, or a transcribed H1 run would look
+    locatable and could back a closed obligation.
+    """
+    if "commit" in run:
+        commit = run["commit"]
+        return isinstance(commit, str) and bool(COMMIT_SHA.fullmatch(commit))
+    return isinstance(matrix.get("commit"), str) and bool(COMMIT_SHA.fullmatch(matrix["commit"]))
+
+
+def check_run_completeness(matrix: dict) -> None:
+    """Every run states its exit, its test applicability, a summary and where
+    its commit is known — or says explicitly that it is not.
+
+    Silent key omission is how "11 runs without a commit, 21 without a tests
+    count" stayed invisible. An explicit null with a note is a recorded fact;
+    a missing key is not a record at all.
+    """
+    for index, run in enumerate(matrix.get("runs") or []):
+        if not isinstance(run, dict):
+            continue
+        where = f"{rel(MATRIX)} runs[{index}] {run.get('id', '?')}"
+        if "exit" not in run:
+            failures.append(f"{where}: missing 'exit' (an int, or null with 'exitNote')")
+        elif run["exit"] is None:
+            if not run.get("exitNote"):
+                failures.append(f"{where}: exit is null without an 'exitNote'")
+        elif not isinstance(run["exit"], int) or isinstance(run["exit"], bool):
+            failures.append(f"{where}: exit {run['exit']!r} is neither an int nor null")
+        tests = run.get("tests")
+        if not isinstance(tests, dict):
+            failures.append(
+                f"{where}: missing 'tests' object (an integer 'passed', or 'applicable': false)"
+            )
+        elif not isinstance(tests.get("passed"), int) and tests.get("applicable") is not False:
+            failures.append(
+                f"{where}: 'tests' has neither an integer 'passed' nor 'applicable': false"
+            )
+        if not (run.get("proves") or run.get("traceSha256")):
+            failures.append(f"{where}: no summary — needs 'proves' or 'traceSha256'")
+        if "commit" not in run:
+            failures.append(
+                f"{where}: missing 'commit' (a 40-character sha, or null with 'commitNote')"
+            )
+        elif run["commit"] is None and not run.get("commitNote"):
+            failures.append(f"{where}: commit is null without a 'commitNote'")
+
+
+def check_matrix_criteria(matrix: dict, known: set[str]) -> None:
+    """Recompute ADR-0024's close predicate from criteria[].
+
+    Three conditions make a criterion closed: its obligations partition both
+    spec columns exactly, every obligation resolves (a #[test] name, a command
+    quoted verbatim in validation.md, or a notApplicable transfer whose target
+    text has landed), and every mapped obligation cites an exit-0 run with a
+    locatable commit and a summary. The stored boolean is only compared with
+    that recomputation — it is never trusted.
+    """
+    spec = spec_rows()
+    rows = matrix.get("criteria")
+    if not isinstance(rows, list) or not rows:
+        failures.append(
+            f"{rel(MATRIX)}: 'criteria' must be a non-empty list (ADR-0024 decision 3)"
+        )
+        return
+    tests = test_manifest()
+    commands = recorded_commands(read_text(VALIDATION))
+    adrs = adr_documents()
+    runs = {
+        run.get("id"): run
+        for run in matrix.get("runs") or []
+        if isinstance(run, dict) and isinstance(run.get("id"), str)
+    }
+
+    def ref_resolves(ref: object) -> bool:
+        if not isinstance(ref, str) or not ref.strip():
+            return False
+        return ref in tests or ref in commands
+
+    def adr_resolves(adr: object, source: str) -> bool:
+        if not isinstance(adr, str) or re.fullmatch(r"ADR-\d{4}", adr) is None:
+            return False
+        if adr not in known or adr not in adrs:
+            return False
+        status, body = adrs[adr]
+        short = source.split("SPEC-GATE-", 1)[-1]  # ADR-0025 writes "A0-03"
+        # The ADR must be about transfers and must name this criterion. Several
+        # ADRs mention A0-11 as a counter-argument, so naming alone is not it.
+        # ADR-0024 defines the predicate and ADR-0026 only corrects ADR-0025:
+        # neither is a handover, so neither may authorize a transfer.
+        return (
+            status == "normative"
+            and adr not in {"ADR-0024", "ADR-0026"}
+            and "notApplicable" in body
+            and "acceptedBy" in body
+            and (source in body or short in body)
+        )
+
+    def accepted_lands(accepted: object, source: str) -> bool:
+        """The target must be a criterion in another gate, and the text must
+        already be in one of that criterion's two columns — not straddling them.
+        """
+        if not isinstance(accepted, dict):
+            return False
+        target_id = accepted.get("criterion")
+        if not isinstance(target_id, str):
+            return False
+        target = spec.get(target_id)
+        text = accepted.get("text")
+        if target is None or target_id == source or target["gate"] == spec[source]["gate"]:
+            return False
+        if not isinstance(text, str):
+            return False
+        needle = strip_text(text)
+        # A transfer must name an obligation, not a particle: the verbatim
+        # substring test would otherwise pass on "的".
+        if len(needle) < 6:
+            return False
+        return needle in strip_text(target["must"]) or needle in strip_text(target["evidence"])
+
+    def expected_failure_ok(run_id: object) -> bool:
+        run = runs.get(run_id) if isinstance(run_id, str) else None
+        return (
+            isinstance(run, dict)
+            and run.get("kind") == "compile-fail"
+            and isinstance(run.get("exit"), int)
+            and run["exit"] != 0
+            and run_commit_known(run, matrix)
+            and bool(run.get("proves") or run.get("traceSha256"))
+        )
+
+    def backed(obligation: dict, criterion_evidence: list) -> bool:
+        ids = obligation["evidence"] if "evidence" in obligation else criterion_evidence
+        if not isinstance(ids, list):
+            return False
+        for run_id in ids:
+            run = runs.get(run_id) if isinstance(run_id, str) else None
+            if (
+                isinstance(run, dict)
+                and run.get("exit") == 0
+                and run_commit_known(run, matrix)
+                and (run.get("proves") or run.get("traceSha256"))
+            ):
+                return True
+        return False
+
+    def obligation_ok(obligation: dict, criterion_evidence: list, source: str) -> bool:
+        if not isinstance(obligation, dict):
+            return False
+        not_applicable = obligation.get("kind") == "notApplicable"
+        ok = True
+        if not_applicable:
+            ok = adr_resolves(obligation.get("adr"), source) and accepted_lands(
+                obligation.get("acceptedBy"), source
+            )
+        # A partially transferred obligation keeps its ref; a fully transferred
+        # one has none. Either way, every ref that is present must resolve and
+        # be backed — expectedFailure is an extra constraint, not a way out.
+        if "ref" in obligation:
+            if not ref_resolves(obligation.get("ref")):
+                ok = False
+            if not backed(obligation, criterion_evidence):
+                ok = False
+        if "expectedFailure" in obligation:
+            # An expected-failure obligation still needs a fixture name; the
+            # run alone is not a witness for "the fixture exists".
+            if "ref" not in obligation:
+                ok = False
+            elif not expected_failure_ok(obligation.get("expectedFailure")):
+                ok = False
+        if "ref" not in obligation and "expectedFailure" not in obligation and not not_applicable:
+            ok = False
+        return ok
+
+    by_id: dict[str, dict] = {}
+    for index, row in enumerate(rows):
+        where = f"{rel(MATRIX)} criteria[{index}]"
+        if not isinstance(row, dict):
+            failures.append(f"{where}: must be an object")
+            continue
+        criterion = row.get("id")
+        if criterion not in spec:
+            failures.append(f"{where}: {criterion!r} is not defined in {rel(GATES)}")
+            continue
+        if criterion in by_id:
+            failures.append(f"{where}: duplicate criterion '{criterion}'")
+            continue
+        by_id[criterion] = row
+        if row.get("gate") != spec[criterion]["gate"]:
+            failures.append(
+                f"{where} ({criterion}): gate {row.get('gate')!r} but the id belongs to "
+                f"'{spec[criterion]['gate']}'"
+            )
+        if row.get("status") != spec[criterion]["status"]:
+            failures.append(
+                f"{where} ({criterion}): status {row.get('status')!r} but {rel(GATES)} "
+                f"says {spec[criterion]['status']!r}"
+            )
+        obligations = row.get("obligations")
+        if not isinstance(obligations, list):
+            failures.append(f"{where} ({criterion}): 'obligations' must be a list")
+            obligations = []
+        for obligation in obligations:
+            if not isinstance(obligation, dict):
+                failures.append(f"{where} ({criterion}): obligation is not an object")
+                continue
+            if obligation.get("source") not in OBLIGATION_SOURCES:
+                failures.append(
+                    f"{where} ({criterion}): obligation source "
+                    f"{obligation.get('source')!r} must be one of {OBLIGATION_SOURCES}"
+                )
+            if not isinstance(obligation.get("text"), str):
+                failures.append(f"{where} ({criterion}): obligation text must be a string")
+            if obligation.get("kind") == "notApplicable":
+                if not adr_resolves(obligation.get("adr"), criterion):
+                    failures.append(
+                        f"{where} ({criterion}): notApplicable obligation without a "
+                        f"defined ADR ({obligation.get('adr')!r}); ADR-0024 requires one"
+                    )
+                if not accepted_lands(obligation.get("acceptedBy"), criterion):
+                    failures.append(
+                        f"{where} ({criterion}): acceptedBy target or text has not "
+                        f"landed ({obligation.get('acceptedBy')!r})"
+                    )
+            if "expectedFailure" in obligation and not isinstance(
+                runs.get(obligation.get("expectedFailure")), dict
+            ):
+                failures.append(
+                    f"{where} ({criterion}): expectedFailure "
+                    f"{obligation.get('expectedFailure')!r} is not a declared run"
+                )
+        for source, column in (
+            ("criterion", spec[criterion]["must"]),
+            ("evidence", spec[criterion]["evidence"]),
+        ):
+            joined = "".join(
+                str(obligation.get("text", ""))
+                for obligation in obligations
+                if isinstance(obligation, dict) and obligation.get("source") == source
+            )
+            if strip_text(joined) != strip_text(column):
+                failures.append(
+                    f"{where} ({criterion}): {source} obligations do not concatenate "
+                    f"to the {rel(GATES)} column ({len(strip_text(joined))} chars vs "
+                    f"{len(strip_text(column))} expected); every character must be mapped"
+                )
+        if "evidence" not in row:
+            failures.append(f"{where} ({criterion}): missing 'evidence' list")
+            evidence = row.get("evidence") or []
+        evidence = row.get("evidence")
+        if not isinstance(evidence, list):
+            failures.append(f"{where} ({criterion}): 'evidence' must be a list")
+            evidence = []
+        for run_id in evidence:
+            if not isinstance(run_id, str) or run_id not in runs:
+                failures.append(
+                    f"{where} ({criterion}): evidence cites unknown run {run_id!r}"
+                )
+        computed = (
+            row.get("status") == "PROBE"
+            and bool(obligations)
+            and all(obligation_ok(obligation, evidence, criterion) for obligation in obligations)
+        )
+        if row.get("closed") is not computed:
+            failures.append(
+                f"{where} ({criterion}): stored closed={row.get('closed')!r} but the "
+                f"predicate recomputes to {computed}"
+            )
+    for missing in sorted(set(spec) - set(by_id)):
+        failures.append(f"{rel(MATRIX)}: criteria[] is missing {missing}")
 
 
 def check_matrix_matches_validation(matrix: dict) -> None:
@@ -574,8 +1061,10 @@ def check_run_commits(matrix: dict) -> None:
     `commit` string, but the object is gone — and nothing in the text can tell
     that apart from an honest record. Only the repository can. Runs without a
     `commit` field (transcribed hosts, external fixtures) are skipped: there is
-    nothing to look up, and inventing one would be worse than the gap. A field
-    that exists but is empty or malformed is not that gap — it is bad data.
+    nothing to look up, and inventing one would be worse than the gap. A null
+    field is that gap made explicit: check_run_completeness requires a
+    `commitNote` beside it, and no obligation may rely on such a run. A field
+    that is empty or malformed is not the gap — it is bad data.
     """
     runs = [run for run in matrix.get("runs") or [] if isinstance(run, dict)]
     cited = [(run.get("id"), run["commit"]) for run in runs if "commit" in run]
@@ -589,11 +1078,14 @@ def check_run_commits(matrix: dict) -> None:
         )
         return
     for run_id, commit in cited:
+        if commit is None:
+            # Explicit unknown, paired with a commitNote by check_run_completeness.
+            continue
         if not isinstance(commit, str) or not COMMIT_SHA.fullmatch(commit):
             failures.append(
                 f"{rel(MATRIX)} {run_id}: commit {commit!r} is not a full "
                 f"40-character sha; an empty or malformed value is bad data, not a "
-                f"missing record — drop the field instead"
+                f"missing record — use null plus a commitNote, or drop the field"
             )
             continue
         exists, _ = git("cat-file", "-e", f"{commit}^{{commit}}")
@@ -646,7 +1138,7 @@ def check_derived_numbers(matrix: dict, max_val: int) -> None:
     coverage = matrix.get("coverage") or {}
     expected_coverage = (
         coverage.get("criteriaTotal"),
-        coverage.get("criteriaVerified"),
+        coverage.get("criteriaClosed"),
         coverage.get("criteriaProbe"),
         coverage.get("criteriaOpen"),
     )
@@ -657,20 +1149,35 @@ def check_derived_numbers(matrix: dict, max_val: int) -> None:
         if not os.path.exists(path):
             failures.append(f"{name}: missing entry document")
             continue
+        coverage_lines: list[int] = []
         for line_no, line in enumerate(read_text(path).splitlines(), 1):
             mark = COVERAGE_MARK.search(line)
             if mark:
-                labels = {status: int(count) for count, status in COVERAGE_LABEL.findall(line)}
+                coverage_lines.append(line_no)
+                labels: dict[str, int] = {}
+                for count, status in COVERAGE_LABEL.findall(line):
+                    if status in labels:
+                        failures.append(
+                            f"{name}:{line_no}: coverage sentence repeats the "
+                            f"{status} label"
+                        )
+                    labels[status] = int(count)
+                closed_match = COVERAGE_CLOSED.search(line)
+                if "VERIFIED" in labels:
+                    failures.append(
+                        f"{name}:{line_no}: coverage sentence still quotes VERIFIED; "
+                        f"ADR-0024 decision 5 stops that usage"
+                    )
                 quoted = (
                     int(mark.group(1)),
-                    labels.get("VERIFIED"),
+                    int(closed_match.group(1)) if closed_match else None,
                     labels.get("PROBE"),
                     labels.get("OPEN"),
                 )
                 if None in quoted:
                     failures.append(
-                        f"{name}:{line_no}: coverage sentence names the total but not "
-                        f"VERIFIED/PROBE/OPEN counts"
+                        f"{name}:{line_no}: coverage sentence must name the total, the "
+                        f"closed count (the '其中 N closed' form), PROBE and OPEN"
                     )
                 elif quoted != expected_coverage:
                     failures.append(
@@ -689,6 +1196,11 @@ def check_derived_numbers(matrix: dict, max_val: int) -> None:
                     failures.append(
                         f"{name}:{line_no}: {key}={value} but runs[] recompute to {derived[key]}"
                     )
+        if len(coverage_lines) != 1:
+            failures.append(
+                f"{name}: expected exactly one coverage sentence, found "
+                f"{len(coverage_lines)} (lines {coverage_lines})"
+            )
 
 
 def check_claim_totals() -> None:
@@ -763,6 +1275,7 @@ def check_claim_evid_keys() -> None:
 def main() -> int:
     files = markdown_files()
     check_frontmatter(files)
+    check_template_residue(files)
     check_links(files)
     known = defined_ids(files)
     check_ids(files, known)
@@ -772,8 +1285,10 @@ def main() -> int:
     max_val = highest_validation_id()
     if matrix is not None:
         check_matrix_runs(matrix)
+        check_run_completeness(matrix)
         check_matrix_counts(matrix)
         check_matrix_coverage(matrix, known)
+        check_matrix_criteria(matrix, known)
         check_matrix_matches_validation(matrix)
         check_run_commits(matrix)
         check_derived_numbers(matrix, max_val)

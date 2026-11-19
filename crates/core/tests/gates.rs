@@ -192,8 +192,8 @@ fn a0_06_rejected_commit_restores_the_previous_commit() {
 
     // `SPEC-GATE-A0-06` asks for an `InvalidGeneration` injection. Under
     // ADR-0017 decision 7 a stale handle is a *value* error, so the frame
-    // commits and the injection is pinned by "the rejected write leaves the
-    // authority identical", not by a rollback.
+    // commits and the injection is pinned by a field-by-field comparison of
+    // the authority before and after, not by a rollback.
     let doomed_row: RowId = runtime.frame(|tx| tx.insert("Z")).expect("insert Z");
     runtime
         .frame(|tx| {
@@ -201,6 +201,7 @@ fn a0_06_rejected_commit_restores_the_previous_commit() {
             Ok(())
         })
         .expect("remove Z");
+    let before_stale = authority(&runtime);
     runtime
         .frame(|tx| {
             let rejected = tx.toggle(doomed_row);
@@ -211,6 +212,37 @@ fn a0_06_rejected_commit_restores_the_previous_commit() {
             Ok(())
         })
         .expect("the frame still commits");
+    let mut after_stale = authority(&runtime);
+    // The frame commits, so the two monotonic counters are the only state
+    // fields allowed to move. `published` records the commit's changed keys:
+    // a rejected write publishes none, so its values are compared first and
+    // the journal entry is then normalised away.
+    assert_eq!(
+        after_stale
+            .published
+            .as_ref()
+            .map(|snapshot| snapshot.1.clone()),
+        before_stale
+            .published
+            .as_ref()
+            .map(|snapshot| snapshot.1.clone()),
+        "the published snapshot values must not move"
+    );
+    assert_eq!(
+        after_stale
+            .published
+            .as_ref()
+            .map(|snapshot| snapshot.0.len()),
+        Some(0),
+        "a rejected write publishes no changed keys"
+    );
+    after_stale.commits = before_stale.commits;
+    after_stale.publications = before_stale.publications;
+    after_stale.published = before_stale.published.clone();
+    assert_eq!(
+        before_stale, after_stale,
+        "a rejected stale generation must not move any authority field"
+    );
     assert_eq!(
         runtime.committed().len(),
         3,
@@ -323,6 +355,66 @@ fn a0_06_a_duplicate_key_is_a_value_error_that_keeps_the_frame_alive() {
         "only the insert wrote"
     );
     assert_eq!(after.publications, before.publications + 1);
+}
+
+/// `SPEC-GATE-A0-06`: a duplicate key is rejected **before** any patch, and
+/// every authority field is identical afterwards. The frame still commits (a
+/// value error is not fatal, `ADR-0017` decision 7), so only the two monotonic
+/// publication counters may move.
+///
+/// Red-ability: let a repeated key reach the store and the `reorder` assertion
+/// fails; publish a partial order and `authority` diverges.
+#[test]
+fn a0_06_a_duplicate_key_leaves_every_authority_field_identical() {
+    let mut runtime = Runtime::new();
+
+    runtime
+        .frame(|tx| {
+            tx.insert("A")?;
+            tx.insert("B")?;
+            Ok(())
+        })
+        .expect("seed");
+
+    runtime
+        .frame(|tx| {
+            let keys: Vec<_> = runtime_keys(tx);
+            let mut views = Vec::with_capacity(keys.len());
+            for key in &keys {
+                views.push(tx.mount_row(*key, 1)?);
+            }
+            tx.reorder_views(&views)?;
+            tx.focus(views[0])?;
+            Ok(())
+        })
+        .expect("mount");
+
+    let before = authority(&runtime);
+
+    runtime
+        .frame(|tx| {
+            let keys: Vec<_> = runtime_keys(tx);
+            let duplicate = tx.reorder(&[keys[0], keys[0]]);
+            assert!(
+                matches!(
+                    duplicate,
+                    Err(ValueError::Store(StoreError::DuplicateKey(_)))
+                ),
+                "a repeated key must be rejected as a value error, got {duplicate:?}"
+            );
+            Ok(())
+        })
+        .expect("the frame still commits");
+
+    let mut after = authority(&runtime);
+    // The frame itself commits, so those two counters are the only permitted
+    // movement; everything they describe must be byte-identical.
+    after.commits = before.commits;
+    after.publications = before.publications;
+    assert_eq!(
+        before, after,
+        "a rejected duplicate key must not move any authority field"
+    );
 }
 
 /// `ADR-0017` decision 3: a failed `read_once` does not count as I/O.

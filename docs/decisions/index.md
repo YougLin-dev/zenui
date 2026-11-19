@@ -66,6 +66,7 @@ replaces: []
 | [ADR-0023](adr-0023-row-set-projection-scope.md) | A0 的共享行集投影由缓存快照承担；可订阅的 `Memo<RowSet>` 随 `For` 在 A1 落地且只从 revision 对派生；粗粒度 membership 掩码以「结构写同时推进 order revision」为前提 | `SPEC-GATE-A0-07`；`SPEC-MACRO-011`；`SPEC-RT-043`；`ADR-0022` | normative |
 | [ADR-0024](adr-0024-gate-close-predicate.md) | Gate `closed` 是证据层脚本计算的结构谓词（子句映射 + `notApplicable` + 证据五要素），不新增状态词；删除恒为 0 的 `criteriaVerified` | `SPEC-GATE-A0-01`…`-11`；`SPEC-GATE-*` 全部 | normative |
 | [ADR-0025](adr-0025-a0-not-applicable-handover.md) | A0 七条无执行对象子句逐条移交 A1：click、多节点环、native/IME/resource、memo/per-row 边、For/订阅、input/toolbar、subscriber bucket | `SPEC-GATE-A0-03`、`-05`、`-06`、`-07`、`-09`、`-10`、`-11`；`SPEC-GATE-A1-01`…`-08` | normative |
+| [ADR-0026](adr-0026-adr-0025-evidence-gap-errata.md) | 勘误 ADR-0025「相邻证据缺口」：三处缺口已由 #22 的 generation / prev / caches 夹具关闭；不改变任何决定 | `SPEC-GATE-A0-09`、`-10`、`-11` | normative |
 
 ## 3. 每条的固定结构
 
@@ -93,6 +94,7 @@ replaces: []
 | 2026-11-18 P3.2 收口·行集投影边界（队长） | 0023 | `Memo<RowSet>` 归 A1；粗粒度掩码的前提与撤销条件 |
 | 2026-11-19 M0 收口·关闭谓词（队长） | 0024 | `closed` 由证据层计算；`criteriaVerified` 恒为 0，不再作论据 |
 | 2026-11-19 M0 收口·无对象子句移交（队长） | 0025 | 七条 A0 子句的对象在 A0 不存在，逐条移交 A1 |
+| 2026-11-19 M0 收口·ADR-0025 勘误（Release） | 0026 | 三处「有对象、缺夹具」由 #22 夹具关闭；ADR 正文不改 |
 | `docs/README.md` 四层治理契约 | 0011 | 文档层的唯一入口与状态词表 |
 
 ## 5. 维护规则

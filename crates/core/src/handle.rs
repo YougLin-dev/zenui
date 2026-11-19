@@ -341,4 +341,43 @@ mod tests {
         let generation = Generation(u32::MAX).next();
         assert_eq!(generation, Generation::FIRST);
     }
+
+    /// `SPEC-GATE-A0-03`: the handle identity is exactly the
+    /// `{runtime_id, slot, generation}` triple — each field alone separates two
+    /// handles whose other fields agree.
+    ///
+    /// Red-ability: drop `runtime`, `slot` or `generation` from `PartialEq`
+    /// and the matching `assert_ne!` fails.
+    #[test]
+    fn a_handle_identity_is_the_runtime_slot_generation_triple() {
+        let runtime_a = RuntimeId::allocate();
+        let runtime_b = RuntimeId::allocate();
+        let slot = SlotIndex::from_index(0);
+        let generation = Generation::FIRST;
+        let handle = Handle::<u32>::new(runtime_a, slot, generation);
+
+        assert_eq!(handle.runtime(), runtime_a);
+        assert_eq!(handle.slot(), slot);
+        assert_eq!(handle.generation(), generation);
+        assert_eq!(
+            handle,
+            Handle::<u32>::new(runtime_a, slot, generation),
+            "the same triple is the same handle"
+        );
+        assert_ne!(
+            handle,
+            Handle::<u32>::new(runtime_b, slot, generation),
+            "runtime_id separates handles"
+        );
+        assert_ne!(
+            handle,
+            Handle::<u32>::new(runtime_a, SlotIndex::from_index(1), generation),
+            "slot separates handles"
+        );
+        assert_ne!(
+            handle,
+            Handle::<u32>::new(runtime_a, slot, generation.next()),
+            "generation separates handles"
+        );
+    }
 }
