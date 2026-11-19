@@ -9,6 +9,7 @@
 //! performed the read on the executor's behalf would measure itself.
 
 use zenui_app::TodoApp;
+use zenui_core::Filter;
 
 #[test]
 fn a0_02_each_new_view_costs_exactly_one_owned_read() {
@@ -68,5 +69,48 @@ fn a0_07_binding_a_filter_clones_no_titles() {
         app.runtime().counters().string_clones - before,
         3,
         "three mount reads and nothing else"
+    );
+}
+
+/// `SPEC-GATE-A0-07`: two consumers of one filter's row set clone no titles.
+///
+/// Red-ability: make `RowSet` carry owned titles (instead of `RowKey`) and
+/// binding it to views clones them again; the counter moves off zero.
+#[test]
+fn a0_07_two_consumers_of_one_filter_clone_no_titles() {
+    let mut app = TodoApp::new();
+    app.frame(|tx, _ui| {
+        for title in ["A", "B", "C"] {
+            tx.insert(title)?;
+        }
+        Ok(())
+    })
+    .expect("seed");
+    app.render().expect("first render");
+    let before = app.runtime().counters();
+
+    app.frame(|tx, ui| {
+        let first = tx.rows(Filter::All);
+        let second = tx.rows(Filter::All);
+        assert_eq!(
+            first.iter().collect::<Vec<_>>(),
+            second.iter().collect::<Vec<_>>(),
+            "both consumers see the same row set"
+        );
+        zenui_app::render(tx, ui)?;
+        Ok(())
+    })
+    .expect("two consumers");
+
+    let after = app.runtime().counters();
+    assert_eq!(
+        after.string_clones - before.string_clones,
+        0,
+        "two consumers of one row set clone no titles"
+    );
+    assert_eq!(
+        after.io_reads - before.io_reads,
+        0,
+        "an existing view is not re-read"
     );
 }

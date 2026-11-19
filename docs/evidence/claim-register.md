@@ -80,11 +80,11 @@ replaces: []
 | EVID-VAL-20 | A | `cargo run -p zenui-app --example todolist_headless --locked`（H2，commit `83b21a4`） | 9 步 trace；两次运行逐字节一致 |
 | EVID-VAL-21 | A | `cargo test --workspace --locked`（H2，commit `83b21a4`） | 40 passed（34 core + 6 golden） |
 | EVID-VAL-22 | D | `cargo test --workspace --locked`（CI 矩阵 ubuntu/macos/windows，commit `213f772`） | 40 passed × 3 平台 |
-| EVID-VAL-23 | A | `cargo test -p zenui-core --test gates --locked`（H2，commit `%COMMIT%`） | 4 passed（A0-03/04/06 夹具，含 mutation 判红复核） |
-| EVID-VAL-24 | A | `cargo test -p zenui-core --locked`（H2，commit `%COMMIT%`） | 50 passed（44 lib + 4 gates + 2 doctest） |
-| EVID-VAL-25 | A | `cargo run -p zenui-app --example todolist_headless --locked`（H2，commit `%COMMIT%`） | 9 步 trace，sha256 与 EVID-VAL-20 相同 |
-| EVID-VAL-26 | A | `cargo clippy --workspace --all-targets --locked -- -D warnings`（H2，commit `%COMMIT%`） | exit 0（本机，不是 CI 日志） |
-| EVID-VAL-27 | A | `cargo test -p zenui-core --test regressions --locked`（H2，commit `bb16522b03abd7fb0102fb092c49284615416fbc`） | 8 passed（ADR-0017 审计回归夹具） |
+| EVID-VAL-23 | A | `cargo test -p zenui-core --test gates --locked`（H2，commit `e53ae0e`） | 6 passed（A0-03/04/06 夹具，含 mutation 判红复核） |
+| EVID-VAL-24 | A | `cargo test -p zenui-core --locked`（H2，commit `e53ae0e`） | 75 passed（52 + 6 + 11 + 6 doctest） |
+| EVID-VAL-25 | A | `cargo run -p zenui-app --example todolist_headless --locked`（H2，commit `e53ae0e`） | 9 步 trace，sha256 与 EVID-VAL-20 相同 |
+| EVID-VAL-26 | A | `cargo clippy --workspace --all-targets --locked -- -D warnings`（H2，commit `e53ae0e`） | exit 0（本机，不是 CI 日志） |
+| EVID-VAL-27 | A | `cargo test -p zenui-core --test regressions --locked`（H2，commit `e53ae0e`） | 11 passed（失败帧与审计回归夹具） |
 | EVID-VAL-28 | A | `cargo test -p zenui-core --test queries --locked`（H2，commit `f7a2d62`） | 4 passed（A0-07/08 计数夹具） |
 | EVID-VAL-29 | A | `cargo test -p zenui-core --test lifecycle --locked`（H2，commit `f7a2d62`） | 7 passed（A0-09/10/11 与 A0-02 运行时夹具） |
 | EVID-VAL-30 | A | `cargo test -p zenui-core --locked`（H2，commit `f7a2d62`） | 90 passed（54 + 6 + 7 + 4 + 11 + 8 doctest） |

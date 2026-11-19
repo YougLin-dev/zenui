@@ -325,6 +325,66 @@ fn a0_06_a_duplicate_key_is_a_value_error_that_keeps_the_frame_alive() {
     assert_eq!(after.publications, before.publications + 1);
 }
 
+/// `SPEC-GATE-A0-06`: a duplicate key is rejected **before** any patch, and
+/// every authority field is identical afterwards. The frame still commits (a
+/// value error is not fatal, `ADR-0017` decision 7), so only the two monotonic
+/// publication counters may move.
+///
+/// Red-ability: let a repeated key reach the store and the `reorder` assertion
+/// fails; publish a partial order and `authority` diverges.
+#[test]
+fn a0_06_a_duplicate_key_leaves_every_authority_field_identical() {
+    let mut runtime = Runtime::new();
+
+    runtime
+        .frame(|tx| {
+            tx.insert("A")?;
+            tx.insert("B")?;
+            Ok(())
+        })
+        .expect("seed");
+
+    runtime
+        .frame(|tx| {
+            let keys: Vec<_> = runtime_keys(tx);
+            let mut views = Vec::with_capacity(keys.len());
+            for key in &keys {
+                views.push(tx.mount_row(*key, 1)?);
+            }
+            tx.reorder_views(&views)?;
+            tx.focus(views[0])?;
+            Ok(())
+        })
+        .expect("mount");
+
+    let before = authority(&runtime);
+
+    runtime
+        .frame(|tx| {
+            let keys: Vec<_> = runtime_keys(tx);
+            let duplicate = tx.reorder(&[keys[0], keys[0]]);
+            assert!(
+                matches!(
+                    duplicate,
+                    Err(ValueError::Store(StoreError::DuplicateKey(_)))
+                ),
+                "a repeated key must be rejected as a value error, got {duplicate:?}"
+            );
+            Ok(())
+        })
+        .expect("the frame still commits");
+
+    let mut after = authority(&runtime);
+    // The frame itself commits, so those two counters are the only permitted
+    // movement; everything they describe must be byte-identical.
+    after.commits = before.commits;
+    after.publications = before.publications;
+    assert_eq!(
+        before, after,
+        "a rejected duplicate key must not move any authority field"
+    );
+}
+
 /// `ADR-0017` decision 3: a failed `read_once` does not count as I/O.
 #[test]
 fn a0_03_a_failed_read_does_not_advance_io_reads() {
