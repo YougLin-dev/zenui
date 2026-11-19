@@ -558,7 +558,7 @@ fn TodoItem(todo: TodoRow, store: TodoStore) -> MountResult<MountPlan> {
 #[component]
 fn Panel(
     title: &'static str,
-    actions: impl Into<Children>,
+    actions: impl Into<ChildrenFactory>,
     children: impl Into<Children>,
 ) -> MountResult<MountPlan> {
     let actions = actions.into();
