@@ -37,7 +37,7 @@ replaces: []
 | 主机 | OS | Rust | GPU / adapter | commit | 证据性质 |
 |---|---|---|---|---|---|
 | **H1** | Windows 11，MSVC 工具链 | `1.99.1 x86_64-pc-windows-msvc` | NVIDIA GeForce RTX 4060 Laptop GPU / Vulkan | 未记录 | 上一轮记录（转述） |
-| **H2** | macOS 27.0.1 (26A434)，Apple M4（10 核 GPU，Metal 4） | `1.99.1 (58cf8f9c3 2026-10-13) aarch64-apple-darwin` | Apple M4 / `metal` | `ab5339b`（EVID-VAL-12…19）/ `83b21a4`（EVID-VAL-20/-21）/ `e53ae0e`（EVID-VAL-23…27）/ `f7a2d62`（EVID-VAL-28…32）/ `7d78cdc`（EVID-VAL-33…40）/ `a24faed`（EVID-VAL-41…46）/ `89b651c`（EVID-VAL-48）/ `6182928`（EVID-VAL-49）/ `02bb2f4`（EVID-VAL-50）/ `7a97d3f`（EVID-VAL-51） | **本轮实测**（commit 逐条见各条目） |
+| **H2** | macOS 27.0.1 (26A434)，Apple M4（10 核 GPU，Metal 4） | `1.99.1 (58cf8f9c3 2026-10-13) aarch64-apple-darwin` | Apple M4 / `metal` | `ab5339b`（EVID-VAL-12…19）/ `83b21a4`（EVID-VAL-20/-21）/ `e53ae0e`（EVID-VAL-23…27）/ `f7a2d62`（EVID-VAL-28…32）/ `7d78cdc`（EVID-VAL-33…40）/ `a24faed`（EVID-VAL-41…46）/ `89b651c`（EVID-VAL-48）/ `6182928`（EVID-VAL-49）/ `02bb2f4`（EVID-VAL-50）/ `7a97d3f`（EVID-VAL-51）/ `cbf7012a`（EVID-VAL-52） | **本轮实测**（commit 逐条见各条目） |
 | **CI** | GitHub Actions 矩阵：`ubuntu-26.04` / `macos-26-arm64` / `windows-2025-vs2026` | `rustc 1.99.1 (58cf8f9c3 2026-10-13)`，三个 runner 一致（取自 `rust-toolchain.toml` 的 pin） | 无（headless；A0 不需要 GPU） | `213f772`（main 上的 PR #5 merge commit） | **本轮 CI 实测**，run [`44284925421`](https://github.com/YougLin-dev/zenui/actions/runs/44284925421) |
 
 > H1 的 commit 在原始记录中未写下，这是本轮无法补的缺口；引用 H1 结果时应同时声明"commit 未知"。
@@ -97,6 +97,7 @@ replaces: []
 | EVID-VAL-49 | A | `cargo test --workspace --locked` | **H2** | 114 passed（67 + 1 + 6 + 11 + 7 + 12 + 2 + 6 + 2） | VERIFIED |
 | EVID-VAL-50 | A | `cargo test --workspace --locked` | **H2** | 117 passed（68 + 1 + 7 + 11 + 7 + 12 + 2 + 6 + 3） | VERIFIED |
 | EVID-VAL-51 | A | `cargo test --workspace --locked` | **H2** | 123 passed（74 + 1 + 7 + 11 + 7 + 12 + 2 + 6 + 3） | VERIFIED |
+| EVID-VAL-52 | A | `cargo test --workspace --locked`（另跑 `-- --list` 取 `names`） | **H2** | 125 passed；125 条 names 全列 | VERIFIED |
 
 ## 3. 仓库内测试：H1 原始记录（转述）
 
@@ -432,7 +433,7 @@ $ cargo test --workspace --locked        # ubuntu-26.04 / macos-26-arm64 / windo
 - 0-test target：根 package，来源 EVID-VAL-17。
 - 跨图形后端 GPU 观测：**2** 个数据点（Vulkan/NVIDIA 来自 H1 转述，Metal/Apple M4 来自 EVID-VAL-15），**不是** "GPU 矩阵已通过"。
 - CI 实际通过测试：**426** 次执行 = EVID-VAL-22 的 40 条 × 3 个 runner（120）加 EVID-VAL-47 的 102 条 × 3 个 runner（306）。它是**执行次数**，不是 426 条不同的测试，也不得与 H2 的计数相加；同一批测试在 H2 与 CI 上各跑过。
-- 可复跑性分布（`EVID-VAL-51` 之后共 51 条）：**38 条**（A 类）可在本机原样复跑；**11 条**（B/C 类）依赖上一轮记录或仓库外夹具；**2 条**（D 类，`EVID-VAL-22`、`-47`）在 CI runner 上，重跑 workflow 可复现，本机不能代替。
+- 可复跑性分布（`EVID-VAL-52` 之后共 52 条）：**39 条**（A 类）可在本机原样复跑；**11 条**（B/C 类）依赖上一轮记录或仓库外夹具；**2 条**（D 类，`EVID-VAL-22`、`-47`）在 CI runner 上，重跑 workflow 可复现，本机不能代替。
 - #22 合流后的 workspace 全量：**114** 条（`EVID-VAL-49`，commit `6182928`）。这是该 commit 上互不相同的用例数；与 `EVID-VAL-44` 的 102 不可相加，差值也不只来自 #22 的三条夹具（其间还有其他合并）。
 
 不得使用"基本完成""大部分支持""应该可以"描述以上任何数字。
@@ -1145,3 +1146,171 @@ $ cargo test --workspace --locked
 - **不证明什么**：只证明六条夹具存在、在本机通过，且各自能在对应 mutation 下判红。它不把
   `SPEC-GATE-A0-09`/`-10` 的状态词升级为 `VERIFIED`，不裁决 M0 出口，也不覆盖 `SPEC-RT-026`
   「command generation」子句——A0 没有 command 对象，该子句需要单独的 `notApplicable` 决策。
+
+### EVID-VAL-52 候选 commit 的 workspace 全量（H2）
+
+- 候选 commit：`cbf7012a2ee5fb9b527a06f33e73a4f53a7cfec9`（#29 的 merge commit）。本轮记录分支
+  `docs/MORT-4-e3-records-candidate` 只改 `docs/evidence/`，代码与 spec 与候选逐字相同。
+- 主机：H2（macOS 27.0.1 / Apple M4）；`rustc 1.99.1 (58cf8f9c3 2026-10-13) aarch64-apple-darwin`；`cargo 1.99.1 (5f94df478 2026-08-27)`。
+
+```text
+$ cargo test --workspace --locked
+     unittests src/main.rs   (zenui)           0 passed
+     unittests src/lib.rs    (zenui_app)       2 passed
+     tests/golden_trace.rs   (zenui_app)       6 passed
+     tests/mount_path.rs     (zenui_app)       3 passed
+     unittests src/lib.rs    (zenui_core)     76 passed
+     tests/compile_fail.rs   (zenui_core)      1 passed
+     tests/gates.rs          (zenui_core)      7 passed
+     tests/lifecycle.rs      (zenui_core)     11 passed
+     tests/queries.rs        (zenui_core)      7 passed
+     tests/regressions.rs    (zenui_core)     12 passed
+     Doc-tests zenui_app / zenui_core          0 passed
+（合计 125 passed / 0 failed）
+```
+
+- `names` 的命令：`cargo test --workspace --locked -- --list`，取其中 `<name>: test` 行。lib target 的名字形如
+  `module::tests::fn`；integration target 的名字就是文件内的函数名。125 条互不重复，全列如下，未抽样：
+
+```text
+  # zenui_app lib (2)
+  tests::a_stale_handle_is_rejected_by_the_value_channel
+  tests::mount_row_skips_a_key_that_cannot_be_resolved
+  # zenui_app tests/golden_trace.rs (6)
+  every_step_reports_every_counter
+  scenario_keeps_the_gate_order
+  state_line_separates_store_from_visible_set
+  trace_carries_no_addresses_or_timings
+  trace_matches_golden
+  two_runs_are_byte_identical
+  # zenui_app tests/mount_path.rs (3)
+  a0_02_each_new_view_costs_exactly_one_owned_read
+  a0_07_binding_a_filter_clones_no_titles
+  a0_07_two_consumers_of_one_filter_clone_no_titles
+  # zenui_core lib (76)
+  arena::tests::freed_slot_without_reuse_is_vacant
+  arena::tests::recycled_slot_rejects_the_previous_generation
+  graph::tests::a_diamond_never_observes_two_epochs
+  graph::tests::a_dirty_dependency_is_not_treated_as_unchanged
+  graph::tests::a_long_chain_keeps_the_final_value_consistent
+  graph::tests::a_self_reading_memo_is_a_cycle
+  graph::tests::a_write_only_frame_leaves_the_memo_dirty
+  graph::tests::dependency_edges_are_replaced_not_accumulated
+  graph::tests::dirty_propagates_transitively
+  graph::tests::equal_value_suppresses_downstream_notification
+  graph::tests::memo_recomputes_only_when_dirty
+  graph::tests::the_compute_stack_reports_a_read_into_a_cycle
+  graph::tests::the_public_compute_path_reports_a_self_read_cycle
+  handle::tests::a_handle_identity_is_the_runtime_slot_generation_triple
+  handle::tests::foreign_runtime_display_hides_the_values
+  handle::tests::generation_wraps_to_first
+  handle::tests::minted_runtime_ids_are_unique_across_threads
+  handle::tests::runtime_id_debug_hides_the_value
+  handle::tests::view_id_index_is_stable_for_trace_output
+  layout::tests::planned_ids_are_installed_on_commit_and_dropped_on_discard
+  layout::tests::preflight_rejects_a_mount_without_a_planned_node
+  layout::tests::preflight_rejects_a_view_that_is_both_mounted_and_unmounted
+  metrics::tests::add_assign_accumulates_every_field
+  metrics::tests::delta_reports_only_the_step
+  owner::tests::disposal_is_post_order_and_lifo
+  owner::tests::dispose_is_idempotent
+  owner::tests::disposing_flag_rejects_child_creation_white_box
+  query::tests::a_different_revision_pair_is_a_different_state
+  query::tests::a_membership_move_only_invalidates_the_filters_it_touches
+  query::tests::an_empty_filter_costs_no_materialization_and_no_visit
+  query::tests::an_order_move_rebuilds_without_touching_membership
+  query::tests::filter_membership_is_exclusive
+  query::tests::row_sets_compare_by_content_and_order
+  query::tests::second_consumer_shares_the_snapshot
+  query::tests::the_committed_view_answers_like_the_staged_one
+  runtime::tests::a_failed_frame_leaves_the_committed_state_untouched
+  runtime::tests::a_frame_commits_once_and_publishes_once
+  runtime::tests::a_memo_cycle_is_fatal_and_recoverable
+  runtime::tests::a_view_write_in_cleanup_is_rejected_and_the_next_frame_succeeds
+  runtime::tests::a_write_during_compute_is_a_domain_error
+  runtime::tests::a_write_in_a_closed_phase_is_a_typed_error_not_a_panic
+  runtime::tests::a_write_outside_the_write_phase_is_typed_and_never_commits
+  runtime::tests::each_runtime_mints_its_own_id
+  runtime::tests::owner_cleanup_runs_after_the_swap_in_the_cleanup_stage
+  store::tests::clear_completed_removes_only_completed_rows
+  store::tests::handle_from_another_store_is_rejected
+  store::tests::one_mutation_is_one_write
+  store::tests::owned_title_read_counts_once
+  store::tests::remaining_and_has_completed_follow_toggle
+  store::tests::removed_row_rejects_its_old_handle
+  store::tests::removing_a_completed_row_decrements_the_counter
+  store::tests::reorder_rejects_duplicate_keys_before_mutating
+  store::tests::set_completed_updates_counters_in_both_directions
+  store::tests::write_through_a_foreign_handle_is_rejected
+  txn::tests::a0_06_the_commit_preflight_sees_a_committed_view_outside_the_order
+  txn::tests::a0_09_an_unordered_view_still_claims_its_key
+  txn::tests::a0_10_a_user_clear_cancels_the_settlement
+  txn::tests::a0_10_a_user_focus_move_cancels_the_settlement
+  txn::tests::a0_10_bulk_clear_settles_one_intent
+  txn::tests::a0_10_settlement_records_next_for_a_live_successor
+  txn::tests::a0_10_settlement_records_previous_at_the_end
+  txn::tests::a_clear_completed_advances_the_order_revision_once
+  txn::tests::a_clear_with_no_completed_rows_does_not_advance_the_order_revision
+  txn::tests::a_completed_write_does_not_advance_the_order_revision
+  txn::tests::a_remove_advances_the_order_revision
+  txn::tests::a_remove_of_an_already_removed_key_does_not_advance_the_order_revision
+  txn::tests::a_reorder_advances_the_order_revision
+  txn::tests::a_reorder_to_the_current_order_does_not_advance_the_order_revision
+  txn::tests::an_insert_advances_the_order_revision
+  view::tests::a_reorder_preserves_each_views_owner
+  view::tests::a_reorder_preserves_every_generation
+  view::tests::focus_intent_reports_both_neighbours
+  view::tests::focus_places_caret_at_title_length
+  view::tests::reorder_preserves_view_ids
+  view::tests::reorder_without_change_does_not_advance_geometry
+  view::tests::unmount_clears_caret_and_leaves_focus_for_the_transaction
+  # zenui_core tests/compile_fail.rs (1)
+  the_named_contracts_do_not_compile_for_the_named_reason
+  # zenui_core tests/gates.rs (7)
+  a0_03_a_failed_read_does_not_advance_io_reads
+  a0_03_cross_runtime_access_is_rejected
+  a0_03_stale_handle_does_not_alias_the_reused_slot
+  a0_04_nested_batch_publishes_once_with_the_outer_value
+  a0_06_a_duplicate_key_is_a_value_error_that_keeps_the_frame_alive
+  a0_06_a_duplicate_key_leaves_every_authority_field_identical
+  a0_06_rejected_commit_restores_the_previous_commit
+  # zenui_core tests/lifecycle.rs (11)
+  a0_02_an_owned_read_counts_once_and_a_borrow_read_is_free
+  a0_09_a_duplicate_key_is_refused_before_any_patch
+  a0_09_a_reorder_preserves_identity_and_moves_no_counter
+  a0_10_a_bulk_clear_settles_once_for_the_surviving_sibling
+  a0_10_a_bulk_clear_with_no_candidate_leaves_no_focus
+  a0_10_a_user_clear_cancels_the_intent
+  a0_10_a_user_focus_move_cancels_the_intent
+  a0_10_deleting_the_focused_row_settles_one_intent
+  a0_10_deleting_the_last_focused_row_falls_back_to_previous
+  a0_11_churn_returns_to_the_baseline
+  a0_11_the_cache_returns_to_the_baseline_after_churn
+  # zenui_core tests/queries.rs (7)
+  a0_07_a_completed_write_moves_only_the_filters_that_read_it
+  a0_07_a_frame_reads_its_own_staged_writes
+  a0_07_a_reorder_moves_the_order_and_the_next_read_sees_it
+  a0_07_one_eval_build_and_materialization_per_epoch_filter
+  a0_08_a_frame_that_empties_a_filter_visits_nothing
+  a0_08_a_thousand_rows_and_three_filters_build_once_each
+  a0_08_an_empty_filter_materializes_nothing
+  # zenui_core tests/regressions.rs (12)
+  a_discarded_frame_does_not_burn_layout_ids
+  a_discarded_frame_does_not_leave_a_row_set_behind
+  a_discarded_frame_does_not_rewind_row_keys
+  a_focus_on_an_unmounted_view_is_rejected
+  a_frame_internal_view_read_sees_staged_mounts
+  a_mount_for_a_removed_row_is_rejected
+  a_no_op_write_does_not_advance_the_epoch
+  a_partial_view_order_is_rejected
+  a_removal_wins_over_a_staged_value
+  a_row_inserted_after_a_reorder_is_not_dropped
+  a_swallowed_nested_failure_poisons_the_frame
+  an_insert_removed_in_the_same_frame_leaves_no_row
+```
+
+- `#29` 新增的两条夹具都在列表中：`txn::tests::a0_09_an_unordered_view_still_claims_its_key`、
+  `txn::tests::a0_06_the_commit_preflight_sees_a_committed_view_outside_the_order`。本机分别做过去屏障验证：
+  去掉调用点的 `claiming_view` 检查，第一条红、第二条仍绿；去掉 preflight 的 `claiming_view` 分支，第二条红、
+  第一条仍绿——两条夹具各自绑定一道屏障，互不代偿。
+- **不证明什么**：只证明候选 commit 上这 125 条在本机通过。它不把任何判据升级为 `VERIFIED`，不裁决 M0 出口。
