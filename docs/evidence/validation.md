@@ -25,7 +25,7 @@ replaces: []
 | **A 本轮实测** | 本轮（2026-11-18）在主机 H2 上亲自执行、看到输出 | 可复跑到命令级 | EVID-VAL-12 起 |
 | **B 上一轮转述** | 上一轮在主机 H1 执行，本轮仅转述其记录 | 只能证明"当时记录如此" | EVID-VAL-01…06 |
 | **C 仓库外夹具** | 位于仓库之外的临时目录，**本仓库无法复跑** | 一次性，永久不可复现 | EVID-VAL-07…11 |
-| **D CI 托管 runner** | 本轮在 GitHub Actions 的 ubuntu/macos/windows runner 上执行，日志与 run URL 可查；本机不是那些主机，不能拿本机结果代替 | 可复跑到 run 级（重跑 workflow） | EVID-VAL-22 |
+| **D CI 托管 runner** | 本轮在 GitHub Actions 的 ubuntu/macos/windows runner 上执行，日志与 run URL 可查；本机不是那些主机，不能拿本机结果代替 | 可复跑到 run 级（重跑 workflow） | EVID-VAL-22、-47、-54 |
 
 两条铁律：
 
@@ -37,7 +37,7 @@ replaces: []
 | 主机 | OS | Rust | GPU / adapter | commit | 证据性质 |
 |---|---|---|---|---|---|
 | **H1** | Windows 11，MSVC 工具链 | `1.99.1 x86_64-pc-windows-msvc` | NVIDIA GeForce RTX 4060 Laptop GPU / Vulkan | 未记录 | 上一轮记录（转述） |
-| **H2** | macOS 27.0.1 (26A434)，Apple M4（10 核 GPU，Metal 4） | `1.99.1 (58cf8f9c3 2026-10-13) aarch64-apple-darwin` | Apple M4 / `metal` | `ab5339b`（EVID-VAL-12…19）/ `83b21a4`（EVID-VAL-20/-21）/ `e53ae0e`（EVID-VAL-23…27）/ `f7a2d62`（EVID-VAL-28…32）/ `7d78cdc`（EVID-VAL-33…40）/ `a24faed`（EVID-VAL-41…46）/ `89b651c`（EVID-VAL-48）/ `6182928`（EVID-VAL-49）/ `02bb2f4`（EVID-VAL-50）/ `7a97d3f`（EVID-VAL-51）/ `cbf7012a`（EVID-VAL-52） | **本轮实测**（commit 逐条见各条目） |
+| **H2** | macOS 27.0.1 (26A434)，Apple M4（10 核 GPU，Metal 4） | `1.99.1 (58cf8f9c3 2026-10-13) aarch64-apple-darwin` | Apple M4 / `metal` | `ab5339b`（EVID-VAL-12…19）/ `83b21a4`（EVID-VAL-20/-21）/ `e53ae0e`（EVID-VAL-23…27）/ `f7a2d62`（EVID-VAL-28…32）/ `7d78cdc`（EVID-VAL-33…40）/ `a24faed`（EVID-VAL-41…46）/ `89b651c`（EVID-VAL-48）/ `6182928`（EVID-VAL-49）/ `02bb2f4`（EVID-VAL-50）/ `7a97d3f`（EVID-VAL-51）/ `cbf7012a`（EVID-VAL-52、-53） | **本轮实测**（commit 逐条见各条目） |
 | **CI** | GitHub Actions 矩阵：`ubuntu-26.04` / `macos-26-arm64` / `windows-2025-vs2026` | `rustc 1.99.1 (58cf8f9c3 2026-10-13)`，三个 runner 一致（取自 `rust-toolchain.toml` 的 pin） | 无（headless；A0 不需要 GPU） | `213f772`（main 上的 PR #5 merge commit） | **本轮 CI 实测**，run [`44284925421`](https://github.com/YougLin-dev/zenui/actions/runs/44284925421) |
 
 > H1 的 commit 在原始记录中未写下，这是本轮无法补的缺口；引用 H1 结果时应同时声明"commit 未知"。
@@ -98,6 +98,8 @@ replaces: []
 | EVID-VAL-50 | A | `cargo test --workspace --locked` | **H2** | 117 passed（68 + 1 + 7 + 11 + 7 + 12 + 2 + 6 + 3） | VERIFIED |
 | EVID-VAL-51 | A | `cargo test --workspace --locked` | **H2** | 123 passed（74 + 1 + 7 + 11 + 7 + 12 + 2 + 6 + 3） | VERIFIED |
 | EVID-VAL-52 | A | `cargo test --workspace --locked`（另跑 `-- --list` 取 `names`） | **H2** | 125 passed；125 条 names 全列 | VERIFIED |
+| EVID-VAL-53 | A | `cargo run -p zenui-app --example todolist_headless --locked` | **H2** | exit 0；`traceSha256` 两次一致 | VERIFIED |
+| EVID-VAL-54 | D | `cargo test --workspace --locked` | **CI** | 三平台各 125 passed / 0 failed（run 44437050702） | VERIFIED（run URL 可查） |
 
 ## 3. 仓库内测试：H1 原始记录（转述）
 
@@ -387,7 +389,7 @@ $ cargo test --workspace --locked        # ubuntu-26.04 / macos-26-arm64 / windo
 - 新事实：同一 commit 的 40 条测试在三个平台各自通过，且 `rustc` 三处都是 `1.99.1`——`rust-toolchain.toml` 的 pin 在三个平台上真的被解析成同一个编译器，而不是各 runner 自带的默认版本。
 - 新事实：`tests/golden_trace.rs` 的逐字节比对在 `windows-2025-vs2026` 上成立。这是 `.gitattributes` 强制 LF 的实证：若 Windows 检出为 CRLF，`include_str!` 的内容与 golden 文件都会变形，测试与 `EVID-VAL-20` 的 sha256 会同时失败。
 - **不证明什么**：任何 GPU / 窗口 / 平台后端能力（A0 是纯 `std` 的 headless core）；`cargo package`、renamed facade 与发布门（`SPEC-GATE-C-04`）——命令集里没有它们，这条记录不能把 C-04 标绿。
-- 计数口径：`testsPassedCi = 426` 是**两次** CI 运行的执行次数之和——本轮 40 条 × 3 个 runner（EVID-VAL-22，120 次）加上合流后 102 条 × 3 个 runner（EVID-VAL-47，306 次）。它是执行次数，不是不同测试的条数；CI 日志没有逐条列出用例名，因此本条不声称两次运行的并集大小，只记录各自那一次报告的数量。它也不得与 H2 的 `testsPassedH2` 相加：H2 与 CI 是不同主机，同一批测试在两处各跑一次只说明两处都跑过（见 `EVID-MATRIX.countsNote`）。
+- 计数口径：本条记录时 CI 只有两次运行，`testsPassedCi` 为 **426** = 本轮 40 条 × 3 个 runner（EVID-VAL-22，120 次）加合流后 102 条 × 3 个 runner（EVID-VAL-47，306 次）；`EVID-VAL-54` 加入后该派生值现为 **801**（另加 125 × 3 = 375，见 §9 与 `EVID-MATRIX.countsNote`）。它是执行次数，不是不同测试的条数；CI 日志没有逐条列出用例名，因此本条不声称各次运行的并集大小，只记录各自那一次报告的数量。它也不得与 H2 的 `testsPassedH2` 相加：H2 与 CI 是不同主机，同一批测试在两处各跑一次只说明两处都跑过（见 `EVID-MATRIX.countsNote`）。
 
 ## 7. 本轮源码核对（不是测试，但可复核）
 
@@ -432,8 +434,8 @@ $ cargo test --workspace --locked        # ubuntu-26.04 / macos-26-arm64 / windo
 - H2 compile-fail fixture：**26** 条 = EVID-VAL-13 的 3 条 trybuild + EVID-VAL-24 的 6 条 + EVID-VAL-30 的 8 条 `compile_fail` doctest + EVID-VAL-41 的 9 条 trybuild UI 用例。这是按 runs[] 求和的**累计**口径，跨 commit 有重叠；现行集合是 EVID-VAL-41 的 9 条（8 条 doctest 已按 ADR-0021 迁移）。
 - 0-test target：根 package，来源 EVID-VAL-17。
 - 跨图形后端 GPU 观测：**2** 个数据点（Vulkan/NVIDIA 来自 H1 转述，Metal/Apple M4 来自 EVID-VAL-15），**不是** "GPU 矩阵已通过"。
-- CI 实际通过测试：**426** 次执行 = EVID-VAL-22 的 40 条 × 3 个 runner（120）加 EVID-VAL-47 的 102 条 × 3 个 runner（306）。它是**执行次数**，不是 426 条不同的测试，也不得与 H2 的计数相加；同一批测试在 H2 与 CI 上各跑过。
-- 可复跑性分布（`EVID-VAL-52` 之后共 52 条）：**39 条**（A 类）可在本机原样复跑；**11 条**（B/C 类）依赖上一轮记录或仓库外夹具；**2 条**（D 类，`EVID-VAL-22`、`-47`）在 CI runner 上，重跑 workflow 可复现，本机不能代替。
+- CI 实际通过测试：**801** 次执行 = EVID-VAL-22 的 40 条 × 3 个 runner（120）加 EVID-VAL-47 的 102 条 × 3 个 runner（306）加 EVID-VAL-54 的 125 条 × 3 个 runner（375）。它是**执行次数**，不是 801 条不同的测试，也不得与 H2 的计数相加；同一批测试在 H2 与 CI 上各跑过。
+- 可复跑性分布（`EVID-VAL-54` 之后共 54 条）：**40 条**（A 类）可在本机原样复跑；**11 条**（B/C 类）依赖上一轮记录或仓库外夹具；**3 条**（D 类，`EVID-VAL-22`、`-47`、`-54`）在 CI runner 上，重跑 workflow 可复现，本机不能代替。
 - #22 合流后的 workspace 全量：**114** 条（`EVID-VAL-49`，commit `6182928`）。这是该 commit 上互不相同的用例数；与 `EVID-VAL-44` 的 102 不可相加，差值也不只来自 #22 的三条夹具（其间还有其他合并）。
 
 不得使用"基本完成""大部分支持""应该可以"描述以上任何数字。
@@ -1314,3 +1316,62 @@ $ cargo test --workspace --locked
   去掉调用点的 `claiming_view` 检查，第一条红、第二条仍绿；去掉 preflight 的 `claiming_view` 分支，第二条红、
   第一条仍绿——两条夹具各自绑定一道屏障，互不代偿。
 - **不证明什么**：只证明候选 commit 上这 125 条在本机通过。它不把任何判据升级为 `VERIFIED`，不裁决 M0 出口。
+
+### EVID-VAL-53 候选 commit 的 headless trace（H2）
+
+- 候选 commit：`cbf7012a2ee5fb9b527a06f33e73a4f53a7cfec9`。
+- 命令与结果：
+
+```text
+$ cargo run -p zenui-app --example todolist_headless --locked | shasum -a 256
+57a4a142999537ddcd0fe4778d5f3604a91a77e664e0a926492f5cc002b0857e
+```
+
+- 同一命令连跑两次，stdout 的 sha256 相同（`57a4a142…`），且与仓库内
+  `crates/app/tests/golden/todolist_headless.trace` 同值：候选上的 trace 仍等于 golden 快照。
+- **不证明什么**：trace 只覆盖 todolist 的 9 步场景；不含 staging 计数、GPU 或平台后端能力。
+
+### EVID-VAL-54 候选 commit 的 CI 矩阵（D）
+
+- run：<https://github.com/YougLin-dev/zenui/actions/runs/44437050702>（workspace workflow，`push`），
+  `headSha = cbf7012a2ee5fb9b527a06f33e73a4f53a7cfec9`，结论 `success`。
+- 三个 job（`gates (ubuntu-latest)`、`gates (macos-latest)`、`gates (windows-latest)`）全部 `success`；从各
+  job 日志的 `test result: ok` 行求和，每个平台 **125 passed / 0 failed**。
+- **不证明什么**：run 级事实，不逐条列用例名（逐条以 `EVID-VAL-52` 的 `names` 为准）；clippy 与 fmt 是同
+  一 job 的步骤，不单独构成证据；也不覆盖 GPU 与平台后端能力。
+
+### M0 见证链输入（候选 `cbf7012a`）
+
+本表是交给出口记录的**输入**，不是出口结论。E3a 就是 `EVID-VAL-52`（候选上的 workspace 全量，带 125 条
+`names`），trace 是 `EVID-VAL-53`，E3b 是 `EVID-VAL-54`。每条 A0 判据选一条未标 `notApplicable` 的义务，
+给出 `ref`，以及候选上哪条运行点名了它。「点名」的判据是：测试义务在 `EVID-VAL-52` 的 `names` 里出现
+（可能带 `module::tests::` 前缀），命令义务与运行的 `command` 逐字相同。
+
+| 判据（均为 `SPEC-GATE-A0-` 前缀） | 选中的义务（`EVID-MATRIX` 原文） | `ref` | 点名该 `ref` 的运行 |
+|---|---|---|---|
+| `A0-01` | `crates/core`、`crates/app` 存在 | `cargo test --workspace --locked` | `EVID-VAL-52`（命令逐字匹配） |
+| `A0-01` | ；上述命令可跑并输出确定性 trace（query/mount/materialization/edge/geometry/focus/caret/I-O 计数） | `cargo run -p zenui-app --example todolist_headless --locked` | `EVID-VAL-53`（命令逐字匹配，`traceSha256` 两次一致并与 golden 同值） |
+| `A0-02` | 每个 UI 行 mount 只读一次 owned title | `a0_02_each_new_view_costs_exactly_one_owned_read` | `EVID-VAL-52`（`tests/mount_path.rs`） |
+| `A0-03` | `{runtime_id, slot, generation}` 分离 | `a_handle_identity_is_the_runtime_slot_generation_triple` | `EVID-VAL-52`（`handle::tests::…`） |
+| `A0-04` | 最外层 batch 只提交一次 | `a0_04_nested_batch_publishes_once_with_the_outer_value` | `EVID-VAL-52`（`tests/gates.rs`） |
+| `A0-05` | Memo 拓扑到稳定值才发布 | `a_diamond_never_observes_two_epochs` | `EVID-VAL-52`（`graph::tests::…`） |
+| `A0-06` | TreeCommit 先完整 preflight（key | `a0_06_the_commit_preflight_sees_a_committed_view_outside_the_order` | `EVID-VAL-52`（`txn::tests::…`） |
+| `A0-07` | query cache 单接线：`rows(filter)` 求值登记 membership | `a0_07_one_eval_build_and_materialization_per_epoch_filter` | `EVID-VAL-52`（`tests/queries.rs`） |
+| `A0-08` | 空态由独立 counter/membership 索引派生：`row_visits = 0`、`RowSet materialization = 0` | `a0_08_an_empty_filter_materializes_nothing` | `EVID-VAL-52`（`tests/queries.rs`） |
+| `A0-09` | ；duplicate key 在任何 patch 前拒绝 | `a0_09_an_unordered_view_still_claims_its_key` | `EVID-VAL-52`（`txn::tests::…`） |
+| `A0-09` | ；same-owner reorder 保留 ViewId | `a0_09_a_reorder_preserves_identity_and_moves_no_counter` | `EVID-VAL-52`（`tests/lifecycle.rs`） |
+| `A0-10` | reducer trace：每次焦点转移的原因与后继 | `a0_10_settlement_records_next_for_a_live_successor` | `EVID-VAL-52`（`txn::tests::…`） |
+| `A0-11` | 1000+ 交错 mount/unmount/filter churn 后 nodes/edges/live owner | `a0_11_churn_returns_to_the_baseline` | `EVID-VAL-52`（`tests/lifecycle.rs`） |
+
+两条需要与表一起读的说明：
+
+- `SPEC-GATE-A0-10` 的 `ref` 只指向五条结算测试中的一条，但五条断言的是同一个 `(cause, rule, target)`
+  机制。出口记录的 E2 里应把五条一起列出，`EVID-VAL-52` 的 `names` 已全部包含：
+  `txn::tests::a0_10_settlement_records_next_for_a_live_successor`、
+  `txn::tests::a0_10_settlement_records_previous_at_the_end`、
+  `txn::tests::a0_10_bulk_clear_settles_one_intent`、
+  `txn::tests::a0_10_a_user_focus_move_cancels_the_settlement`、
+  `txn::tests::a0_10_a_user_clear_cancels_the_settlement`。
+- 上表之外的义务不因本表获得复核：测试义务可能同样出现在 `EVID-VAL-52` 的 `names` 里（例如 A0-09 的
+  `/generation` 与 `/owner` 夹具），命令义务（A0-01 与 A0-05 的 trace）只能靠 `command` 匹配；E2 的点名
+  只按上表选中的那一条计算。
