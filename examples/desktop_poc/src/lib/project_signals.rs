@@ -17,7 +17,6 @@ pub struct Signal<T> {
 }
 
 impl<T: 'static> Signal<T> {
-
     pub fn with<R>(&self, get: impl FnOnce(&T) -> R) -> R {
         if self.valid.upgrade().is_some_and(|live| live.get())
             && let Some(graph) = self.graph.upgrade()

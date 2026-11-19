@@ -1132,7 +1132,9 @@ impl<'a> Tx<'a> {
         for mount in &draft.mounts {
             self.views
                 .mount_row_with_id(mount.id, mount.row, mount.owner, mount.title_len);
-            self.owners.on_cleanup(mount.owner, Box::new(|| {}));
+            self.owners
+                .on_cleanup(mount.owner, Box::new(|| {}))
+                .expect("staged mount requires a live owner");
         }
         if let Some(order) = &draft.order {
             self.views.reorder(order);

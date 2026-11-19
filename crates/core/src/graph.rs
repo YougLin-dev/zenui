@@ -858,6 +858,78 @@ mod tests {
     }
 
     #[test]
+    fn a_refusal_restores_computation_state_without_losing_previous_dependencies() {
+        let mut graph = MemoGraph::new();
+        let source = graph.source("source");
+        let memo = graph.memo("memo");
+        graph
+            .compute(memo, |reader| {
+                reader.read(source);
+                Value::Count(1)
+            })
+            .unwrap();
+        graph.bump_source(source);
+        assert!(matches!(
+            graph.compute(memo, |reader| {
+                reader.read(source);
+                Value::Flag(true)
+            }),
+            Err(GraphError::ValueKindChanged { node, expected: "count" }) if node == memo
+        ));
+        assert_eq!(graph.peek(memo), Some(&Value::Count(1)));
+        assert_eq!(graph.edge_count(), 1);
+        assert_eq!(
+            graph
+                .compute(memo, |reader| {
+                    reader.read(source);
+                    Value::Count(2)
+                })
+                .unwrap(),
+            Value::Count(2)
+        );
+
+        graph.bump_source(source);
+        let mut scratch = GraphScratch::new();
+        graph
+            .compute_staged(memo, &mut scratch, 2, |reader| {
+                reader.read(source);
+                Value::Count(2)
+            })
+            .unwrap();
+        graph.bump_source_staged(&mut scratch, source);
+        assert!(matches!(
+            graph.compute_staged(memo, &mut scratch, 2, |_| Value::Flag(false)),
+            Err(GraphError::ValueKindChanged { node, .. }) if node == memo
+        ));
+        assert_eq!(scratch.cycle, None);
+        assert!(
+            matches!(
+                graph.compute_staged(memo, &mut scratch, 2, |reader| {
+                    let _ = reader.read(memo);
+                    Value::Count(3)
+                }),
+                Err(GraphError::Cycle { node }) if node == memo
+            ),
+            "the failed memo has been removed from the computation stack"
+        );
+        scratch.begin_computing(source);
+        assert!(
+            matches!(
+                graph.compute_staged(memo, &mut scratch, 2, |reader| {
+                    let _ = reader.read(source);
+                    Value::Count(3)
+                }),
+                Err(GraphError::Cycle { node }) if node == source
+            ),
+            "only the introduced source is on the computation stack"
+        );
+        scratch.cycle = None;
+        assert_eq!(scratch.computing.pop(), Some(source));
+        assert!(scratch.computing.is_empty());
+        assert_eq!(scratch.values.get(&memo), Some(&Value::Count(2)));
+    }
+
+    #[test]
     fn a_long_chain_keeps_the_final_value_consistent() {
         let mut graph = MemoGraph::new();
         let source = graph.source("store");

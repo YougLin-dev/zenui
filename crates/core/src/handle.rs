@@ -70,9 +70,19 @@ pub struct Generation(u32);
 impl Generation {
     pub(crate) const FIRST: Generation = Generation(0);
 
-    /// 当前占位代际递增顺序；长生命周期接口需独立处理代际耗尽与禁止别名。
-    pub(crate) fn next(self) -> Generation {
-        Generation(self.0.wrapping_add(1))
+    pub(crate) const LAST_ALLOCATABLE_RAW: u32 = u32::MAX - 1;
+
+    pub(crate) const fn retiring() -> Self {
+        Self(u32::MAX)
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn from_raw(raw: u32) -> Self {
+        Self(raw)
+    }
+
+    pub(crate) fn next(self) -> Self {
+        Self(self.0.saturating_add(1))
     }
 
     pub const fn raw(self) -> u32 {
@@ -261,9 +271,9 @@ mod tests {
     }
 
     #[test]
-    fn generation_wraps_to_first() {
-        let generation = Generation(u32::MAX).next();
-        assert_eq!(generation, Generation::FIRST);
+    fn incremental_generations_end_without_reusing_a_published_identity() {
+        let last = Generation::from_raw(Generation::LAST_ALLOCATABLE_RAW);
+        assert_eq!(last.next(), Generation::retiring());
     }
 
     #[test]

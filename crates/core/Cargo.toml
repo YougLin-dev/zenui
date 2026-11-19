@@ -6,9 +6,5 @@ publish = false
 description = "Headless model, reactive graph, ownership, and transaction primitives for ZenUI"
 license = "MIT OR Apache-2.0"
 
-# Normal dependencies stay empty; build diagnostics are development-only.
 [dependencies]
-
-[dev-dependencies]
-trybuild = "1.0"
 

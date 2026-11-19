@@ -1,5 +1,6 @@
-use glifo::Glyph;
+use glifo::{FontEmbolden, Glyph};
 use parley::{FontContext, Layout, LayoutContext, PositionedLayoutItem, StyleProperty};
+use vello_gpu::kurbo::{Affine, Diagonal2};
 use vello_gpu::{Image, ImageSource, TextureId, TextureRegion};
 
 pub const WIDTH: u16 = 128;
@@ -11,14 +12,11 @@ pub fn build_text(
     fonts: &mut FontContext,
     contexts: &mut LayoutContext<()>,
     content: &str,
-    max_width: Option<f32>,
 ) -> Layout<()> {
     let mut builder = contexts.ranged_builder(fonts, content, 1., true);
     builder.push_default(StyleProperty::FontSize(24.));
     builder.push_default(parley::LineHeight::FontSizeRelative(1.25));
-    let mut layout = builder.build(content);
-    layout.break_all_lines(max_width);
-    layout
+    builder.build(content)
 }
 
 pub fn build_layout(
@@ -26,7 +24,9 @@ pub fn build_layout(
     contexts: &mut LayoutContext<()>,
     max_width: Option<f32>,
 ) -> Layout<()> {
-    build_text(fonts, contexts, TEXT, max_width)
+    let mut layout = build_text(fonts, contexts, TEXT);
+    layout.break_all_lines(max_width);
+    layout
 }
 
 pub fn draw_gpu(
@@ -38,13 +38,21 @@ pub fn draw_gpu(
     for line in layout.lines() {
         for item in line.items() {
             if let PositionedLayoutItem::GlyphRun(run) = item {
-
                 let coords: Vec<i16> = run
                     .run()
                     .normalized_coords()
                     .iter()
                     .map(|coord| coord.to_bits())
                     .collect();
+                let synthesis = run.run().synthesis();
+                let embolden = if synthesis.embolden() {
+                    FontEmbolden::new(Diagonal2::new(1., 1.))
+                } else {
+                    FontEmbolden::default()
+                };
+                let skew = synthesis
+                    .skew()
+                    .map(|angle| Affine::skew(-f64::from(angle).to_radians().tan(), 0.));
                 let glyphs = run.positioned_glyphs().map(|glyph| Glyph {
                     id: glyph.id,
                     x: glyph.x,
@@ -54,6 +62,8 @@ pub fn draw_gpu(
                     .glyph_run(resources, run.run().font())
                     .font_size(run.run().font_size())
                     .normalized_coords(&coords)
+                    .font_embolden(embolden)
+                    .glyph_transform(skew.unwrap_or(Affine::IDENTITY))
                     .atlas_cache(false)
                     .fill_glyphs(glyphs)
                     .expect("glyph run rasterization succeeded in probe");
@@ -78,6 +88,15 @@ pub fn draw_cpu(
                     .iter()
                     .map(|coord| coord.to_bits())
                     .collect();
+                let synthesis = run.run().synthesis();
+                let embolden = if synthesis.embolden() {
+                    FontEmbolden::new(Diagonal2::new(1., 1.))
+                } else {
+                    FontEmbolden::default()
+                };
+                let skew = synthesis
+                    .skew()
+                    .map(|angle| Affine::skew(-f64::from(angle).to_radians().tan(), 0.));
                 let glyphs = run.positioned_glyphs().map(|glyph| Glyph {
                     id: glyph.id,
                     x: glyph.x,
@@ -87,6 +106,8 @@ pub fn draw_cpu(
                     .glyph_run(resources, run.run().font())
                     .font_size(run.run().font_size())
                     .normalized_coords(&coords)
+                    .font_embolden(embolden)
+                    .glyph_transform(skew.unwrap_or(Affine::IDENTITY))
                     .atlas_cache(false)
                     .fill_glyphs(glyphs)
                     .expect("glyph run rasterization succeeded in probe");

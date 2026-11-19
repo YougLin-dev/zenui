@@ -11,6 +11,8 @@ pub enum OwnerError {
     AlreadyDisposed(OwnerId),
 
     MountDuringDispose(OwnerId),
+
+    CleanupDuringDispose(OwnerId),
 }
 
 impl fmt::Display for OwnerError {
@@ -20,6 +22,13 @@ impl fmt::Display for OwnerError {
             OwnerError::AlreadyDisposed(owner) => write!(f, "owner {owner:?} is disposed"),
             OwnerError::MountDuringDispose(owner) => {
                 write!(f, "owner {owner:?} is disposing; mount is rejected")
+            }
+
+            OwnerError::CleanupDuringDispose(owner) => {
+                write!(
+                    f,
+                    "owner {owner:?} is disposing; cleanup registration is rejected"
+                )
             }
         }
     }
@@ -138,10 +147,18 @@ impl OwnerTree {
         Ok(id)
     }
 
-    pub fn on_cleanup(&mut self, owner: OwnerId, cleanup: Cleanup) {
-        if let Some(node) = self.nodes.get_mut(&owner) {
-            node.cleanups.push(cleanup);
+    pub fn on_cleanup(&mut self, owner: OwnerId, cleanup: Cleanup) -> Result<(), OwnerError> {
+        let Some(node) = self.nodes.get_mut(&owner) else {
+            return Err(OwnerError::UnknownOwner(owner));
+        };
+        if node.disposed {
+            return Err(OwnerError::AlreadyDisposed(owner));
         }
+        if node.disposing {
+            return Err(OwnerError::CleanupDuringDispose(owner));
+        }
+        node.cleanups.push(cleanup);
+        Ok(())
     }
 
     pub fn dispose(&mut self, owner: OwnerId) {
@@ -152,50 +169,46 @@ impl OwnerTree {
         if already_gone {
             return;
         }
-        self.dispose_recursive(owner);
+        self.dispose_subtree(owner);
     }
 
-    /// 后序释放整棵子树；新创建的子级先退出，同级清理回调倒序执行。
-    ///
-    /// 正释放的 Owner 不再接受挂载，重复释放幂等，回调始终见到还活着的父级。
-    fn dispose_recursive(&mut self, owner: OwnerId) {
-        let children = {
-            let Some(node) = self.nodes.get_mut(&owner) else {
-                return;
+    /// 释放使用独立栈，父级在全部后代退出前保持未释放状态。
+    fn dispose_subtree(&mut self, owner: OwnerId) {
+        let mut pending = vec![owner];
+        while let Some(current) = pending.pop() {
+            let Some(node) = self.nodes.get_mut(&current) else {
+                continue;
             };
+            if node.disposing {
+                let mut cleanups = std::mem::take(&mut node.cleanups);
+                cleanups.reverse();
+                for cleanup in cleanups {
+                    cleanup();
+                    self.cleanup_runs += 1;
+                }
+
+                let parent = self.nodes.get_mut(&current).and_then(|node| {
+                    node.disposed = true;
+                    node.disposing = false;
+                    node.parent
+                });
+                if let Some(parent) = parent
+                    && let Some(parent_node) = self.nodes.get_mut(&parent)
+                {
+                    parent_node.children.retain(|child| *child != current);
+                }
+                self.live = self.live.saturating_sub(1);
+                continue;
+            }
+            if node.disposed {
+                continue;
+            }
             node.disposing = true;
-            let mut children = std::mem::take(&mut node.children);
-            children.reverse();
-            children
-        };
-        for child in children {
-            self.dispose_recursive(child);
+            pending.push(current);
+            for child in std::mem::take(&mut node.children).into_iter().rev() {
+                pending.push(child);
+            }
         }
-
-        let cleanups = {
-            let Some(node) = self.nodes.get_mut(&owner) else {
-                return;
-            };
-            let mut cleanups = std::mem::take(&mut node.cleanups);
-            cleanups.reverse();
-            cleanups
-        };
-        for cleanup in cleanups {
-            cleanup();
-            self.cleanup_runs += 1;
-        }
-
-        let parent = self.nodes.get_mut(&owner).and_then(|node| {
-            node.disposed = true;
-            node.disposing = false;
-            node.parent
-        });
-        if let Some(parent) = parent
-            && let Some(parent_node) = self.nodes.get_mut(&parent)
-        {
-            parent_node.children.retain(|child| *child != owner);
-        }
-        self.live = self.live.saturating_sub(1);
     }
 
     pub fn is_disposed(&self, owner: OwnerId) -> bool {
@@ -242,21 +255,27 @@ mod tests {
         let child = owners.child_of(parent).expect("child");
 
         let child_log = Rc::clone(&log);
-        owners.on_cleanup(
-            child,
-            Box::new(move || child_log.borrow_mut().push("child")),
-        );
+        owners
+            .on_cleanup(
+                child,
+                Box::new(move || child_log.borrow_mut().push("child")),
+            )
+            .unwrap();
 
         let first = Rc::clone(&log);
-        owners.on_cleanup(
-            parent,
-            Box::new(move || first.borrow_mut().push("parent-first")),
-        );
+        owners
+            .on_cleanup(
+                parent,
+                Box::new(move || first.borrow_mut().push("parent-first")),
+            )
+            .unwrap();
         let second = Rc::clone(&log);
-        owners.on_cleanup(
-            parent,
-            Box::new(move || second.borrow_mut().push("parent-second")),
-        );
+        owners
+            .on_cleanup(
+                parent,
+                Box::new(move || second.borrow_mut().push("parent-second")),
+            )
+            .unwrap();
 
         owners.dispose(parent);
 
@@ -276,11 +295,44 @@ mod tests {
         let scope = owners.child_of(owners.root()).expect("child");
         let runs = Rc::new(RefCell::new(0));
         let counter = Rc::clone(&runs);
-        owners.on_cleanup(scope, Box::new(move || *counter.borrow_mut() += 1));
+        owners
+            .on_cleanup(scope, Box::new(move || *counter.borrow_mut() += 1))
+            .unwrap();
 
         owners.dispose(scope);
         owners.dispose(scope);
         assert_eq!(*runs.borrow(), 1);
+    }
+
+    #[test]
+    fn cleanup_registration_rejects_disposing_and_disposed_owners() {
+        let mut owners = OwnerTree::new();
+        let unknown = OwnerId::from_index(4096);
+        assert!(matches!(
+            owners.on_cleanup(unknown, Box::new(|| {})),
+            Err(OwnerError::UnknownOwner(id)) if id == unknown
+        ));
+        let scope = owners.child_of(owners.root()).expect("child");
+        owners.nodes.get_mut(&scope).expect("scope").disposing = true;
+        let dropped = Rc::new(());
+        let capture = Rc::clone(&dropped);
+        assert!(matches!(
+            owners.on_cleanup(scope, Box::new(move || drop(capture))),
+            Err(OwnerError::CleanupDuringDispose(id)) if id == scope
+        ));
+        assert_eq!(
+            Rc::strong_count(&dropped),
+            1,
+            "a rejected callback is dropped immediately"
+        );
+
+        owners.nodes.get_mut(&scope).expect("scope").disposing = false;
+        owners.dispose(scope);
+        assert!(matches!(
+            owners.on_cleanup(scope, Box::new(|| {})),
+            Err(OwnerError::AlreadyDisposed(id)) if id == scope
+        ));
+        assert_eq!(owners.cleanup_runs(), 0);
     }
 
     #[test]
@@ -300,5 +352,32 @@ mod tests {
             owners.child_of(scope),
             Err(OwnerError::AlreadyDisposed(_))
         ));
+    }
+
+    #[test]
+    fn a_deep_owner_chain_is_disposed_without_call_stack_recursion() {
+        const DEPTH: usize = 10_000;
+        let mut owners = OwnerTree::new();
+        let root = owners.root();
+        let deepest = (0..DEPTH).fold(root, |parent, _| owners.child_of(parent).unwrap());
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let child_log = Rc::clone(&log);
+        owners
+            .on_cleanup(
+                deepest,
+                Box::new(move || child_log.borrow_mut().push("child")),
+            )
+            .unwrap();
+        let parent_log = Rc::clone(&log);
+        owners
+            .on_cleanup(
+                root,
+                Box::new(move || parent_log.borrow_mut().push("parent")),
+            )
+            .unwrap();
+        owners.dispose(root);
+        assert_eq!(*log.borrow(), vec!["child", "parent"]);
+        assert_eq!(owners.live(), 0);
+        assert!(owners.is_disposed(deepest));
     }
 }

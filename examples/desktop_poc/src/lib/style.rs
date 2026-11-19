@@ -24,6 +24,8 @@ pub enum Property {
     TextColor,
     BorderColor,
     Padding,
+    PaddingX,
+    PaddingY,
     Gap,
     Width,
     Radius,
@@ -123,6 +125,8 @@ pub fn parse_classes(input: &str) -> Result<Vec<Rule>, ClassError> {
                 let (property, value) = base.split_once('-').ok_or_else(|| error(raw, offset))?;
                 let property = match property {
                     "p" if !value.contains('[') => Property::Padding,
+                    "px" if !value.contains('[') => Property::PaddingX,
+                    "py" if !value.contains('[') => Property::PaddingY,
                     "gap" if !value.contains('[') => Property::Gap,
                     "rounded" if !value.contains('[') => Property::Radius,
                     "w" if !value.contains('[') => Property::Width,
@@ -173,12 +177,37 @@ pub fn resolve(rules: &[Rule], state: Modifier) -> BTreeMap<Property, &Value> {
     let mut fields = BTreeMap::new();
     for rule in rules {
         if rule.modifier == Modifier::Base || rule.modifier == state {
-            fields.insert(rule.declaration.property, &rule.declaration.value);
+            insert(&mut fields, &rule.declaration);
         }
     }
     fields
 }
 
+pub fn resolve_with_inline<'a>(
+    rules: &'a [Rule],
+    inline: &'a [Declaration],
+    state: Modifier,
+) -> BTreeMap<Property, &'a Value> {
+    let mut fields = resolve(rules, state);
+    for declaration in inline {
+        insert(&mut fields, declaration);
+    }
+    fields
+}
+
+fn insert<'a>(fields: &mut BTreeMap<Property, &'a Value>, declaration: &'a Declaration) {
+    match declaration.property {
+        Property::Padding => {
+            fields.remove(&Property::PaddingX);
+            fields.remove(&Property::PaddingY);
+        }
+        Property::PaddingX | Property::PaddingY => {
+            fields.remove(&Property::Padding);
+        }
+        _ => {}
+    }
+    fields.insert(declaration.property, &declaration.value);
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -222,6 +251,45 @@ mod tests {
         assert!(!normal.contains_key(&Property::TextColor));
     }
 
+    #[test]
+    fn shorthand_and_axis_paddings_replace_only_their_shared_axes() {
+        let rules = parse_classes("p-4 px-2 hover:py-1").unwrap();
+        let normal = resolve(&rules, Modifier::Base);
+        assert!(!normal.contains_key(&Property::Padding));
+        assert_eq!(normal[&Property::PaddingX], &Value::Points(8.));
+
+        let hover = resolve(&rules, Modifier::Hover);
+        assert_eq!(hover[&Property::PaddingX], &Value::Points(8.));
+        assert_eq!(hover[&Property::PaddingY], &Value::Points(4.));
+    }
+
+    #[test]
+    fn inline_wins_over_a_state_class_on_the_same_field() {
+        let rules = parse_classes("p-2 hover:px-8 bg-blue-600 hover:bg-blue-800").unwrap();
+        let inline = [
+            Declaration {
+                property: Property::PaddingX,
+                value: Value::Points(12.),
+            },
+            Declaration {
+                property: Property::Background,
+                value: Value::Color(Color([1, 2, 3, 4])),
+            },
+        ];
+        for state in [Modifier::Base, Modifier::Hover] {
+            let fields = resolve_with_inline(&rules, &inline, state);
+            assert_eq!(fields[&Property::PaddingX], &Value::Points(12.));
+            assert_eq!(
+                fields[&Property::Background],
+                &Value::Color(Color([1, 2, 3, 4]))
+            );
+        }
+        let fields = resolve_with_inline(&rules, &inline, Modifier::Hover);
+        assert!(
+            !fields.contains_key(&Property::Padding),
+            "an axis-specific value supersedes the shorthand"
+        );
+    }
     #[test]
     fn invalid_values_and_unknown_classes_report_source_location() {
         let error = parse_classes("p-2 p--2 bg-syzygy-900").unwrap_err();

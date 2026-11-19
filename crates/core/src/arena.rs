@@ -4,7 +4,7 @@ use crate::handle::{Generation, HandleError, SlotIndex};
 pub(crate) struct Slots<T> {
     values: Vec<Option<T>>,
     generations: Vec<Generation>,
-    free: Vec<u32>,
+    free: Vec<SlotIndex>,
 }
 
 impl<T> Slots<T> {
@@ -58,10 +58,12 @@ impl<T> Slots<T> {
 
     pub(crate) fn reserve(&mut self) -> (SlotIndex, Generation) {
         match self.free.pop() {
-            Some(raw) => {
-                let index = raw as usize;
-                debug_assert!(self.values[index].is_none(), "free slot was occupied");
-                (SlotIndex::from_index(raw), self.generations[index])
+            Some(slot) => {
+                debug_assert!(
+                    self.values[slot.index() as usize].is_none(),
+                    "free slot was occupied"
+                );
+                (slot, self.generations[slot.index() as usize])
             }
             None => {
                 let raw = u32::try_from(self.values.len()).expect("slot table exhausted");
@@ -83,21 +85,27 @@ impl<T> Slots<T> {
     }
 
     pub(crate) fn release(&mut self, slot: SlotIndex) {
-        let index = slot.index() as usize;
-        if index >= self.values.len() {
-            return;
-        }
-        self.values[index] = None;
-        self.generations[index] = self.generations[index].next();
-        self.free.push(slot.index());
+        self.retire(slot);
     }
 
     pub(crate) fn free(&mut self, slot: SlotIndex) -> Option<T> {
-        let index = slot.index() as usize;
-        let value = self.values.get_mut(index)?.take()?;
-        self.generations[index] = self.generations[index].next();
-        self.free.push(slot.index());
+        let value = self.values.get_mut(slot.index() as usize)?.take()?;
+        self.retire(slot);
         Some(value)
+    }
+
+    fn retire(&mut self, slot: SlotIndex) {
+        let index = slot.index() as usize;
+        if index >= self.values.len() || self.generations[index] == Generation::retiring() {
+            return;
+        }
+        self.values[index] = None;
+        let released_generation = self.generations[index];
+        let retired = released_generation.raw() == Generation::LAST_ALLOCATABLE_RAW;
+        self.generations[index] = released_generation.next();
+        if !retired {
+            self.free.push(slot);
+        }
     }
 
     pub(crate) fn find<F>(&self, mut predicate: F) -> Option<SlotIndex>
@@ -143,6 +151,39 @@ mod tests {
                 .expect("live slot"),
             &"second"
         );
+    }
+
+    #[test]
+    fn an_exhausted_slot_is_retired_instead_of_reused() {
+        let mut slots = Slots::<&str> {
+            values: vec![None, None],
+            generations: vec![
+                Generation::from_raw(Generation::LAST_ALLOCATABLE_RAW),
+                Generation::FIRST,
+            ],
+            free: vec![SlotIndex::from_index(0)],
+        };
+
+        let (last_slot, last_generation) = slots.reserve();
+        assert!(slots.fill(last_slot, "last"));
+        assert_eq!(slots.get(last_slot, last_generation), Ok(&"last"));
+        slots.free(last_slot);
+        assert_eq!(slots.generation(last_slot), Some(Generation::retiring()));
+
+        let (fresh_slot, fresh_generation) = slots.reserve();
+        assert!(slots.fill(fresh_slot, "fresh"));
+        slots.release(fresh_slot);
+
+        assert_ne!(fresh_slot, last_slot);
+        assert_ne!(fresh_generation, last_generation);
+        assert_eq!(slots.generation(last_slot), Some(Generation::retiring()));
+        assert_eq!(slots.generation(fresh_slot), Some(Generation::FIRST.next()));
+        assert!(!slots.free.contains(&last_slot));
+        assert!(slots.free.contains(&fresh_slot));
+        assert!(matches!(
+            slots.get(last_slot, last_generation),
+            Err(HandleError::Vacant { .. })
+        ));
     }
 
     #[test]

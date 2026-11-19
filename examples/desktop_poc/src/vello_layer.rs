@@ -44,7 +44,6 @@ pub fn paint(
             scene,
             &target.view,
             &vello::RenderParams {
-
                 base_color: Color::TRANSPARENT,
                 width: size.width,
                 height: size.height,
