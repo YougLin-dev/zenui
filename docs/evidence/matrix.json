@@ -2139,6 +2139,10 @@
           "text": "；无同 kind 后继时焦点回退到可聚焦 input 并只结算一次"
         },
         {
+          "source": "criterion",
+          "text": "；`FocusRemovalIntent` 记录 command generation"
+        },
+        {
           "source": "evidence",
           "text": "IME trace：ime_consumed / input_commit / submit / insert / clear 各恰一条"
         }

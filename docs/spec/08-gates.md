@@ -98,7 +98,7 @@ graph LR
 | `SPEC-GATE-A1-04` | For/Show/typed listener/TextEdit 专属 epoch adapter 在原定 feature 范围内工作；`{expr}` 是 mount 值、`{move \|\| expr}` 是绑定、事件不建立订阅；真实 A→B→A 环返回 `GraphCycle`（不使用 `begin_computing` 手工构造）；`Memo<RowSet>` 只随 (membership revision, order revision) 失效；per-row 失效；same-owner reorder 后订阅不增不减；空 subscriber bucket 不计活跃订阅 | 计数：mount 时 `binding_reads`/`event_reads` 符合定义；事件后不新增订阅 | `OPEN` |
 | `SPEC-GATE-A1-05` | Windows semantic dump：Tasks 固定 `list`、行 `listitem`、filter 为三个 toggle 组成的 group；空 Store 与"筛选无匹配"是两个独立提示，且 Store 非空时 list 容器不消失 | semantic dump 快照 + 两个空态的场景记录 | `OPEN` |
 | `SPEC-GATE-A1-06` | 键盘与可见域：Tab/Shift+Tab、Space、Delete click、filter、Add、wheel 可操作；clip 外不可 hit、不可成为 a11y focus；旧 generation 派发 click 只得到 `InvalidHandle`，不产生 patch；无 input 候选时焦点回退到 filter toolbar 并只结算一次 | Windows 真机交互 trace + 缩窗场景 | `OPEN` |
-| `SPEC-GATE-A1-07` | 中文 IME 候选 Enter 只确认不 submit；随后普通 Enter 或鼠标 Add 各只提交一次；`SubmitEvent` 携带 origin/command_id/generation/default_prevented；IME preflight 失败后候选与组合状态回滚；无同 kind 后继时焦点回退到可聚焦 input 并只结算一次 | IME trace：ime_consumed / input_commit / submit / insert / clear 各恰一条 | `OPEN` |
+| `SPEC-GATE-A1-07` | 中文 IME 候选 Enter 只确认不 submit；随后普通 Enter 或鼠标 Add 各只提交一次；`SubmitEvent` 携带 origin/command_id/generation/default_prevented；IME preflight 失败后候选与组合状态回滚；无同 kind 后继时焦点回退到可聚焦 input 并只结算一次；`FocusRemovalIntent` 记录 command generation | IME trace：ime_consumed / input_commit / submit / insert / clear 各恰一条 | `OPEN` |
 | `SPEC-GATE-A1-08` | Add 的 insert 与 draft clear 同事务：全成（各 1）或全不成（各 0），失败保留已提交值并进 sink | 失败注入测试两种分支 | `OPEN` |
 | `SPEC-GATE-A1-09` | 该 Todo 所需的 source rect / clip / alpha / logical size / resize 上，CPU reference 与 GPU 像素在声明容差内一致 | 像素对比报告 + 固定字体 artifact hash | `OPEN` |
 
