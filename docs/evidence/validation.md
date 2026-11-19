@@ -95,6 +95,7 @@ replaces: []
 | EVID-VAL-47 | D | `cargo test --workspace --locked` | **CI** | 102 passed × 3 平台（含 trybuild 快照） | VERIFIED（CI 日志与 run URL 可查） |
 | EVID-VAL-48 | A | `rustdoc --test --crate-name probe` × 8 用例 | **H2** | 6 ok / 2 对照组 **FAILED** | VERIFIED（错误码后缀不产生约束，见条目） |
 | EVID-VAL-49 | A | `cargo test --workspace --locked` | **H2** | 114 passed（67 + 1 + 6 + 11 + 7 + 12 + 2 + 6 + 2） | VERIFIED |
+| EVID-VAL-50 | A | `cargo test --workspace --locked` | **H2** | 117 passed（68 + 1 + 7 + 11 + 7 + 12 + 2 + 6 + 3） | VERIFIED |
 
 ## 3. 仓库内测试：H1 原始记录（转述）
 
@@ -430,7 +431,7 @@ $ cargo test --workspace --locked        # ubuntu-26.04 / macos-26-arm64 / windo
 - 0-test target：根 package，来源 EVID-VAL-17。
 - 跨图形后端 GPU 观测：**2** 个数据点（Vulkan/NVIDIA 来自 H1 转述，Metal/Apple M4 来自 EVID-VAL-15），**不是** "GPU 矩阵已通过"。
 - CI 实际通过测试：**426** 次执行 = EVID-VAL-22 的 40 条 × 3 个 runner（120）加 EVID-VAL-47 的 102 条 × 3 个 runner（306）。它是**执行次数**，不是 426 条不同的测试，也不得与 H2 的计数相加；同一批测试在 H2 与 CI 上各跑过。
-- 可复跑性分布（`EVID-VAL-49` 之后共 49 条）：**36 条**（A 类）可在本机原样复跑；**11 条**（B/C 类）依赖上一轮记录或仓库外夹具；**2 条**（D 类，`EVID-VAL-22`、`-47`）在 CI runner 上，重跑 workflow 可复现，本机不能代替。
+- 可复跑性分布（`EVID-VAL-50` 之后共 50 条）：**37 条**（A 类）可在本机原样复跑；**11 条**（B/C 类）依赖上一轮记录或仓库外夹具；**2 条**（D 类，`EVID-VAL-22`、`-47`）在 CI runner 上，重跑 workflow 可复现，本机不能代替。
 - #22 合流后的 workspace 全量：**114** 条（`EVID-VAL-49`，commit `6182928`）。这是该 commit 上互不相同的用例数；与 `EVID-VAL-44` 的 102 不可相加，差值也不只来自 #22 的三条夹具（其间还有其他合并）。
 
 不得使用"基本完成""大部分支持""应该可以"描述以上任何数字。
@@ -1071,3 +1072,33 @@ $ cargo test --workspace --locked
 - **不证明什么**：只证明这些夹具存在且在本机通过。它不把任何逐行状态升级为 `VERIFIED`，也不回答
   「`PROBE` 级证据是否足以出口 M0」——后者是产品裁决（`ADR-0024` 决定 6）。`cargo clippy` 的独立性、
   Windows/Linux 与 GPU 行为均不在此条范围内。
+
+### EVID-VAL-50 P1.1 的三条补口夹具（H2）
+
+- 分支：`chore/MORT-4-gate-close-predicate`；被测代码 commit `02bb2f47053abda3b912989800a4e3cced792f51`。
+- 主机：H2（macOS 27.0.1 / Apple M4）；`rustc 1.99.1 (58cf8f9c3 2026-10-13) aarch64-apple-darwin`；`cargo 1.99.1 (5f94df478 2026-08-27)`。
+
+逐 target 结果（把 `Running …` 与 `test result: ok. N passed` 归并为一行）：
+
+```text
+$ cargo test --workspace --locked
+     unittests src/main.rs   (zenui)           0 passed
+     unittests src/lib.rs    (zenui_app)       2 passed
+     tests/golden_trace.rs   (zenui_app)       6 passed
+     tests/mount_path.rs     (zenui_app)       3 passed
+     unittests src/lib.rs    (zenui_core)     68 passed
+     tests/compile_fail.rs   (zenui_core)      1 passed
+     tests/gates.rs          (zenui_core)      7 passed
+     tests/lifecycle.rs      (zenui_core)     11 passed
+     tests/queries.rs        (zenui_core)      7 passed
+     tests/regressions.rs    (zenui_core)     12 passed
+     Doc-tests zenui_app / zenui_core          0 passed
+（合计 117 passed / 0 failed）
+```
+
+- 新增三条，均写明「哪一处 mutation 会让它判红」：
+  `a_handle_identity_is_the_runtime_slot_generation_triple`（`crates/core/src/handle.rs`）、
+  `a0_06_a_duplicate_key_leaves_every_authority_field_identical`（`crates/core/tests/gates.rs`）、
+  `a0_07_two_consumers_of_one_filter_clone_no_titles`（`crates/app/tests/mount_path.rs`）。
+- 计数口径：117 是该 commit 上一次全量运行的不同用例数；与 `EVID-VAL-49` 的 114 不可相加（后者是更早 commit 的全量）。
+- **不证明什么**：只证明这三条夹具存在且在本机通过。它不扩大任何判据的语义范围，也不回答 M0 出口。
