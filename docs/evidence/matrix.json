@@ -1495,11 +1495,6 @@
         {
           "source": "evidence",
           "text": "注入 `InvalidGeneration`/`DuplicateKey` 后逐字段比对",
-          "ref": "a0_06_rejected_commit_restores_the_previous_commit",
-          "evidence": [
-            "EVID-VAL-23",
-            "EVID-VAL-49"
-          ],
           "note": "夹具实际注入的是 StaleStagedRow（暂存同 key 的 update+remove），不是 Fatal::InvalidGeneration 变体；ADR-0017 决定 7 使旧 generation 成为值错误"
         },
         {
