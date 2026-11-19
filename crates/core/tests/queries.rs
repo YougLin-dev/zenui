@@ -74,6 +74,67 @@ fn a0_07_one_eval_build_and_materialization_per_epoch_filter() {
     );
 }
 
+/// `SPEC-GATE-A0-07`: **two consumers** of one `(store epoch, filter)` share a
+/// single snapshot and clone no title.
+///
+/// The obligation is "two consumers: `String` clones = 0", and it is about the
+/// consumers, not about the mount executor: the existing `zenui-app` fixture
+/// (`a0_07_binding_a_filter_clones_no_titles`) asserts 3 clones — the one owned
+/// read per mount — and cannot stand in for a zero.
+///
+/// See also the app-level `a0_07_two_consumers_of_one_filter_clone_no_titles`
+/// (`crates/app/tests/mount_path.rs`): that one covers the executor's binding
+/// path and the same zero; this one adds the shared-allocation identity and the
+/// cross-commit hit. Both consumers here read in the same frame; a third read
+/// in the next frame additionally checks that the snapshot a frame builds
+/// survives its own commit and is the one the next frame is served.
+///
+/// Red-ability: materialize the snapshot with owned reads (`Tx::rows` calling
+/// `read_once` per key) and both the clone and the I/O deltas stop being zero;
+/// drop the cache slot's revision check and the second frame evaluates again
+/// instead of hitting.
+#[test]
+fn a0_07_two_consumers_share_one_snapshot_and_clone_no_titles() {
+    let mut runtime = Runtime::new();
+    seed(&mut runtime, &["A", "B", "C"]);
+
+    let before = runtime.counters();
+    let (first, second) = runtime
+        .frame(|tx| Ok((tx.rows(Filter::All), tx.rows(Filter::All))))
+        .expect("two consumers in one epoch");
+    let counters = delta(&runtime, before);
+    assert_eq!(
+        counters.query_evals, 1,
+        "one evaluation serves both consumers"
+    );
+    assert_eq!(counters.cache_builds, 1);
+    assert_eq!(counters.id_materializations, 1);
+    assert_eq!(counters.string_clones, 0, "neither consumer cloned a title");
+    assert_eq!(
+        counters.io_reads, 0,
+        "a row set is stable keys, not owned reads"
+    );
+    assert!(
+        first.shares_with(&second),
+        "the two consumers share the one snapshot"
+    );
+
+    // Second epoch: the same snapshot after the commit, without rebuilding.
+    let before = runtime.counters();
+    let third = runtime
+        .frame(|tx| Ok(tx.rows(Filter::All)))
+        .expect("a consumer in the next epoch");
+    let counters = delta(&runtime, before);
+    assert_eq!(counters.query_evals, 0, "a hit is not an evaluation");
+    assert_eq!(counters.string_clones, 0);
+    assert_eq!(counters.io_reads, 0);
+    assert_eq!(third.as_slice(), first.as_slice(), "same keys, same order");
+    assert!(
+        third.shares_with(&first),
+        "the published snapshot is still the same allocation"
+    );
+}
+
 /// `SPEC-GATE-A0-07`: the reverse edge is `(row, completed)`, so a flag write
 /// invalidates `Active`/`Completed` but not `All`.
 ///

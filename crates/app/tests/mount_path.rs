@@ -74,6 +74,11 @@ fn a0_07_binding_a_filter_clones_no_titles() {
 
 /// `SPEC-GATE-A0-07`: two consumers of one filter's row set clone no titles.
 ///
+/// See also `a0_07_two_consumers_share_one_snapshot_and_clone_no_titles` in
+/// `zenui-core`'s `tests/queries.rs`: that one runs on the runtime path and adds
+/// the shared-allocation identity and the cross-commit hit, while this fixture
+/// is the app-level witness next to the binding path below.
+///
 /// Red-ability: make `RowSet` carry owned titles (instead of `RowKey`) and
 /// binding it to views clones them again; the counter moves off zero.
 #[test]
