@@ -25,7 +25,7 @@ replaces: []
 | **A 本轮实测** | 本轮（2026-11-18）在主机 H2 上亲自执行、看到输出 | 可复跑到命令级 | EVID-VAL-12 起 |
 | **B 上一轮转述** | 上一轮在主机 H1 执行，本轮仅转述其记录 | 只能证明"当时记录如此" | EVID-VAL-01…06 |
 | **C 仓库外夹具** | 位于仓库之外的临时目录，**本仓库无法复跑** | 一次性，永久不可复现 | EVID-VAL-07…11 |
-| **D CI 托管 runner** | 本轮在 GitHub Actions 的 ubuntu/macos/windows runner 上执行，日志与 run URL 可查；本机不是那些主机，不能拿本机结果代替 | 可复跑到 run 级（重跑 workflow） | EVID-VAL-22、-47、-54 |
+| **D CI 托管 runner** | 本轮在 GitHub Actions 的 ubuntu/macos/windows runner 上执行，日志与 run URL 可查；本机不是那些主机，不能拿本机结果代替 | 可复跑到 run 级（重跑 workflow） | EVID-VAL-22、-47、-54、-57 |
 
 两条铁律：
 
@@ -37,7 +37,7 @@ replaces: []
 | 主机 | OS | Rust | GPU / adapter | commit | 证据性质 |
 |---|---|---|---|---|---|
 | **H1** | Windows 11，MSVC 工具链 | `1.99.1 x86_64-pc-windows-msvc` | NVIDIA GeForce RTX 4060 Laptop GPU / Vulkan | 未记录 | 上一轮记录（转述） |
-| **H2** | macOS 27.0.1 (26A434)，Apple M4（10 核 GPU，Metal 4） | `1.99.1 (58cf8f9c3 2026-10-13) aarch64-apple-darwin` | Apple M4 / `metal` | `ab5339b`（EVID-VAL-12…19）/ `83b21a4`（EVID-VAL-20/-21）/ `e53ae0e`（EVID-VAL-23…27）/ `f7a2d62`（EVID-VAL-28…32）/ `7d78cdc`（EVID-VAL-33…40）/ `a24faed`（EVID-VAL-41…46）/ `89b651c`（EVID-VAL-48）/ `6182928`（EVID-VAL-49）/ `02bb2f4`（EVID-VAL-50）/ `7a97d3f`（EVID-VAL-51）/ `cbf7012a`（EVID-VAL-52、-53） | **本轮实测**（commit 逐条见各条目） |
+| **H2** | macOS 27.0.1 (26A434)，Apple M4（10 核 GPU，Metal 4） | `1.99.1 (58cf8f9c3 2026-10-13) aarch64-apple-darwin` | Apple M4 / `metal` | `ab5339b`（EVID-VAL-12…19）/ `83b21a4`（EVID-VAL-20/-21）/ `e53ae0e`（EVID-VAL-23…27）/ `f7a2d62`（EVID-VAL-28…32）/ `7d78cdc`（EVID-VAL-33…40）/ `a24faed`（EVID-VAL-41…46）/ `89b651c`（EVID-VAL-48）/ `6182928`（EVID-VAL-49）/ `02bb2f4`（EVID-VAL-50）/ `7a97d3f`（EVID-VAL-51）/ `cbf7012a`（EVID-VAL-52、-53）/ `d52f3346`（EVID-VAL-55、-56） | **本轮实测**（commit 逐条见各条目） |
 | **CI** | GitHub Actions 矩阵：`ubuntu-26.04` / `macos-26-arm64` / `windows-2025-vs2026` | `rustc 1.99.1 (58cf8f9c3 2026-10-13)`，三个 runner 一致（取自 `rust-toolchain.toml` 的 pin） | 无（headless；A0 不需要 GPU） | `213f772`（main 上的 PR #5 merge commit） | **本轮 CI 实测**，run [`44284925421`](https://github.com/YougLin-dev/zenui/actions/runs/44284925421) |
 
 > H1 的 commit 在原始记录中未写下，这是本轮无法补的缺口；引用 H1 结果时应同时声明"commit 未知"。
@@ -100,6 +100,9 @@ replaces: []
 | EVID-VAL-52 | A | `cargo test --workspace --locked`（另跑 `-- --list` 取 `names`） | **H2** | 125 passed；125 条 names 全列 | VERIFIED |
 | EVID-VAL-53 | A | `cargo run -p zenui-app --example todolist_headless --locked` | **H2** | exit 0；`traceSha256` 两次一致 | VERIFIED |
 | EVID-VAL-54 | D | `cargo test --workspace --locked` | **CI** | 三平台各 125 passed / 0 failed（run 44437050702） | VERIFIED（run URL 可查） |
+| EVID-VAL-55 | A | `cargo test --workspace --locked`（另跑 `-- --list` 取 `names`） | **H2** | 127 passed；127 条 names 全列 | VERIFIED |
+| EVID-VAL-56 | A | `cargo run -p zenui-app --example todolist_headless --locked` | **H2** | exit 0；`traceSha256` 两次一致 | VERIFIED |
+| EVID-VAL-57 | D | `cargo test --workspace --locked` | **CI** | 三平台各 127 passed / 0 failed（run 44439452036） | VERIFIED（run URL 可查） |
 
 ## 3. 仓库内测试：H1 原始记录（转述）
 
@@ -389,7 +392,7 @@ $ cargo test --workspace --locked        # ubuntu-26.04 / macos-26-arm64 / windo
 - 新事实：同一 commit 的 40 条测试在三个平台各自通过，且 `rustc` 三处都是 `1.99.1`——`rust-toolchain.toml` 的 pin 在三个平台上真的被解析成同一个编译器，而不是各 runner 自带的默认版本。
 - 新事实：`tests/golden_trace.rs` 的逐字节比对在 `windows-2025-vs2026` 上成立。这是 `.gitattributes` 强制 LF 的实证：若 Windows 检出为 CRLF，`include_str!` 的内容与 golden 文件都会变形，测试与 `EVID-VAL-20` 的 sha256 会同时失败。
 - **不证明什么**：任何 GPU / 窗口 / 平台后端能力（A0 是纯 `std` 的 headless core）；`cargo package`、renamed facade 与发布门（`SPEC-GATE-C-04`）——命令集里没有它们，这条记录不能把 C-04 标绿。
-- 计数口径：本条记录时 CI 只有两次运行，`testsPassedCi` 为 **426** = 本轮 40 条 × 3 个 runner（EVID-VAL-22，120 次）加合流后 102 条 × 3 个 runner（EVID-VAL-47，306 次）；`EVID-VAL-54` 加入后该派生值现为 **801**（另加 125 × 3 = 375，见 §9 与 `EVID-MATRIX.countsNote`）。它是执行次数，不是不同测试的条数；CI 日志没有逐条列出用例名，因此本条不声称各次运行的并集大小，只记录各自那一次报告的数量。它也不得与 H2 的 `testsPassedH2` 相加：H2 与 CI 是不同主机，同一批测试在两处各跑一次只说明两处都跑过（见 `EVID-MATRIX.countsNote`）。
+- 计数口径：本条记录时 CI 只有两次运行，`testsPassedCi` 为 **426** = 本轮 40 条 × 3 个 runner（EVID-VAL-22，120 次）加合流后 102 条 × 3 个 runner（EVID-VAL-47，306 次）；`EVID-VAL-54` 与 `EVID-VAL-57` 加入后该派生值现为 **1182**（另加 125 × 3 = 375 与 127 × 3 = 381，见 §9 与 `EVID-MATRIX.countsNote`）。它是执行次数，不是不同测试的条数；CI 日志没有逐条列出用例名，因此本条不声称各次运行的并集大小，只记录各自那一次报告的数量。它也不得与 H2 的 `testsPassedH2` 相加：H2 与 CI 是不同主机，同一批测试在两处各跑一次只说明两处都跑过（见 `EVID-MATRIX.countsNote`）。
 
 ## 7. 本轮源码核对（不是测试，但可复核）
 
@@ -434,9 +437,10 @@ $ cargo test --workspace --locked        # ubuntu-26.04 / macos-26-arm64 / windo
 - H2 compile-fail fixture：**26** 条 = EVID-VAL-13 的 3 条 trybuild + EVID-VAL-24 的 6 条 + EVID-VAL-30 的 8 条 `compile_fail` doctest + EVID-VAL-41 的 9 条 trybuild UI 用例。这是按 runs[] 求和的**累计**口径，跨 commit 有重叠；现行集合是 EVID-VAL-41 的 9 条（8 条 doctest 已按 ADR-0021 迁移）。
 - 0-test target：根 package，来源 EVID-VAL-17。
 - 跨图形后端 GPU 观测：**2** 个数据点（Vulkan/NVIDIA 来自 H1 转述，Metal/Apple M4 来自 EVID-VAL-15），**不是** "GPU 矩阵已通过"。
-- CI 实际通过测试：**801** 次执行 = EVID-VAL-22 的 40 条 × 3 个 runner（120）加 EVID-VAL-47 的 102 条 × 3 个 runner（306）加 EVID-VAL-54 的 125 条 × 3 个 runner（375）。它是**执行次数**，不是 801 条不同的测试，也不得与 H2 的计数相加；同一批测试在 H2 与 CI 上各跑过。
-- 可复跑性分布（`EVID-VAL-54` 之后共 54 条）：**40 条**（A 类）可在本机原样复跑；**11 条**（B/C 类）依赖上一轮记录或仓库外夹具；**3 条**（D 类，`EVID-VAL-22`、`-47`、`-54`）在 CI runner 上，重跑 workflow 可复现，本机不能代替。
+- CI 实际通过测试：**1182** 次执行 = EVID-VAL-22 的 40 条 × 3 个 runner（120）加 EVID-VAL-47 的 102 条 × 3 个 runner（306）加 EVID-VAL-54 的 125 条 × 3 个 runner（375）加 EVID-VAL-57 的 127 条 × 3 个 runner（381）。它是**执行次数**，不是 1182 条不同的测试，也不得与 H2 的计数相加；同一批测试在 H2 与 CI 上各跑过。
+- 可复跑性分布（`EVID-VAL-57` 之后共 57 条）：**42 条**（A 类）可在本机原样复跑；**11 条**（B/C 类）依赖上一轮记录或仓库外夹具；**4 条**（D 类，`EVID-VAL-22`、`-47`、`-54`、`-57`）在 CI runner 上，重跑 workflow 可复现，本机不能代替。
 - #22 合流后的 workspace 全量：**114** 条（`EVID-VAL-49`，commit `6182928`）。这是该 commit 上互不相同的用例数；与 `EVID-VAL-44` 的 102 不可相加，差值也不只来自 #22 的三条夹具（其间还有其他合并）。
+- 候选 commit `d52f3346` 上的 workspace 全量：**127** 条（`EVID-VAL-55`），names 由 `cargo test -- --list` 全量导出。
 
 不得使用"基本完成""大部分支持""应该可以"描述以上任何数字。
 
@@ -1340,83 +1344,275 @@ $ cargo run -p zenui-app --example todolist_headless --locked | shasum -a 256
 - **不证明什么**：run 级事实，不逐条列用例名（逐条以 `EVID-VAL-52` 的 `names` 为准）；clippy 与 fmt 是同
   一 job 的步骤，不单独构成证据；也不覆盖 GPU 与平台后端能力。
 
-### M0 见证链输入（候选 `cbf7012a`）
+### EVID-VAL-55 新候选 commit 的 workspace 全量（H2）
+
+- 候选 commit：`d52f3346e23c8577bdfeffb9ee9aac0fe66b3488`（#33 的 merge commit）。本轮记录分支
+  `docs/MORT-4-e3-records-d52f334` 只改 `docs/evidence/` 与证据编号范围，代码与 spec 与候选逐字相同。
+- 主机：H2（macOS 27.0.1 / Apple M4）；`rustc 1.99.1 (58cf8f9c3 2026-10-13) aarch64-apple-darwin`；`cargo 1.99.1 (5f94df478 2026-08-27)`。
+
+```text
+$ cargo test --workspace --locked
+     unittests src/main.rs   (zenui)           0 passed
+     unittests src/lib.rs    (zenui_app)       2 passed
+     tests/golden_trace.rs   (zenui_app)       6 passed
+     tests/mount_path.rs     (zenui_app)       3 passed
+     unittests src/lib.rs    (zenui_core)     78 passed
+     tests/compile_fail.rs   (zenui_core)      1 passed
+     tests/gates.rs          (zenui_core)      7 passed
+     tests/lifecycle.rs      (zenui_core)     11 passed
+     tests/queries.rs        (zenui_core)      7 passed
+     tests/regressions.rs    (zenui_core)     12 passed
+     Doc-tests zenui_app / zenui_core          0 passed
+（合计 127 passed / 0 failed）
+```
+
+- `names` 的命令：`cargo test --workspace --locked -- --list`，直接取 `<name>: test` 行并只去掉 `: test`
+  后缀，不做任何切片。127 条互不重复，全列如下，未抽样；与 `--list` 集合精确相等（见本节末尾自检）：
+
+```text
+  # zenui_app lib (2)
+  tests::a_stale_handle_is_rejected_by_the_value_channel
+  tests::mount_row_skips_a_key_that_cannot_be_resolved
+  # zenui_app tests/golden_trace.rs (6)
+  every_step_reports_every_counter
+  scenario_keeps_the_gate_order
+  state_line_separates_store_from_visible_set
+  trace_carries_no_addresses_or_timings
+  trace_matches_golden
+  two_runs_are_byte_identical
+  # zenui_app tests/mount_path.rs (3)
+  a0_02_each_new_view_costs_exactly_one_owned_read
+  a0_07_binding_a_filter_clones_no_titles
+  a0_07_two_consumers_of_one_filter_clone_no_titles
+  # zenui_core lib (78)
+  arena::tests::freed_slot_without_reuse_is_vacant
+  arena::tests::recycled_slot_rejects_the_previous_generation
+  graph::tests::a_diamond_never_observes_two_epochs
+  graph::tests::a_dirty_dependency_is_not_treated_as_unchanged
+  graph::tests::a_long_chain_keeps_the_final_value_consistent
+  graph::tests::a_self_reading_memo_is_a_cycle
+  graph::tests::a_write_only_frame_leaves_the_memo_dirty
+  graph::tests::dependency_edges_are_replaced_not_accumulated
+  graph::tests::dirty_propagates_transitively
+  graph::tests::equal_value_suppresses_downstream_notification
+  graph::tests::memo_recomputes_only_when_dirty
+  graph::tests::the_compute_stack_reports_a_read_into_a_cycle
+  graph::tests::the_public_compute_path_reports_a_self_read_cycle
+  handle::tests::a_handle_identity_is_the_runtime_slot_generation_triple
+  handle::tests::foreign_runtime_display_hides_the_values
+  handle::tests::generation_wraps_to_first
+  handle::tests::minted_runtime_ids_are_unique_across_threads
+  handle::tests::runtime_id_debug_hides_the_value
+  handle::tests::view_id_index_is_stable_for_trace_output
+  layout::tests::planned_ids_are_installed_on_commit_and_dropped_on_discard
+  layout::tests::preflight_rejects_a_mount_without_a_planned_node
+  layout::tests::preflight_rejects_a_view_that_is_both_mounted_and_unmounted
+  metrics::tests::add_assign_accumulates_every_field
+  metrics::tests::delta_reports_only_the_step
+  owner::tests::disposal_is_post_order_and_lifo
+  owner::tests::dispose_is_idempotent
+  owner::tests::disposing_flag_rejects_child_creation_white_box
+  query::tests::a_different_revision_pair_is_a_different_state
+  query::tests::a_membership_move_only_invalidates_the_filters_it_touches
+  query::tests::an_empty_filter_costs_no_materialization_and_no_visit
+  query::tests::an_order_move_rebuilds_without_touching_membership
+  query::tests::filter_membership_is_exclusive
+  query::tests::row_sets_compare_by_content_and_order
+  query::tests::second_consumer_shares_the_snapshot
+  query::tests::the_committed_view_answers_like_the_staged_one
+  runtime::tests::a_failed_frame_leaves_the_committed_state_untouched
+  runtime::tests::a_frame_commits_once_and_publishes_once
+  runtime::tests::a_memo_cycle_is_fatal_and_recoverable
+  runtime::tests::a_view_write_in_cleanup_is_rejected_and_the_next_frame_succeeds
+  runtime::tests::a_write_during_compute_is_a_domain_error
+  runtime::tests::a_write_in_a_closed_phase_is_a_typed_error_not_a_panic
+  runtime::tests::a_write_outside_the_write_phase_is_typed_and_never_commits
+  runtime::tests::each_runtime_mints_its_own_id
+  runtime::tests::owner_cleanup_runs_after_the_swap_in_the_cleanup_stage
+  store::tests::clear_completed_removes_only_completed_rows
+  store::tests::handle_from_another_store_is_rejected
+  store::tests::one_mutation_is_one_write
+  store::tests::owned_title_read_counts_once
+  store::tests::remaining_and_has_completed_follow_toggle
+  store::tests::removed_row_rejects_its_old_handle
+  store::tests::removing_a_completed_row_decrements_the_counter
+  store::tests::reorder_rejects_duplicate_keys_before_mutating
+  store::tests::set_completed_updates_counters_in_both_directions
+  store::tests::write_through_a_foreign_handle_is_rejected
+  txn::tests::a0_06_the_commit_preflight_sees_a_committed_view_outside_the_order
+  txn::tests::a0_09_an_unordered_view_still_claims_its_key
+  txn::tests::a0_10_a_bulk_clear_with_no_live_candidate_records_cleared
+  txn::tests::a0_10_a_user_clear_cancels_the_settlement
+  txn::tests::a0_10_a_user_focus_move_cancels_the_settlement
+  txn::tests::a0_10_bulk_clear_settles_one_intent
+  txn::tests::a0_10_settlement_records_next_for_a_live_successor
+  txn::tests::a0_10_settlement_records_previous_at_the_end
+  txn::tests::a0_10_settlement_skips_a_next_sibling_unmounted_in_the_same_frame
+  txn::tests::a_clear_completed_advances_the_order_revision_once
+  txn::tests::a_clear_with_no_completed_rows_does_not_advance_the_order_revision
+  txn::tests::a_completed_write_does_not_advance_the_order_revision
+  txn::tests::a_remove_advances_the_order_revision
+  txn::tests::a_remove_of_an_already_removed_key_does_not_advance_the_order_revision
+  txn::tests::a_reorder_advances_the_order_revision
+  txn::tests::a_reorder_to_the_current_order_does_not_advance_the_order_revision
+  txn::tests::an_insert_advances_the_order_revision
+  view::tests::a_reorder_preserves_each_views_owner
+  view::tests::a_reorder_preserves_every_generation
+  view::tests::focus_intent_reports_both_neighbours
+  view::tests::focus_places_caret_at_title_length
+  view::tests::reorder_preserves_view_ids
+  view::tests::reorder_without_change_does_not_advance_geometry
+  view::tests::unmount_clears_caret_and_leaves_focus_for_the_transaction
+  # zenui_core tests/compile_fail.rs (1)
+  the_named_contracts_do_not_compile_for_the_named_reason
+  # zenui_core tests/gates.rs (7)
+  a0_03_a_failed_read_does_not_advance_io_reads
+  a0_03_cross_runtime_access_is_rejected
+  a0_03_stale_handle_does_not_alias_the_reused_slot
+  a0_04_nested_batch_publishes_once_with_the_outer_value
+  a0_06_a_duplicate_key_is_a_value_error_that_keeps_the_frame_alive
+  a0_06_a_duplicate_key_leaves_every_authority_field_identical
+  a0_06_rejected_commit_restores_the_previous_commit
+  # zenui_core tests/lifecycle.rs (11)
+  a0_02_an_owned_read_counts_once_and_a_borrow_read_is_free
+  a0_09_a_duplicate_key_is_refused_before_any_patch
+  a0_09_a_reorder_preserves_identity_and_moves_no_counter
+  a0_10_a_bulk_clear_settles_once_for_the_surviving_sibling
+  a0_10_a_bulk_clear_with_no_candidate_leaves_no_focus
+  a0_10_a_user_clear_cancels_the_intent
+  a0_10_a_user_focus_move_cancels_the_intent
+  a0_10_deleting_the_focused_row_settles_one_intent
+  a0_10_deleting_the_last_focused_row_falls_back_to_previous
+  a0_11_churn_returns_to_the_baseline
+  a0_11_the_cache_returns_to_the_baseline_after_churn
+  # zenui_core tests/queries.rs (7)
+  a0_07_a_completed_write_moves_only_the_filters_that_read_it
+  a0_07_a_frame_reads_its_own_staged_writes
+  a0_07_a_reorder_moves_the_order_and_the_next_read_sees_it
+  a0_07_one_eval_build_and_materialization_per_epoch_filter
+  a0_08_a_frame_that_empties_a_filter_visits_nothing
+  a0_08_a_thousand_rows_and_three_filters_build_once_each
+  a0_08_an_empty_filter_materializes_nothing
+  # zenui_core tests/regressions.rs (12)
+  a_discarded_frame_does_not_burn_layout_ids
+  a_discarded_frame_does_not_leave_a_row_set_behind
+  a_discarded_frame_does_not_rewind_row_keys
+  a_focus_on_an_unmounted_view_is_rejected
+  a_frame_internal_view_read_sees_staged_mounts
+  a_mount_for_a_removed_row_is_rejected
+  a_no_op_write_does_not_advance_the_epoch
+  a_partial_view_order_is_rejected
+  a_removal_wins_over_a_staged_value
+  a_row_inserted_after_a_reorder_is_not_dropped
+  a_swallowed_nested_failure_poisons_the_frame
+  an_insert_removed_in_the_same_frame_leaves_no_row
+```
+
+- 自检：`names` 与 `--list` 的测试名集合精确相等 **127 / 127**；54 条测试义务的 `ref` 按最后一个 `::`
+  段全部命中（54 / 54，未命中 0）；4 条命令义务对应 2 条命令，与 `EVID-VAL-55` / `EVID-VAL-56` 的
+  `command` 逐字相等（2 / 2）。
+- **不证明什么**：只证明候选 commit 上这 127 条在本机通过。它不把任何判据升级为 `VERIFIED`，不裁决 M0 出口。
+
+### EVID-VAL-56 新候选 commit 的 headless trace（H2）
+
+- 候选 commit：`d52f3346e23c8577bdfeffb9ee9aac0fe66b3488`。
+- 命令与结果：
+
+```text
+$ cargo run -p zenui-app --example todolist_headless --locked | shasum -a 256
+57a4a142999537ddcd0fe4778d5f3604a91a77e664e0a926492f5cc002b0857e
+```
+
+- 同一命令连跑两次，stdout 的 sha256 相同（`57a4a142…`），且与仓库内
+  `crates/app/tests/golden/todolist_headless.trace` 同值：新候选上的 trace 仍等于 golden 快照。
+- **不证明什么**：trace 只覆盖 todolist 的 9 步场景；不含 staging 计数、GPU 或平台后端能力。
+
+### EVID-VAL-57 新候选 commit 的 CI 矩阵（D）
+
+- run：<https://github.com/YougLin-dev/zenui/actions/runs/44439452036>（workspace workflow，`push`），
+  `headSha = d52f3346e23c8577bdfeffb9ee9aac0fe66b3488`，结论 `success`。
+- 三个 job（`gates (ubuntu-latest)`、`gates (macos-latest)`、`gates (windows-latest)`）全部 `success`；从各
+  job 日志的 `test result: ok` 行求和，每个平台 **127 passed / 0 failed**。
+- **不证明什么**：run 级事实，不逐条列用例名（逐条以 `EVID-VAL-55` 的 `names` 为准）；clippy 与 fmt 是同
+  一 job 的步骤，不单独构成证据；也不覆盖 GPU 与平台后端能力。
+
+### M0 见证链输入（候选 `d52f3346`）
 
 本表是交给出口记录的**输入**，不是出口结论。它与 `ADR-0027` 的 E2 同口径：**每条 A0 判据下全部
 非 `notApplicable` 义务**逐条列出（共 58 条：54 条测试义务、4 条命令义务），给出 `ref` 与候选上点名它的
-运行。E3a 就是 `EVID-VAL-52`（候选上的 workspace 全量，带 125 条 `names`），trace 是 `EVID-VAL-53`，
-E3b 是 `EVID-VAL-54`。
+运行。E3a 是 `EVID-VAL-55`（候选上的 workspace 全量，带 127 条 `names`），trace 是 `EVID-VAL-56`，
+E3b 是 `EVID-VAL-57`。
 
-「点名」的判据：测试义务在 `EVID-VAL-52` 的 `names` 里出现（按最后一个 `::` 段的函数名精确匹配，允许
+「点名」的判据：测试义务在 `EVID-VAL-55` 的 `names` 里出现（按最后一个 `::` 段的函数名精确匹配，允许
 `module::tests::` 前缀）；命令义务与运行的 `command` 逐字相同。
 
 | 判据（`SPEC-GATE-A0-` 前缀） | 义务（`EVID-MATRIX` 原文） | `ref` | 点名该 `ref` 的运行 |
 |---|---|---|---|
-| `A0-01` | `crates/core`、`crates/app` 存在 | `cargo test --workspace --locked` | EVID-VAL-52（workspace 命令逐字匹配） |
-| `A0-01` | ；上述命令可跑并输出确定性 trace（query/mount/materialization/edge/geometry/focus/caret/I-O 计数） | `cargo run -p zenui-app --example todolist_headless --locked` | EVID-VAL-53（trace 命令逐字匹配） |
-| `A0-01` | 仓库内可复跑的命令 + trace 快照 | `cargo run -p zenui-app --example todolist_headless --locked` | EVID-VAL-53（trace 命令逐字匹配） |
-| `A0-02` | 每个 UI 行 mount 只读一次 owned title | `a0_02_each_new_view_costs_exactly_one_owned_read` | EVID-VAL-52 |
-| `A0-02` | ；Copy handle 不携带 `String` | `the_named_contracts_do_not_compile_for_the_named_reason` | EVID-VAL-52 |
-| `A0-02` | ；`read_once` 返回 `Result` | `a0_03_a_failed_read_does_not_advance_io_reads` | EVID-VAL-52 |
-| `A0-02` | trybuild：`#[derive(Copy)] struct{String}` 必须 E0204 | `the_named_contracts_do_not_compile_for_the_named_reason` | EVID-VAL-52 |
-| `A0-02` | ；运行时 read 计数恰为 1 | `a0_02_an_owned_read_counts_once_and_a_borrow_read_is_free` | EVID-VAL-52 |
-| `A0-02` | ；`String::with` 借读合法 | `a0_02_an_owned_read_counts_once_and_a_borrow_read_is_free` | EVID-VAL-52 |
-| `A0-02` | 、拥有式 get 不编译 | `the_named_contracts_do_not_compile_for_the_named_reason` | EVID-VAL-52 |
-| `A0-03` | `{runtime_id, slot, generation}` 分离 | `a_handle_identity_is_the_runtime_slot_generation_triple` | EVID-VAL-52 |
-| `A0-03` | ；旧 handle/旧 generation 只得到一条 `InvalidHandle`，无默认值、无旧值 patch | `a0_03_stale_handle_does_not_alias_the_reused_slot` | EVID-VAL-52 |
-| `A0-03` | /读/写 | `a0_03_stale_handle_does_not_alias_the_reused_slot` | EVID-VAL-52 |
-| `A0-03` | ；跨 runtime handle 拒绝 | `a0_03_cross_runtime_access_is_rejected` | EVID-VAL-52 |
-| `A0-03` | ；类型层 ViewId/RowKey/LayoutNodeId 互传必须编译失败（判据原文的 `TodoId`/`TaffyId` 在现行代码中对应 `RowKey`/`LayoutNodeId`） | `the_named_contracts_do_not_compile_for_the_named_reason` | EVID-VAL-52 |
-| `A0-04` | 最外层 batch 只提交一次 | `a0_04_nested_batch_publishes_once_with_the_outer_value` | EVID-VAL-52 |
-| `A0-04` | ；嵌套 batch 不外泄中间值 | `a0_04_nested_batch_publishes_once_with_the_outer_value` | EVID-VAL-52 |
-| `A0-04` | instrumented committed-read 记录中间值与提交次数 | `a0_04_nested_batch_publishes_once_with_the_outer_value` | EVID-VAL-52 |
-| `A0-05` | Memo 拓扑到稳定值才发布 | `a_diamond_never_observes_two_epochs` | EVID-VAL-52 |
-| `A0-05` | ；diamond/长链无 glitch | `a_long_chain_keeps_the_final_value_consistent` | EVID-VAL-52 |
-| `A0-05` | ；`WriteDuringCompute` | `a_write_during_compute_is_a_domain_error` | EVID-VAL-52 |
-| `A0-05` | 运行时 trace：发布值 + 每 epoch 可观测次数 | `cargo run -p zenui-app --example todolist_headless --locked` | EVID-VAL-53（trace 命令逐字匹配） |
-| `A0-05` | ；错误可恢复 | `a_memo_cycle_is_fatal_and_recoverable` | EVID-VAL-52 |
-| `A0-06` | TreeCommit 先完整 preflight（key | `a0_06_the_commit_preflight_sees_a_committed_view_outside_the_order` | EVID-VAL-52 |
-| `A0-06` | /topology | `a_partial_view_order_is_rejected` | EVID-VAL-52 |
-| `A0-06` | /focus | `a_focus_on_an_unmounted_view_is_rejected` | EVID-VAL-52 |
-| `A0-06` | /`LayoutMap`）到 staging，再一次 swap | `planned_ids_are_installed_on_commit_and_dropped_on_discard` | EVID-VAL-52 |
-| `A0-06` | 、id 映射 | `a0_06_rejected_commit_restores_the_previous_commit` | EVID-VAL-52 |
-| `A0-06` | 、focus | `a0_06_rejected_commit_restores_the_previous_commit` | EVID-VAL-52 |
-| `A0-06` | 、geometry epoch 与上次提交完全一致 | `a0_06_rejected_commit_restores_the_previous_commit` | EVID-VAL-52 |
-| `A0-06` | 注入 `InvalidGeneration` | `a0_06_rejected_commit_restores_the_previous_commit` | EVID-VAL-52 |
-| `A0-06` | /`DuplicateKey` 后逐字段比对 | `a0_06_a_duplicate_key_leaves_every_authority_field_identical` | EVID-VAL-52 |
-| `A0-06` | ；随后一笔干净事务可正常提交（phase guard 已复位） | `a0_06_rejected_commit_restores_the_previous_commit` | EVID-VAL-52 |
-| `A0-07` | query cache 单接线：`rows(filter)` 求值登记 membership | `a0_07_one_eval_build_and_materialization_per_epoch_filter` | EVID-VAL-52 |
-| `A0-07` | ；命中只标脏 cache | `a0_07_a_completed_write_moves_only_the_filters_that_read_it` | EVID-VAL-52 |
-| `A0-07` | `(store_epoch, filter)` 每 epoch query_eval/cache_build/id_materialize 各恰 +1 | `a0_07_one_eval_build_and_materialization_per_epoch_filter` | EVID-VAL-52 |
-| `A0-07` | ；两个消费者 String clones = 0 | `a0_07_two_consumers_of_one_filter_clone_no_titles` | EVID-VAL-52 |
-| `A0-08` | 空态由独立 counter/membership 索引派生：`row_visits = 0`、`RowSet materialization = 0` | `a0_08_an_empty_filter_materializes_nothing` | EVID-VAL-52 |
-| `A0-08` | 1000 行 + 三 filter 切换时计数不增长 | `a0_08_a_thousand_rows_and_three_filters_build_once_each` | EVID-VAL-52 |
-| `A0-08` | ；用 `collect()` 实现 `is_empty` 必须判红 | `a0_08_a_thousand_rows_and_three_filters_build_once_each` | EVID-VAL-52 |
-| `A0-09` | ；same-owner reorder 保留 ViewId | `a0_09_a_reorder_preserves_identity_and_moves_no_counter` | EVID-VAL-52 |
-| `A0-09` | /generation | `a_reorder_preserves_every_generation` | EVID-VAL-52 |
-| `A0-09` | /owner | `a_reorder_preserves_each_views_owner` | EVID-VAL-52 |
-| `A0-09` | /caret | `a0_09_a_reorder_preserves_identity_and_moves_no_counter` | EVID-VAL-52 |
-| `A0-09` | /focus | `a0_09_a_reorder_preserves_identity_and_moves_no_counter` | EVID-VAL-52 |
-| `A0-09` | ；duplicate key 在任何 patch 前拒绝 | `a0_09_an_unordered_view_still_claims_its_key` | EVID-VAL-52 |
-| `A0-09` | reorder 后 unmount/setup = 0 | `a0_09_a_reorder_preserves_identity_and_moves_no_counter` | EVID-VAL-52 |
-| `A0-09` | ；重复 key 抛领域错误且旧视图不变 | `a0_09_a_duplicate_key_is_refused_before_any_patch` | EVID-VAL-52 |
-| `A0-10` | 结构 mutation 前记 `FocusRemovalIntent` | `a0_10_deleting_the_focused_row_settles_one_intent` | EVID-VAL-52 |
-| `A0-10` | ；commit 后仅在目标仍受影响时按 同 kind next | `a0_10_deleting_the_focused_row_settles_one_intent` | EVID-VAL-52 |
-| `A0-10` |  → prev | `a0_10_deleting_the_last_focused_row_falls_back_to_previous` | EVID-VAL-52 |
-| `A0-10` | ；批量 Clear 只结算一次 | `a0_10_a_bulk_clear_settles_once_for_the_surviving_sibling` | EVID-VAL-52 |
-| `A0-10` | reducer trace：每次焦点转移的原因与后继 | `a0_10_settlement_records_next_for_a_live_successor` | EVID-VAL-52 |
-| `A0-10` | ；用户中途转移焦点时 intent 被取消 | `a0_10_a_user_focus_move_cancels_the_intent` | EVID-VAL-52 |
-| `A0-11` | 1000+ 交错 mount/unmount/filter churn 后 nodes/edges/live owner | `a0_11_churn_returns_to_the_baseline` | EVID-VAL-52 |
-| `A0-11` | /caches 回到基线 | `a0_11_the_cache_returns_to_the_baseline_after_churn` | EVID-VAL-52 |
-| `A0-11` | 压力测试前后 live graph 计数 | `a0_11_churn_returns_to_the_baseline` | EVID-VAL-52 |
-| `A0-11` | ；回收关系而非 `Arc` size | `a0_11_churn_returns_to_the_baseline` | EVID-VAL-52 |
+| `A0-01` | `crates/core`、`crates/app` 存在 | `cargo test --workspace --locked` | EVID-VAL-55（workspace 命令逐字匹配） |
+| `A0-01` | ；上述命令可跑并输出确定性 trace（query/mount/materialization/edge/geometry/focus/caret/I-O 计数） | `cargo run -p zenui-app --example todolist_headless --locked` | EVID-VAL-56（trace 命令逐字匹配） |
+| `A0-01` | 仓库内可复跑的命令 + trace 快照 | `cargo run -p zenui-app --example todolist_headless --locked` | EVID-VAL-56（trace 命令逐字匹配） |
+| `A0-02` | 每个 UI 行 mount 只读一次 owned title | `a0_02_each_new_view_costs_exactly_one_owned_read` | EVID-VAL-55 |
+| `A0-02` | ；Copy handle 不携带 `String` | `the_named_contracts_do_not_compile_for_the_named_reason` | EVID-VAL-55 |
+| `A0-02` | ；`read_once` 返回 `Result` | `a0_03_a_failed_read_does_not_advance_io_reads` | EVID-VAL-55 |
+| `A0-02` | trybuild：`#[derive(Copy)] struct{String}` 必须 E0204 | `the_named_contracts_do_not_compile_for_the_named_reason` | EVID-VAL-55 |
+| `A0-02` | ；运行时 read 计数恰为 1 | `a0_02_an_owned_read_counts_once_and_a_borrow_read_is_free` | EVID-VAL-55 |
+| `A0-02` | ；`String::with` 借读合法 | `a0_02_an_owned_read_counts_once_and_a_borrow_read_is_free` | EVID-VAL-55 |
+| `A0-02` | 、拥有式 get 不编译 | `the_named_contracts_do_not_compile_for_the_named_reason` | EVID-VAL-55 |
+| `A0-03` | `{runtime_id, slot, generation}` 分离 | `a_handle_identity_is_the_runtime_slot_generation_triple` | EVID-VAL-55 |
+| `A0-03` | ；旧 handle/旧 generation 只得到一条 `InvalidHandle`，无默认值、无旧值 patch | `a0_03_stale_handle_does_not_alias_the_reused_slot` | EVID-VAL-55 |
+| `A0-03` | /读/写 | `a0_03_stale_handle_does_not_alias_the_reused_slot` | EVID-VAL-55 |
+| `A0-03` | ；跨 runtime handle 拒绝 | `a0_03_cross_runtime_access_is_rejected` | EVID-VAL-55 |
+| `A0-03` | ；类型层 ViewId/RowKey/LayoutNodeId 互传必须编译失败（判据原文的 `TodoId`/`TaffyId` 在现行代码中对应 `RowKey`/`LayoutNodeId`） | `the_named_contracts_do_not_compile_for_the_named_reason` | EVID-VAL-55 |
+| `A0-04` | 最外层 batch 只提交一次 | `a0_04_nested_batch_publishes_once_with_the_outer_value` | EVID-VAL-55 |
+| `A0-04` | ；嵌套 batch 不外泄中间值 | `a0_04_nested_batch_publishes_once_with_the_outer_value` | EVID-VAL-55 |
+| `A0-04` | instrumented committed-read 记录中间值与提交次数 | `a0_04_nested_batch_publishes_once_with_the_outer_value` | EVID-VAL-55 |
+| `A0-05` | Memo 拓扑到稳定值才发布 | `a_diamond_never_observes_two_epochs` | EVID-VAL-55 |
+| `A0-05` | ；diamond/长链无 glitch | `a_long_chain_keeps_the_final_value_consistent` | EVID-VAL-55 |
+| `A0-05` | ；`WriteDuringCompute` | `a_write_during_compute_is_a_domain_error` | EVID-VAL-55 |
+| `A0-05` | 运行时 trace：发布值 + 每 epoch 可观测次数 | `cargo run -p zenui-app --example todolist_headless --locked` | EVID-VAL-56（trace 命令逐字匹配） |
+| `A0-05` | ；错误可恢复 | `a_memo_cycle_is_fatal_and_recoverable` | EVID-VAL-55 |
+| `A0-06` | TreeCommit 先完整 preflight（key | `a0_06_the_commit_preflight_sees_a_committed_view_outside_the_order` | EVID-VAL-55 |
+| `A0-06` | /topology | `a_partial_view_order_is_rejected` | EVID-VAL-55 |
+| `A0-06` | /focus | `a_focus_on_an_unmounted_view_is_rejected` | EVID-VAL-55 |
+| `A0-06` | /`LayoutMap`）到 staging，再一次 swap | `planned_ids_are_installed_on_commit_and_dropped_on_discard` | EVID-VAL-55 |
+| `A0-06` | 、id 映射 | `a0_06_rejected_commit_restores_the_previous_commit` | EVID-VAL-55 |
+| `A0-06` | 、focus | `a0_06_rejected_commit_restores_the_previous_commit` | EVID-VAL-55 |
+| `A0-06` | 、geometry epoch 与上次提交完全一致 | `a0_06_rejected_commit_restores_the_previous_commit` | EVID-VAL-55 |
+| `A0-06` | 注入 `InvalidGeneration` | `a0_06_rejected_commit_restores_the_previous_commit` | EVID-VAL-55 |
+| `A0-06` | /`DuplicateKey` 后逐字段比对 | `a0_06_a_duplicate_key_leaves_every_authority_field_identical` | EVID-VAL-55 |
+| `A0-06` | ；随后一笔干净事务可正常提交（phase guard 已复位） | `a0_06_rejected_commit_restores_the_previous_commit` | EVID-VAL-55 |
+| `A0-07` | query cache 单接线：`rows(filter)` 求值登记 membership | `a0_07_one_eval_build_and_materialization_per_epoch_filter` | EVID-VAL-55 |
+| `A0-07` | ；命中只标脏 cache | `a0_07_a_completed_write_moves_only_the_filters_that_read_it` | EVID-VAL-55 |
+| `A0-07` | `(store_epoch, filter)` 每 epoch query_eval/cache_build/id_materialize 各恰 +1 | `a0_07_one_eval_build_and_materialization_per_epoch_filter` | EVID-VAL-55 |
+| `A0-07` | ；两个消费者 String clones = 0 | `a0_07_two_consumers_of_one_filter_clone_no_titles` | EVID-VAL-55 |
+| `A0-08` | 空态由独立 counter/membership 索引派生：`row_visits = 0`、`RowSet materialization = 0` | `a0_08_an_empty_filter_materializes_nothing` | EVID-VAL-55 |
+| `A0-08` | 1000 行 + 三 filter 切换时计数不增长 | `a0_08_a_thousand_rows_and_three_filters_build_once_each` | EVID-VAL-55 |
+| `A0-08` | ；用 `collect()` 实现 `is_empty` 必须判红 | `a0_08_a_thousand_rows_and_three_filters_build_once_each` | EVID-VAL-55 |
+| `A0-09` | ；same-owner reorder 保留 ViewId | `a0_09_a_reorder_preserves_identity_and_moves_no_counter` | EVID-VAL-55 |
+| `A0-09` | /generation | `a_reorder_preserves_every_generation` | EVID-VAL-55 |
+| `A0-09` | /owner | `a_reorder_preserves_each_views_owner` | EVID-VAL-55 |
+| `A0-09` | /caret | `a0_09_a_reorder_preserves_identity_and_moves_no_counter` | EVID-VAL-55 |
+| `A0-09` | /focus | `a0_09_a_reorder_preserves_identity_and_moves_no_counter` | EVID-VAL-55 |
+| `A0-09` | ；duplicate key 在任何 patch 前拒绝 | `a0_09_an_unordered_view_still_claims_its_key` | EVID-VAL-55 |
+| `A0-09` | reorder 后 unmount/setup = 0 | `a0_09_a_reorder_preserves_identity_and_moves_no_counter` | EVID-VAL-55 |
+| `A0-09` | ；重复 key 抛领域错误且旧视图不变 | `a0_09_a_duplicate_key_is_refused_before_any_patch` | EVID-VAL-55 |
+| `A0-10` | 结构 mutation 前记 `FocusRemovalIntent` | `a0_10_deleting_the_focused_row_settles_one_intent` | EVID-VAL-55 |
+| `A0-10` | ；commit 后仅在目标仍受影响时按 同 kind next | `a0_10_deleting_the_focused_row_settles_one_intent` | EVID-VAL-55 |
+| `A0-10` |  → prev | `a0_10_deleting_the_last_focused_row_falls_back_to_previous` | EVID-VAL-55 |
+| `A0-10` | ；批量 Clear 只结算一次 | `a0_10_a_bulk_clear_settles_once_for_the_surviving_sibling` | EVID-VAL-55 |
+| `A0-10` | reducer trace：每次焦点转移的原因与后继 | `a0_10_settlement_records_next_for_a_live_successor` | EVID-VAL-55 |
+| `A0-10` | ；用户中途转移焦点时 intent 被取消 | `a0_10_a_user_focus_move_cancels_the_intent` | EVID-VAL-55 |
+| `A0-11` | 1000+ 交错 mount/unmount/filter churn 后 nodes/edges/live owner | `a0_11_churn_returns_to_the_baseline` | EVID-VAL-55 |
+| `A0-11` | /caches 回到基线 | `a0_11_the_cache_returns_to_the_baseline_after_churn` | EVID-VAL-55 |
+| `A0-11` | 压力测试前后 live graph 计数 | `a0_11_churn_returns_to_the_baseline` | EVID-VAL-55 |
+| `A0-11` | ；回收关系而非 `Arc` size | `a0_11_churn_returns_to_the_baseline` | EVID-VAL-55 |
 
 机械自检（在候选树上执行）：
 
-- `EVID-VAL-52.names` 与 `cargo test --workspace --locked -- --list` 的 `name: test` 行集合**精确相等**：
-  125 / 125，无截断、无重复。
+- `EVID-VAL-55.names` 与 `cargo test --workspace --locked -- --list` 的 `name: test` 行集合**精确相等**：
+  127 / 127，无截断、无重复。
 - 54 条测试义务的 `ref` 按最后一个 `::` 段在 `names` 中命中：**54 / 54**，未命中 0 条。
-- 4 条命令义务对应 2 条不同命令，与 `EVID-VAL-52` / `EVID-VAL-53` 的 `command` 逐字相等：**4 / 4**。
+- 4 条命令义务对应 2 条不同命令，与 `EVID-VAL-55` / `EVID-VAL-56` 的 `command` 逐字相等：**4 / 4**。
 
 补充说明：
 
@@ -1426,4 +1622,7 @@ E3b 是 `EVID-VAL-54`。
   `txn::tests::a0_10_bulk_clear_settles_one_intent`、
   `txn::tests::a0_10_a_user_focus_move_cancels_the_settlement`、
   `txn::tests::a0_10_a_user_clear_cancels_the_settlement`。
+- #33 新增的两条分支夹具也在 `names` 里：
+  `txn::tests::a0_10_a_bulk_clear_with_no_live_candidate_records_cleared` 覆盖 `(None, None) => Cleared` 臂；
+  `txn::tests::a0_10_settlement_skips_a_next_sibling_unmounted_in_the_same_frame` 覆盖 next 的 `is_live` 过滤。
 - 标了 `notApplicable` 的义务不在本表内（它们由 `acceptedBy` 的 ADR 承担），本表不声称对它们做过运行复核。
