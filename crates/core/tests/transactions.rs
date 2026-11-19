@@ -600,3 +600,57 @@ fn cross_runtime_access_is_rejected() {
         "the owning store is untouched"
     );
 }
+
+#[test]
+fn a_title_write_is_committed_and_rejects_a_stale_handle() {
+    let mut runtime = Runtime::new();
+    let row: RowId = runtime.frame(|tx| tx.insert("A")).expect("insert");
+
+    runtime
+        .frame(|tx| {
+            tx.set_title(row, "A updated").map_err(|_| Fatal::Aborted)?;
+            Ok(())
+        })
+        .expect("rename");
+    assert_eq!(
+        runtime.committed().titles().collect::<Vec<_>>(),
+        vec!["A updated"]
+    );
+
+    let epoch_before = runtime.committed().epoch();
+    let writes_before = runtime.committed().counters().io_writes;
+    runtime
+        .frame(|tx| {
+            tx.set_title(row, "A updated").expect("same-title write");
+            Ok(())
+        })
+        .expect("frame");
+    assert_eq!(
+        runtime.committed().epoch(),
+        epoch_before,
+        "a same-title write must not advance the epoch"
+    );
+    assert_eq!(
+        runtime.committed().counters().io_writes,
+        writes_before,
+        "a same-title write is not a write"
+    );
+
+    runtime
+        .frame(|tx| {
+            assert_eq!(tx.read_once(row).expect("owned read"), "A updated");
+            tx.remove(row).map_err(|_| Fatal::Aborted)?;
+            Ok(())
+        })
+        .expect("read and remove");
+    runtime
+        .frame(|tx| {
+            assert!(
+                matches!(tx.set_title(row, "ghost"), Err(ValueError::Handle(_))),
+                "a stale handle must not write a title"
+            );
+            Ok(())
+        })
+        .expect("frame");
+    assert_eq!(runtime.committed().len(), 0);
+}

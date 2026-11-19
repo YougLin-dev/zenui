@@ -71,6 +71,10 @@ impl Runtime {
             .and_then(|()| self.views.caret(view))
     }
 
+    pub fn view_owner(&self, view: crate::handle::ViewId) -> Option<crate::handle::OwnerId> {
+        self.views.owner(view)
+    }
+
     pub fn counters(&self) -> crate::metrics::Counters {
         let mut total = self.store.counters();
         total += self.views.counters();
