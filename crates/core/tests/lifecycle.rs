@@ -327,7 +327,7 @@ fn a_user_focus_move_cancels_the_intent() {
 }
 
 #[test]
-fn a_bulk_clear_with_no_candidate_leaves_no_focus() {
+fn a_bulk_clear_selects_the_surviving_next_sibling() {
     let mut runtime = Runtime::new();
     runtime
         .frame(|tx| {
@@ -356,6 +356,7 @@ fn a_bulk_clear_with_no_candidate_leaves_no_focus() {
         .expect("focus A");
 
     let moves_before = runtime.counters().focus_moves;
+    let carets_before = runtime.counters().caret_ops;
     runtime
         .frame(|tx| {
             tx.clear_completed()?;
@@ -367,13 +368,33 @@ fn a_bulk_clear_with_no_candidate_leaves_no_focus() {
         .expect("clear");
 
     assert_eq!(
+        runtime
+            .row_views()
+            .into_iter()
+            .map(|(view, _)| view)
+            .collect::<Vec<_>>(),
+        vec![views[2]],
+        "A and B are actually unmounted; C survives"
+    );
+    assert_eq!(
         runtime.counters().focus_moves,
         moves_before + 1,
         "one intent for the whole clear"
     );
-    assert!(
-        runtime.focused().is_none(),
-        "every candidate row was cleared, so the fallback is no focus"
+    assert_eq!(
+        runtime.counters().caret_ops,
+        carets_before + 1,
+        "one placement for the surviving next sibling"
+    );
+    assert_eq!(
+        runtime.focused(),
+        Some(views[2]),
+        "C is the surviving next sibling after A and its old next B are unmounted"
+    );
+    assert_eq!(
+        runtime.caret(views[2]),
+        Some(1),
+        "C receives one settled caret"
     );
 }
 

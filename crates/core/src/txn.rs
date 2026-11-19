@@ -227,6 +227,25 @@ struct PlannedMount {
     title_len: u32,
 }
 
+#[derive(Clone, Copy)]
+struct FocusRecovery {
+    position: usize,
+}
+
+impl FocusRecovery {
+    fn new(order: &[ViewId], view: ViewId) -> Option<Self> {
+        let position = order.iter().position(|candidate| *candidate == view)?;
+        Some(Self { position })
+    }
+
+    fn settle(self, order: &[ViewId]) -> (Option<ViewId>, Option<ViewId>) {
+        let position = self.position.min(order.len());
+        (
+            order.get(position).copied(),
+            order[..position].last().copied(),
+        )
+    }
+}
 #[derive(Debug, Default)]
 struct ViewDraft {
     next_view: u32,
@@ -269,7 +288,7 @@ pub struct Txn {
     publishes: Vec<Publication>,
     commits: u64,
 
-    focus_intents: Vec<FocusIntent>,
+    focus_intents: Vec<FocusRecovery>,
 
     user_focused: bool,
 
@@ -597,9 +616,10 @@ impl<'a> Tx<'a> {
                     .node(focused)
                     .and_then(|node| node.row)
                     .is_some_and(|row| removed.contains(&row))
-                && let Some(intent) = self.views.focus_intent_for(focused)
+                && let Some(recovery) = FocusRecovery::new(&self.committed_order(), focused)
             {
-                self.txn.focus_intents.push(intent);
+                // 新挂载、相邻卸载和重排完成前，不能预先固定接任身份。
+                self.txn.focus_intents.push(recovery);
                 #[cfg(test)]
                 self.txn.intent_causes.push(FocusSettlementCause::BulkClear);
             }
@@ -836,6 +856,11 @@ impl<'a> Tx<'a> {
         self.store.handle_for(key)
     }
 
+    /// 删除前的已发布可见位置用于定位，发布后的结构再决定接任身份。
+    fn committed_order(&self) -> Vec<ViewId> {
+        self.views.order().to_vec()
+    }
+
     fn require_view(&self, view: ViewId) -> Result<(), Fatal> {
         // 暂存 mount 尚不在已提交树中；丢弃事务后，未发布身份可从原 checkpoint 重用。
         if self.txn.view.mounts.iter().any(|mount| mount.id == view) {
@@ -915,12 +940,13 @@ impl<'a> Tx<'a> {
                 .retain(|(candidate, _)| *candidate != owner);
             self.txn.view.unmounts.push(view);
         } else if !self.txn.view.unmounts.contains(&view) {
+            let recovery = (self.views.focused() == Some(view)
+                && self.txn.focus_intents.is_empty())
+            .then(|| FocusRecovery::new(&self.committed_order(), view))
+            .flatten();
             self.txn.view.unmounts.push(view);
-            if self.views.focused() == Some(view)
-                && self.txn.focus_intents.is_empty()
-                && let Some(intent) = self.views.focus_intent_for(view)
-            {
-                self.txn.focus_intents.push(intent);
+            if let Some(recovery) = recovery {
+                self.txn.focus_intents.push(recovery);
                 #[cfg(test)]
                 self.txn.intent_causes.push(FocusSettlementCause::Unmount);
             }
@@ -1221,10 +1247,16 @@ impl<'a> Tx<'a> {
 
         if !self.txn.user_focused
             && focused.is_none()
-            && let Some(intent) = self.txn.focus_intents.last().copied()
+            && let Some(recovery) = self.txn.focus_intents.last().copied()
         {
-            let next = intent.next.filter(|view| self.views.is_live(*view));
-            let previous = intent.previous.filter(|view| self.views.is_live(*view));
+            let final_order: Vec<ViewId> = self
+                .views
+                .row_views()
+                .into_iter()
+                .map(|(view, _)| view)
+                .collect();
+            // final_order 已包含本帧挂载，并排除了本帧卸载；新结构决定存活邻接。
+            let (next, previous) = recovery.settle(&final_order);
             let target = next.or(previous);
 
             #[cfg(test)]
@@ -1985,10 +2017,10 @@ mod tests {
             *log.last().expect("settlement"),
             (
                 FocusSettlementCause::BulkClear,
-                FocusSettlementRule::Next,
+                FocusSettlementRule::Previous,
                 Some(views[2])
             ),
-            "the clear is one intent and a surviving sibling settles it"
+            "the same survivor is selected once by its final position"
         );
     }
 
@@ -2261,18 +2293,19 @@ mod tests {
     #[test]
     fn a_bulk_clear_with_no_live_candidate_records_cleared() {
         let mut runtime = Runtime::new();
-        let (a, b, _c) = runtime
+        let (a, _b, _c) = runtime
             .frame(|tx| Ok((tx.insert("A")?, tx.insert("B")?, tx.insert("C")?)))
             .expect("seed");
         let views = mount_all(&mut runtime);
-        for row in [a, b] {
-            runtime
-                .frame(|tx| {
-                    tx.set_completed(row, true).map_err(|_| Fatal::Aborted)?;
-                    Ok(())
-                })
-                .expect("complete a row");
-        }
+
+        runtime
+            .frame(|tx| {
+                tx.set_completed(a, true).map_err(|_| Fatal::Aborted)?;
+                tx.unmount(views[1])?;
+                tx.unmount(views[2])?;
+                Ok(())
+            })
+            .expect("only the focused completed row has a View");
         runtime
             .frame(|tx| {
                 tx.focus(views[0])?;
@@ -2284,12 +2317,9 @@ mod tests {
         runtime
             .frame(|tx| {
                 tx.clear_completed()?;
-                for view in &views[..2] {
-                    tx.unmount(*view)?;
-                }
-                Ok(())
+                tx.unmount(views[0])
             })
-            .expect("clear");
+            .expect("clear the only View");
 
         assert_eq!(
             runtime.txn().focus_settlements().len(),
@@ -2309,5 +2339,6 @@ mod tests {
             runtime.focused().is_none(),
             "no candidate survives the clear"
         );
+        assert!(runtime.row_views().is_empty(), "every View is removed");
     }
 }
