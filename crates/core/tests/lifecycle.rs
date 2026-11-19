@@ -7,7 +7,9 @@
 //! duplicate key that slips through, or a focus intent settled twice all show
 //! up as a moved counter.
 
-use zenui_core::{Fatal, Filter, RowId, RowKey, Runtime, Tx, ViewId};
+use std::collections::BTreeMap;
+
+use zenui_core::{Fatal, Filter, OwnerId, RowId, RowKey, Runtime, Tx, ViewId};
 
 fn keys(tx: &mut Tx<'_>) -> Vec<RowKey> {
     tx.rows(Filter::All).iter().collect()
@@ -162,6 +164,86 @@ fn a0_09_a_reorder_preserves_identity_and_moves_no_counter() {
     assert_eq!(
         identities_after, expected,
         "the same ViewIds, in the reversed display order"
+    );
+}
+
+/// `SPEC-GATE-A0-09`: a reorder preserves **each view's** owner and generation.
+///
+/// The fixture above compares the live-owner *set*, which stays equal when two
+/// views swap owners — a set comparison witnesses "no owner leaked", not "the
+/// owner survived on its view". This one compares the mapping per
+/// `(view, owner, generation)` through `Runtime::view_node`.
+///
+/// Red-ability: make `ViewTree::reorder` rebuild the nodes by position (move
+/// `ViewNode` values onto the reordered ids) instead of reordering the id list,
+/// and every pair changes while the owner set still matches.
+#[test]
+fn a0_09_a_reorder_preserves_each_view_owner_and_generation() {
+    let mut runtime = Runtime::new();
+    runtime
+        .frame(|tx| {
+            tx.insert("A")?;
+            tx.insert("B")?;
+            tx.insert("C")?;
+            Ok(())
+        })
+        .expect("seed");
+    let views = mount_all(&mut runtime);
+    // Start from a non-initial order, so the assertion below is not the
+    // identity mapping by accident.
+    runtime
+        .frame(|tx| {
+            tx.reorder_views(&[views[2], views[0], views[1]])?;
+            Ok(())
+        })
+        .expect("first reorder");
+
+    let mapping = |runtime: &Runtime| -> BTreeMap<ViewId, (OwnerId, u32)> {
+        runtime
+            .row_views()
+            .into_iter()
+            .map(|(view, _)| {
+                let node = runtime.view_node(view).expect("the row view is live");
+                (view, (node.owner, node.generation.raw()))
+            })
+            .collect()
+    };
+    let owners_before: Vec<OwnerId> = runtime.live_owner_ids();
+    let before = mapping(&runtime);
+    assert_eq!(before.len(), 3, "all three views are in the mapping");
+
+    let current: Vec<ViewId> = runtime
+        .row_views()
+        .into_iter()
+        .map(|(view, _)| view)
+        .collect();
+    let reversed: Vec<ViewId> = current.iter().rev().copied().collect();
+    assert_ne!(current, reversed, "the fixture must reorder for real");
+    runtime
+        .frame(|tx| {
+            tx.reorder_views(&reversed)?;
+            Ok(())
+        })
+        .expect("reorder");
+
+    assert_eq!(
+        mapping(&runtime),
+        before,
+        "each view keeps its own owner and generation across the reorder"
+    );
+    assert_eq!(
+        runtime.live_owner_ids(),
+        owners_before,
+        "and the live-owner set is unchanged"
+    );
+    assert_eq!(
+        runtime
+            .row_views()
+            .into_iter()
+            .map(|(view, _)| view)
+            .collect::<Vec<_>>(),
+        reversed,
+        "the display order really moved"
     );
 }
 

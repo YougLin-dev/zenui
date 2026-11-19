@@ -83,6 +83,17 @@ impl Runtime {
         self.views.caret(view)
     }
 
+    /// The committed node for a live view.
+    ///
+    /// `SPEC-GATE-A0-09` requires a reorder to preserve each view's owner and
+    /// generation. `ViewNode`'s fields are already public; this read-only
+    /// accessor is what makes them reachable from outside the crate, so the
+    /// assertion can compare per `(view, owner)` instead of comparing the live
+    /// owner *set*, which stays equal under an owner swap.
+    pub fn view_node(&self, view: crate::handle::ViewId) -> Option<&crate::view::ViewNode> {
+        self.views.node(view)
+    }
+
     /// Diagnostics for the trace. Monotonic counters may advance on a frame
     /// that is later discarded; authority state does not (`SPEC-RT-053`).
     pub fn counters(&self) -> crate::metrics::Counters {
@@ -470,6 +481,143 @@ mod tests {
             })
             .expect("next frame unmounts");
         assert_eq!(runtime.row_views().len(), 0);
+    }
+
+    /// `SPEC-GATE-A0-05`: the publication half of "a memo converges to its
+    /// stable value before it is published".
+    ///
+    /// The diamond and long-chain fixtures in `graph.rs` drive `compute_staged`
+    /// and never publish; this one runs the real `Runtime::frame` path, which
+    /// installs the staged memos through `commit_scratch`, and asserts the
+    /// per-epoch observation count: one recompute per memo per moved epoch,
+    /// zero on an epoch that moves nothing, and one publication per commit.
+    ///
+    /// Red-ability: drop `commit_scratch` from `Tx::commit` (or stop installing
+    /// the values) and epoch 2 recomputes, so the zero fails.
+    #[test]
+    fn a0_05_a_memo_is_published_once_per_epoch() {
+        let mut runtime = Runtime::new();
+        let publications_before = runtime.txn().publications().len();
+
+        // Epoch 1: one row, the memo read twice.
+        let before = runtime.counters();
+        let (first, second, has_completed) = runtime
+            .frame(|tx| {
+                tx.insert("A")?;
+                let first = tx.remaining();
+                let second = tx.remaining();
+                Ok((first, second, tx.has_completed()))
+            })
+            .expect("epoch 1");
+        let epoch = runtime.counters().delta(before);
+        assert_eq!((first, second, has_completed), (1, 1, false));
+        assert_eq!(
+            epoch.memo_recomputes, 2,
+            "one recompute per memo, not per read"
+        );
+        assert_eq!(epoch.commits, 1);
+        assert_eq!(
+            runtime.txn().publications().len(),
+            publications_before + 1,
+            "one epoch publishes exactly once"
+        );
+        assert_eq!(
+            runtime
+                .txn()
+                .publications()
+                .last()
+                .expect("publication")
+                .values
+                .len(),
+            1,
+            "the published snapshot carries the committed rows"
+        );
+
+        // Epoch 2: no writes. The published memo is served, not recomputed.
+        let before = runtime.counters();
+        let (remaining, has_completed) = runtime
+            .frame(|tx| Ok((tx.remaining(), tx.has_completed())))
+            .expect("epoch 2");
+        let idle = runtime.counters().delta(before);
+        assert_eq!((remaining, has_completed), (1, false));
+        assert_eq!(idle.memo_recomputes, 0, "a stable epoch recomputes nothing");
+
+        // Epoch 3: a write moves the source; the memo recomputes exactly once.
+        let before = runtime.counters();
+        let (first, second) = runtime
+            .frame(|tx| {
+                tx.insert("B")?;
+                Ok((tx.remaining(), tx.remaining()))
+            })
+            .expect("epoch 3");
+        let moved = runtime.counters().delta(before);
+        assert_eq!((first, second), (2, 2));
+        assert_eq!(
+            moved.memo_recomputes, 1,
+            "one recompute for the epoch, not per read"
+        );
+        assert_eq!(
+            runtime
+                .txn()
+                .publications()
+                .last()
+                .expect("publication")
+                .values
+                .len(),
+            2
+        );
+    }
+
+    /// `SPEC-GATE-A0-05`: a memo computed from an overlay that a later staged
+    /// write replaced is **not published** — `commit_scratch` installs only the
+    /// values computed at the final revision.
+    ///
+    /// Red-ability: delete the `observed_at.get(&node) != Some(&final_staged_rev)`
+    /// guard in `MemoGraph::commit_scratch`, and the stale mid-frame value is
+    /// installed: epoch 3 answers 2, recomputing nothing, and both assertions
+    /// fail.
+    #[test]
+    fn a0_05_a_memo_computed_before_the_last_staged_write_is_not_published() {
+        let mut runtime = Runtime::new();
+        runtime
+            .frame(|tx| {
+                tx.insert("A")?;
+                assert_eq!(tx.remaining(), 1, "the seeded epoch is published");
+                Ok(())
+            })
+            .expect("epoch 1");
+
+        // Epoch 2 reads at one revision and then writes again.
+        let mid_frame = runtime
+            .frame(|tx| {
+                tx.insert("B")?;
+                let mid_frame = tx.remaining();
+                tx.insert("C")?;
+                Ok(mid_frame)
+            })
+            .expect("epoch 2");
+        assert_eq!(mid_frame, 2);
+        assert_eq!(
+            runtime
+                .txn()
+                .publications()
+                .last()
+                .expect("publication")
+                .values
+                .len(),
+            3,
+            "the commit publishes the final overlay, not the one the read saw"
+        );
+
+        // Epoch 3: no writes.
+        let before = runtime.counters();
+        let remaining = runtime.frame(|tx| Ok(tx.remaining())).expect("epoch 3");
+        let settled = runtime.counters().delta(before);
+        assert_eq!(remaining, 3, "the settled value, not the mid-frame one");
+        assert_eq!(
+            settled.memo_recomputes, 1,
+            "the mid-frame memo was dropped at commit, so this epoch recomputes"
+        );
     }
 
     #[test]

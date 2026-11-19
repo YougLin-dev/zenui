@@ -1012,4 +1012,67 @@ mod tests {
             );
         }
     }
+
+    /// `SPEC-GATE-A0-05`: the published half of the diamond.
+    ///
+    /// `a_diamond_never_observes_two_epochs` never calls `commit_scratch`, so it
+    /// proves convergence in the stage but not that the converged value is what
+    /// the graph installs. This fixture commits each epoch and reads the
+    /// installed value back through `peek`.
+    ///
+    /// Red-ability: make `commit_scratch` skip the install (or stop matching
+    /// `observed_at` against the final revision) and `peek` keeps the previous
+    /// epoch's value.
+    #[test]
+    fn a_published_diamond_holds_one_stable_value_per_epoch() {
+        let mut graph = MemoGraph::new();
+        let source = graph.source("store");
+        let left = graph.memo("left");
+        let right = graph.memo("right");
+        let join = graph.memo("join");
+
+        for epoch in 1..=3u32 {
+            let mut scratch = GraphScratch::new();
+            graph.bump_source_staged(&mut scratch, source);
+            let revision = graph.effective_revision(&scratch, source);
+
+            let _ = graph
+                .compute_staged(left, &mut scratch, revision, |reader| {
+                    reader.read(source);
+                    Value::Count(epoch)
+                })
+                .expect("left");
+            let _ = graph
+                .compute_staged(right, &mut scratch, revision, |reader| {
+                    reader.read(source);
+                    Value::Count(epoch)
+                })
+                .expect("right");
+            let count = |value: Option<&Value>| match value {
+                Some(Value::Count(count)) => *count,
+                _ => 0,
+            };
+            let (joined, _) = graph
+                .compute_staged(join, &mut scratch, revision, |reader| {
+                    let left_value = count(reader.read(left));
+                    let right_value = count(reader.read(right));
+                    assert_eq!(
+                        left_value, right_value,
+                        "a diamond must not mix epochs: {left_value} vs {right_value}"
+                    );
+                    Value::Count(left_value + right_value)
+                })
+                .expect("join");
+            assert_eq!(joined, Value::Count(epoch * 2));
+
+            graph.commit_scratch(scratch, revision);
+            assert_eq!(
+                graph.peek(join),
+                Some(&Value::Count(epoch * 2)),
+                "epoch {epoch}: the converged value must be the published one"
+            );
+            assert_eq!(graph.peek(left), Some(&Value::Count(epoch)));
+            assert_eq!(graph.peek(right), Some(&Value::Count(epoch)));
+        }
+    }
 }

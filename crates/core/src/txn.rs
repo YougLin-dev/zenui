@@ -297,6 +297,57 @@ struct ViewDraft {
     caret: Option<(ViewId, usize)>,
 }
 
+/// A focus intent recorded before a structural change (`SPEC-RT-026`).
+///
+/// The cause is test-only: it exists so the settlement trace can name *what*
+/// recorded the intent (`SPEC-GATE-A0-10` asks for the cause and the successor
+/// of every focus transfer), and it is never read outside a fixture.
+#[derive(Clone, Copy)]
+struct PendingFocusIntent {
+    intent: FocusIntent,
+    #[cfg(test)]
+    cause: FocusSettlementCause,
+}
+
+/// Test-only: what recorded a focus intent.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FocusSettlementCause {
+    /// A view was unmounted.
+    Unmount,
+    /// `clear_completed` removed the focused row.
+    BulkClear,
+}
+
+/// Test-only: which arm of the fallback order settled the intent.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FocusSettlementRule {
+    /// The same-kind next sibling was live.
+    Next,
+    /// No live next sibling; the previous one was live.
+    Previous,
+    /// No candidate was live, so focus was cleared.
+    Cleared,
+}
+
+/// Test-only observation point: one settled focus intent
+/// (`SPEC-GATE-A0-10`).
+///
+/// `SPEC-RT-026` requires the reducer trace to name the cause and successor of
+/// every focus transfer. The intent itself only records the neighbours
+/// (`FocusIntent`), and the settlement used to vanish into the private branch
+/// in [`Tx::apply_views`] — the behaviour existed but was not observable. This
+/// is that observation point, modelled on `cleanup_log`: it records what the
+/// commit did, and it is compiled out of the public build.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FocusSettlement {
+    pub cause: FocusSettlementCause,
+    pub rule: FocusSettlementRule,
+    pub target: Option<ViewId>,
+}
+
 /// Transaction state owned by the runtime.
 pub struct Txn {
     depth: u32,
@@ -320,12 +371,17 @@ pub struct Txn {
     commits: u64,
     /// Focus intents recorded before a structural change, settled once at the
     /// end of the commit (`SPEC-RT-026`, `SPEC-GATE-A0-10`).
-    focus_intents: Vec<FocusIntent>,
+    focus_intents: Vec<PendingFocusIntent>,
     /// Set when the frame moves focus explicitly; cancels pending intents.
     user_focused: bool,
     /// Test-only: what the Cleanup stage observed when it released an owner.
     #[cfg(test)]
     cleanup_log: Vec<(crate::handle::OwnerId, Phase, usize)>,
+    /// Test-only: every focus settlement the commit applied, oldest first.
+    /// Like `cleanup_log`, it accumulates across frames and is never reset by
+    /// `reset`, so a fixture reads it after the frame that produced it.
+    #[cfg(test)]
+    settlements: Vec<FocusSettlement>,
     /// Latched fatal error: set by a phase violation or a nested failure.
     /// `commit` returns it even when the frame body returned `Ok`
     /// (`ADR-0019` decision 6).
@@ -351,6 +407,8 @@ impl Txn {
             user_focused: false,
             #[cfg(test)]
             cleanup_log: Vec::new(),
+            #[cfg(test)]
+            settlements: Vec::new(),
         }
     }
 
@@ -386,6 +444,14 @@ impl Txn {
     #[cfg(test)]
     pub(crate) fn cleanup_log(&self) -> &[(crate::handle::OwnerId, Phase, usize)] {
         &self.cleanup_log
+    }
+
+    /// Test-only observation point: the focus settlements the commits applied,
+    /// oldest first (`SPEC-GATE-A0-10`). Adding this accessor does not widen the
+    /// public API; the settlement branch itself is unchanged.
+    #[cfg(test)]
+    pub(crate) fn focus_settlements(&self) -> &[FocusSettlement] {
+        &self.settlements
     }
 
     pub fn publications(&self) -> &[Publication] {
@@ -665,7 +731,11 @@ impl<'a> Tx<'a> {
                     .is_some_and(|row| removed.contains(&row))
                 && let Some(intent) = self.views.focus_intent_for(focused)
             {
-                self.txn.focus_intents.push(intent);
+                self.txn.focus_intents.push(PendingFocusIntent {
+                    intent,
+                    #[cfg(test)]
+                    cause: FocusSettlementCause::BulkClear,
+                });
             }
             self.txn.model.writes += 1;
             self.bump();
@@ -990,7 +1060,11 @@ impl<'a> Tx<'a> {
                 && self.txn.focus_intents.is_empty()
                 && let Some(intent) = self.views.focus_intent_for(view)
             {
-                self.txn.focus_intents.push(intent);
+                self.txn.focus_intents.push(PendingFocusIntent {
+                    intent,
+                    #[cfg(test)]
+                    cause: FocusSettlementCause::Unmount,
+                });
             }
         }
         Ok(())
@@ -1303,18 +1377,43 @@ impl<'a> Tx<'a> {
         // swap, once — only when the frame did not move focus explicitly.
         // Fallback order is next -> previous; a focusable input and the
         // toolbar do not exist in A0 (they are A1 nodes).
+        //
+        // The settlement is recorded under `cfg(test)` so the reducer trace can
+        // name the cause and successor of the one transfer this branch makes
+        // (`SPEC-RT-026`); the production behaviour is exactly the three arms.
         if !self.txn.user_focused
             && focused.is_none()
-            && let Some(intent) = self.txn.focus_intents.last().copied()
+            && let Some(pending) = self.txn.focus_intents.last().copied()
         {
-            let target = intent
-                .next
+            if let Some(view) = pending.intent.next.filter(|view| self.views.is_live(*view)) {
+                self.views.focus(view);
+                #[cfg(test)]
+                self.txn.settlements.push(FocusSettlement {
+                    cause: pending.cause,
+                    rule: FocusSettlementRule::Next,
+                    target: Some(view),
+                });
+            } else if let Some(view) = pending
+                .intent
+                .previous
                 .filter(|view| self.views.is_live(*view))
-                .or_else(|| intent.previous.filter(|view| self.views.is_live(*view)));
-            match target {
-                Some(view) => self.views.focus(view),
-                None => self.views.clear_focus(),
-            };
+            {
+                self.views.focus(view);
+                #[cfg(test)]
+                self.txn.settlements.push(FocusSettlement {
+                    cause: pending.cause,
+                    rule: FocusSettlementRule::Previous,
+                    target: Some(view),
+                });
+            } else {
+                self.views.clear_focus();
+                #[cfg(test)]
+                self.txn.settlements.push(FocusSettlement {
+                    cause: pending.cause,
+                    rule: FocusSettlementRule::Cleared,
+                    target: None,
+                });
+            }
         }
         // A focus pointer left on an unmounted view is resolved once, after
         // the settlement, and counts as a move.
@@ -1998,5 +2097,434 @@ mod tests {
             end, start,
             "a reorder that moves nothing must not advance the order revision"
         );
+    }
+
+    // ---- SPEC-GATE-A0-10: the settlement trace -------------------------------
+    //
+    // The fixtures below live in this file on purpose. The observation point is
+    // `#[cfg(test)]`, and integration tests under `crates/core/tests/` are
+    // compiled against a library built *without* it, so only a unit test inside
+    // this module can read the recorded cause, rule and target.
+
+    fn seed(titles: &[&str]) -> Runtime {
+        let mut runtime = Runtime::new();
+        runtime
+            .frame(|tx| {
+                for title in titles {
+                    tx.insert(*title)?;
+                }
+                Ok(())
+            })
+            .expect("seed");
+        runtime
+    }
+
+    fn mount_all(runtime: &mut Runtime) -> Vec<ViewId> {
+        runtime
+            .frame(|tx| {
+                let keys: Vec<RowKey> = tx.rows(Filter::All).iter().collect();
+                let mut views = Vec::with_capacity(keys.len());
+                for key in &keys {
+                    views.push(tx.mount_row(*key, 1)?);
+                }
+                tx.reorder_views(&views)?;
+                Ok(views)
+            })
+            .expect("mount all")
+    }
+
+    fn key_of(runtime: &Runtime, index: usize) -> RowKey {
+        runtime
+            .committed()
+            .keys()
+            .nth(index)
+            .expect("the seeded row")
+    }
+
+    /// `SPEC-GATE-A0-10`: an unmount of the focused view settles once, and the
+    /// recorded cause is the unmount itself.
+    ///
+    /// Red-ability: push the intent with `FocusSettlementCause::BulkClear` in
+    /// `Tx::unmount` (or drop the push), and the exact-slice assertion fails.
+    #[test]
+    fn a0_10_settlement_records_the_unmount_cause_and_the_next_sibling() {
+        let mut runtime = seed(&["A", "B", "C"]);
+        let views = mount_all(&mut runtime);
+        runtime
+            .frame(|tx| {
+                tx.focus(views[0])?;
+                Ok(())
+            })
+            .expect("focus A");
+
+        let key = key_of(&runtime, 0);
+        runtime
+            .frame(|tx| {
+                let handle = tx.handle_for(key).expect("row A");
+                tx.remove(handle).map_err(|_| Fatal::Aborted)?;
+                tx.unmount(views[0])?;
+                Ok(())
+            })
+            .expect("delete the focused row");
+
+        assert_eq!(runtime.focused(), Some(views[1]));
+        assert_eq!(
+            runtime.txn().focus_settlements(),
+            &[FocusSettlement {
+                cause: FocusSettlementCause::Unmount,
+                rule: FocusSettlementRule::Next,
+                target: Some(views[1]),
+            }],
+            "one settlement, named by its cause and its successor"
+        );
+    }
+
+    /// `SPEC-GATE-A0-10`: with no next sibling, the recorded rule is
+    /// `Previous` — the arm the delete-the-first-row fixture never reaches.
+    ///
+    /// Red-ability: delete the `else if` previous arm in `Tx::apply_views` and
+    /// the settlement becomes `Cleared` with `target: None`.
+    #[test]
+    fn a0_10_settlement_records_the_previous_rule_when_no_next_survives() {
+        let mut runtime = seed(&["A", "B", "C"]);
+        let views = mount_all(&mut runtime);
+        runtime
+            .frame(|tx| {
+                tx.focus(views[2])?;
+                Ok(())
+            })
+            .expect("focus C");
+
+        let key = key_of(&runtime, 2);
+        runtime
+            .frame(|tx| {
+                let handle = tx.handle_for(key).expect("row C");
+                tx.remove(handle).map_err(|_| Fatal::Aborted)?;
+                tx.unmount(views[2])?;
+                Ok(())
+            })
+            .expect("delete the last focused row");
+
+        assert_eq!(runtime.focused(), Some(views[1]));
+        assert_eq!(
+            runtime.txn().focus_settlements(),
+            &[FocusSettlement {
+                cause: FocusSettlementCause::Unmount,
+                rule: FocusSettlementRule::Previous,
+                target: Some(views[1]),
+            }]
+        );
+    }
+
+    /// `SPEC-GATE-A0-10`: "only when the target is still affected" — the
+    /// settlement must skip a next sibling that this frame also unmounted.
+    ///
+    /// Red-ability: delete the `.filter(|view| self.views.is_live(*view))` on
+    /// the next arm and the settlement reports `Next` with a dead target; the
+    /// pointer then lands nowhere and the trailing cleanup clears focus, so the
+    /// `focused == Some(views[0])` assertion fails too.
+    #[test]
+    fn a0_10_settlement_skips_a_next_sibling_unmounted_in_the_same_frame() {
+        let mut runtime = seed(&["A", "B", "C"]);
+        let views = mount_all(&mut runtime);
+        runtime
+            .frame(|tx| {
+                tx.focus(views[1])?;
+                Ok(())
+            })
+            .expect("focus B");
+
+        runtime
+            .frame(|tx| {
+                // B and its next sibling C both leave the tree.
+                tx.unmount(views[1])?;
+                tx.unmount(views[2])?;
+                Ok(())
+            })
+            .expect("unmount B and C");
+
+        assert_eq!(
+            runtime.focused(),
+            Some(views[0]),
+            "the settlement must fall through the dead next sibling"
+        );
+        assert_eq!(
+            runtime.txn().focus_settlements(),
+            &[FocusSettlement {
+                cause: FocusSettlementCause::Unmount,
+                rule: FocusSettlementRule::Previous,
+                target: Some(views[0]),
+            }]
+        );
+    }
+
+    /// `SPEC-GATE-A0-10`: a bulk clear records one intent for the whole clear,
+    /// and the cause is the clear — not the unmounts that follow it.
+    ///
+    /// Red-ability: record `BulkClear` as `Unmount` in `Tx::clear_completed`
+    /// and the cause assertion fails; record one intent per removed row and the
+    /// single-element slice fails.
+    #[test]
+    fn a0_10_a_bulk_clear_records_one_settlement_with_its_own_cause() {
+        let mut runtime = seed(&["A", "B", "C"]);
+        let views = mount_all(&mut runtime);
+        for index in [0, 1] {
+            let key = key_of(&runtime, index);
+            runtime
+                .frame(|tx| {
+                    let handle = tx.handle_for(key).expect("row");
+                    tx.set_completed(handle, true).map_err(|_| Fatal::Aborted)?;
+                    Ok(())
+                })
+                .expect("complete");
+        }
+        runtime
+            .frame(|tx| {
+                tx.focus(views[1])?;
+                Ok(())
+            })
+            .expect("focus B");
+
+        runtime
+            .frame(|tx| {
+                tx.clear_completed()?;
+                for view in &views[..2] {
+                    tx.unmount(*view)?;
+                }
+                Ok(())
+            })
+            .expect("clear");
+
+        assert_eq!(runtime.focused(), Some(views[2]));
+        assert_eq!(
+            runtime.txn().focus_settlements(),
+            &[FocusSettlement {
+                cause: FocusSettlementCause::BulkClear,
+                rule: FocusSettlementRule::Next,
+                target: Some(views[2]),
+            }],
+            "one settlement for the clear, named by the clear"
+        );
+    }
+
+    /// `SPEC-GATE-A0-10`: a clear that removes every candidate records the
+    /// `Cleared` rule with no target.
+    ///
+    /// Red-ability: make the `None` arm keep the dead pointer instead of
+    /// clearing it, and the settlement still says `Cleared` while `focused()`
+    /// stays `Some` — the `focused().is_none()` assertion fails.
+    #[test]
+    fn a0_10_a_bulk_clear_with_no_live_candidate_records_cleared() {
+        let mut runtime = seed(&["A", "B", "C"]);
+        let views = mount_all(&mut runtime);
+        for index in [0, 1] {
+            let key = key_of(&runtime, index);
+            runtime
+                .frame(|tx| {
+                    let handle = tx.handle_for(key).expect("row");
+                    tx.set_completed(handle, true).map_err(|_| Fatal::Aborted)?;
+                    Ok(())
+                })
+                .expect("complete");
+        }
+        runtime
+            .frame(|tx| {
+                tx.focus(views[0])?;
+                Ok(())
+            })
+            .expect("focus A");
+
+        runtime
+            .frame(|tx| {
+                tx.clear_completed()?;
+                for view in &views[..2] {
+                    tx.unmount(*view)?;
+                }
+                Ok(())
+            })
+            .expect("clear");
+
+        assert!(runtime.focused().is_none());
+        assert_eq!(
+            runtime.txn().focus_settlements(),
+            &[FocusSettlement {
+                cause: FocusSettlementCause::BulkClear,
+                rule: FocusSettlementRule::Cleared,
+                target: None,
+            }]
+        );
+    }
+
+    /// `SPEC-GATE-A0-10`: a user focus move in the same frame cancels the
+    /// intent — the trace must contain no settlement at all.
+    ///
+    /// Red-ability: this frame sets an explicit focus target, so each guard
+    /// blocks the settlement on its own; delete both the `!user_focused` guard
+    /// and the `focused.is_none()` condition to see it. A settlement then
+    /// appears and focus is pulled back to the next sibling, so both assertions
+    /// fail. The user-*clear* fixture below is the one that isolates the
+    /// `!user_focused` guard, because a clear leaves `focused` at `None`.
+    #[test]
+    fn a0_10_a_user_focus_move_records_no_settlement() {
+        let mut runtime = seed(&["A", "B", "C"]);
+        let views = mount_all(&mut runtime);
+        runtime
+            .frame(|tx| {
+                tx.focus(views[0])?;
+                Ok(())
+            })
+            .expect("focus A");
+
+        let key = key_of(&runtime, 0);
+        runtime
+            .frame(|tx| {
+                let handle = tx.handle_for(key).expect("row A");
+                tx.remove(handle).map_err(|_| Fatal::Aborted)?;
+                tx.unmount(views[0])?;
+                tx.focus(views[2])?;
+                Ok(())
+            })
+            .expect("delete + user focus");
+
+        assert_eq!(runtime.focused(), Some(views[2]));
+        assert!(
+            runtime.txn().focus_settlements().is_empty(),
+            "a cancelled intent leaves no settlement: {:?}",
+            runtime.txn().focus_settlements()
+        );
+    }
+
+    /// `SPEC-GATE-A0-10`: an explicit clear is a user choice too.
+    ///
+    /// Red-ability: delete the `!self.txn.user_focused` guard and the
+    /// settlement slice stops being empty.
+    #[test]
+    fn a0_10_a_user_clear_records_no_settlement() {
+        let mut runtime = seed(&["A", "B", "C"]);
+        let views = mount_all(&mut runtime);
+        runtime
+            .frame(|tx| {
+                tx.focus(views[0])?;
+                Ok(())
+            })
+            .expect("focus A");
+
+        let key = key_of(&runtime, 0);
+        runtime
+            .frame(|tx| {
+                let handle = tx.handle_for(key).expect("row A");
+                tx.remove(handle).map_err(|_| Fatal::Aborted)?;
+                tx.unmount(views[0])?;
+                tx.clear_focus()?;
+                Ok(())
+            })
+            .expect("delete + clear");
+
+        assert!(runtime.focused().is_none());
+        assert!(runtime.txn().focus_settlements().is_empty());
+    }
+
+    // ---- SPEC-GATE-A0-06: the commit-time key preflight ----------------------
+
+    /// Stage one mount the way `Tx::mount_row` would, without going through it.
+    ///
+    /// This exists only for the fixture below: `Tx::mount_row` refuses a
+    /// duplicate key at the call site, which is precisely why the duplicate
+    /// can never reach the commit-time preflight through the public API.
+    fn stage_mount(tx: &mut Tx<'_>, row: RowKey, title_len: u32) -> ViewId {
+        let view = ViewId::from_index(tx.txn.view.next_view);
+        let owner = OwnerId::from_index(tx.txn.view.next_owner);
+        let parent = tx.owners.root();
+        tx.txn.view.next_view += 1;
+        tx.txn.view.next_owner += 1;
+        tx.txn.view.owners.push((owner, parent));
+        tx.txn.view.mounts.push(PlannedMount {
+            id: view,
+            row,
+            owner,
+            title_len,
+        });
+        tx.layout.plan(view);
+        view
+    }
+
+    /// `SPEC-GATE-A0-06`: `TreeCommit` runs a complete key preflight before any
+    /// patch, and a staged duplicate key is refused there.
+    ///
+    /// The obligation names the *commit* preflight, so a fixture that asserts
+    /// the call-site refusal (`a0_09_a_duplicate_key_is_refused_before_any_patch`)
+    /// is a sibling obligation, not this one. `Tx::mount_row` refuses the
+    /// duplicate before it can be staged, so this fixture stages the draft
+    /// directly — the only way to reach the preflight — and first proves the
+    /// same hand-staged shape commits when the keys are distinct, so a green
+    /// result cannot be "every hand-staged draft is rejected".
+    ///
+    /// The draft here is legal in every other respect — two distinct view ids
+    /// and owners, both layout nodes planned, and an order that is a
+    /// permutation of the live views — so the duplicate key is the only defect
+    /// that can reject it.
+    ///
+    /// Red-ability: delete the `seen_keys` loop in `Tx::preflight` and the
+    /// duplicate frame commits: the model is unchanged but two views claim one
+    /// row key, so `row_views().len() == 4` and the authority comparison fails.
+    #[test]
+    fn a0_06_the_commit_preflight_refuses_a_duplicate_view_key() {
+        let mut runtime = seed(&["A", "B", "C"]);
+        let a = key_of(&runtime, 0);
+        let b = key_of(&runtime, 1);
+        let c = key_of(&runtime, 2);
+        let commits_before = runtime.txn().commits();
+
+        // Control: the same hand-staged draft, two distinct keys, commits.
+        let mounted = runtime
+            .frame(|tx| {
+                let first = stage_mount(tx, a, 1);
+                let second = stage_mount(tx, b, 1);
+                tx.txn.view.order = Some(vec![first, second]);
+                Ok((first, second))
+            })
+            .expect("a hand-staged draft with distinct keys must commit");
+        assert_eq!(runtime.row_views().len(), 2);
+        assert_eq!(runtime.layout_pairs().len(), 2);
+        assert_eq!(runtime.txn().commits(), commits_before + 1);
+        assert!(runtime.layout_of(mounted.0).is_some());
+        assert!(runtime.layout_of(mounted.1).is_some());
+
+        let views_before = runtime.row_views();
+        let owners_before = runtime.live_owner_ids();
+        let layout_before = runtime.layout_pairs();
+        let commits_before = runtime.txn().commits();
+        let publications_before = runtime.txn().publications().len();
+        let geometry_before = runtime.geometry_epoch();
+        let next_view_before = runtime.next_view();
+        let next_owner_before = runtime.next_owner();
+
+        // The duplicate: two staged mounts for the same live row. The order
+        // names every view that would be live afterwards, so only the key
+        // check stands between this draft and a commit.
+        let result = runtime.frame(|tx| {
+            let first = stage_mount(tx, c, 1);
+            let second = stage_mount(tx, c, 1);
+            assert_ne!(first, second, "two distinct views claim the same key");
+            tx.txn.view.order = Some(vec![mounted.0, mounted.1, first, second]);
+            Ok(())
+        });
+
+        assert!(
+            matches!(result, Err(Fatal::DuplicateViewKey { key }) if key == c),
+            "expected the commit preflight to refuse the duplicate, got {result:?}"
+        );
+        assert_eq!(runtime.row_views(), views_before, "no patch was applied");
+        assert_eq!(runtime.live_owner_ids(), owners_before, "no owner survived");
+        assert_eq!(runtime.layout_pairs(), layout_before, "layout is untouched");
+        assert_eq!(runtime.geometry_epoch(), geometry_before);
+        assert_eq!(runtime.txn().commits(), commits_before, "nothing committed");
+        assert_eq!(
+            runtime.txn().publications().len(),
+            publications_before,
+            "a refused commit publishes nothing"
+        );
+        assert_eq!(runtime.next_view(), next_view_before);
+        assert_eq!(runtime.next_owner(), next_owner_before);
     }
 }
