@@ -25,6 +25,7 @@ cargo run -p zenui-app --example todolist_headless --locked
 
 ## 阅读路径
 
+- [愿景](docs/愿景.md)：产品定位、不可放弃的原则与产品边界。
 - [快速开始](docs/快速开始.md)：工具链、运行方式、工作区结构。
 - [界面与组件](docs/界面与组件.md)：组件、属性、条件、列表和 `view!`。
 - [数据与更新](docs/数据与更新.md)：Signal、Memo、Store、Field 和异步边界。
