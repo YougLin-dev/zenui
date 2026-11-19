@@ -1342,36 +1342,88 @@ $ cargo run -p zenui-app --example todolist_headless --locked | shasum -a 256
 
 ### M0 见证链输入（候选 `cbf7012a`）
 
-本表是交给出口记录的**输入**，不是出口结论。E3a 就是 `EVID-VAL-52`（候选上的 workspace 全量，带 125 条
-`names`），trace 是 `EVID-VAL-53`，E3b 是 `EVID-VAL-54`。每条 A0 判据选一条未标 `notApplicable` 的义务，
-给出 `ref`，以及候选上哪条运行点名了它。「点名」的判据是：测试义务在 `EVID-VAL-52` 的 `names` 里出现
-（可能带 `module::tests::` 前缀），命令义务与运行的 `command` 逐字相同。
+本表是交给出口记录的**输入**，不是出口结论。它与 `ADR-0027` 的 E2 同口径：**每条 A0 判据下全部
+非 `notApplicable` 义务**逐条列出（共 58 条：54 条测试义务、4 条命令义务），给出 `ref` 与候选上点名它的
+运行。E3a 就是 `EVID-VAL-52`（候选上的 workspace 全量，带 125 条 `names`），trace 是 `EVID-VAL-53`，
+E3b 是 `EVID-VAL-54`。
 
-| 判据（均为 `SPEC-GATE-A0-` 前缀） | 选中的义务（`EVID-MATRIX` 原文） | `ref` | 点名该 `ref` 的运行 |
+「点名」的判据：测试义务在 `EVID-VAL-52` 的 `names` 里出现（按最后一个 `::` 段的函数名精确匹配，允许
+`module::tests::` 前缀）；命令义务与运行的 `command` 逐字相同。
+
+| 判据（`SPEC-GATE-A0-` 前缀） | 义务（`EVID-MATRIX` 原文） | `ref` | 点名该 `ref` 的运行 |
 |---|---|---|---|
-| `A0-01` | `crates/core`、`crates/app` 存在 | `cargo test --workspace --locked` | `EVID-VAL-52`（命令逐字匹配） |
-| `A0-01` | ；上述命令可跑并输出确定性 trace（query/mount/materialization/edge/geometry/focus/caret/I-O 计数） | `cargo run -p zenui-app --example todolist_headless --locked` | `EVID-VAL-53`（命令逐字匹配，`traceSha256` 两次一致并与 golden 同值） |
-| `A0-02` | 每个 UI 行 mount 只读一次 owned title | `a0_02_each_new_view_costs_exactly_one_owned_read` | `EVID-VAL-52`（`tests/mount_path.rs`） |
-| `A0-03` | `{runtime_id, slot, generation}` 分离 | `a_handle_identity_is_the_runtime_slot_generation_triple` | `EVID-VAL-52`（`handle::tests::…`） |
-| `A0-04` | 最外层 batch 只提交一次 | `a0_04_nested_batch_publishes_once_with_the_outer_value` | `EVID-VAL-52`（`tests/gates.rs`） |
-| `A0-05` | Memo 拓扑到稳定值才发布 | `a_diamond_never_observes_two_epochs` | `EVID-VAL-52`（`graph::tests::…`） |
-| `A0-06` | TreeCommit 先完整 preflight（key | `a0_06_the_commit_preflight_sees_a_committed_view_outside_the_order` | `EVID-VAL-52`（`txn::tests::…`） |
-| `A0-07` | query cache 单接线：`rows(filter)` 求值登记 membership | `a0_07_one_eval_build_and_materialization_per_epoch_filter` | `EVID-VAL-52`（`tests/queries.rs`） |
-| `A0-08` | 空态由独立 counter/membership 索引派生：`row_visits = 0`、`RowSet materialization = 0` | `a0_08_an_empty_filter_materializes_nothing` | `EVID-VAL-52`（`tests/queries.rs`） |
-| `A0-09` | ；duplicate key 在任何 patch 前拒绝 | `a0_09_an_unordered_view_still_claims_its_key` | `EVID-VAL-52`（`txn::tests::…`） |
-| `A0-09` | ；same-owner reorder 保留 ViewId | `a0_09_a_reorder_preserves_identity_and_moves_no_counter` | `EVID-VAL-52`（`tests/lifecycle.rs`） |
-| `A0-10` | reducer trace：每次焦点转移的原因与后继 | `a0_10_settlement_records_next_for_a_live_successor` | `EVID-VAL-52`（`txn::tests::…`） |
-| `A0-11` | 1000+ 交错 mount/unmount/filter churn 后 nodes/edges/live owner | `a0_11_churn_returns_to_the_baseline` | `EVID-VAL-52`（`tests/lifecycle.rs`） |
+| `A0-01` | `crates/core`、`crates/app` 存在 | `cargo test --workspace --locked` | EVID-VAL-52（workspace 命令逐字匹配） |
+| `A0-01` | ；上述命令可跑并输出确定性 trace（query/mount/materialization/edge/geometry/focus/caret/I-O 计数） | `cargo run -p zenui-app --example todolist_headless --locked` | EVID-VAL-53（trace 命令逐字匹配） |
+| `A0-01` | 仓库内可复跑的命令 + trace 快照 | `cargo run -p zenui-app --example todolist_headless --locked` | EVID-VAL-53（trace 命令逐字匹配） |
+| `A0-02` | 每个 UI 行 mount 只读一次 owned title | `a0_02_each_new_view_costs_exactly_one_owned_read` | EVID-VAL-52 |
+| `A0-02` | ；Copy handle 不携带 `String` | `the_named_contracts_do_not_compile_for_the_named_reason` | EVID-VAL-52 |
+| `A0-02` | ；`read_once` 返回 `Result` | `a0_03_a_failed_read_does_not_advance_io_reads` | EVID-VAL-52 |
+| `A0-02` | trybuild：`#[derive(Copy)] struct{String}` 必须 E0204 | `the_named_contracts_do_not_compile_for_the_named_reason` | EVID-VAL-52 |
+| `A0-02` | ；运行时 read 计数恰为 1 | `a0_02_an_owned_read_counts_once_and_a_borrow_read_is_free` | EVID-VAL-52 |
+| `A0-02` | ；`String::with` 借读合法 | `a0_02_an_owned_read_counts_once_and_a_borrow_read_is_free` | EVID-VAL-52 |
+| `A0-02` | 、拥有式 get 不编译 | `the_named_contracts_do_not_compile_for_the_named_reason` | EVID-VAL-52 |
+| `A0-03` | `{runtime_id, slot, generation}` 分离 | `a_handle_identity_is_the_runtime_slot_generation_triple` | EVID-VAL-52 |
+| `A0-03` | ；旧 handle/旧 generation 只得到一条 `InvalidHandle`，无默认值、无旧值 patch | `a0_03_stale_handle_does_not_alias_the_reused_slot` | EVID-VAL-52 |
+| `A0-03` | /读/写 | `a0_03_stale_handle_does_not_alias_the_reused_slot` | EVID-VAL-52 |
+| `A0-03` | ；跨 runtime handle 拒绝 | `a0_03_cross_runtime_access_is_rejected` | EVID-VAL-52 |
+| `A0-03` | ；类型层 ViewId/RowKey/LayoutNodeId 互传必须编译失败（判据原文的 `TodoId`/`TaffyId` 在现行代码中对应 `RowKey`/`LayoutNodeId`） | `the_named_contracts_do_not_compile_for_the_named_reason` | EVID-VAL-52 |
+| `A0-04` | 最外层 batch 只提交一次 | `a0_04_nested_batch_publishes_once_with_the_outer_value` | EVID-VAL-52 |
+| `A0-04` | ；嵌套 batch 不外泄中间值 | `a0_04_nested_batch_publishes_once_with_the_outer_value` | EVID-VAL-52 |
+| `A0-04` | instrumented committed-read 记录中间值与提交次数 | `a0_04_nested_batch_publishes_once_with_the_outer_value` | EVID-VAL-52 |
+| `A0-05` | Memo 拓扑到稳定值才发布 | `a_diamond_never_observes_two_epochs` | EVID-VAL-52 |
+| `A0-05` | ；diamond/长链无 glitch | `a_long_chain_keeps_the_final_value_consistent` | EVID-VAL-52 |
+| `A0-05` | ；`WriteDuringCompute` | `a_write_during_compute_is_a_domain_error` | EVID-VAL-52 |
+| `A0-05` | 运行时 trace：发布值 + 每 epoch 可观测次数 | `cargo run -p zenui-app --example todolist_headless --locked` | EVID-VAL-53（trace 命令逐字匹配） |
+| `A0-05` | ；错误可恢复 | `a_memo_cycle_is_fatal_and_recoverable` | EVID-VAL-52 |
+| `A0-06` | TreeCommit 先完整 preflight（key | `a0_06_the_commit_preflight_sees_a_committed_view_outside_the_order` | EVID-VAL-52 |
+| `A0-06` | /topology | `a_partial_view_order_is_rejected` | EVID-VAL-52 |
+| `A0-06` | /focus | `a_focus_on_an_unmounted_view_is_rejected` | EVID-VAL-52 |
+| `A0-06` | /`LayoutMap`）到 staging，再一次 swap | `planned_ids_are_installed_on_commit_and_dropped_on_discard` | EVID-VAL-52 |
+| `A0-06` | 、id 映射 | `a0_06_rejected_commit_restores_the_previous_commit` | EVID-VAL-52 |
+| `A0-06` | 、focus | `a0_06_rejected_commit_restores_the_previous_commit` | EVID-VAL-52 |
+| `A0-06` | 、geometry epoch 与上次提交完全一致 | `a0_06_rejected_commit_restores_the_previous_commit` | EVID-VAL-52 |
+| `A0-06` | 注入 `InvalidGeneration` | `a0_06_rejected_commit_restores_the_previous_commit` | EVID-VAL-52 |
+| `A0-06` | /`DuplicateKey` 后逐字段比对 | `a0_06_a_duplicate_key_leaves_every_authority_field_identical` | EVID-VAL-52 |
+| `A0-06` | ；随后一笔干净事务可正常提交（phase guard 已复位） | `a0_06_rejected_commit_restores_the_previous_commit` | EVID-VAL-52 |
+| `A0-07` | query cache 单接线：`rows(filter)` 求值登记 membership | `a0_07_one_eval_build_and_materialization_per_epoch_filter` | EVID-VAL-52 |
+| `A0-07` | ；命中只标脏 cache | `a0_07_a_completed_write_moves_only_the_filters_that_read_it` | EVID-VAL-52 |
+| `A0-07` | `(store_epoch, filter)` 每 epoch query_eval/cache_build/id_materialize 各恰 +1 | `a0_07_one_eval_build_and_materialization_per_epoch_filter` | EVID-VAL-52 |
+| `A0-07` | ；两个消费者 String clones = 0 | `a0_07_two_consumers_of_one_filter_clone_no_titles` | EVID-VAL-52 |
+| `A0-08` | 空态由独立 counter/membership 索引派生：`row_visits = 0`、`RowSet materialization = 0` | `a0_08_an_empty_filter_materializes_nothing` | EVID-VAL-52 |
+| `A0-08` | 1000 行 + 三 filter 切换时计数不增长 | `a0_08_a_thousand_rows_and_three_filters_build_once_each` | EVID-VAL-52 |
+| `A0-08` | ；用 `collect()` 实现 `is_empty` 必须判红 | `a0_08_a_thousand_rows_and_three_filters_build_once_each` | EVID-VAL-52 |
+| `A0-09` | ；same-owner reorder 保留 ViewId | `a0_09_a_reorder_preserves_identity_and_moves_no_counter` | EVID-VAL-52 |
+| `A0-09` | /generation | `a_reorder_preserves_every_generation` | EVID-VAL-52 |
+| `A0-09` | /owner | `a_reorder_preserves_each_views_owner` | EVID-VAL-52 |
+| `A0-09` | /caret | `a0_09_a_reorder_preserves_identity_and_moves_no_counter` | EVID-VAL-52 |
+| `A0-09` | /focus | `a0_09_a_reorder_preserves_identity_and_moves_no_counter` | EVID-VAL-52 |
+| `A0-09` | ；duplicate key 在任何 patch 前拒绝 | `a0_09_an_unordered_view_still_claims_its_key` | EVID-VAL-52 |
+| `A0-09` | reorder 后 unmount/setup = 0 | `a0_09_a_reorder_preserves_identity_and_moves_no_counter` | EVID-VAL-52 |
+| `A0-09` | ；重复 key 抛领域错误且旧视图不变 | `a0_09_a_duplicate_key_is_refused_before_any_patch` | EVID-VAL-52 |
+| `A0-10` | 结构 mutation 前记 `FocusRemovalIntent` | `a0_10_deleting_the_focused_row_settles_one_intent` | EVID-VAL-52 |
+| `A0-10` | ；commit 后仅在目标仍受影响时按 同 kind next | `a0_10_deleting_the_focused_row_settles_one_intent` | EVID-VAL-52 |
+| `A0-10` |  → prev | `a0_10_deleting_the_last_focused_row_falls_back_to_previous` | EVID-VAL-52 |
+| `A0-10` | ；批量 Clear 只结算一次 | `a0_10_a_bulk_clear_settles_once_for_the_surviving_sibling` | EVID-VAL-52 |
+| `A0-10` | reducer trace：每次焦点转移的原因与后继 | `a0_10_settlement_records_next_for_a_live_successor` | EVID-VAL-52 |
+| `A0-10` | ；用户中途转移焦点时 intent 被取消 | `a0_10_a_user_focus_move_cancels_the_intent` | EVID-VAL-52 |
+| `A0-11` | 1000+ 交错 mount/unmount/filter churn 后 nodes/edges/live owner | `a0_11_churn_returns_to_the_baseline` | EVID-VAL-52 |
+| `A0-11` | /caches 回到基线 | `a0_11_the_cache_returns_to_the_baseline_after_churn` | EVID-VAL-52 |
+| `A0-11` | 压力测试前后 live graph 计数 | `a0_11_churn_returns_to_the_baseline` | EVID-VAL-52 |
+| `A0-11` | ；回收关系而非 `Arc` size | `a0_11_churn_returns_to_the_baseline` | EVID-VAL-52 |
 
-两条需要与表一起读的说明：
+机械自检（在候选树上执行）：
 
-- `SPEC-GATE-A0-10` 的 `ref` 只指向五条结算测试中的一条，但五条断言的是同一个 `(cause, rule, target)`
-  机制。出口记录的 E2 里应把五条一起列出，`EVID-VAL-52` 的 `names` 已全部包含：
-  `txn::tests::a0_10_settlement_records_next_for_a_live_successor`、
+- `EVID-VAL-52.names` 与 `cargo test --workspace --locked -- --list` 的 `name: test` 行集合**精确相等**：
+  125 / 125，无截断、无重复。
+- 54 条测试义务的 `ref` 按最后一个 `::` 段在 `names` 中命中：**54 / 54**，未命中 0 条。
+- 4 条命令义务对应 2 条不同命令，与 `EVID-VAL-52` / `EVID-VAL-53` 的 `command` 逐字相等：**4 / 4**。
+
+补充说明：
+
+- `SPEC-GATE-A0-10` 的「原因与后继」义务 `ref` 指向五条结算测试中的一条；五条测试本身不都是独立义务，
+  但都在 `names` 里：`txn::tests::a0_10_settlement_records_next_for_a_live_successor`、
   `txn::tests::a0_10_settlement_records_previous_at_the_end`、
   `txn::tests::a0_10_bulk_clear_settles_one_intent`、
   `txn::tests::a0_10_a_user_focus_move_cancels_the_settlement`、
   `txn::tests::a0_10_a_user_clear_cancels_the_settlement`。
-- 上表之外的义务不因本表获得复核：测试义务可能同样出现在 `EVID-VAL-52` 的 `names` 里（例如 A0-09 的
-  `/generation` 与 `/owner` 夹具），命令义务（A0-01 与 A0-05 的 trace）只能靠 `command` 匹配；E2 的点名
-  只按上表选中的那一条计算。
+- 标了 `notApplicable` 的义务不在本表内（它们由 `acceptedBy` 的 ADR 承担），本表不声称对它们做过运行复核。
