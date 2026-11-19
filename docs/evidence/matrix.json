@@ -1089,7 +1089,7 @@
       "blocking": true,
       "status": "OPEN",
       "criteria": 11,
-      "closed": true
+      "closed": false
     },
     {
       "id": "SPEC-GATE-A1",
@@ -1436,12 +1436,7 @@
         {
           "source": "criterion",
           "text": "TreeCommit 先完整 preflight（key",
-          "ref": "a0_06_rejected_commit_restores_the_previous_commit",
-          "evidence": [
-            "EVID-VAL-23",
-            "EVID-VAL-49"
-          ],
-          "note": "preflight 拒绝的是同 key 的 update+remove（Fatal::StaleStagedRow），不是 duplicate-key 值错误；后者按 ADR-0017 决定 7 是调用点值错误"
+          "note": "已复现（b6806a5f）：不 reorder 的 mount 路径上，同一个 key 第二次 mount 返回 Ok(ViewId)、row_views() 为空，key preflight 未被调用；等 #28 的 preflight 夹具。原注保留：PR #24 的夹具拒绝的是同 key 的 update+remove（Fatal::StaleStagedRow），不是 duplicate-key 值错误"
         },
         {
           "source": "criterion",
@@ -1564,7 +1559,7 @@
         "EVID-VAL-24",
         "EVID-VAL-50"
       ],
-      "closed": true
+      "closed": false
     },
     {
       "id": "SPEC-GATE-A0-07",
@@ -1753,11 +1748,7 @@
         {
           "source": "criterion",
           "text": "；duplicate key 在任何 patch 前拒绝",
-          "ref": "a0_09_a_duplicate_key_is_refused_before_any_patch",
-          "evidence": [
-            "EVID-VAL-34",
-            "EVID-VAL-49"
-          ]
+          "note": "已复现（b6806a5f）：同一 key 连续 mount 两次，第二次返回 Ok(ViewId(2)) 而 row_views() 为空，未在任何 patch 前抛领域错误；等 #28 的修复与夹具"
         },
         {
           "source": "evidence",
@@ -1783,7 +1774,7 @@
         "EVID-VAL-49",
         "EVID-VAL-51"
       ],
-      "closed": true
+      "closed": false
     },
     {
       "id": "SPEC-GATE-A0-10",
@@ -2629,12 +2620,12 @@
   ],
   "coverage": {
     "criteriaTotal": 42,
-    "criteriaClosed": 11,
+    "criteriaClosed": 9,
     "criteriaSpec": 0,
     "criteriaProbe": 12,
     "criteriaOpen": 30,
     "criteriaWithdrawn": 0,
-    "note": "四状态词构成划分（criteriaSpec + criteriaProbe + criteriaOpen + criteriaWithdrawn = criteriaTotal）；criteriaClosed 单独报告且 criteriaClosed ≤ criteriaProbe。closed 由 criteria[].obligations[] 按 ADR-0024 计算，不可手填。A0 现有 11 条 closed；A0-09 的 /owner 与 A0-10 的『原因与后继』现由测试夹具映射。gate 汇总状态不由谓词改写，仍为 OPEN。"
+    "note": "四状态词构成划分（criteriaSpec + criteriaProbe + criteriaOpen + criteriaWithdrawn = criteriaTotal）；criteriaClosed 单独报告且 criteriaClosed ≤ criteriaProbe。closed 由 criteria[].obligations[] 按 ADR-0024 计算，不可手填。A0 现有 9 条 closed；A0-06 的 key preflight 与 A0-09 的 duplicate-key 义务在无序 mount 路径上已复现逃逸，暂不映射，等 #28 的修复与夹具；A0-09 的 /owner 与 A0-10 的『原因与后继』仍由测试夹具映射。gate 汇总状态不由谓词改写，仍为 OPEN。"
   },
   "counts": {
     "testsPassedH2": 1048,
