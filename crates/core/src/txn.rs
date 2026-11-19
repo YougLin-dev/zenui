@@ -995,12 +995,15 @@ impl<'a> Tx<'a> {
         self.require(WriteKind::OwnerMount)?;
         // `For` is keyed: two live views for one row would alias its identity,
         // so the duplicate is refused before any patch is staged
-        // (`SPEC-GATE-A0-09`).
+        // (`SPEC-RT-024`, `SPEC-GATE-A0-09`).
+        //
+        // The scan asks the node table, not `row_views()`: a view mounted
+        // without a staged reorder is live but absent from the display order,
+        // and an order-based scan would let a second view claim its key.
         let already_mounted = self
             .views
-            .row_views()
-            .into_iter()
-            .any(|(view, key)| key == row && !self.txn.view.unmounts.contains(&view));
+            .claiming_view(row)
+            .is_some_and(|view| !self.txn.view.unmounts.contains(&view));
         if already_mounted || self.txn.view.mounts.iter().any(|mount| mount.row == row) {
             return Err(Fatal::DuplicateViewKey { key: row });
         }
@@ -1184,6 +1187,16 @@ impl<'a> Tx<'a> {
                 return Err(Fatal::MountForMissingRow { view: mount.id });
             }
             if !seen_keys.insert(mount.row) {
+                return Err(Fatal::DuplicateViewKey { key: mount.row });
+            }
+            // `seen_keys` only covers this frame's draft. A committed view the
+            // frame does not unmount also claims the key — and it may be absent
+            // from the display order, so this asks the node table
+            // (`SPEC-RT-024`: the key preflight is complete, not
+            // order-dependent).
+            if let Some(existing) = self.views.claiming_view(mount.row)
+                && !self.txn.view.unmounts.contains(&existing)
+            {
                 return Err(Fatal::DuplicateViewKey { key: mount.row });
             }
         }
@@ -2297,5 +2310,146 @@ mod tests {
             "a user clear must cancel the recorded intent"
         );
         assert_eq!(runtime.focused(), None);
+    }
+
+    // ---- SPEC-RT-024: key uniqueness is a property of the node table --------
+
+    /// `SPEC-RT-024` / `SPEC-GATE-A0-09`: a view mounted **without** a staged
+    /// reorder enters the tree but not the display order, and it still claims
+    /// its key.
+    ///
+    /// `Tx::mount_row` used to scan `row_views()`, which is order-driven, so
+    /// such a view was invisible to the duplicate check and a second mount for
+    /// the same row was accepted: two views and two owners claiming one
+    /// `RowKey`, with `row_views()` showing neither. The check now asks the
+    /// node table.
+    ///
+    /// The refusal is asserted **at the call site** and the frame is then
+    /// aborted on purpose: the commit preflight refuses the same duplicate with
+    /// the same variant, so a fixture that only inspects the frame's result
+    /// cannot tell the two barriers apart. The preflight half has its own
+    /// fixture below.
+    ///
+    /// Red-ability: revert `Tx::mount_row`'s `already_mounted` scan to
+    /// `row_views()` and the second mount is accepted — the in-frame assertion
+    /// fails.
+    #[test]
+    fn a0_09_an_unordered_view_still_claims_its_key() {
+        let mut runtime = Runtime::new();
+        runtime
+            .frame(|tx| {
+                tx.insert("A")?;
+                Ok(())
+            })
+            .expect("seed");
+        let key = runtime.committed().keys().next().expect("the seeded row");
+
+        runtime
+            .frame(|tx| {
+                tx.mount_row(key, 1)?;
+                Ok(())
+            })
+            .expect("a mount without a reorder");
+        assert_eq!(
+            runtime.row_views().len(),
+            0,
+            "the fixture needs a view outside the display order"
+        );
+        assert_eq!(
+            runtime.live_owner_ids().len(),
+            2,
+            "root plus one mount owner"
+        );
+
+        let result: Result<(), Fatal> = runtime.frame(|tx| {
+            let second = tx.mount_row(key, 1);
+            assert!(
+                matches!(second, Err(Fatal::DuplicateViewKey { key: claimed }) if claimed == key),
+                "the unordered view must still own its key, got {second:?}"
+            );
+            Err(Fatal::Aborted)
+        });
+        assert!(result.is_err(), "the frame was discarded");
+        assert_eq!(
+            runtime.live_owner_ids().len(),
+            2,
+            "the aborted frame minted no second owner"
+        );
+    }
+
+    /// Stage one mount the way `Tx::mount_row` would, without going through it.
+    ///
+    /// This exists only for the fixture below: `Tx::mount_row` refuses a
+    /// duplicate key at the call site, so the commit-time key preflight cannot
+    /// be reached with a duplicate through the public API. Staging the draft
+    /// directly exercises the barrier.
+    fn stage_mount(tx: &mut Tx<'_>, row: RowKey, title_len: u32) -> ViewId {
+        let view = ViewId::from_index(tx.txn.view.next_view);
+        let owner = OwnerId::from_index(tx.txn.view.next_owner);
+        let parent = tx.owners.root();
+        tx.txn.view.next_view += 1;
+        tx.txn.view.next_owner += 1;
+        tx.txn.view.owners.push((owner, parent));
+        tx.txn.view.mounts.push(PlannedMount {
+            id: view,
+            row,
+            owner,
+            title_len,
+        });
+        tx.layout.plan(view);
+        view
+    }
+
+    /// `SPEC-RT-024`: the commit-time key preflight compares a staged mount
+    /// against the live nodes, not only against the frame's own draft.
+    ///
+    /// A single staged mount whose key a committed (unordered) view already
+    /// claims passes the `seen_keys` check — the draft has one mount — so this
+    /// is the branch the barrier needs, and it is the only way the key check
+    /// survives a call-site hole.
+    ///
+    /// Red-ability: delete the `claiming_view` branch in `Tx::preflight` and the
+    /// frame commits: two views claim one row key, so
+    /// `live_owner_ids().len() == 3` and the authority comparison fails.
+    #[test]
+    fn a0_06_the_commit_preflight_sees_a_committed_view_outside_the_order() {
+        let mut runtime = Runtime::new();
+        runtime
+            .frame(|tx| {
+                tx.insert("A")?;
+                Ok(())
+            })
+            .expect("seed");
+        let key = runtime.committed().keys().next().expect("the seeded row");
+        runtime
+            .frame(|tx| {
+                tx.mount_row(key, 1)?;
+                Ok(())
+            })
+            .expect("a mount without a reorder");
+
+        let owners_before = runtime.live_owner_ids();
+        let layout_before = runtime.layout_pairs();
+        let commits_before = runtime.txn().commits();
+        let publications_before = runtime.txn().publications().len();
+
+        let result = runtime.frame(|tx| {
+            let staged = stage_mount(tx, key, 1);
+            tx.txn.view.order = Some(vec![staged]);
+            Ok(())
+        });
+
+        assert!(
+            matches!(result, Err(Fatal::DuplicateViewKey { key: claimed }) if claimed == key),
+            "expected the preflight to see the committed claim, got {result:?}"
+        );
+        assert_eq!(runtime.live_owner_ids(), owners_before, "no owner survived");
+        assert_eq!(runtime.layout_pairs(), layout_before, "layout is untouched");
+        assert_eq!(runtime.txn().commits(), commits_before, "nothing committed");
+        assert_eq!(
+            runtime.txn().publications().len(),
+            publications_before,
+            "a refused commit publishes nothing"
+        );
     }
 }
