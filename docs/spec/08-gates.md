@@ -45,7 +45,7 @@ blocked 的记录形状（机器可读，写入 `artifacts/desktop/<os>-<display
 
 | Gate | 目标 | 方法 | 阻塞合并 | 当前状态 |
 |---|---|---|---|---|
-| **A0** | 纯 Rust core + Todo reducer（headless，无宏/无窗口/无 GPU） | 编译期 + 运行时 trace | 是 | `OPEN`（gate 汇总；逐行 11 条全部为 `PROBE`，以逐行单元格为准。证据见 `EVID-VAL-20`…`-24`、`-27`、`-33`…`-36`、`-41`、`-42`、`-49`；关闭谓词见 `EVID-MATRIX.criteria[].closed`） |
+| **A0** | 纯 Rust core + Todo reducer（headless，无宏/无窗口/无 GPU） | 编译期 + 运行时 trace | 是 | `OPEN`（gate 汇总；逐行 11 条全部为 `PROBE`，以逐行单元格为准。证据见 `EVID-VAL-20`…`-24`、`-27`、`-33`…`-36`、`-41`、`-42`、`-49`、`-51`；关闭谓词见 `EVID-MATRIX.criteria[].closed`） |
 | **A1** | 单 Windows Todo 真实窗口 | 真机 + 运行时 | 是（针对"桌面可用"宣称） | `OPEN` |
 | **B** | layout / text / style 差分基线 | 运行时 golden | 是（针对样式与文字能力宣称） | `SPEC`（有 3 条 style 探针，见 `EVID-VAL-12`） |
 | **C** | 三平台真实发布门 | 真机 + AT + package | 发布阻断 | `OPEN`（缺 runner） |
@@ -80,8 +80,8 @@ graph LR
 | `SPEC-GATE-A0-06` | TreeCommit 先完整 preflight（key/topology/focus/IME/resource/`LayoutMap`）到 staging，再一次 swap；失败后 native 树、id 映射、focus、geometry epoch 与上次提交完全一致 | 注入 `InvalidGeneration`/`DuplicateKey` 后逐字段比对；随后一笔干净事务可正常提交（phase guard 已复位） | `PROBE`（`EVID-VAL-23` 的回滚夹具 + `EVID-VAL-24` 的 `LayoutMap`/preflight 单测；native 树与 IME 在 A0 不存在，属 Gate A1） |
 | `SPEC-GATE-A0-07` | query cache 单接线：`rows(filter)` 求值登记 membership + 实际读取的 `(row, completed)` 反向边；命中只标脏 cache；`Memo<RowSet>` 只追踪 cache revision | `(store_epoch, filter)` 每 epoch query_eval/cache_build/id_materialize 各恰 +1；两个消费者 String clones = 0 | `PROBE`（`EVID-VAL-42` 的 7 条计数夹具与五条变异判红、`EVID-VAL-33` 的 reorder 与共享快照断言、`6a99185` 的 8 条 order-revision 守卫；**`Memo<RowSet>` 未在 A0 验证，归 A1**（[ADR-0023](../decisions/adr-0023-row-set-projection-scope.md)，`EVID-PROBE-06`）；gate 整体仍 `OPEN`） |
 | `SPEC-GATE-A0-08` | 空态由独立 counter/membership 索引派生：`row_visits = 0`、`RowSet materialization = 0` | 1000 行 + 三 filter 切换时计数不增长；用 `collect()` 实现 `is_empty` 必须判红 | `PROBE`（`EVID-VAL-42`：空态短路、1000 行 × 三 filter 第二轮全命中；把 `is_empty_for` 改成扫描式（数一遍 `rows_for(All)`，布尔不变）会让 6 条夹具判红；gate 整体仍 `OPEN`） |
-| `SPEC-GATE-A0-09` | For 强制 key；same-owner reorder 保留 ViewId/generation/owner/subscriptions/caret/focus；duplicate key 在任何 patch 前拒绝 | reorder 后 unmount/setup = 0；重复 key 抛领域错误且旧视图不变 | `PROBE`（`EVID-VAL-34`：duplicate key 在任何 patch 前拒绝、reorder 用未排序比对且 mount/unmount 差值为 0、身份与焦点保留；gate 整体仍 `OPEN`） |
-| `SPEC-GATE-A0-10` | 结构 mutation 前记 `FocusRemovalIntent`；commit 后仅在目标仍受影响时按 同 kind next → prev → 可聚焦 input → toolbar；批量 Clear 只结算一次 | reducer trace：每次焦点转移的原因与后继；用户中途转移焦点时 intent 被取消 | `PROBE`（`EVID-VAL-34`：删除焦点行结算一次、用户转移与批量 Clear 的 intent 取消、保留存活兄弟时的单次结算；gate 整体仍 `OPEN`） |
+| `SPEC-GATE-A0-09` | For 强制 key；same-owner reorder 保留 ViewId/generation/owner/subscriptions/caret/focus；duplicate key 在任何 patch 前拒绝 | reorder 后 unmount/setup = 0；重复 key 抛领域错误且旧视图不变 | `PROBE`（`EVID-VAL-34`：duplicate key 在任何 patch 前拒绝、reorder 用未排序比对且 mount/unmount 差值为 0、身份与焦点保留；`EVID-VAL-51` 逐 view 比对 reorder 前后的 owner；gate 整体仍 `OPEN`） |
+| `SPEC-GATE-A0-10` | 结构 mutation 前记 `FocusRemovalIntent`；commit 后仅在目标仍受影响时按 同 kind next → prev → 可聚焦 input → toolbar；批量 Clear 只结算一次 | reducer trace：每次焦点转移的原因与后继；用户中途转移焦点时 intent 被取消 | `PROBE`（`EVID-VAL-34`：删除焦点行结算一次、用户转移与批量 Clear 的 intent 取消、保留存活兄弟时的单次结算；`EVID-VAL-51` 逐条断言结算三元组（Next/Previous/Clear/取消）；gate 整体仍 `OPEN`） |
 | `SPEC-GATE-A0-11` | 1000+ 交错 mount/unmount/filter churn 后 nodes/edges/live owner/caches 回到基线；**空 subscriber bucket 不计活跃订阅** | 压力测试前后 live graph 计数；回收关系而非 `Arc` size | `PROBE`（`EVID-VAL-34`：1200 轮交错 churn 后 live owner/edge/source/layout 回基线；**subscriber bucket 在 A0 没有模型**，该子句无可验证对象，见 `SRC crates/core/src/owner.rs:14`；gate 整体仍 `OPEN`） |
 
 > `SPEC-GATE-A0-06` 的映射项在 A0 由 core 内零依赖的私有 `LayoutMap` 承担并真实参与 preflight；`taffy::NodeId` 适配器归 Gate B（[ADR-0017](../decisions/adr-0017-p2-runtime-authority-and-transaction-shape.md)）。
