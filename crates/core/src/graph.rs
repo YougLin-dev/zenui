@@ -1020,9 +1020,12 @@ mod tests {
     /// the graph installs. This fixture commits each epoch and reads the
     /// installed value back through `peek`.
     ///
-    /// Red-ability: make `commit_scratch` skip the install (or stop matching
-    /// `observed_at` against the final revision) and `peek` keeps the previous
-    /// epoch's value.
+    /// Red-ability: make `commit_scratch` skip the install (`installed` still
+    /// records the node, but the value is never stored) and `peek` keeps the
+    /// previous epoch's value. This fixture computes and commits at one
+    /// revision, so it does not witness the `observed_at` gate; that gate is
+    /// pinned by `a0_05_a_memo_computed_before_the_last_staged_write_is_not_published`
+    /// in `runtime.rs`, whose memo is computed before a later staged write.
     #[test]
     fn a_published_diamond_holds_one_stable_value_per_epoch() {
         let mut graph = MemoGraph::new();

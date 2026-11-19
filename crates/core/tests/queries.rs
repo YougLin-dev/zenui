@@ -80,10 +80,10 @@ fn a0_07_one_eval_build_and_materialization_per_epoch_filter() {
 /// The obligation is "two consumers: `String` clones = 0", and it is about the
 /// consumers, not about the mount executor: the existing `zenui-app` fixture
 /// (`a0_07_binding_a_filter_clones_no_titles`) asserts 3 clones — the one owned
-/// read per mount — and cannot stand in for a zero. Here the two consumers are
-/// one in each of two frames, so "no clone" is asserted across the publish
-/// barrier: the snapshot a frame builds survives its own commit and is the one
-/// the next frame is served.
+/// read per mount — and cannot stand in for a zero. Both consumers here read in
+/// the same frame; a third read in the next frame additionally checks that the
+/// snapshot a frame builds survives its own commit and is the one the next
+/// frame is served.
 ///
 /// Red-ability: materialize the snapshot with owned reads (`Tx::rows` calling
 /// `read_once` per key) and both the clone and the I/O deltas stop being zero;

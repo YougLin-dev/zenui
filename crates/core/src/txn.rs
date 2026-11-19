@@ -1023,11 +1023,14 @@ impl<'a> Tx<'a> {
         // `For` is keyed: two live views for one row would alias its identity,
         // so the duplicate is refused before any patch is staged
         // (`SPEC-GATE-A0-09`).
+        //
+        // The scan asks the node table, not `row_views()`: a view mounted
+        // without a staged reorder is live but absent from the display order,
+        // and an order-based scan would let a second view claim its key.
         let already_mounted = self
             .views
-            .row_views()
-            .into_iter()
-            .any(|(view, key)| key == row && !self.txn.view.unmounts.contains(&view));
+            .claiming_view(row)
+            .is_some_and(|view| !self.txn.view.unmounts.contains(&view));
         if already_mounted || self.txn.view.mounts.iter().any(|mount| mount.row == row) {
             return Err(Fatal::DuplicateViewKey { key: row });
         }
@@ -1213,6 +1216,16 @@ impl<'a> Tx<'a> {
                 return Err(Fatal::MountForMissingRow { view: mount.id });
             }
             if !seen_keys.insert(mount.row) {
+                return Err(Fatal::DuplicateViewKey { key: mount.row });
+            }
+            // `seen_keys` only covers this frame's draft. A committed view the
+            // frame does not unmount also claims the key — and it may be absent
+            // from the display order, so this asks the node table
+            // (`SPEC-GATE-A0-06`: the key preflight is complete, not
+            // order-dependent).
+            if let Some(existing) = self.views.claiming_view(mount.row)
+                && !self.txn.view.unmounts.contains(&existing)
+            {
                 return Err(Fatal::DuplicateViewKey { key: mount.row });
             }
         }
@@ -2261,9 +2274,13 @@ mod tests {
     /// `SPEC-GATE-A0-10`: a bulk clear records one intent for the whole clear,
     /// and the cause is the clear — not the unmounts that follow it.
     ///
-    /// Red-ability: record `BulkClear` as `Unmount` in `Tx::clear_completed`
-    /// and the cause assertion fails; record one intent per removed row and the
-    /// single-element slice fails.
+    /// Red-ability: record the intent as `Unmount` in `Tx::clear_completed`
+    /// and the cause assertion fails; swap the next and previous arms and the
+    /// rule assertion fails. What the exact slice witnesses is one
+    /// *settlement* per commit, not one queued intent: `apply_views` settles
+    /// only the last intent, so recording one intent per removed row would not
+    /// change the slice — the "one intent" half of the clause is structural
+    /// (the `is_empty` guard at the recording site), not observable here.
     #[test]
     fn a0_10_a_bulk_clear_records_one_settlement_with_its_own_cause() {
         let mut runtime = seed(&["A", "B", "C"]);
@@ -2310,9 +2327,12 @@ mod tests {
     /// `SPEC-GATE-A0-10`: a clear that removes every candidate records the
     /// `Cleared` rule with no target.
     ///
-    /// Red-ability: make the `None` arm keep the dead pointer instead of
-    /// clearing it, and the settlement still says `Cleared` while `focused()`
-    /// stays `Some` — the `focused().is_none()` assertion fails.
+    /// Red-ability: drop the settlement push in the `None` arm and the exact
+    /// slice fails; record it as `Next` (or with a target) and the slice fails
+    /// too. The `focused().is_none()` assertion is a result assertion, not the
+    /// witness for the arm's own `clear_focus()`: the trailing dead-pointer
+    /// guard would clear the pointer even if the arm omitted it, so the arm's
+    /// clear is a redundancy the fixture deliberately does not depend on.
     #[test]
     fn a0_10_a_bulk_clear_with_no_live_candidate_records_cleared() {
         let mut runtime = seed(&["A", "B", "C"]);
@@ -2428,9 +2448,10 @@ mod tests {
 
     /// Stage one mount the way `Tx::mount_row` would, without going through it.
     ///
-    /// This exists only for the fixture below: `Tx::mount_row` refuses a
-    /// duplicate key at the call site, which is precisely why the duplicate
-    /// can never reach the commit-time preflight through the public API.
+    /// This exists only for the fixtures below: `Tx::mount_row` refuses a
+    /// duplicate key at the call site, so the commit-time key preflight cannot
+    /// be reached with a duplicate through the public API. Staging the draft
+    /// directly exercises the barrier the criterion actually names.
     fn stage_mount(tx: &mut Tx<'_>, row: RowKey, title_len: u32) -> ViewId {
         let view = ViewId::from_index(tx.txn.view.next_view);
         let owner = OwnerId::from_index(tx.txn.view.next_owner);
@@ -2453,11 +2474,10 @@ mod tests {
     ///
     /// The obligation names the *commit* preflight, so a fixture that asserts
     /// the call-site refusal (`a0_09_a_duplicate_key_is_refused_before_any_patch`)
-    /// is a sibling obligation, not this one. `Tx::mount_row` refuses the
-    /// duplicate before it can be staged, so this fixture stages the draft
-    /// directly — the only way to reach the preflight — and first proves the
-    /// same hand-staged shape commits when the keys are distinct, so a green
-    /// result cannot be "every hand-staged draft is rejected".
+    /// is a sibling obligation, not this one. This fixture stages the draft
+    /// directly, and first proves the same hand-staged shape commits when the
+    /// keys are distinct, so a green result cannot be "every hand-staged draft
+    /// is rejected".
     ///
     /// The draft here is legal in every other respect — two distinct view ids
     /// and owners, both layout nodes planned, and an order that is a
@@ -2526,5 +2546,108 @@ mod tests {
         );
         assert_eq!(runtime.next_view(), next_view_before);
         assert_eq!(runtime.next_owner(), next_owner_before);
+    }
+
+    /// `SPEC-GATE-A0-09`: a view mounted **without** a staged reorder enters the
+    /// tree but not the display order, and it still claims its key.
+    ///
+    /// `Tx::mount_row` used to scan `row_views()`, which is order-driven, so
+    /// such a view was invisible to the duplicate check and a second mount for
+    /// the same row was accepted: two views and two owners claiming one
+    /// `RowKey`, with `row_views()` showing neither. The check now asks the
+    /// node table.
+    ///
+    /// The refusal is asserted **at the call site** and the frame is then
+    /// aborted on purpose: the commit preflight refuses the same duplicate with
+    /// the same variant, so a fixture that only inspects the frame's result
+    /// cannot tell the two barriers apart. The preflight half has its own
+    /// fixture below.
+    ///
+    /// Red-ability: revert `Tx::mount_row`'s `already_mounted` scan to
+    /// `row_views()` and the second mount is accepted — the in-frame assertion
+    /// fails (and, without the preflight half, the frame would commit a second
+    /// view and a second owner for one key).
+    #[test]
+    fn a0_09_an_unordered_view_still_claims_its_key() {
+        let mut runtime = seed(&["A"]);
+        let a = key_of(&runtime, 0);
+        runtime
+            .frame(|tx| {
+                tx.mount_row(a, 1)?;
+                Ok(())
+            })
+            .expect("a mount without a reorder");
+        assert_eq!(
+            runtime.row_views().len(),
+            0,
+            "the fixture needs a view outside the display order"
+        );
+        assert_eq!(
+            runtime.live_owner_ids().len(),
+            2,
+            "root plus one mount owner"
+        );
+
+        let result: Result<(), Fatal> = runtime.frame(|tx| {
+            let second = tx.mount_row(a, 1);
+            assert!(
+                matches!(second, Err(Fatal::DuplicateViewKey { key }) if key == a),
+                "the unordered view must still own its key, got {second:?}"
+            );
+            Err(Fatal::Aborted)
+        });
+        assert!(result.is_err(), "the frame was discarded");
+        assert_eq!(
+            runtime.live_owner_ids().len(),
+            2,
+            "the aborted frame minted no second owner"
+        );
+    }
+
+    /// `SPEC-GATE-A0-06`: the commit-time key preflight compares a staged mount
+    /// against the live nodes, not only against the frame's own draft.
+    ///
+    /// A single staged mount whose key a committed (unordered) view already
+    /// claims passes the `seen_keys` check — the draft has one mount — so this
+    /// is the branch the barrier needs, and it is the only way the key check
+    /// survives a call-site hole.
+    ///
+    /// Red-ability: delete the `claiming_view` branch in `Tx::preflight` and the
+    /// frame commits: two views claim one row key, so
+    /// `live_owner_ids().len() == 3` and the authority comparison fails.
+    #[test]
+    fn a0_06_the_commit_preflight_sees_a_committed_view_outside_the_order() {
+        let mut runtime = seed(&["A"]);
+        let a = key_of(&runtime, 0);
+        runtime
+            .frame(|tx| {
+                tx.mount_row(a, 1)?;
+                Ok(())
+            })
+            .expect("a mount without a reorder");
+
+        let owners_before = runtime.live_owner_ids();
+        let layout_before = runtime.layout_pairs();
+        let commits_before = runtime.txn().commits();
+        let publications_before = runtime.txn().publications().len();
+
+        let result = runtime.frame(|tx| {
+            let staged = stage_mount(tx, a, 1);
+            tx.txn.view.order = Some(vec![staged]);
+            Ok(())
+        });
+
+        assert!(
+            matches!(result, Err(Fatal::DuplicateViewKey { key }) if key == a),
+            "expected the preflight to see the committed claim, got {result:?}"
+        );
+        assert_eq!(runtime.live_owner_ids(), owners_before, "no owner survived");
+        assert_eq!(runtime.layout_pairs(), layout_before, "layout is untouched");
+        assert_eq!(runtime.txn().commits(), commits_before, "nothing committed");
+        assert_eq!(
+            runtime.txn().publications().len(),
+            publications_before,
+            "a refused commit publishes nothing"
+        );
     }
 }

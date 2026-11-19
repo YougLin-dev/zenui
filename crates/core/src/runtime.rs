@@ -486,11 +486,12 @@ mod tests {
     /// `SPEC-GATE-A0-05`: the publication half of "a memo converges to its
     /// stable value before it is published".
     ///
-    /// The diamond and long-chain fixtures in `graph.rs` drive `compute_staged`
-    /// and never publish; this one runs the real `Runtime::frame` path, which
-    /// installs the staged memos through `commit_scratch`, and asserts the
-    /// per-epoch observation count: one recompute per memo per moved epoch,
-    /// zero on an epoch that moves nothing, and one publication per commit.
+    /// The pre-existing diamond and long-chain fixtures in `graph.rs` drive
+    /// `compute_staged` without a commit; this one runs the real
+    /// `Runtime::frame` path, which installs the staged memos through
+    /// `commit_scratch`, and asserts the per-epoch observation count: one
+    /// recompute per memo per moved epoch, zero on an epoch that moves nothing,
+    /// and one publication per commit.
     ///
     /// Red-ability: drop `commit_scratch` from `Tx::commit` (or stop installing
     /// the values) and epoch 2 recomputes, so the zero fails.

@@ -174,9 +174,15 @@ fn a0_09_a_reorder_preserves_identity_and_moves_no_counter() {
 /// owner survived on its view". This one compares the mapping per
 /// `(view, owner, generation)` through `Runtime::view_node`.
 ///
+/// The generation half is a "the reorder does not touch it" assertion, not a
+/// discriminator: A0 never recycles a view slot, so every mounted view carries
+/// `Generation::FIRST` and the value cannot differ between fixtures.
+///
 /// Red-ability: make `ViewTree::reorder` rebuild the nodes by position (move
-/// `ViewNode` values onto the reordered ids) instead of reordering the id list,
-/// and every pair changes while the owner set still matches.
+/// `ViewNode` values onto the reordered ids) instead of reordering the id list.
+/// For the permutation used here the middle view keeps its own node, but the
+/// two swapped views take each other's owner, so the mapping changes while the
+/// owner *set* still matches.
 #[test]
 fn a0_09_a_reorder_preserves_each_view_owner_and_generation() {
     let mut runtime = Runtime::new();

@@ -250,6 +250,20 @@ impl ViewTree {
             .find(|id| self.nodes.get(id).is_some_and(|node| node.row == Some(row)))
     }
 
+    /// The live view claiming `row`, whether or not it is in the display order.
+    ///
+    /// `view_of_row` and `row_views` are order-driven, and a mount without a
+    /// staged reorder enters the tree but not `order`. Key uniqueness
+    /// (`SPEC-GATE-A0-09`) must therefore ask the node table, not the order:
+    /// a scan through `row_views` misses an unordered view and lets a second
+    /// view claim the same key.
+    pub(crate) fn claiming_view(&self, row: RowKey) -> Option<ViewId> {
+        self.nodes
+            .values()
+            .find(|node| node.row == Some(row))
+            .map(|node| node.id)
+    }
+
     pub fn node(&self, view: ViewId) -> Option<&ViewNode> {
         self.nodes.get(&view)
     }
