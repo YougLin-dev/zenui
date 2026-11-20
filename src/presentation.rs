@@ -198,6 +198,7 @@ pub struct TextEditState {
     pub(crate) caret: usize,
     pub(crate) selection: Option<(usize, usize)>,
     pub(crate) preedit: Option<String>,
+    pub(crate) composition: Option<(usize, usize)>,
 }
 
 impl TextEditState {
@@ -213,6 +214,12 @@ impl TextEditState {
     /// 组合中的 preedit 文本；未组合时为 `None`。
     pub fn preedit(&self) -> Option<&str> {
         self.preedit.as_deref()
+    }
+
+    /// 组合替换的字符区间（`start..end`，按当前值计）；未组合时为 `None`。
+    /// 提交时会用 preedit 替换该区间。
+    pub const fn composition(&self) -> Option<(usize, usize)> {
+        self.composition
     }
 }
 

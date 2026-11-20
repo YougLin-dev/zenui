@@ -2533,6 +2533,9 @@ fn snapshot_edit(local: &LocalState) -> Option<TextEditState> {
             preedit: composition
                 .as_ref()
                 .map(|composition| composition.preedit.clone()),
+            composition: composition
+                .as_ref()
+                .map(|composition| composition.base_range()),
         }),
         _ => None,
     }
