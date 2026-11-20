@@ -14,6 +14,7 @@ pub mod runtime;
 pub mod signal;
 pub mod store;
 pub mod task;
+mod text_edit;
 pub mod view;
 pub mod window;
 
