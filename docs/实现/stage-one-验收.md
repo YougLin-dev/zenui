@@ -98,7 +98,7 @@ tasks: delivered=2 | 2 remaining | Add | All | Active | Done | Reverse | Clear d
 | --- | --- | --- |
 | 原生 Windows 窗口与 `view!` 宿主 | `Runtime::open_window` 只是 headless activation；根二进制仍是 `Hello, world!`，没有 HWND 或原生事件循环 | [#60](https://github.com/YougLin-dev/zenui/issues/60) |
 | IME composition | target event 只有 click/input/change/submit/keydown；`on:input` 是 `String`，无法表达 preedit/commit/cancel，也没有候选 Enter 不提交的测试 | [#61](https://github.com/YougLin-dev/zenui/issues/61) |
-| 焦点/失焦与焦点遍历 | runtime 只有 caret 观察，没有 target focus/blur 事件、焦点 dispatch 或重挂/重排后的焦点结算 | [#62](https://github.com/YougLin-dev/zenui/issues/62) |
+| 原生焦点适配 | headless target runtime 已提供 `on:focus`/`on:blur`、`focus`、`focus_next`/`focus_previous` 与重挂/重排后的焦点结算（`tests/focus.rs`）；Windows 原生焦点适配仍未实现 | [#62](https://github.com/YougLin-dev/zenui/issues/62)（headless 部分完成，原生适配待做） |
 | 原生布局、文本、GPU、DPI 呈现 | target Todo 只通过 `texts()` 观察；`native_poc`/`desktop_poc` 是独立原型，不消费 `MountPlan` | [#63](https://github.com/YougLin-dev/zenui/issues/63) |
 
 这些缺口是阶段二/三的工作。阶段一验收不因它们失败，也不把 headless 测试当作原生完成的替代。
