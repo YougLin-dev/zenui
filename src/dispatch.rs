@@ -18,6 +18,12 @@ pub enum NodeOperation {
     CompositionUpdate,
     CompositionCommit,
     CompositionCancel,
+    InsertText,
+    Backspace,
+    DeleteForward,
+    SetCaret,
+    SetSelection,
+    SelectAll,
 }
 
 impl NodeOperation {
@@ -34,6 +40,12 @@ impl NodeOperation {
             Self::CompositionUpdate => "composition update",
             Self::CompositionCommit => "composition commit",
             Self::CompositionCancel => "composition cancel",
+            Self::InsertText => "insert text",
+            Self::Backspace => "backspace",
+            Self::DeleteForward => "delete forward",
+            Self::SetCaret => "set caret",
+            Self::SetSelection => "set selection",
+            Self::SelectAll => "select all",
         }
     }
 }

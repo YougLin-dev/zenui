@@ -15,6 +15,7 @@ use crate::presentation::{
 use crate::signal::{Memo, MemoCell, SignalCell};
 use crate::store::{TodoId, WriteError};
 use crate::task::{TaskRecord, WakeCallback};
+use crate::text_edit::{self, Edit, Movement};
 use crate::view::{
     Attr, AttrValue, BlurEvent, ChildrenFactory, CompositionEvent, CompositionPhase, Event,
     FocusCause, FocusEvent, Key, KeyEvent, MountError, MountPlan, MountResult, PlanNode,
@@ -346,11 +347,71 @@ impl State {
         }
     }
 
-    /// `None` 表示该元素不是文本输入；`Some(true)` 表示正在组合。
-    fn text_input_composing(&self, element: usize) -> Option<bool> {
-        match &self.elements[element].local {
-            LocalState::TextInput { composition, .. } => Some(composition.is_some()),
-            _ => None,
+    /// 只校验控件类型：组合中的取消必须对已禁用的输入仍然可用。
+    fn require_text_input(
+        &self,
+        node: NodeId,
+        element: usize,
+        operation: NodeOperation,
+    ) -> Result<(), DispatchError> {
+        if matches!(self.elements[element].local, LocalState::TextInput { .. }) {
+            Ok(())
+        } else {
+            Err(DispatchError::WrongKind { node, operation })
+        }
+    }
+
+    /// 文本输入且未禁用；不检查组合状态。
+    fn require_enabled_text_input(
+        &self,
+        node: NodeId,
+        element: usize,
+        operation: NodeOperation,
+    ) -> Result<(), DispatchError> {
+        self.require_text_input(node, element, operation)?;
+        if self.elements[element].is_disabled() {
+            return Err(DispatchError::Rejected {
+                node,
+                operation,
+                reason: "text input is disabled",
+            });
+        }
+        Ok(())
+    }
+
+    /// 可编辑的文本输入：文本输入、未禁用、未在组合中。
+    fn require_editable_text_input(
+        &self,
+        node: NodeId,
+        element: usize,
+        operation: NodeOperation,
+    ) -> Result<(), DispatchError> {
+        self.require_enabled_text_input(node, element, operation)?;
+        if self.elements[element].local.is_composing() {
+            return Err(DispatchError::Rejected {
+                node,
+                operation,
+                reason: "text input is composing",
+            });
+        }
+        Ok(())
+    }
+
+    /// 组合中的文本输入；操作必须是组合终态或更新。
+    fn require_composing_text_input(
+        &self,
+        node: NodeId,
+        element: usize,
+        operation: NodeOperation,
+    ) -> Result<(), DispatchError> {
+        if self.elements[element].local.is_composing() {
+            Ok(())
+        } else {
+            Err(DispatchError::Rejected {
+                node,
+                operation,
+                reason: "text input is not composing",
+            })
         }
     }
 
@@ -516,13 +577,13 @@ impl MountedElement {
             })
     }
 
-    fn text_value(&self) -> Option<String> {
+    fn text_value(&self) -> Option<&str> {
         self.attrs
             .iter()
             .find(|attr| attr.name == "value")
             .and_then(|attr| attr.current.as_ref())
             .and_then(|current| match current {
-                AttrCurrent::Text(text) => Some(text.clone()),
+                AttrCurrent::Text(text) => Some(text.as_str()),
                 AttrCurrent::Bool(_) => None,
             })
     }
@@ -1494,6 +1555,138 @@ impl Runtime {
         })
     }
 
+    /// 在 caret/selection 处插入文本；一次编辑恰好派发一次 `on:input`。
+    pub fn insert_text_node(&mut self, node: NodeId, text: &str) -> Result<(), DispatchError> {
+        let state = self.state.clone();
+        context::install(&state, || {
+            let element = with_state(|state| state.element_for_node(node))?;
+            self.apply_text_edit(node, element, NodeOperation::InsertText, Edit::Insert(text))
+        })
+    }
+
+    /// 删除 selection，或 caret 前一个字符；没有可删除内容时是不派发事件的无操作。
+    pub fn backspace_node(&mut self, node: NodeId) -> Result<(), DispatchError> {
+        let state = self.state.clone();
+        context::install(&state, || {
+            let element = with_state(|state| state.element_for_node(node))?;
+            self.apply_text_edit(node, element, NodeOperation::Backspace, Edit::Backspace)
+        })
+    }
+
+    /// 删除 selection，或 caret 后一个字符；没有可删除内容时是不派发事件的无操作。
+    pub fn delete_forward_node(&mut self, node: NodeId) -> Result<(), DispatchError> {
+        let state = self.state.clone();
+        context::install(&state, || {
+            let element = with_state(|state| state.element_for_node(node))?;
+            self.apply_text_edit(
+                node,
+                element,
+                NodeOperation::DeleteForward,
+                Edit::DeleteForward,
+            )
+        })
+    }
+
+    /// 设置折叠 caret；偏移按字符夹取到当前值，不派发事件。
+    pub fn set_caret_node(&mut self, node: NodeId, offset: usize) -> Result<(), DispatchError> {
+        self.place_selection(node, NodeOperation::SetCaret, Movement::Caret(offset))
+    }
+
+    /// 设置 selection；起点终点按字符夹取并归一化，不派发事件。
+    pub fn set_selection_node(
+        &mut self,
+        node: NodeId,
+        start: usize,
+        end: usize,
+    ) -> Result<(), DispatchError> {
+        self.place_selection(
+            node,
+            NodeOperation::SetSelection,
+            Movement::Selection(start, end),
+        )
+    }
+
+    /// 选中全部文本；caret 停在末尾，不派发事件。
+    pub fn select_all_node(&mut self, node: NodeId) -> Result<(), DispatchError> {
+        self.place_selection(node, NodeOperation::SelectAll, Movement::SelectAll)
+    }
+
+    fn place_selection(
+        &mut self,
+        node: NodeId,
+        operation: NodeOperation,
+        movement: Movement,
+    ) -> Result<(), DispatchError> {
+        let mut state = self.state.borrow_mut();
+        let element = state.element_for_node(node)?;
+        state.require_editable_text_input(node, element, operation)?;
+        let (start, end) =
+            text_edit::movement_range(text_length(&state.elements[element]), movement);
+        set_local_selection(&mut state.elements[element].local, start, end);
+        Ok(())
+    }
+
+    fn apply_text_edit(
+        &mut self,
+        node: NodeId,
+        element: usize,
+        operation: NodeOperation,
+        edit: Edit<'_>,
+    ) -> Result<(), DispatchError> {
+        let (value, caret, selection) = with_state(|state| {
+            state.require_editable_text_input(node, element, operation)?;
+            let LocalState::TextInput {
+                caret, selection, ..
+            } = &state.elements[element].local
+            else {
+                unreachable!("require_editable_text_input validated the input");
+            };
+            Ok::<_, DispatchError>((
+                state.elements[element]
+                    .text_value()
+                    .unwrap_or_default()
+                    .to_owned(),
+                *caret,
+                *selection,
+            ))
+        })?;
+        let Some(outcome) = text_edit::apply(&value, caret, selection, edit) else {
+            return Ok(());
+        };
+        let text_edit::EditOutcome {
+            value: new_value,
+            caret: next_caret,
+        } = outcome;
+        let (event_id, mut event) =
+            self.take_node_event(node, element, EventKind::Input, operation)?;
+        with_state(|state| {
+            let LocalState::TextInput {
+                caret, selection, ..
+            } = &mut state.elements[element].local
+            else {
+                unreachable!("require_editable_text_input validated the input");
+            };
+            *caret = next_caret;
+            *selection = None;
+        });
+        // handler unwind 不能把占位事件或 Event 阶段留在槽位里。
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if let Event::Input(handler) = &mut event {
+                handler(new_value);
+            }
+        }));
+        with_state(|state| {
+            state.put_event(event_id, event);
+            state.phase = Phase::Idle;
+        });
+        if let Err(payload) = outcome {
+            std::panic::resume_unwind(payload);
+        }
+        self.finish_command().map_err(DispatchError::Command)?;
+        with_state(|state| clamp_local_edit(state, element));
+        Ok(())
+    }
+
     /// 开始一次本地 composition；preedit 只进入编辑器，不写入模型。
     pub fn compose_start(&mut self, label: &str) -> Result<(), MountError> {
         self.dispatch_label(
@@ -1509,6 +1702,9 @@ impl Runtime {
         let state = self.state.clone();
         context::install(&state, || {
             let element = with_state(|state| state.element_for_node(node))?;
+            with_state(|state| {
+                state.require_enabled_text_input(node, element, NodeOperation::CompositionStart)
+            })?;
             let (caret, selection) = with_state(|state| {
                 let LocalState::TextInput {
                     caret,
@@ -1516,10 +1712,7 @@ impl Runtime {
                     composition,
                 } = &mut state.elements[element].local
                 else {
-                    return Err(DispatchError::WrongKind {
-                        node,
-                        operation: NodeOperation::CompositionStart,
-                    });
+                    unreachable!("require_enabled_text_input validated the input");
                 };
                 if composition.is_some() {
                     return Err(DispatchError::Rejected {
@@ -1569,6 +1762,9 @@ impl Runtime {
         let state = self.state.clone();
         context::install(&state, || {
             let element = with_state(|state| state.element_for_node(node))?;
+            with_state(|state| {
+                state.require_enabled_text_input(node, element, NodeOperation::CompositionUpdate)
+            })?;
             let (caret, selection) = with_state(|state| {
                 let LocalState::TextInput {
                     caret,
@@ -1576,10 +1772,7 @@ impl Runtime {
                     composition,
                 } = &mut state.elements[element].local
                 else {
-                    return Err(DispatchError::WrongKind {
-                        node,
-                        operation: NodeOperation::CompositionUpdate,
-                    });
+                    unreachable!("require_enabled_text_input validated the input");
                 };
                 let Some(composition) = composition else {
                     return Err(DispatchError::Rejected {
@@ -1623,25 +1816,19 @@ impl Runtime {
         let state = self.state.clone();
         context::install(&state, || {
             let element = with_state(|state| state.element_for_node(node))?;
-            match with_state(|state| state.text_input_composing(element)) {
-                None => {
-                    return Err(DispatchError::WrongKind {
-                        node,
-                        operation: NodeOperation::CompositionCommit,
-                    });
-                }
-                Some(false) => {
-                    return Err(DispatchError::Rejected {
-                        node,
-                        operation: NodeOperation::CompositionCommit,
-                        reason: "text input is not composing",
-                    });
-                }
-                Some(true) => {}
-            }
+            with_state(|state| {
+                state.require_enabled_text_input(
+                    node,
+                    element,
+                    NodeOperation::CompositionCommit,
+                )?;
+                state.require_composing_text_input(node, element, NodeOperation::CompositionCommit)
+            })?;
             self.enter_event_phase();
             self.commit_composition(node, element, text)?;
-            self.leave_event_phase().map_err(DispatchError::Command)
+            self.leave_event_phase().map_err(DispatchError::Command)?;
+            with_state(|state| clamp_local_edit(state, element));
+            Ok(())
         })
     }
 
@@ -1655,27 +1842,15 @@ impl Runtime {
         )
     }
 
-    /// 按 Node ID 取消组合；只有组合中的文本输入接受该操作。
+    /// 按 Node ID 取消组合；取消不写模型，因此组合期间被禁用的输入仍可取消。
     pub fn compose_cancel_node(&mut self, node: NodeId) -> Result<(), DispatchError> {
         let state = self.state.clone();
         context::install(&state, || {
             let element = with_state(|state| state.element_for_node(node))?;
-            match with_state(|state| state.text_input_composing(element)) {
-                None => {
-                    return Err(DispatchError::WrongKind {
-                        node,
-                        operation: NodeOperation::CompositionCancel,
-                    });
-                }
-                Some(false) => {
-                    return Err(DispatchError::Rejected {
-                        node,
-                        operation: NodeOperation::CompositionCancel,
-                        reason: "text input is not composing",
-                    });
-                }
-                Some(true) => {}
-            }
+            with_state(|state| {
+                state.require_text_input(node, element, NodeOperation::CompositionCancel)?;
+                state.require_composing_text_input(node, element, NodeOperation::CompositionCancel)
+            })?;
             self.enter_event_phase();
             self.cancel_composition(node, element)?;
             self.leave_event_phase().map_err(DispatchError::Command)
@@ -1689,8 +1864,12 @@ impl Runtime {
         text: &str,
     ) -> Result<(), DispatchError> {
         // 组合期间外部 value 可能已更新；候选插入当前文本并按长度夹取组合区间。
-        let current_text =
-            with_state(|state| state.elements[element].text_value().unwrap_or_default());
+        let current_text = with_state(|state| {
+            state.elements[element]
+                .text_value()
+                .unwrap_or_default()
+                .to_owned()
+        });
         let (new_text, caret) = with_state(|state| {
             let LocalState::TextInput {
                 caret,
@@ -1710,12 +1889,9 @@ impl Runtime {
                     reason: "text input is not composing",
                 });
             };
-            let length = current_text.chars().count();
             let (start, end) = composition.base_range();
-            let start = start.min(length);
-            let end = end.min(length).max(start);
-            let new_text = splice_chars(&current_text, start, end, text);
-            *caret = start + text.chars().count();
+            let (new_text, next_caret) = text_edit::replace_range(&current_text, start, end, text);
+            *caret = next_caret;
             *selection = None;
             Ok((new_text, *caret))
         })?;
@@ -2223,11 +2399,34 @@ fn focus_replacement(
         })
 }
 
-fn splice_chars(text: &str, start: usize, end: usize, insert: &str) -> String {
-    let mut result: String = text.chars().take(start).collect();
-    result.push_str(insert);
-    result.extend(text.chars().skip(end));
-    result
+fn text_length(element: &MountedElement) -> usize {
+    element
+        .text_value()
+        .map_or(0, |value| value.chars().count())
+}
+
+/// handler 可能改写了值；刷新后把本地 caret/selection 夹回新值范围。
+fn clamp_local_edit(state: &mut State, element: usize) {
+    let length = text_length(&state.elements[element]);
+    if let LocalState::TextInput {
+        caret, selection, ..
+    } = &mut state.elements[element].local
+    {
+        *caret = (*caret).min(length);
+        if let Some((start, end)) = *selection {
+            *selection = Some(text_edit::normalized_range(start, end, length));
+        }
+    }
+}
+
+fn set_local_selection(local: &mut LocalState, start: usize, end: usize) {
+    if let LocalState::TextInput {
+        caret, selection, ..
+    } = local
+    {
+        *caret = end;
+        *selection = Some((start, end));
+    }
 }
 
 fn collect_elements(state: &State, nodes: &[MountedNode], order: &mut Vec<usize>) {
