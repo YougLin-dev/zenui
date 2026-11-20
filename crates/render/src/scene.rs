@@ -593,18 +593,31 @@ fn measure_leaf(
     let Some(context) = context else {
         return compute_leaf_layout(inputs, style, |_, _| 0.0, |_, _| TaffySize::ZERO);
     };
-    let (size, baseline) = shaper.measure(
-        &context.text,
-        inputs.known_dimensions,
-        inputs.available_space,
-    );
-    let mut output = compute_leaf_layout(inputs, style, |_, _| 0.0, |_, _| size);
     let padding = style
         .padding
         .resolve_or_zero(inputs.parent_size.width, |_, _| 0.0);
     let border = style
         .border
         .resolve_or_zero(inputs.parent_size.width, |_, _| 0.0);
+    // Taffy 的 known dimension 是 border box；文本按 content box 断行，
+    // 否则带 padding 的文本（如 text-input）会按更宽的盒子测量，
+    // 却在更窄的内容盒里绘制，行数和高度都对不上。
+    let inset =
+        |size: Option<f32>, start: f32, end: f32| size.map(|size| (size - start - end).max(0.0));
+    let known = TaffySize {
+        width: inset(
+            inputs.known_dimensions.width,
+            padding.left + border.left,
+            padding.right + border.right,
+        ),
+        height: inset(
+            inputs.known_dimensions.height,
+            padding.top + border.top,
+            padding.bottom + border.bottom,
+        ),
+    };
+    let (size, baseline) = shaper.measure(&context.text, known, inputs.available_space);
+    let mut output = compute_leaf_layout(inputs, style, |_, _| 0.0, |_, _| size);
     output.baselines = Baselines::from_first(Some(baseline + padding.top + border.top));
     output
 }

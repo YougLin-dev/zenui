@@ -95,6 +95,9 @@ impl TextShaper {
             }
             AvailableSpace::Definite(_) => layout.width(),
         };
+        // Taffy 把最终布局尺寸取整到整像素；向上取整测量结果，避免下一轮
+        // 以少一个像素的宽度重新断行。
+        let intrinsic_width = intrinsic_width.ceil();
         let height = layout.height();
         let baseline = layout.first_baseline().unwrap_or(height);
         (
@@ -218,6 +221,34 @@ fn fallback_caret(layout: &Layout<()>, origin: Point) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn measured_widths_land_on_the_pixel_grid() {
+        let mut shaper = TextShaper::new();
+        let layout = shaper.build("Load sample");
+        let max_content = layout.calculate_content_widths().max;
+        assert!(
+            max_content.fract() != 0.0,
+            "the fixture has a fractional width"
+        );
+
+        let (size, _) = shaper.measure(
+            "Load sample",
+            TaffySize {
+                width: None,
+                height: None,
+            },
+            TaffySize {
+                width: AvailableSpace::MaxContent,
+                height: AvailableSpace::MaxContent,
+            },
+        );
+        assert_eq!(size.width, max_content.ceil());
+        assert!(
+            size.width >= max_content,
+            "the measured width never rounds below the line"
+        );
+    }
 
     #[test]
     fn a_non_collapsed_selection_produces_ordered_rects() {

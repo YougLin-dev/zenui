@@ -33,6 +33,55 @@ fn by_text(snapshot: &PresentationSnapshot, tag: &str, text: &str) -> NodeId {
 }
 
 #[test]
+fn long_toolbar_labels_stay_inside_their_buttons() {
+    let app = runtime();
+    let snapshot = app.presentation().expect("snapshot");
+    let scene = build_scene(&snapshot, 800.0);
+
+    for label in ["Load sample", "Preview import"] {
+        let element = scene
+            .node(by_text(&snapshot, "button", label))
+            .expect("toolbar button");
+        let glyphs: Vec<_> = element.text().iter().flat_map(|run| run.glyphs()).collect();
+        let baseline = glyphs.first().expect("a label glyph").y;
+        assert!(
+            glyphs.iter().all(|glyph| (glyph.y - baseline).abs() < 0.01),
+            "{label:?} wraps onto a second line"
+        );
+        let rect = element.rect();
+        assert!(
+            baseline < rect.y + rect.height,
+            "{label:?} sits inside its button"
+        );
+    }
+}
+
+#[test]
+fn a_long_value_stays_inside_its_input() {
+    let mut app = runtime();
+    let value = "word ".repeat(40);
+    app.input("What needs to be done?", &value).expect("input");
+    let snapshot = app.presentation().expect("snapshot");
+    let scene = build_scene(&snapshot, 220.0);
+    let node = snapshot
+        .find_label("What needs to be done?")
+        .expect("draft input");
+    let input = scene.node(node.id()).expect("scene input");
+    let rect = input.rect();
+    let glyphs: Vec<_> = input.text().iter().flat_map(|run| run.glyphs()).collect();
+    assert!(!glyphs.is_empty(), "the value is laid out");
+    assert!(
+        glyphs.iter().all(|glyph| glyph.y <= rect.y + rect.height),
+        "every line stays inside the input"
+    );
+    let caret = scene.caret(node.id()).expect("caret");
+    assert!(
+        caret.y + caret.height <= rect.y + rect.height + 0.5,
+        "the caret stays inside the input: {caret:?} vs {rect:?}"
+    );
+}
+
+#[test]
 fn the_todo_snapshot_lays_out_non_zero_ordered_boxes() {
     let mut app = runtime();
     add(&mut app, "Write tests");
