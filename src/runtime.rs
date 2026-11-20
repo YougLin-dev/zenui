@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use zenui_core::{Counters, RowSet};
 
 use crate::context::{self, ContextFault, DepKey, Phase, with_state};
+use crate::dispatch::{DispatchError, NodeOperation};
 use crate::presentation::{
     NodeId, NodeStatus, PresentationSnapshot, SnapshotAttr, SnapshotElement, SnapshotNode,
     SnapshotValue, TextEditState,
@@ -312,33 +313,25 @@ impl State {
             .and_then(|tree| find_element(self, tree, target))
     }
 
-    /// handler 在 State 借用之外执行，因此先用占位事件换出，调用后再放回原槽位。
-    fn take_event(&mut self, kind: EventKind, target: &FindTarget) -> Option<(usize, Event)> {
-        let element = self.find_element(target)?;
-        self.take_element_event(element, kind)
-    }
-
     fn put_event(&mut self, id: usize, event: Event) {
         self.events[id] = event;
     }
 
-    fn update_local(&mut self, target: &FindTarget, value: LocalUpdate) {
-        if let Some(element) = self.find_element(target) {
-            match (&mut self.elements[element].local, value) {
-                (
-                    LocalState::TextInput {
-                        caret, selection, ..
-                    },
-                    LocalUpdate::Input(value),
-                ) => {
-                    *caret = value.chars().count();
-                    *selection = None;
-                }
-                (LocalState::Checkbox { checked }, LocalUpdate::Change(value)) => {
-                    *checked = value;
-                }
-                _ => {}
+    fn update_local(&mut self, element: usize, value: LocalUpdate) {
+        match (&mut self.elements[element].local, value) {
+            (
+                LocalState::TextInput {
+                    caret, selection, ..
+                },
+                LocalUpdate::Input(value),
+            ) => {
+                *caret = value.chars().count();
+                *selection = None;
             }
+            (LocalState::Checkbox { checked }, LocalUpdate::Change(value)) => {
+                *checked = value;
+            }
+            _ => {}
         }
     }
 
@@ -350,17 +343,39 @@ impl State {
         }
     }
 
-    fn composition_element(&self, label: &str) -> Result<usize, MountError> {
-        let target = FindTarget::Label(label.to_owned());
-        let Some(element) = self.find_element(&target) else {
-            return Err(MountError::Component("composition target not found"));
+    /// `None` 表示该元素不是文本输入；`Some(true)` 表示正在组合。
+    fn text_input_composing(&self, element: usize) -> Option<bool> {
+        match &self.elements[element].local {
+            LocalState::TextInput { composition, .. } => Some(composition.is_some()),
+            _ => None,
+        }
+    }
+
+    /// 判定一个 Node ID 相对已提交界面的状态。
+    fn node_status(&self, node: NodeId) -> NodeStatus {
+        if node.runtime_id() != self.id {
+            return NodeStatus::Unknown;
+        }
+        let Some(element) = self.elements.get(node.slot() as usize) else {
+            return NodeStatus::Unknown;
         };
-        if matches!(self.elements[element].local, LocalState::TextInput { .. }) {
-            Ok(element)
+        // 槽位已由查表确定；代际仍须匹配，否则这是同一槽位更早一次挂载的身份。
+        if element.id.slot() != node.slot() || element.id.generation() != node.generation() {
+            return NodeStatus::Stale;
+        }
+        if self.element_is_mounted(node.slot() as usize) {
+            NodeStatus::Live
         } else {
-            Err(MountError::Component(
-                "composition target is not a text input",
-            ))
+            NodeStatus::Stale
+        }
+    }
+
+    /// 解析一个存活的 Node ID；未知与已卸载身份分别报错，绝不猜测替代目标。
+    fn element_for_node(&self, node: NodeId) -> Result<usize, DispatchError> {
+        match self.node_status(node) {
+            NodeStatus::Live => Ok(node.slot() as usize),
+            NodeStatus::Stale => Err(DispatchError::StaleNode(node)),
+            NodeStatus::Unknown => Err(DispatchError::UnknownNode(node)),
         }
     }
 
@@ -1363,24 +1378,30 @@ impl Runtime {
     }
 
     pub fn click_text(&mut self, text: &str) -> Result<(), MountError> {
-        self.dispatch_click(FindTarget::Text(text.to_owned()))
+        self.dispatch_label(
+            FindTarget::Text(text.to_owned()),
+            "click target not found",
+            "click target not found",
+            Self::click_node,
+        )
     }
 
     pub fn click_label(&mut self, label: &str) -> Result<(), MountError> {
-        self.dispatch_click(FindTarget::Label(label.to_owned()))
+        self.dispatch_label(
+            FindTarget::Label(label.to_owned()),
+            "click target not found",
+            "click target not found",
+            Self::click_node,
+        )
     }
 
-    fn dispatch_click(&mut self, target: FindTarget) -> Result<(), MountError> {
+    /// 按 Node ID 派发 click；只运行该元素自己的 handler。
+    pub fn click_node(&mut self, node: NodeId) -> Result<(), DispatchError> {
         let state = self.state.clone();
         context::install(&state, || {
-            let Some((event_id, mut event)) = with_state(|state| {
-                state.phase = Phase::Event;
-                state.fault = None;
-                state.write_error = None;
-                state.take_event(EventKind::Click, &target)
-            }) else {
-                return Err(MountError::Component("click target not found"));
-            };
+            let element = with_state(|state| state.element_for_node(node))?;
+            let (event_id, mut event) =
+                self.take_node_event(node, element, EventKind::Click, NodeOperation::Click)?;
             if let Event::Click(handler) = &mut event {
                 handler();
             }
@@ -1388,31 +1409,77 @@ impl Runtime {
                 state.put_event(event_id, event);
                 state.phase = Phase::Idle;
             });
-            self.finish_command()
+            self.finish_command().map_err(DispatchError::Command)
         })
+    }
+
+    /// 先取事件再进入 Event 阶段：被拒绝的派发不会把运行时留在 Event 阶段。
+    fn take_node_event(
+        &mut self,
+        node: NodeId,
+        element: usize,
+        kind: EventKind,
+        operation: NodeOperation,
+    ) -> Result<(usize, Event), DispatchError> {
+        let Some(taken) = with_state(|state| state.take_element_event(element, kind)) else {
+            return Err(DispatchError::WrongKind { node, operation });
+        };
+        with_state(|state| {
+            state.phase = Phase::Event;
+            state.fault = None;
+            state.write_error = None;
+        });
+        Ok(taken)
+    }
+
+    /// label 只是查找助手：解析到 Node ID 后与原生派发共用同一条路径。
+    fn dispatch_label(
+        &mut self,
+        target: FindTarget,
+        not_found: &'static str,
+        wrong_kind: &'static str,
+        dispatch: impl FnOnce(&mut Self, NodeId) -> Result<(), DispatchError>,
+    ) -> Result<(), MountError> {
+        let Some(node) = self.label_node(&target) else {
+            return Err(MountError::Component(not_found));
+        };
+        dispatch(self, node).map_err(|error| match error {
+            DispatchError::UnknownNode(_) | DispatchError::StaleNode(_) => {
+                MountError::Component(not_found)
+            }
+            DispatchError::WrongKind { .. } => MountError::Component(wrong_kind),
+            DispatchError::Rejected { reason, .. } => MountError::Component(reason),
+            DispatchError::Command(error) => error,
+        })
+    }
+
+    fn label_node(&self, target: &FindTarget) -> Option<NodeId> {
+        let state = self.state.borrow();
+        let element = state.find_element(target)?;
+        Some(state.elements[element].id)
     }
 
     pub fn input(&mut self, label: &str, value: &str) -> Result<(), MountError> {
         let target = FindTarget::Label(label.to_owned());
         let state = self.state.clone();
         context::install(&state, || {
-            let composing = with_state(|state| {
-                state
-                    .find_element(&target)
-                    .is_some_and(|element| state.elements[element].local.is_composing())
-            });
-            if composing {
+            let Some(element) = with_state(|state| state.find_element(&target)) else {
+                return Err(MountError::Component("input target not found"));
+            };
+            if with_state(|state| state.elements[element].local.is_composing()) {
                 return Err(MountError::Component("text input is composing"));
             }
-            let Some((event_id, mut event)) = with_state(|state| {
+            let Some((event_id, mut event)) =
+                with_state(|state| state.take_element_event(element, EventKind::Input))
+            else {
+                return Err(MountError::Component("input target not found"));
+            };
+            with_state(|state| {
                 state.phase = Phase::Event;
                 state.fault = None;
                 state.write_error = None;
-                state.update_local(&target, LocalUpdate::Input(value.to_owned()));
-                state.take_event(EventKind::Input, &target)
-            }) else {
-                return Err(MountError::Component("input target not found"));
-            };
+                state.update_local(element, LocalUpdate::Input(value.to_owned()));
+            });
             if let Event::Input(handler) = &mut event {
                 handler(value.to_owned());
             }
@@ -1426,9 +1493,19 @@ impl Runtime {
 
     /// 开始一次本地 composition；preedit 只进入编辑器，不写入模型。
     pub fn compose_start(&mut self, label: &str) -> Result<(), MountError> {
+        self.dispatch_label(
+            FindTarget::Label(label.to_owned()),
+            "composition target not found",
+            "composition target is not a text input",
+            Self::compose_start_node,
+        )
+    }
+
+    /// 按 Node ID 开始组合；目标必须是文本输入且未在组合中。
+    pub fn compose_start_node(&mut self, node: NodeId) -> Result<(), DispatchError> {
         let state = self.state.clone();
         context::install(&state, || {
-            let element = with_state(|state| state.composition_element(label))?;
+            let element = with_state(|state| state.element_for_node(node))?;
             let (caret, selection) = with_state(|state| {
                 let LocalState::TextInput {
                     caret,
@@ -1436,10 +1513,17 @@ impl Runtime {
                     composition,
                 } = &mut state.elements[element].local
                 else {
-                    unreachable!("composition_element validated the input");
+                    return Err(DispatchError::WrongKind {
+                        node,
+                        operation: NodeOperation::CompositionStart,
+                    });
                 };
                 if composition.is_some() {
-                    return Err(MountError::Component("text input is already composing"));
+                    return Err(DispatchError::Rejected {
+                        node,
+                        operation: NodeOperation::CompositionStart,
+                        reason: "text input is already composing",
+                    });
                 }
                 *composition = Some(Composition {
                     base_caret: *caret,
@@ -1459,15 +1543,29 @@ impl Runtime {
                     ));
                 }
             });
-            self.leave_event_phase()
+            self.leave_event_phase().map_err(DispatchError::Command)
         })
     }
 
     /// 更新编辑器本地的 preedit；caret 跟随 preedit 末尾，模型保持不变。
     pub fn compose_update(&mut self, label: &str, preedit: &str) -> Result<(), MountError> {
+        self.dispatch_label(
+            FindTarget::Label(label.to_owned()),
+            "composition target not found",
+            "composition target is not a text input",
+            move |runtime, node| runtime.compose_update_node(node, preedit),
+        )
+    }
+
+    /// 按 Node ID 更新 preedit；目标必须已在组合中。
+    pub fn compose_update_node(
+        &mut self,
+        node: NodeId,
+        preedit: &str,
+    ) -> Result<(), DispatchError> {
         let state = self.state.clone();
         context::install(&state, || {
-            let element = with_state(|state| state.composition_element(label))?;
+            let element = with_state(|state| state.element_for_node(node))?;
             let (caret, selection) = with_state(|state| {
                 let LocalState::TextInput {
                     caret,
@@ -1475,10 +1573,17 @@ impl Runtime {
                     composition,
                 } = &mut state.elements[element].local
                 else {
-                    unreachable!("composition_element validated the input");
+                    return Err(DispatchError::WrongKind {
+                        node,
+                        operation: NodeOperation::CompositionUpdate,
+                    });
                 };
                 let Some(composition) = composition else {
-                    return Err(MountError::Component("text input is not composing"));
+                    return Err(DispatchError::Rejected {
+                        node,
+                        operation: NodeOperation::CompositionUpdate,
+                        reason: "text input is not composing",
+                    });
                 };
                 composition.preedit = preedit.to_owned();
                 *caret = composition.base_range().0 + preedit.chars().count();
@@ -1496,39 +1601,90 @@ impl Runtime {
                     ));
                 }
             });
-            self.leave_event_phase()
+            self.leave_event_phase().map_err(DispatchError::Command)
         })
     }
 
     /// 候选确认：用 `text` 替换组合区间，清除 preedit 并派发一次 `on:input`。
     pub fn compose_commit(&mut self, label: &str, text: &str) -> Result<(), MountError> {
+        self.dispatch_label(
+            FindTarget::Label(label.to_owned()),
+            "composition target not found",
+            "composition target is not a text input",
+            move |runtime, node| runtime.compose_commit_node(node, text),
+        )
+    }
+
+    /// 按 Node ID 确认候选；只有组合中的文本输入接受该操作。
+    pub fn compose_commit_node(&mut self, node: NodeId, text: &str) -> Result<(), DispatchError> {
         let state = self.state.clone();
         context::install(&state, || {
-            let element = with_state(|state| state.composition_element(label))?;
-            if !with_state(|state| state.elements[element].local.is_composing()) {
-                return Err(MountError::Component("text input is not composing"));
+            let element = with_state(|state| state.element_for_node(node))?;
+            match with_state(|state| state.text_input_composing(element)) {
+                None => {
+                    return Err(DispatchError::WrongKind {
+                        node,
+                        operation: NodeOperation::CompositionCommit,
+                    });
+                }
+                Some(false) => {
+                    return Err(DispatchError::Rejected {
+                        node,
+                        operation: NodeOperation::CompositionCommit,
+                        reason: "text input is not composing",
+                    });
+                }
+                Some(true) => {}
             }
             self.enter_event_phase();
-            self.commit_composition(element, text)?;
-            self.leave_event_phase()
+            self.commit_composition(node, element, text)?;
+            self.leave_event_phase().map_err(DispatchError::Command)
         })
     }
 
     /// 取消组合：丢弃 preedit，恢复组合开始时的 caret/selection，不派发 `on:input`。
     pub fn compose_cancel(&mut self, label: &str) -> Result<(), MountError> {
+        self.dispatch_label(
+            FindTarget::Label(label.to_owned()),
+            "composition target not found",
+            "composition target is not a text input",
+            Self::compose_cancel_node,
+        )
+    }
+
+    /// 按 Node ID 取消组合；只有组合中的文本输入接受该操作。
+    pub fn compose_cancel_node(&mut self, node: NodeId) -> Result<(), DispatchError> {
         let state = self.state.clone();
         context::install(&state, || {
-            let element = with_state(|state| state.composition_element(label))?;
-            if !with_state(|state| state.elements[element].local.is_composing()) {
-                return Err(MountError::Component("text input is not composing"));
+            let element = with_state(|state| state.element_for_node(node))?;
+            match with_state(|state| state.text_input_composing(element)) {
+                None => {
+                    return Err(DispatchError::WrongKind {
+                        node,
+                        operation: NodeOperation::CompositionCancel,
+                    });
+                }
+                Some(false) => {
+                    return Err(DispatchError::Rejected {
+                        node,
+                        operation: NodeOperation::CompositionCancel,
+                        reason: "text input is not composing",
+                    });
+                }
+                Some(true) => {}
             }
             self.enter_event_phase();
-            self.cancel_composition(element)?;
-            self.leave_event_phase()
+            self.cancel_composition(node, element)?;
+            self.leave_event_phase().map_err(DispatchError::Command)
         })
     }
 
-    fn commit_composition(&mut self, element: usize, text: &str) -> Result<(), MountError> {
+    fn commit_composition(
+        &mut self,
+        node: NodeId,
+        element: usize,
+        text: &str,
+    ) -> Result<(), DispatchError> {
         // 组合期间外部 value 可能已更新；候选插入当前文本并按长度夹取组合区间。
         let current_text =
             with_state(|state| state.elements[element].text_value().unwrap_or_default());
@@ -1539,12 +1695,17 @@ impl Runtime {
                 composition,
             } = &mut state.elements[element].local
             else {
-                return Err(MountError::Component(
-                    "composition target is not a text input",
-                ));
+                return Err(DispatchError::WrongKind {
+                    node,
+                    operation: NodeOperation::CompositionCommit,
+                });
             };
             let Some(composition) = composition.take() else {
-                return Err(MountError::Component("text input is not composing"));
+                return Err(DispatchError::Rejected {
+                    node,
+                    operation: NodeOperation::CompositionCommit,
+                    reason: "text input is not composing",
+                });
             };
             let length = current_text.chars().count();
             let (start, end) = composition.base_range();
@@ -1573,7 +1734,7 @@ impl Runtime {
         Ok(())
     }
 
-    fn cancel_composition(&mut self, element: usize) -> Result<(), MountError> {
+    fn cancel_composition(&mut self, node: NodeId, element: usize) -> Result<(), DispatchError> {
         let (discarded, caret, selection) = with_state(|state| {
             let LocalState::TextInput {
                 caret,
@@ -1581,12 +1742,17 @@ impl Runtime {
                 composition,
             } = &mut state.elements[element].local
             else {
-                return Err(MountError::Component(
-                    "composition target is not a text input",
-                ));
+                return Err(DispatchError::WrongKind {
+                    node,
+                    operation: NodeOperation::CompositionCancel,
+                });
             };
             let Some(composition) = composition.take() else {
-                return Err(MountError::Component("text input is not composing"));
+                return Err(DispatchError::Rejected {
+                    node,
+                    operation: NodeOperation::CompositionCancel,
+                    reason: "text input is not composing",
+                });
             };
             *caret = composition.base_caret;
             *selection = composition.base_selection;
@@ -1606,18 +1772,22 @@ impl Runtime {
     }
 
     pub fn change(&mut self, label: &str, value: bool) -> Result<(), MountError> {
-        let target = FindTarget::Label(label.to_owned());
+        self.dispatch_label(
+            FindTarget::Label(label.to_owned()),
+            "change target not found",
+            "change target not found",
+            move |runtime, node| runtime.change_node(node, value),
+        )
+    }
+
+    /// 按 Node ID 派发 change；先确认该元素拥有 change handler，再更新本地状态。
+    pub fn change_node(&mut self, node: NodeId, value: bool) -> Result<(), DispatchError> {
         let state = self.state.clone();
         context::install(&state, || {
-            let Some((event_id, mut event)) = with_state(|state| {
-                state.phase = Phase::Event;
-                state.fault = None;
-                state.write_error = None;
-                state.update_local(&target, LocalUpdate::Change(value));
-                state.take_event(EventKind::Change, &target)
-            }) else {
-                return Err(MountError::Component("change target not found"));
-            };
+            let element = with_state(|state| state.element_for_node(node))?;
+            let (event_id, mut event) =
+                self.take_node_event(node, element, EventKind::Change, NodeOperation::Change)?;
+            with_state(|state| state.update_local(element, LocalUpdate::Change(value)));
             if let Event::Change(handler) = &mut event {
                 handler(value);
             }
@@ -1625,22 +1795,26 @@ impl Runtime {
                 state.put_event(event_id, event);
                 state.phase = Phase::Idle;
             });
-            self.finish_command()
+            self.finish_command().map_err(DispatchError::Command)
         })
     }
 
     pub fn submit(&mut self, label: &str) -> Result<(), MountError> {
-        let target = FindTarget::Label(label.to_owned());
+        self.dispatch_label(
+            FindTarget::Label(label.to_owned()),
+            "submit target not found",
+            "submit target not found",
+            Self::submit_node,
+        )
+    }
+
+    /// 按 Node ID 派发 submit。
+    pub fn submit_node(&mut self, node: NodeId) -> Result<(), DispatchError> {
         let state = self.state.clone();
         context::install(&state, || {
-            let Some((event_id, mut event)) = with_state(|state| {
-                state.phase = Phase::Event;
-                state.fault = None;
-                state.write_error = None;
-                state.take_event(EventKind::Submit, &target)
-            }) else {
-                return Err(MountError::Component("submit target not found"));
-            };
+            let element = with_state(|state| state.element_for_node(node))?;
+            let (event_id, mut event) =
+                self.take_node_event(node, element, EventKind::Submit, NodeOperation::Submit)?;
             if let Event::Submit(handler) = &mut event {
                 handler(SubmitEvent::default());
             }
@@ -1648,7 +1822,7 @@ impl Runtime {
                 state.put_event(event_id, event);
                 state.phase = Phase::Idle;
             });
-            self.finish_command()
+            self.finish_command().map_err(DispatchError::Command)
         })
     }
 
@@ -1656,12 +1830,19 @@ impl Runtime {
     /// 候选文本由 IME 随后通过 compositionend/`compose_commit` 确认。
     /// 其他键仍按普通路由派发。未消费的 Enter 才是表单提交命令。
     pub fn keydown(&mut self, label: &str, key: Key) -> Result<(), MountError> {
-        let target = FindTarget::Label(label.to_owned());
+        self.dispatch_label(
+            FindTarget::Label(label.to_owned()),
+            "keydown target not found",
+            "keydown target not found",
+            move |runtime, node| runtime.keydown_node(node, key),
+        )
+    }
+
+    /// 按 Node ID 派发 keydown；组合中的 Enter/Escape 仍然优先被编辑器消费。
+    pub fn keydown_node(&mut self, node: NodeId, key: Key) -> Result<(), DispatchError> {
         let state = self.state.clone();
         context::install(&state, || {
-            let Some(element) = with_state(|state| state.find_element(&target)) else {
-                return Err(MountError::Component("keydown target not found"));
-            };
+            let element = with_state(|state| state.element_for_node(node))?;
             if with_state(|state| state.elements[element].local.is_composing()) {
                 match key {
                     Key::Enter => {
@@ -1670,20 +1851,14 @@ impl Runtime {
                     }
                     Key::Escape => {
                         self.enter_event_phase();
-                        self.cancel_composition(element)?;
-                        return self.leave_event_phase();
+                        self.cancel_composition(node, element)?;
+                        return self.leave_event_phase().map_err(DispatchError::Command);
                     }
                     Key::Other => {}
                 }
             }
-            let Some((event_id, mut event)) = with_state(|state| {
-                state.phase = Phase::Event;
-                state.fault = None;
-                state.write_error = None;
-                state.take_event(EventKind::KeyDown, &target)
-            }) else {
-                return Err(MountError::Component("keydown target not found"));
-            };
+            let (event_id, mut event) =
+                self.take_node_event(node, element, EventKind::KeyDown, NodeOperation::KeyDown)?;
             if let Event::KeyDown(handler) = &mut event {
                 handler(KeyEvent::new(key));
             }
@@ -1691,22 +1866,52 @@ impl Runtime {
                 state.put_event(event_id, event);
                 state.phase = Phase::Idle;
             });
-            self.finish_command()
+            self.finish_command().map_err(DispatchError::Command)
         })
     }
 
     /// headless 焦点命令：先对旧目标派发一次 blur，再对新目标派发一次 focus。
     pub fn focus(&mut self, label: &str) -> Result<(), MountError> {
+        self.dispatch_label(
+            FindTarget::Label(label.to_owned()),
+            "focus target not found",
+            "focus target is not focusable",
+            Self::focus_node,
+        )
+    }
+
+    /// 按 Node ID 移动焦点；不可聚焦的目标返回 `WrongKind`，焦点保持不变。
+    pub fn focus_node(&mut self, node: NodeId) -> Result<(), DispatchError> {
         let state = self.state.clone();
         context::install(&state, || {
-            let target = FindTarget::Label(label.to_owned());
-            let Some(element) = with_state(|state| state.find_element(&target)) else {
-                return Err(MountError::Component("focus target not found"));
-            };
+            let element = with_state(|state| state.element_for_node(node))?;
             if !with_state(|state| state.is_focusable(element)) {
-                return Err(MountError::Component("focus target is not focusable"));
+                return Err(DispatchError::WrongKind {
+                    node,
+                    operation: NodeOperation::Focus,
+                });
             }
             self.move_focus(Some(element))
+                .map_err(DispatchError::Command)
+        })
+    }
+
+    /// 按 Node ID 清除焦点：只有该元素仍是当前焦点时才清空，绝不改焦到其他元素。
+    ///
+    /// 已提交但未持有焦点的元素返回 `Rejected`；迟到的原生 blur 不会命中新的焦点。
+    pub fn blur_node(&mut self, node: NodeId) -> Result<(), DispatchError> {
+        let state = self.state.clone();
+        context::install(&state, || {
+            let element = with_state(|state| state.element_for_node(node))?;
+            let focused = with_state(|state| state.focused);
+            if focused != Some(element) {
+                return Err(DispatchError::Rejected {
+                    node,
+                    operation: NodeOperation::Blur,
+                    reason: "node is not focused",
+                });
+            }
+            self.move_focus(None).map_err(DispatchError::Command)
         })
     }
 
@@ -1947,22 +2152,7 @@ impl Runtime {
 
     /// 对照当前已提交界面判定一个 Node ID：存活、已卸载或从未分配。
     pub fn node_status(&self, node: NodeId) -> NodeStatus {
-        let state = self.state.borrow();
-        if node.runtime_id() != state.id {
-            return NodeStatus::Unknown;
-        }
-        let Some(element) = state.elements.get(node.slot() as usize) else {
-            return NodeStatus::Unknown;
-        };
-        // 槽位已由查表确定；代际仍须匹配，否则这是同一槽位更早一次挂载的身份。
-        if element.id.slot() != node.slot() || element.id.generation() != node.generation() {
-            return NodeStatus::Stale;
-        }
-        if state.element_is_mounted(node.slot() as usize) {
-            NodeStatus::Live
-        } else {
-            NodeStatus::Stale
-        }
+        self.state.borrow().node_status(node)
     }
 }
 
