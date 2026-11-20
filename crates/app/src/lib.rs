@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use zenui_core::{Counters, Fatal, Filter, RowId, RowKey, Runtime, Tx, ValueError, ViewId};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -267,21 +269,21 @@ impl std::fmt::Debug for TodoApp {
 pub fn render(tx: &mut Tx<'_>, ui: &mut UiState) -> Result<(), Fatal> {
     let want = tx.rows(ui.filter);
     let want_keys: Vec<RowKey> = want.iter().collect();
+    let want_set: BTreeSet<RowKey> = want_keys.iter().copied().collect();
     let existing = tx.row_views();
+    let existing_by_key: BTreeMap<RowKey, ViewId> =
+        existing.iter().map(|(view, key)| (*key, *view)).collect();
 
     for (view, key) in existing.iter().copied() {
-        if !want_keys.contains(&key) {
+        if !want_set.contains(&key) {
             tx.unmount(view)?;
         }
     }
 
     let mut order = Vec::with_capacity(want_keys.len());
     for key in &want_keys {
-        match existing
-            .iter()
-            .find(|(_, existing_key)| existing_key == key)
-        {
-            Some((view, _)) => order.push(*view),
+        match existing_by_key.get(key) {
+            Some(view) => order.push(*view),
             None => {
                 if let Some(view) = mount_row(tx, ui, *key)? {
                     order.push(view);

@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use crate::handle::{
@@ -33,6 +33,7 @@ pub struct ViewTree {
     runtime: RuntimeId,
     next: u32,
     nodes: BTreeMap<ViewId, ViewNode>,
+    by_row: BTreeMap<RowKey, ViewId>,
     order: Vec<ViewId>,
     root: ViewId,
     focused: Option<ViewId>,
@@ -67,6 +68,7 @@ impl ViewTree {
             runtime,
             next: 1,
             nodes,
+            by_row: BTreeMap::new(),
             order: Vec::new(),
             root,
             focused: None,
@@ -105,6 +107,7 @@ impl ViewTree {
                 title_len,
             },
         );
+        self.by_row.insert(row, id);
         self.mounts += 1;
         self.geometry_epoch += 1;
         id
@@ -158,6 +161,11 @@ impl ViewTree {
     pub fn unmount(&mut self, view: ViewId) -> Result<Option<ViewNode>, InvalidHandle> {
         self.require(view)?;
         let node = self.nodes.remove(&view).expect("already validated");
+        if let Some(row) = node.row
+            && self.by_row.get(&row) == Some(&view)
+        {
+            self.by_row.remove(&row);
+        }
         self.order.retain(|candidate| *candidate != view);
         self.carets.remove(&view);
 
@@ -171,8 +179,9 @@ impl ViewTree {
             self.require(*view)?;
         }
         let mut next = Vec::with_capacity(order.len());
+        let mut seen = BTreeSet::new();
         for id in order {
-            if self.nodes.contains_key(id) && !next.contains(id) {
+            if self.nodes.contains_key(id) && seen.insert(*id) {
                 next.push(*id);
             }
         }
@@ -238,32 +247,33 @@ impl ViewTree {
     }
 
     pub fn row_views(&self) -> Vec<(ViewId, RowKey)> {
-        let mut rows: Vec<_> = self
-            .order
-            .iter()
-            .filter_map(|id| {
-                let node = self.nodes.get(id)?;
-                Some((*id, node.row?))
-            })
-            .collect();
+        let mut rows = Vec::with_capacity(self.by_row.len());
+        let mut included = BTreeSet::new();
+        for id in &self.order {
+            if let Some(node) = self.nodes.get(id)
+                && let Some(row) = node.row
+            {
+                rows.push((*id, row));
+                included.insert(*id);
+            }
+        }
         // A mount can commit without a reorder; that live node is not discarded.
-        rows.extend(self.nodes.iter().filter_map(|(id, node)| {
-            (!self.order.contains(id)).then(|| node.row.map(|key| (*id, key)))?
-        }));
+        for (id, node) in &self.nodes {
+            if let Some(row) = node.row
+                && !included.contains(id)
+            {
+                rows.push((*id, row));
+            }
+        }
         rows
     }
 
     pub fn view_of_row(&self, row: RowKey) -> Option<ViewId> {
-        self.row_views()
-            .into_iter()
-            .find_map(|(view, key)| (key == row).then_some(view))
+        self.by_row.get(&row).copied()
     }
 
     pub(crate) fn claiming_view(&self, row: RowKey) -> Option<ViewId> {
-        self.nodes
-            .values()
-            .find(|node| node.row == Some(row))
-            .map(|node| node.id)
+        self.by_row.get(&row).copied()
     }
 
     pub fn node(&self, view: ViewId) -> Option<&ViewNode> {

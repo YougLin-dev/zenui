@@ -12,3 +12,7 @@ zenui-core = { path = "../core" }
 [[example]]
 name = "todolist_headless"
 path = "examples/todolist_headless/main.rs"
+
+[[example]]
+name = "reconcile_bench"
+path = "examples/reconcile_bench.rs"

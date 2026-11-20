@@ -40,7 +40,6 @@ struct OwnerNode {
     parent: Option<OwnerId>,
     children: Vec<OwnerId>,
     cleanups: Vec<Cleanup>,
-    disposed: bool,
     disposing: bool,
 }
 
@@ -62,7 +61,6 @@ impl OwnerTree {
                 parent: None,
                 children: Vec::new(),
                 cleanups: Vec::new(),
-                disposed: false,
                 disposing: false,
             },
         );
@@ -84,11 +82,7 @@ impl OwnerTree {
     }
 
     pub(crate) fn live_ids(&self) -> Vec<crate::handle::OwnerId> {
-        self.nodes
-            .iter()
-            .filter(|(_, node)| !node.disposed)
-            .map(|(id, _)| *id)
-            .collect()
+        self.nodes.keys().copied().collect()
     }
 
     pub(crate) const fn next_id(&self) -> u32 {
@@ -105,7 +99,6 @@ impl OwnerTree {
                 parent: Some(parent),
                 children: Vec::new(),
                 cleanups: Vec::new(),
-                disposed: false,
                 disposing: false,
             },
         );
@@ -118,11 +111,8 @@ impl OwnerTree {
 
     pub fn child_of(&mut self, parent: OwnerId) -> Result<OwnerId, OwnerError> {
         let Some(node) = self.nodes.get(&parent) else {
-            return Err(OwnerError::UnknownOwner(parent));
+            return Err(self.missing_owner_error(parent));
         };
-        if node.disposed {
-            return Err(OwnerError::AlreadyDisposed(parent));
-        }
         if node.disposing {
             return Err(OwnerError::MountDuringDispose(parent));
         }
@@ -135,7 +125,6 @@ impl OwnerTree {
                 parent: Some(parent),
                 children: Vec::new(),
                 cleanups: Vec::new(),
-                disposed: false,
                 disposing: false,
             },
         );
@@ -149,11 +138,8 @@ impl OwnerTree {
 
     pub fn on_cleanup(&mut self, owner: OwnerId, cleanup: Cleanup) -> Result<(), OwnerError> {
         let Some(node) = self.nodes.get_mut(&owner) else {
-            return Err(OwnerError::UnknownOwner(owner));
+            return Err(self.missing_owner_error(owner));
         };
-        if node.disposed {
-            return Err(OwnerError::AlreadyDisposed(owner));
-        }
         if node.disposing {
             return Err(OwnerError::CleanupDuringDispose(owner));
         }
@@ -162,10 +148,7 @@ impl OwnerTree {
     }
 
     pub fn dispose(&mut self, owner: OwnerId) {
-        let already_gone = self
-            .nodes
-            .get(&owner)
-            .is_none_or(|node| node.disposed || node.disposing);
+        let already_gone = self.nodes.get(&owner).is_none_or(|node| node.disposing);
         if already_gone {
             return;
         }
@@ -187,20 +170,15 @@ impl OwnerTree {
                     self.cleanup_runs += 1;
                 }
 
-                let parent = self.nodes.get_mut(&current).and_then(|node| {
-                    node.disposed = true;
-                    node.disposing = false;
-                    node.parent
-                });
+                let parent = self.nodes.get(&current).and_then(|node| node.parent);
                 if let Some(parent) = parent
                     && let Some(parent_node) = self.nodes.get_mut(&parent)
                 {
                     parent_node.children.retain(|child| *child != current);
                 }
+                // 已释放的 Owner 只保留在 issued 水位之下，不继续占用节点存储。
+                self.nodes.remove(&current);
                 self.live = self.live.saturating_sub(1);
-                continue;
-            }
-            if node.disposed {
                 continue;
             }
             node.disposing = true;
@@ -211,12 +189,31 @@ impl OwnerTree {
         }
     }
 
+    /// 已保留并释放的 Owner 为 disposed；水位以上从未保留的 id 不混为 disposed。
     pub fn is_disposed(&self, owner: OwnerId) -> bool {
-        self.nodes.get(&owner).is_none_or(|node| node.disposed)
+        !self.nodes.contains_key(&owner) && self.was_reserved(owner)
+    }
+
+    /// 水位以下代表该编号已经被保留；它可能从未发布就随失败计划消失。
+    const fn was_reserved(&self, owner: OwnerId) -> bool {
+        owner.index() < self.next
+    }
+
+    fn missing_owner_error(&self, owner: OwnerId) -> OwnerError {
+        if self.was_reserved(owner) {
+            OwnerError::AlreadyDisposed(owner)
+        } else {
+            OwnerError::UnknownOwner(owner)
+        }
     }
 
     pub const fn live(&self) -> usize {
         self.live
+    }
+
+    /// 已分配节点存储；释放后节点应离开该存储，而不是只改变状态位。
+    pub fn storage_len(&self) -> usize {
+        self.nodes.len()
     }
 
     pub const fn cleanup_runs(&self) -> u64 {
@@ -302,6 +299,38 @@ mod tests {
         owners.dispose(scope);
         owners.dispose(scope);
         assert_eq!(*runs.borrow(), 1);
+    }
+
+    #[test]
+    fn disposed_nodes_leave_storage_but_keep_their_identity() {
+        let mut owners = OwnerTree::new();
+        let scope = owners.child_of(owners.root()).expect("child");
+        let child = owners.child_of(scope).expect("grandchild");
+        assert_eq!(owners.storage_len(), 3, "root, scope, child");
+
+        owners.dispose(scope);
+        assert_eq!(owners.live(), 1, "root survives");
+        assert_eq!(owners.storage_len(), 1, "disposed nodes are not retained");
+        assert!(owners.is_disposed(scope));
+        assert!(owners.is_disposed(child));
+
+        let never_issued = OwnerId::from_index(4096);
+        assert!(!owners.is_disposed(never_issued));
+        assert!(matches!(
+            owners.child_of(scope),
+            Err(OwnerError::AlreadyDisposed(id)) if id == scope
+        ));
+        assert!(matches!(
+            owners.child_of(never_issued),
+            Err(OwnerError::UnknownOwner(id)) if id == never_issued
+        ));
+
+        for _ in 0..1000 {
+            let scope = owners.child_of(owners.root()).expect("churn child");
+            owners.dispose(scope);
+        }
+        assert_eq!(owners.live(), 1);
+        assert_eq!(owners.storage_len(), owners.live());
     }
 
     #[test]

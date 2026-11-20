@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 #[cfg(test)]
 use std::collections::BTreeSet;
 use std::fmt;
@@ -64,6 +65,8 @@ pub struct Store {
     runtime: RuntimeId,
     rows: Slots<Row>,
     order: Vec<SlotIndex>,
+    /// 业务键到 slot 的索引；行查找和事务提交不再线性扫描 arena。
+    by_key: BTreeMap<RowKey, SlotIndex>,
     next_key: u64,
     epoch: u64,
 
@@ -147,6 +150,7 @@ impl Store {
             runtime: id,
             rows: Slots::new(),
             order: Vec::new(),
+            by_key: BTreeMap::new(),
             next_key: 1,
             epoch: 0,
             filter_epoch: [0; 3],
@@ -171,6 +175,7 @@ impl Store {
         let (slot, generation) = self.rows.reserve();
         assert!(self.rows.fill(slot, row), "fresh reservation must be empty");
         self.order.push(slot);
+        self.by_key.insert(key, slot);
         self.record_write();
         self.touch_filters([true, true, true]);
         self.order_epoch += 1;
@@ -220,6 +225,7 @@ impl Store {
         let slot = row.slot();
         let was_completed = self.entry(row)?.completed;
         let removed = self.rows.free(slot).ok_or(HandleError::Vacant { slot })?;
+        self.by_key.remove(&removed.key);
         self.order.retain(|candidate| *candidate != slot);
         if was_completed {
             self.completed -= 1;
@@ -242,6 +248,7 @@ impl Store {
         let mut removed = Vec::with_capacity(doomed.len());
         for slot in doomed {
             if let Some(row) = self.rows.free(slot) {
+                self.by_key.remove(&row.key);
                 removed.push(row.key);
                 self.completed -= 1;
             }
@@ -304,20 +311,22 @@ impl Store {
     }
 
     pub(crate) fn slot_for(&self, key: RowKey) -> Option<(SlotIndex, Generation)> {
-        let slot = self.rows.find(|row| row.key() == key)?;
+        let slot = *self.by_key.get(&key)?;
         Some((slot, self.rows.generation(slot)?))
     }
 
     pub(crate) fn install(&mut self, draft: StoreDraft) {
         for (slot, key, title, completed) in draft.fills {
-            let _ = self.rows.fill(
+            if self.rows.fill(
                 slot,
                 Row {
                     key,
                     title,
                     completed,
                 },
-            );
+            ) {
+                self.by_key.insert(key, slot);
+            }
         }
         for (slot, title, completed) in draft.updates {
             if let Some(generation) = self.rows.generation(slot)
@@ -332,8 +341,11 @@ impl Store {
             }
         }
         for slot in draft.removals {
-            let _ = self.rows.free(slot);
+            if let Some(row) = self.rows.free(slot) {
+                self.by_key.remove(&row.key);
+            }
         }
+        // releases 只包含从未填充过的 reservation，因此不影响 by_key。
         for slot in draft.releases {
             self.rows.release(slot);
         }
@@ -389,15 +401,9 @@ impl Store {
     }
 
     pub fn handle_for(&self, key: RowKey) -> Option<RowId> {
-        self.order.iter().find_map(|slot| {
-            let row = self.rows.get_ref(*slot)?;
-            if row.key == key {
-                let generation = self.rows.generation(*slot)?;
-                Some(Handle::new(self.runtime, *slot, generation))
-            } else {
-                None
-            }
-        })
+        let slot = *self.by_key.get(&key)?;
+        let generation = self.rows.generation(slot)?;
+        Some(Handle::new(self.runtime, slot, generation))
     }
 
     pub fn rows(&self) -> impl Iterator<Item = &Row> + '_ {

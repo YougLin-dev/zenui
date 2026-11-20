@@ -13,6 +13,7 @@ ZenUI 处在开发阶段。阶段一 target API 的 headless Todo 已可运行�
 - headless Runtime：模型、行集、代际句柄、Owner、Memo 和事务；
 - 阶段一 target API：Copy Signal/Memo/Store Field、mount-once 组件、`view!` 数据位、`Show`/`For` 与共享 RowSet；
 - headless 窗口 activation 与任务交付边界：app/window 所有权、Send worker、代际检查后的 UI continuation；窗口关闭取消其交付，共享模型仍可由 app 所有权任务提交；
+- 有界运行时存储：最近发布快照按固定窗口保留，释放的 Owner 节点回到存活规模，Todo 的列表 reconciliation 与行句柄查找使用索引而不是逐行扫描；
 - 可复现的 Todo 场景：插入、删除、筛选、重排、焦点与拒绝句柄后的恢复；
 - 独立的宏、文本、布局和 GPU 原型；
 - 目标界面语法的预览。
@@ -72,7 +73,10 @@ view! {
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
+cargo run --release -p zenui-app --example reconcile_bench --locked
 ```
+
+`reconcile_bench` 是固定负载的时间探针：扫描 500/1000/2000/4000 行，分别测量未变化列表 reconciliation 与空提交，并打印发布窗口和 Owner 存储规模。它只提供测量，不作为 wall-clock 断言。
 
 独立的原型工作区使用各自的 `Cargo.toml`。宏原型可以这样运行：
 

@@ -37,6 +37,24 @@ fn an_insert_removed_in_the_same_frame_leaves_no_row() {
 }
 
 #[test]
+fn the_key_index_follows_removal_and_reinsertion() {
+    let mut runtime = Runtime::new();
+    let first = runtime.frame(|tx| tx.insert("A")).expect("insert A");
+    let first_key = runtime.committed().keys().next().expect("A key");
+    assert_eq!(runtime.committed().handle_for(first_key), Some(first));
+
+    runtime
+        .frame(|tx| tx.remove(first).map_err(|_| Fatal::Aborted))
+        .expect("remove A");
+    assert!(runtime.committed().handle_for(first_key).is_none());
+
+    let second = runtime.frame(|tx| tx.insert("B")).expect("insert B");
+    let second_key = runtime.committed().keys().next().expect("B key");
+    assert_ne!(second_key, first_key);
+    assert_eq!(runtime.committed().handle_for(second_key), Some(second));
+}
+
+#[test]
 fn a_removal_wins_over_a_staged_value() {
     let mut runtime = Runtime::new();
     let row: RowId = runtime.frame(|tx| tx.insert("A")).expect("insert");
