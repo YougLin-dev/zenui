@@ -97,7 +97,7 @@ tasks: delivered=2 | 2 remaining | Add | All | Active | Done | Reverse | Clear d
 | 缺口 | 为什么现在没有证据 | 窄 blocker |
 | --- | --- | --- |
 | 原生 Windows 窗口与 `view!` 宿主 | `Runtime::open_window` 只是 headless activation；根二进制仍是 `Hello, world!`，没有 HWND 或原生事件循环 | [#60](https://github.com/YougLin-dev/zenui/issues/60) |
-| IME composition | target event 只有 click/input/change/submit/keydown；`on:input` 是 `String`，无法表达 preedit/commit/cancel，也没有候选 Enter 不提交的测试 | [#61](https://github.com/YougLin-dev/zenui/issues/61) |
+| IME composition | target event 只有 click/input/change/submit/keydown/focus/blur；`on:input` 是 `String`，无法表达 preedit/commit/cancel，也没有候选 Enter 不提交的测试 | [#61](https://github.com/YougLin-dev/zenui/issues/61) |
 | 原生焦点适配 | headless target runtime 已提供 `on:focus`/`on:blur`、`focus`、`focus_next`/`focus_previous` 与重挂/重排后的焦点结算（`tests/focus.rs`）；Windows 原生焦点适配仍未实现 | [#62](https://github.com/YougLin-dev/zenui/issues/62)（headless 部分完成，原生适配待做） |
 | 原生布局、文本、GPU、DPI 呈现 | target Todo 只通过 `texts()` 观察；`native_poc`/`desktop_poc` 是独立原型，不消费 `MountPlan` | [#63](https://github.com/YougLin-dev/zenui/issues/63) |
 

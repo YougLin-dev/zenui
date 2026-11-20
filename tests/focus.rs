@@ -602,6 +602,333 @@ fn reopening_a_window_starts_without_focus() {
     );
 }
 
+#[component]
+fn ReenableNeighbour(focuses: Rc<Cell<u32>>, blurs: Rc<Cell<u32>>) -> MountResult<MountPlan> {
+    let switched = signal(false);
+    let a_disabled = memo(move || switched.get());
+    let b_disabled = memo(move || !switched.get());
+    let a_focus = focuses.clone();
+    let a_blur = blurs.clone();
+    let b_focus = focuses.clone();
+    let b_blur = blurs.clone();
+    let c_focus = focuses.clone();
+    let c_blur = blurs.clone();
+
+    view! {
+        <view>
+            <button
+                aria:label="a"
+                disabled={a_disabled}
+                on:focus={move |_event: FocusEvent| a_focus.set(a_focus.get() + 1)}
+                on:blur={move |_event: BlurEvent| a_blur.set(a_blur.get() + 1)}
+            >"A"</button>
+            <button
+                aria:label="b"
+                disabled={b_disabled}
+                on:focus={move |_event: FocusEvent| b_focus.set(b_focus.get() + 1)}
+                on:blur={move |_event: BlurEvent| b_blur.set(b_blur.get() + 1)}
+            >"B"</button>
+            <button
+                aria:label="c"
+                on:focus={move |_event: FocusEvent| c_focus.set(c_focus.get() + 1)}
+                on:blur={move |_event: BlurEvent| c_blur.set(c_blur.get() + 1)}
+            >"C"</button>
+            <view aria:label="go" on:click={move || switched.set(true)}>"go"</view>
+        </view>
+    }
+}
+
+#[test]
+fn settlement_chooses_a_survivor_the_frame_reenables() {
+    let focuses = Rc::new(Cell::new(0));
+    let blurs = Rc::new(Cell::new(0));
+    let mut app = Runtime::new();
+    app.mount({
+        let focuses = focuses.clone();
+        let blurs = blurs.clone();
+        move || view! { <ReenableNeighbour focuses={focuses} blurs={blurs} /> }
+    })
+    .expect("mount");
+
+    app.focus("a").expect("focus a");
+    assert_eq!(focuses.get(), 1);
+
+    app.click_label("go").expect("disable a and enable b");
+
+    assert_eq!(
+        app.focused().and_then(|focus| focus.label),
+        Some(String::from("b")),
+        "the nearest surviving same-tag control is chosen even though it was disabled at frame start"
+    );
+    assert_eq!(focuses.get(), 2, "one settlement focus");
+    assert_eq!(blurs.get(), 1, "the disabled target blurs once");
+}
+
+#[component]
+fn ReenableSurvivor(focuses: Rc<Cell<u32>>, blurs: Rc<Cell<u32>>) -> MountResult<MountPlan> {
+    let enabled = signal(false);
+    let show_c = signal(true);
+    let a_disabled = memo(move || !enabled.get());
+    let when = memo(move || show_c.get());
+    let a_focus = focuses.clone();
+    let a_blur = blurs.clone();
+
+    view! {
+        <view>
+            <button
+                aria:label="a"
+                disabled={a_disabled}
+                on:focus={move |_event: FocusEvent| a_focus.set(a_focus.get() + 1)}
+                on:blur={move |_event: BlurEvent| a_blur.set(a_blur.get() + 1)}
+            >"A"</button>
+            <Show when={when}>
+                <button aria:label="c">"C"</button>
+            </Show>
+            <view aria:label="go" on:click={move || {
+                show_c.set(false);
+                enabled.set(true);
+            }}>"go"</view>
+        </view>
+    }
+}
+
+#[test]
+fn settlement_can_reuse_an_old_control_that_the_frame_reenables() {
+    let focuses = Rc::new(Cell::new(0));
+    let blurs = Rc::new(Cell::new(0));
+    let mut app = Runtime::new();
+    app.mount({
+        let focuses = focuses.clone();
+        let blurs = blurs.clone();
+        move || view! { <ReenableSurvivor focuses={focuses} blurs={blurs} /> }
+    })
+    .expect("mount");
+
+    app.focus("c").expect("focus c");
+    assert_eq!(
+        app.focused().and_then(|focus| focus.label),
+        Some(String::from("c"))
+    );
+
+    app.click_label("go").expect("hide c and enable a");
+
+    assert_eq!(
+        app.focused().and_then(|focus| focus.label),
+        Some(String::from("a")),
+        "an old-generation survivor re-enabled by the frame takes over"
+    );
+    assert_eq!(focuses.get(), 1, "one settlement focus on a");
+    assert_eq!(blurs.get(), 0, "the unmounted c cannot receive a blur");
+}
+
+#[component]
+fn Bomb() -> MountResult<MountPlan> {
+    Err(MountError::Component("bomb"))
+}
+
+#[component]
+fn FailedFrame(focuses: Rc<Cell<u32>>, blurs: Rc<Cell<u32>>) -> MountResult<MountPlan> {
+    let disabled = signal(false);
+    let armed = signal(false);
+    let is_disabled = memo(move || disabled.get());
+    let when = memo(move || armed.get());
+    let victim_focus = focuses.clone();
+    let victim_blur = blurs.clone();
+
+    view! {
+        <view>
+            <button
+                aria:label="victim"
+                disabled={is_disabled}
+                on:focus={move |_event: FocusEvent| {
+                    victim_focus.set(victim_focus.get() + 1);
+                }}
+                on:blur={move |_event: BlurEvent| {
+                    victim_blur.set(victim_blur.get() + 1);
+                }}
+            >"Victim"</button>
+            <Show when={when}>
+                <Bomb />
+            </Show>
+            <button aria:label="safe">"Safe"</button>
+            <button aria:label="go" on:click={move || {
+                disabled.set(true);
+                armed.set(true);
+            }}>"Go"</button>
+            <button aria:label="fix" on:click={move || armed.set(false)}>"Fix"</button>
+        </view>
+    }
+}
+
+#[test]
+fn a_failed_frame_does_not_leave_a_disabled_target_focused() {
+    let focuses = Rc::new(Cell::new(0));
+    let blurs = Rc::new(Cell::new(0));
+    let mut app = Runtime::new();
+    app.mount({
+        let focuses = focuses.clone();
+        let blurs = blurs.clone();
+        move || view! { <FailedFrame focuses={focuses} blurs={blurs} /> }
+    })
+    .expect("mount");
+    app.focus("victim").expect("focus victim");
+    assert_eq!(focuses.get(), 1);
+
+    let failure = app
+        .click_text("Go")
+        .expect_err("the branch mount fails after the victim was disabled");
+    assert_eq!(failure, MountError::Component("bomb"));
+
+    assert_eq!(
+        app.focused(),
+        None,
+        "a failed frame must not report a disabled target as focused"
+    );
+    assert_eq!(
+        app.focus("victim")
+            .expect_err("focus agrees with the observation"),
+        MountError::Component("focus target is not focusable")
+    );
+
+    app.click_text("Fix")
+        .expect("the next legal command recovers");
+    assert_eq!(
+        app.focused(),
+        None,
+        "the failed frame never published a focus move"
+    );
+    assert_eq!(
+        blurs.get(),
+        0,
+        "no blur or settlement is dispatched for an unpublished frame"
+    );
+}
+
+#[component]
+fn CascadingRows(
+    count: usize,
+    last_focuses: Rc<Cell<u32>>,
+    last_blurs: Rc<Cell<u32>>,
+) -> MountResult<MountPlan> {
+    let store = Store::new();
+    let rows = memo(move || store.rows(Filter::All));
+
+    view! {
+        <view>
+            <button aria:label="seed" on:click={move || {
+                let mut transaction = Transaction::new();
+                for index in 0..count {
+                    transaction = transaction.write(store.insert(format!("row {index}")));
+                }
+                let _ = transaction.finish();
+            }}>"Seed"</button>
+            <For each={rows} key={|id: TodoId| id}>
+                {move |todo: TodoId| view! {
+                    <button
+                        aria:label={once(format!("row {}", todo.raw()))}
+                        on:focus={move |_event: FocusEvent| {
+                            let _ = Transaction::new().write(store.remove(todo)).finish();
+                        }}
+                    >"row"</button>
+                }}
+            </For>
+            <button
+                aria:label="last"
+                on:focus={move |_event: FocusEvent| {
+                    last_focuses.set(last_focuses.get() + 1);
+                }}
+                on:blur={move |_event: BlurEvent| {
+                    last_blurs.set(last_blurs.get() + 1);
+                }}
+            >"Last"</button>
+        </view>
+    }
+}
+
+fn cascade(rows: usize) -> (Runtime, Rc<Cell<u32>>, Rc<Cell<u32>>) {
+    let last_focuses = Rc::new(Cell::new(0));
+    let last_blurs = Rc::new(Cell::new(0));
+    let mut app = Runtime::new();
+    app.mount({
+        let last_focuses = last_focuses.clone();
+        let last_blurs = last_blurs.clone();
+        move || {
+            view! {
+                <CascadingRows count={rows} last_focuses={last_focuses} last_blurs={last_blurs} />
+            }
+        }
+    })
+    .expect("mount");
+    app.click_text("Seed").expect("seed rows");
+    (app, last_focuses, last_blurs)
+}
+
+#[test]
+fn a_cascade_that_converges_on_the_cap_keeps_its_valid_target() {
+    let (mut app, last_focuses, last_blurs) = cascade(8);
+    let first = app.for_items()[0].todo;
+    app.focus(&format!("row {}", first.raw()))
+        .expect("focus the first row");
+
+    assert_eq!(
+        app.focused().and_then(|focus| focus.label),
+        Some(String::from("last")),
+        "the eighth settlement lands on a stable target"
+    );
+    assert_eq!(last_focuses.get(), 1);
+    assert_eq!(
+        last_blurs.get(),
+        0,
+        "a converged cascade must not blur the final target"
+    );
+
+    let (mut app, last_focuses, last_blurs) = cascade(7);
+    let first = app.for_items()[0].todo;
+    app.focus(&format!("row {}", first.raw()))
+        .expect("focus the first row");
+    assert_eq!(
+        app.focused().and_then(|focus| focus.label),
+        Some(String::from("last")),
+        "the same target is stable below the cap"
+    );
+    assert_eq!(last_focuses.get(), 1);
+    assert_eq!(last_blurs.get(), 0);
+}
+
+#[test]
+fn a_panicking_focus_handler_restores_the_event_slot() {
+    #[component]
+    fn PanicOnFocus() -> MountResult<MountPlan> {
+        view! {
+            <view
+                aria:label="panel"
+                on:focus={move |_event: FocusEvent| panic!("boom")}
+            >
+                <text>"panel"</text>
+            </view>
+        }
+    }
+
+    let mut app = Runtime::new();
+    app.mount(|| view! { <PanicOnFocus /> }).expect("mount");
+
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| app.focus("panel")));
+    assert!(outcome.is_err(), "the handler panic unwinds the command");
+
+    assert_eq!(
+        app.focused().map(|focus| focus.tag),
+        Some("view"),
+        "the target stays mounted and focusable after the unwind"
+    );
+    app.focus("panel")
+        .expect("the same target is still focusable and already focused");
+    assert_eq!(
+        app.click_label("panel"),
+        Err(MountError::Component("click target not found")),
+        "the focus slot did not become a phantom click handler"
+    );
+}
+
 #[test]
 fn focus_rejects_unknown_and_non_focusable_targets() {
     #[component]

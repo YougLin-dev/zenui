@@ -58,7 +58,7 @@ pub(crate) struct State {
     next_instance: u64,
     unmounts: u64,
     focused: Option<usize>,
-    focus_before: Option<Vec<usize>>,
+    settle_before: Option<Vec<usize>>,
 }
 
 /// 旧焦点离开可见集合后的一次结算：旧目标（可选 blur）与接任目标。
@@ -123,7 +123,7 @@ impl State {
             next_instance: 1,
             unmounts: 0,
             focused: None,
-            focus_before: None,
+            settle_before: None,
         }
     }
 
@@ -358,23 +358,33 @@ impl State {
         order
     }
 
+    /// 结算快照包含旧一代的全部挂载元素；某个控件当时禁用、本帧重新启用时仍可接任。
+    fn element_order(&self) -> Vec<usize> {
+        let mut order = Vec::new();
+        if let Some(tree) = &self.tree {
+            collect_elements(self, tree, &mut order);
+        }
+        order
+    }
+
     fn element_is_mounted(&self, element: usize) -> bool {
         self.tree
             .as_ref()
             .is_some_and(|tree| contains_element(self, tree, element))
     }
 
-    /// 旧焦点不在新的可见集合时，下一次结算才产生接任目标。
+    /// 旧焦点不在新的可聚焦集合时，下一次结算才产生接任目标。
     ///
-    /// 只在旧一代的存活控件里选：同 tag 的下一控件、同 tag 的上一控件，
-    /// 再退到任意下一控件、任意上一控件；新挂载的控件不会因返场抢焦点。
+    /// 只在旧一代的挂载顺序里选：同 tag 的下一控件、同 tag 的上一控件，
+    /// 再退到任意下一控件、任意上一控件；本帧新挂载的控件不会因返场抢焦点，
+    /// 当时禁用、本帧重新启用的旧控件仍然可以接任。
     fn focus_settlement(&mut self) -> Option<FocusSettlement> {
         let old = self.focused?;
         let after = self.focus_order();
         if after.contains(&old) {
             return None;
         }
-        let before = self.focus_before.take().unwrap_or_default();
+        let before = self.settle_before.take().unwrap_or_default();
         let target = focus_replacement(self, &before, &after, old);
         Some(FocusSettlement {
             old,
@@ -770,10 +780,10 @@ impl Runtime {
 
     pub fn refresh(&mut self) -> Result<(), MountError> {
         if let Err(error) = self.refresh_once() {
-            // 失败的帧可能已经移除了旧目标；不能让焦点身份指向不可见节点。
+            // 失败的帧没有发布；不能让焦点身份停留在已被移除或禁用的旧目标上。
             let mut state = self.state.borrow_mut();
             let focused = state.focused;
-            if focused.is_some_and(|id| !state.element_is_mounted(id)) {
+            if focused.is_some_and(|id| !state.element_is_mounted(id) || !state.is_focusable(id)) {
                 state.focused = None;
             }
             return Err(error);
@@ -787,7 +797,7 @@ impl Runtime {
             let Some(mut tree) = with_state(|state| {
                 state.fault = None;
                 state.phase = Phase::Binding;
-                state.focus_before = state.focused.is_some().then(|| state.focus_order());
+                state.settle_before = state.focused.is_some().then(|| state.element_order());
                 state.tree.take()
             }) else {
                 return Err(MountError::Component("root is not mounted"));
@@ -841,19 +851,28 @@ impl Runtime {
                 }
                 self.refresh_once()?;
             }
-            // 病态的 focus handler 连续制造新结构时停止级联，但仍让可见目标收到 blur。
-            if let Some(old) = with_state(|state| state.focused) {
-                if with_state(|state| state.element_is_mounted(old)) {
-                    with_state(|state| {
-                        state.phase = Phase::Event;
-                        state.focused = None;
-                    });
-                    self.fire_blur(old, FocusCause::Settlement);
-                    with_state(|state| state.phase = Phase::Idle);
-                } else {
-                    with_state(|state| state.focused = None);
-                }
+            // 第 8 轮恰好收敛时焦点仍然有效；只有确实还有待结算的目标才做兜底清理。
+            let Some(settlement) = with_state(|state| state.focus_settlement()) else {
+                return Ok(());
+            };
+            with_state(|state| {
+                state.phase = Phase::Event;
+                state.fault = None;
+                state.write_error = None;
+            });
+            if settlement.blur_old {
+                with_state(|state| state.focused = None);
+                self.fire_blur(settlement.old, FocusCause::Settlement);
             }
+            with_state(|state| state.focused = None);
+            with_state(|state| state.phase = Phase::Idle);
+            if let Some(fault) = with_state(|state| state.fault) {
+                return Err(State::context_error(fault));
+            }
+            if let Some(error) = with_state(|state| state.write_error.take()) {
+                return Err(MountError::Write(error));
+            }
+            self.refresh_once()?;
             Ok(())
         })
     }
@@ -1464,8 +1483,12 @@ impl Runtime {
         else {
             return;
         };
-        invoke(&mut event);
+        // handler unwind 不能把占位事件留在槽位里；恢复后再继续展开。
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| invoke(&mut event)));
         with_state(|state| state.put_event(id, event));
+        if let Err(payload) = outcome {
+            std::panic::resume_unwind(payload);
+        }
     }
 
     fn finish_command(&mut self) -> Result<(), MountError> {
@@ -1552,7 +1575,7 @@ impl Runtime {
     pub fn focused(&self) -> Option<FocusInfo> {
         let state = self.state.borrow();
         let id = state.focused?;
-        if !state.element_is_mounted(id) {
+        if !state.element_is_mounted(id) || !state.is_focusable(id) {
             return None;
         }
         let element = &state.elements[id];
@@ -1634,6 +1657,33 @@ fn focus_replacement(
                 .find(|id| live.contains(id))
                 .copied()
         })
+}
+
+fn collect_elements(state: &State, nodes: &[MountedNode], order: &mut Vec<usize>) {
+    for node in nodes {
+        match node {
+            MountedNode::Text(_) => {}
+            MountedNode::Element(id) => {
+                order.push(*id);
+                collect_elements(state, &state.elements[*id].children, order);
+            }
+            MountedNode::Component(id) => {
+                collect_elements(state, &state.components[*id].children, order);
+            }
+            MountedNode::Show(show) => {
+                if let Some(branch) = &show.active {
+                    collect_elements(state, &branch.children, order);
+                }
+            }
+            MountedNode::For(for_node) => {
+                for key in &for_node.order {
+                    if let Some(item) = for_node.items.get(key) {
+                        collect_elements(state, &item.children, order);
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn collect_focusable(state: &State, nodes: &[MountedNode], order: &mut Vec<usize>) {
