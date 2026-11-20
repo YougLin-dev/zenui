@@ -24,6 +24,10 @@ _Avoid_: display list, frame
 一次场景构建使用的逻辑视口尺寸与 Window scale；布局始终使用逻辑像素。
 _Avoid_: screen size, resolution
 
+**Render target**:
+GPU 层的一张目标纹理及其格式与物理像素尺寸；窗口呈现时由 Surface 提供，离屏测试使用独立纹理。
+_Avoid_: surface (when meaning the texture target)
+
 **Text run**:
 场景中同一字体、字号与 shaping 结果的一段文本，携带绝对字形位置；不是平台文本句柄。
 _Avoid_: glyph line, paragraph
