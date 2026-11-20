@@ -25,7 +25,7 @@ cargo run -p zenui-app --example todolist_headless --locked
 cargo run -p zenui --example minimal_todo --locked
 ```
 
-target API 的公开行为测试位于根包 `tests/`，其中 `tests/tasks.rs` 覆盖窗口关闭、重开代际、过期交付与 app 所有权模型提交；它不声明原生窗口、IME 或 Windows 完成。
+target API 的公开行为测试位于根包 `tests/`，其中 `tests/tasks.rs` 覆盖窗口关闭、重开代际、过期交付与 app 所有权模型提交，`tests/ime.rs` 覆盖 headless composition 的 preedit、候选确认与取消；它们不声明原生窗口、原生 IME 适配或 Windows 完成。
 
 根工程的二进制只保留最小入口，不会打开桌面窗口。目标语法的预览文件不参与默认 workspace 构建，因为只有部分所需 API 已经存在。
 

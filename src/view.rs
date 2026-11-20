@@ -208,6 +208,10 @@ pub enum Event {
     KeyDown(Box<dyn FnMut(KeyEvent)>),
     Focus(Box<dyn FnMut(FocusEvent)>),
     Blur(Box<dyn FnMut(BlurEvent)>),
+    CompositionStart(Box<dyn FnMut(CompositionEvent)>),
+    CompositionUpdate(Box<dyn FnMut(CompositionEvent)>),
+    CompositionEnd(Box<dyn FnMut(CompositionEvent)>),
+    CompositionCancel(Box<dyn FnMut(CompositionEvent)>),
 }
 
 pub trait IntoText {
@@ -445,6 +449,22 @@ pub fn on_blur(handler: impl FnMut(BlurEvent) + 'static) -> Attr {
     Attr::Event(Event::Blur(Box::new(handler)))
 }
 
+pub fn on_composition_start(handler: impl FnMut(CompositionEvent) + 'static) -> Attr {
+    Attr::Event(Event::CompositionStart(Box::new(handler)))
+}
+
+pub fn on_composition_update(handler: impl FnMut(CompositionEvent) + 'static) -> Attr {
+    Attr::Event(Event::CompositionUpdate(Box::new(handler)))
+}
+
+pub fn on_composition_end(handler: impl FnMut(CompositionEvent) + 'static) -> Attr {
+    Attr::Event(Event::CompositionEnd(Box::new(handler)))
+}
+
+pub fn on_composition_cancel(handler: impl FnMut(CompositionEvent) + 'static) -> Attr {
+    Attr::Event(Event::CompositionCancel(Box::new(handler)))
+}
+
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub struct SubmitEvent {
     prevented: bool,
@@ -494,6 +514,57 @@ impl BlurEvent {
 
     pub const fn cause(self) -> FocusCause {
         self.cause
+    }
+}
+
+/// 一次本地 composition 的阶段；候选确认是 `End`，取消恢复是 `Cancel`。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CompositionPhase {
+    Start,
+    Update,
+    End,
+    Cancel,
+}
+
+/// 编辑器本地 composition 的 typed 载荷；`text` 在 Start/Update 是 preedit，
+/// 在 End 是确认的候选文本，在 Cancel 是被丢弃的 preedit。
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct CompositionEvent {
+    phase: CompositionPhase,
+    text: String,
+    caret: usize,
+    selection: Option<(usize, usize)>,
+}
+
+impl CompositionEvent {
+    pub(crate) fn new(
+        phase: CompositionPhase,
+        text: String,
+        caret: usize,
+        selection: Option<(usize, usize)>,
+    ) -> Self {
+        Self {
+            phase,
+            text,
+            caret,
+            selection,
+        }
+    }
+
+    pub const fn phase(&self) -> CompositionPhase {
+        self.phase
+    }
+
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    pub const fn caret(&self) -> usize {
+        self.caret
+    }
+
+    pub const fn selection(&self) -> Option<(usize, usize)> {
+        self.selection
     }
 }
 

@@ -10,8 +10,9 @@ use crate::signal::{Memo, MemoCell, SignalCell};
 use crate::store::{TodoId, WriteError};
 use crate::task::TaskRecord;
 use crate::view::{
-    Attr, AttrValue, BlurEvent, ChildrenFactory, Event, FocusCause, FocusEvent, Key, KeyEvent,
-    MountError, MountPlan, MountResult, PlanNode, ResultBoolValue, SubmitEvent, TextSlot,
+    Attr, AttrValue, BlurEvent, ChildrenFactory, CompositionEvent, CompositionPhase, Event,
+    FocusCause, FocusEvent, Key, KeyEvent, MountError, MountPlan, MountResult, PlanNode,
+    ResultBoolValue, SubmitEvent, TextSlot,
 };
 use crate::window::{WindowCtx, WindowError, WindowRecord};
 
@@ -301,7 +302,12 @@ impl State {
     fn update_local(&mut self, target: &FindTarget, value: LocalUpdate) {
         if let Some(element) = self.find_element(target) {
             match (&mut self.elements[element].local, value) {
-                (LocalState::TextInput { caret, selection }, LocalUpdate::Input(value)) => {
+                (
+                    LocalState::TextInput {
+                        caret, selection, ..
+                    },
+                    LocalUpdate::Input(value),
+                ) => {
                     *caret = value.chars().count();
                     *selection = None;
                 }
@@ -321,11 +327,33 @@ impl State {
         }
     }
 
+    fn composition_element(&self, label: &str) -> Result<usize, MountError> {
+        let target = FindTarget::Label(label.to_owned());
+        let Some(element) = self.find_element(&target) else {
+            return Err(MountError::Component("composition target not found"));
+        };
+        if matches!(self.elements[element].local, LocalState::TextInput { .. }) {
+            Ok(element)
+        } else {
+            Err(MountError::Component(
+                "composition target is not a text input",
+            ))
+        }
+    }
+
     fn set_text_input_caret(&mut self, target: &FindTarget, offset: usize) -> bool {
         let Some(element) = self.find_element(target) else {
             return false;
         };
-        if let LocalState::TextInput { caret, selection } = &mut self.elements[element].local {
+        if let LocalState::TextInput {
+            caret,
+            selection,
+            composition,
+        } = &mut self.elements[element].local
+        {
+            if composition.is_some() {
+                return false;
+            }
             *caret = offset;
             *selection = Some((offset, offset));
             true
@@ -446,6 +474,17 @@ impl MountedElement {
             })
     }
 
+    fn text_value(&self) -> Option<String> {
+        self.attrs
+            .iter()
+            .find(|attr| attr.name == "value")
+            .and_then(|attr| attr.current.as_ref())
+            .and_then(|current| match current {
+                AttrCurrent::Text(text) => Some(text.clone()),
+                AttrCurrent::Bool(_) => None,
+            })
+    }
+
     fn is_disabled(&self) -> bool {
         self.attrs
             .iter()
@@ -472,10 +511,40 @@ enum LocalState {
     TextInput {
         caret: usize,
         selection: Option<(usize, usize)>,
+        composition: Option<Composition>,
     },
     Checkbox {
         checked: bool,
     },
+}
+
+impl LocalState {
+    fn is_composing(&self) -> bool {
+        matches!(
+            self,
+            Self::TextInput {
+                composition: Some(_),
+                ..
+            }
+        )
+    }
+}
+
+/// preedit 只存在于编辑器本地；`base_*` 记录组合开始时的已提交状态，取消时恢复。
+struct Composition {
+    base_caret: usize,
+    base_selection: Option<(usize, usize)>,
+    preedit: String,
+}
+
+impl Composition {
+    /// 组合替换的字符区间；没有范围选择时折叠在组合开始的 caret。
+    fn base_range(&self) -> (usize, usize) {
+        match self.base_selection {
+            Some((start, end)) => (start.min(end), start.max(end)),
+            None => (self.base_caret, self.base_caret),
+        }
+    }
 }
 
 enum LocalUpdate {
@@ -527,6 +596,10 @@ enum EventKind {
     KeyDown,
     Focus,
     Blur,
+    CompositionStart,
+    CompositionUpdate,
+    CompositionEnd,
+    CompositionCancel,
 }
 
 fn event_kind(event: &Event) -> EventKind {
@@ -538,6 +611,10 @@ fn event_kind(event: &Event) -> EventKind {
         Event::KeyDown(_) => EventKind::KeyDown,
         Event::Focus(_) => EventKind::Focus,
         Event::Blur(_) => EventKind::Blur,
+        Event::CompositionStart(_) => EventKind::CompositionStart,
+        Event::CompositionUpdate(_) => EventKind::CompositionUpdate,
+        Event::CompositionEnd(_) => EventKind::CompositionEnd,
+        Event::CompositionCancel(_) => EventKind::CompositionCancel,
     }
 }
 
@@ -941,6 +1018,7 @@ impl Runtime {
                         "text-input" => LocalState::TextInput {
                             caret: 0,
                             selection: None,
+                            composition: None,
                         },
                         "checkbox" => LocalState::Checkbox { checked: false },
                         _ => LocalState::None,
@@ -1292,6 +1370,14 @@ impl Runtime {
         let target = FindTarget::Label(label.to_owned());
         let state = self.state.clone();
         context::install(&state, || {
+            let composing = with_state(|state| {
+                state
+                    .find_element(&target)
+                    .is_some_and(|element| state.elements[element].local.is_composing())
+            });
+            if composing {
+                return Err(MountError::Component("text input is composing"));
+            }
             let Some((event_id, mut event)) = with_state(|state| {
                 state.phase = Phase::Event;
                 state.fault = None;
@@ -1310,6 +1396,187 @@ impl Runtime {
             });
             self.finish_command()
         })
+    }
+
+    /// 开始一次本地 composition；preedit 只进入编辑器，不写入模型。
+    pub fn compose_start(&mut self, label: &str) -> Result<(), MountError> {
+        let state = self.state.clone();
+        context::install(&state, || {
+            let element = with_state(|state| state.composition_element(label))?;
+            let (caret, selection) = with_state(|state| {
+                let LocalState::TextInput {
+                    caret,
+                    selection,
+                    composition,
+                } = &mut state.elements[element].local
+                else {
+                    unreachable!("composition_element validated the input");
+                };
+                if composition.is_some() {
+                    return Err(MountError::Component("text input is already composing"));
+                }
+                *composition = Some(Composition {
+                    base_caret: *caret,
+                    base_selection: *selection,
+                    preedit: String::new(),
+                });
+                Ok((*caret, *selection))
+            })?;
+            self.enter_event_phase();
+            self.dispatch_element_event(element, EventKind::CompositionStart, |event| {
+                if let Event::CompositionStart(handler) = event {
+                    handler(CompositionEvent::new(
+                        CompositionPhase::Start,
+                        String::new(),
+                        caret,
+                        selection,
+                    ));
+                }
+            });
+            self.leave_event_phase()
+        })
+    }
+
+    /// 更新编辑器本地的 preedit；caret 跟随 preedit 末尾，模型保持不变。
+    pub fn compose_update(&mut self, label: &str, preedit: &str) -> Result<(), MountError> {
+        let state = self.state.clone();
+        context::install(&state, || {
+            let element = with_state(|state| state.composition_element(label))?;
+            let (caret, selection) = with_state(|state| {
+                let LocalState::TextInput {
+                    caret,
+                    selection,
+                    composition,
+                } = &mut state.elements[element].local
+                else {
+                    unreachable!("composition_element validated the input");
+                };
+                let Some(composition) = composition else {
+                    return Err(MountError::Component("text input is not composing"));
+                };
+                composition.preedit = preedit.to_owned();
+                *caret = composition.base_range().0 + preedit.chars().count();
+                *selection = None;
+                Ok((*caret, *selection))
+            })?;
+            self.enter_event_phase();
+            self.dispatch_element_event(element, EventKind::CompositionUpdate, |event| {
+                if let Event::CompositionUpdate(handler) = event {
+                    handler(CompositionEvent::new(
+                        CompositionPhase::Update,
+                        preedit.to_owned(),
+                        caret,
+                        selection,
+                    ));
+                }
+            });
+            self.leave_event_phase()
+        })
+    }
+
+    /// 候选确认：用 `text` 替换组合区间，清除 preedit 并派发一次 `on:input`。
+    pub fn compose_commit(&mut self, label: &str, text: &str) -> Result<(), MountError> {
+        let state = self.state.clone();
+        context::install(&state, || {
+            let element = with_state(|state| state.composition_element(label))?;
+            if !with_state(|state| state.elements[element].local.is_composing()) {
+                return Err(MountError::Component("text input is not composing"));
+            }
+            self.enter_event_phase();
+            self.commit_composition(element, text)?;
+            self.leave_event_phase()
+        })
+    }
+
+    /// 取消组合：丢弃 preedit，恢复组合开始时的 caret/selection，不派发 `on:input`。
+    pub fn compose_cancel(&mut self, label: &str) -> Result<(), MountError> {
+        let state = self.state.clone();
+        context::install(&state, || {
+            let element = with_state(|state| state.composition_element(label))?;
+            if !with_state(|state| state.elements[element].local.is_composing()) {
+                return Err(MountError::Component("text input is not composing"));
+            }
+            self.enter_event_phase();
+            self.cancel_composition(element)?;
+            self.leave_event_phase()
+        })
+    }
+
+    fn commit_composition(&mut self, element: usize, text: &str) -> Result<(), MountError> {
+        // 组合期间外部 value 可能已更新；候选插入当前文本并按长度夹取组合区间。
+        let current_text =
+            with_state(|state| state.elements[element].text_value().unwrap_or_default());
+        let (new_text, caret) = with_state(|state| {
+            let LocalState::TextInput {
+                caret,
+                selection,
+                composition,
+            } = &mut state.elements[element].local
+            else {
+                return Err(MountError::Component(
+                    "composition target is not a text input",
+                ));
+            };
+            let Some(composition) = composition.take() else {
+                return Err(MountError::Component("text input is not composing"));
+            };
+            let length = current_text.chars().count();
+            let (start, end) = composition.base_range();
+            let start = start.min(length);
+            let end = end.min(length).max(start);
+            let new_text = splice_chars(&current_text, start, end, text);
+            *caret = start + text.chars().count();
+            *selection = None;
+            Ok((new_text, *caret))
+        })?;
+        self.dispatch_element_event(element, EventKind::CompositionEnd, |event| {
+            if let Event::CompositionEnd(handler) = event {
+                handler(CompositionEvent::new(
+                    CompositionPhase::End,
+                    text.to_owned(),
+                    caret,
+                    None,
+                ));
+            }
+        });
+        self.dispatch_element_event(element, EventKind::Input, |event| {
+            if let Event::Input(handler) = event {
+                handler(new_text.clone());
+            }
+        });
+        Ok(())
+    }
+
+    fn cancel_composition(&mut self, element: usize) -> Result<(), MountError> {
+        let (discarded, caret, selection) = with_state(|state| {
+            let LocalState::TextInput {
+                caret,
+                selection,
+                composition,
+            } = &mut state.elements[element].local
+            else {
+                return Err(MountError::Component(
+                    "composition target is not a text input",
+                ));
+            };
+            let Some(composition) = composition.take() else {
+                return Err(MountError::Component("text input is not composing"));
+            };
+            *caret = composition.base_caret;
+            *selection = composition.base_selection;
+            Ok((composition.preedit, *caret, *selection))
+        })?;
+        self.dispatch_element_event(element, EventKind::CompositionCancel, |event| {
+            if let Event::CompositionCancel(handler) = event {
+                handler(CompositionEvent::new(
+                    CompositionPhase::Cancel,
+                    discarded.clone(),
+                    caret,
+                    selection,
+                ));
+            }
+        });
+        Ok(())
     }
 
     pub fn change(&mut self, label: &str, value: bool) -> Result<(), MountError> {
@@ -1359,10 +1626,30 @@ impl Runtime {
         })
     }
 
+    /// 组合中的候选 Enter 与取消 Escape 在用户 key handler 之前被消费；
+    /// 候选文本由 IME 随后通过 compositionend/`compose_commit` 确认。
+    /// 其他键仍按普通路由派发。未消费的 Enter 才是表单提交命令。
     pub fn keydown(&mut self, label: &str, key: Key) -> Result<(), MountError> {
         let target = FindTarget::Label(label.to_owned());
         let state = self.state.clone();
         context::install(&state, || {
+            let Some(element) = with_state(|state| state.find_element(&target)) else {
+                return Err(MountError::Component("keydown target not found"));
+            };
+            if with_state(|state| state.elements[element].local.is_composing()) {
+                match key {
+                    Key::Enter => {
+                        // 确认候选属于 IME；这里只保证按键不会进入表单提交或用户 handler。
+                        return Ok(());
+                    }
+                    Key::Escape => {
+                        self.enter_event_phase();
+                        self.cancel_composition(element)?;
+                        return self.leave_event_phase();
+                    }
+                    Key::Other => {}
+                }
+            }
             let Some((event_id, mut event)) = with_state(|state| {
                 state.phase = Phase::Event;
                 state.fault = None;
@@ -1491,6 +1778,19 @@ impl Runtime {
         }
     }
 
+    fn enter_event_phase(&self) {
+        with_state(|state| {
+            state.phase = Phase::Event;
+            state.fault = None;
+            state.write_error = None;
+        });
+    }
+
+    fn leave_event_phase(&mut self) -> Result<(), MountError> {
+        with_state(|state| state.phase = Phase::Idle);
+        self.finish_command()
+    }
+
     fn finish_command(&mut self) -> Result<(), MountError> {
         let fault = with_state(|state| state.fault);
         if let Some(fault) = fault {
@@ -1564,6 +1864,19 @@ impl Runtime {
         self.state
             .borrow()
             .text_input(&FindTarget::Label(label.to_owned()))
+    }
+
+    /// 当前编辑器本地的 preedit；未在组合中时为 `None`。
+    pub fn preedit(&self, label: &str) -> Option<String> {
+        let state = self.state.borrow();
+        let element = state.find_element(&FindTarget::Label(label.to_owned()))?;
+        match &state.elements[element].local {
+            LocalState::TextInput {
+                composition: Some(composition),
+                ..
+            } => Some(composition.preedit.clone()),
+            _ => None,
+        }
     }
 
     pub fn set_caret(&mut self, label: &str, offset: usize) -> bool {
@@ -1657,6 +1970,13 @@ fn focus_replacement(
                 .find(|id| live.contains(id))
                 .copied()
         })
+}
+
+fn splice_chars(text: &str, start: usize, end: usize, insert: &str) -> String {
+    let mut result: String = text.chars().take(start).collect();
+    result.push_str(insert);
+    result.extend(text.chars().skip(end));
+    result
 }
 
 fn collect_elements(state: &State, nodes: &[MountedNode], order: &mut Vec<usize>) {

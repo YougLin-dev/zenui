@@ -1,4 +1,4 @@
-//! 阶段一目标 API 的最小 headless Todo；不声明原生窗口、IME 或 Windows 完成。
+//! 阶段一目标 API 的最小 headless Todo；不声明原生窗口、原生 IME 适配或 Windows 完成。
 #![allow(
     unused_braces,
     reason = "{} is the intentionally supported event-expression syntax"
