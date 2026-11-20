@@ -3,24 +3,30 @@ use std::fmt;
 use std::num::NonZeroIsize;
 
 use windows::Win32::Foundation::{
-    ERROR_CLASS_ALREADY_EXISTS, GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM,
+    ERROR_CLASS_ALREADY_EXISTS, GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForSystem, GetDpiForWindow,
     SetProcessDpiAwarenessContext,
 };
+use windows::Win32::UI::Input::Ime::{
+    CANDIDATEFORM, CFS_CANDIDATEPOS, CFS_POINT, COMPOSITIONFORM, CPS_CANCEL, GCS_COMPSTR,
+    GCS_RESULTSTR, IME_COMPOSITION_STRING, ImmGetCompositionStringW, ImmGetContext, ImmNotifyIME,
+    ImmReleaseContext, ImmSetCandidateWindow, ImmSetCompositionWindow, NI_COMPOSITIONSTR,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, VIRTUAL_KEY, VK_A, VK_BACK, VK_CONTROL, VK_DELETE, VK_END, VK_HOME, VK_LEFT,
-    VK_RETURN, VK_RIGHT, VK_SHIFT, VK_TAB,
+    GetKeyState, VIRTUAL_KEY, VK_A, VK_BACK, VK_CONTROL, VK_DELETE, VK_END, VK_ESCAPE, VK_HOME,
+    VK_LEFT, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_TAB,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRect, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW,
     DestroyWindow, DispatchMessageW, GetClientRect, GetMessageW, IDC_ARROW, LoadCursorW, MSG,
     PM_REMOVE, PeekMessageW, PostMessageW, PostQuitMessage, RegisterClassExW, SW_HIDE, SW_SHOW,
     SWP_NOACTIVATE, SWP_NOZORDER, SetWindowPos, ShowWindow, TranslateMessage, WINDOW_EX_STYLE,
-    WM_CHAR, WM_CLOSE, WM_DESTROY, WM_DPICHANGED, WM_KEYDOWN, WM_LBUTTONDOWN, WM_PAINT, WM_SIZE,
-    WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
+    WM_CHAR, WM_CLOSE, WM_DESTROY, WM_DPICHANGED, WM_IME_CHAR, WM_IME_COMPOSITION,
+    WM_IME_ENDCOMPOSITION, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN,
+    WM_PAINT, WM_SIZE, WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
 };
 use windows::core::{HSTRING, w};
 use zenui::prelude::*;
@@ -250,6 +256,11 @@ impl Host {
 
     /// 分派一条消息；返回是否收到 `WM_CLOSE`。
     fn process_message(&mut self, message: &MSG) -> Result<bool, HostError> {
+        // 提交已经由 WM_IME_COMPOSITION 的 GCS_RESULTSTR 处理；WM_IME_CHAR
+        // 若再交给默认窗口过程会产生重复字符。
+        if message.message == WM_IME_CHAR {
+            return Ok(false);
+        }
         // 安全：消息来自本线程消息队列，目标窗口仍有效。
         unsafe {
             let _ = TranslateMessage(message);
@@ -262,6 +273,12 @@ impl Host {
             self.char_typed(message.wParam)?;
         } else if message.message == WM_KEYDOWN {
             self.key_down(message.wParam)?;
+        } else if message.message == WM_IME_STARTCOMPOSITION {
+            self.ime_start()?;
+        } else if message.message == WM_IME_COMPOSITION {
+            self.ime_composition(message.lParam)?;
+        } else if matches!(message.message, WM_IME_ENDCOMPOSITION | WM_KILLFOCUS) {
+            self.ime_cancel()?;
         } else if message.message == WM_CLOSE {
             // 窗口的 HWND 仍然有效；Window::drop 在 surface 释放后才销毁它。
             self.runtime
@@ -288,7 +305,7 @@ impl Host {
         if width == 0 || height == 0 {
             return Ok(());
         }
-        let scene = self.current_scene(width, height)?;
+        let (scene, snapshot) = self.current_scene(width, height)?;
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame)
             | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
@@ -313,6 +330,7 @@ impl Host {
         self.queue.submit([encoder.finish()]);
         self.queue.present(frame);
         self.scene = Some(scene);
+        self.position_ime(&snapshot);
         Ok(())
     }
 
@@ -320,6 +338,8 @@ impl Host {
     ///
     /// `lparam` 是客户区物理像素坐标；场景几何是逻辑像素，按最近一次呈现的 scale 换算。
     fn pointer_pressed(&mut self, lparam: LPARAM) -> Result<(), HostError> {
+        // 指针操作会移动焦点或 caret；先结束任何组合，避免 preedit 跟随到别处。
+        self.cancel_compositions()?;
         let scale = self
             .scene
             .as_ref()
@@ -371,7 +391,7 @@ impl Host {
                 "cannot read a frame from an empty client area",
             )));
         }
-        let scene = self.current_scene(width, height)?;
+        let (scene, _) = self.current_scene(width, height)?;
         let format = self.surface_config.format;
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("zenui host readback"),
@@ -504,6 +524,7 @@ impl Host {
         control: bool,
     ) -> Result<(), HostError> {
         if key == VK_TAB {
+            self.cancel_compositions()?;
             if shift {
                 self.runtime.focus_previous()
             } else {
@@ -517,6 +538,15 @@ impl Host {
         let Some(focused) = focused_input(&snapshot) else {
             return Ok(());
         };
+        if key == VK_ESCAPE {
+            // 运行时在组合中优先取消并恢复文本；否则派发给用户 keydown。
+            let composing = is_composing(&snapshot, focused);
+            pointer_dispatch(self.runtime.keydown_node(focused, Key::Escape))?;
+            if composing {
+                self.notify_ime_cancel();
+            }
+            return self.render();
+        }
         if control && key == VK_A {
             pointer_dispatch(self.runtime.select_all_node(focused))?;
             return self.render();
@@ -553,6 +583,204 @@ impl Host {
         self.render()
     }
 
+    /// `WM_IME_STARTCOMPOSITION`：在当前聚焦输入上开始组合。
+    fn ime_start(&mut self) -> Result<(), HostError> {
+        let snapshot = self.runtime.presentation().map_err(HostError::Runtime)?;
+        let Some(node) = focused_input(&snapshot) else {
+            return Ok(());
+        };
+        if !is_composing(&snapshot, node) {
+            pointer_dispatch(self.runtime.compose_start_node(node))?;
+        }
+        self.render()
+    }
+
+    /// `WM_IME_COMPOSITION`：结果串提交，组合串更新 preedit。
+    fn ime_composition(&mut self, flags: LPARAM) -> Result<(), HostError> {
+        let request = ime_request(flags.0 as u32);
+        let snapshot = self.runtime.presentation().map_err(HostError::Runtime)?;
+        let Some(node) = focused_input(&snapshot) else {
+            return Ok(());
+        };
+        let commit = if request.commit {
+            self.composition_string(GCS_RESULTSTR)?
+        } else {
+            None
+        };
+        let update = if request.update {
+            self.composition_string(GCS_COMPSTR)?
+        } else {
+            None
+        };
+        self.apply_ime_composition(node, request, commit, update)?;
+        self.render()
+    }
+
+    /// 把已取出的 IME 字符串应用到运行时；与 Win32 消息解耦以便测试。
+    fn apply_ime_composition(
+        &mut self,
+        node: NodeId,
+        request: ImeRequest,
+        commit: Option<String>,
+        update: Option<String>,
+    ) -> Result<(), HostError> {
+        let mut composing = self
+            .runtime
+            .presentation()
+            .map_err(HostError::Runtime)?
+            .node(node)
+            .and_then(SnapshotElement::edit)
+            .is_some_and(|edit| edit.composition().is_some());
+
+        if request.commit {
+            match commit {
+                Some(text) => {
+                    if !composing {
+                        pointer_dispatch(self.runtime.compose_start_node(node))?;
+                    }
+                    pointer_dispatch(self.runtime.compose_commit_node(node, &text))?;
+                }
+                None if composing => {
+                    pointer_dispatch(self.runtime.compose_cancel_node(node))?;
+                }
+                None => {}
+            }
+            composing = false;
+        }
+        if request.update {
+            let text = update.unwrap_or_default();
+            if !composing {
+                pointer_dispatch(self.runtime.compose_start_node(node))?;
+            }
+            pointer_dispatch(self.runtime.compose_update_node(node, &text))?;
+        }
+        Ok(())
+    }
+
+    /// 取消未提交的组合；焦点丢失与 `WM_IME_ENDCOMPOSITION` 共用。
+    fn ime_cancel(&mut self) -> Result<(), HostError> {
+        if self.cancel_compositions()? {
+            self.render()?;
+        }
+        Ok(())
+    }
+
+    /// 取消所有仍在组合的输入并通知 OS IME；返回是否取消了组合。
+    ///
+    /// 扫描全部输入而不是只看焦点，焦点已在宿主内移走或输入被禁用时也能清理。
+    fn cancel_compositions(&mut self) -> Result<bool, HostError> {
+        let snapshot = self.runtime.presentation().map_err(HostError::Runtime)?;
+        let composing: Vec<NodeId> = snapshot
+            .elements()
+            .filter(|element| element.tag() == "text-input")
+            .filter(|element| {
+                element
+                    .edit()
+                    .is_some_and(|edit| edit.composition().is_some())
+            })
+            .map(SnapshotElement::id)
+            .collect();
+        let mut cancelled = false;
+        for node in composing {
+            match self.runtime.compose_cancel_node(node) {
+                Ok(()) => cancelled = true,
+                Err(error) => pointer_dispatch(Err(error))?,
+            }
+        }
+        if cancelled {
+            self.notify_ime_cancel();
+        }
+        Ok(cancelled)
+    }
+
+    fn notify_ime_cancel(&self) {
+        // 安全：HIMC 由 ImmGetContext 获取并与 HWND 配对释放。
+        unsafe {
+            let himc = ImmGetContext(self.window.hwnd);
+            if !himc.0.is_null() {
+                let _ = ImmNotifyIME(himc, NI_COMPOSITIONSTR, CPS_CANCEL, 0);
+                let _ = ImmReleaseContext(self.window.hwnd, himc);
+            }
+        }
+    }
+
+    fn composition_string(
+        &self,
+        kind: IME_COMPOSITION_STRING,
+    ) -> Result<Option<String>, HostError> {
+        // 安全：himc 由 ImmGetContext 返回，读取的缓冲在调用期间有效。
+        let himc = unsafe { ImmGetContext(self.window.hwnd) };
+        if himc.0.is_null() {
+            return Ok(None);
+        }
+        let result: Result<Option<String>, HostError> = (|| {
+            let bytes = unsafe { ImmGetCompositionStringW(himc, kind, None, 0) };
+            if bytes <= 0 {
+                return Ok(None);
+            }
+            let mut buffer = vec![0_u16; bytes as usize / 2];
+            let written = unsafe {
+                ImmGetCompositionStringW(himc, kind, Some(buffer.as_mut_ptr().cast()), bytes as u32)
+            };
+            if written <= 0 {
+                return Ok(None);
+            }
+            buffer.truncate(written as usize / 2);
+            String::from_utf16(&buffer).map(Some).map_err(|_| {
+                HostError::Window(String::from("IME composition was not valid UTF-16"))
+            })
+        })();
+        // 安全：himc 与获取它的 HWND 配对释放。
+        unsafe {
+            let _ = ImmReleaseContext(self.window.hwnd, himc);
+        }
+        result
+    }
+
+    /// 用 caret 的物理客户区坐标定位 OS 组合与候选窗口。
+    ///
+    /// `COMPOSITIONFORM` / `CANDIDATEFORM` 的坐标相对窗口左上角，不是屏幕坐标。
+    fn position_ime(&self, snapshot: &PresentationSnapshot) {
+        let Some(node) = focused_input(snapshot) else {
+            return;
+        };
+        if !is_composing(snapshot, node) {
+            return;
+        }
+        let Some(scene) = &self.scene else {
+            return;
+        };
+        let Some(caret) = scene.caret(node) else {
+            return;
+        };
+        let scale = scene.viewport().scale();
+        let point = POINT {
+            x: (caret.x * scale).round() as i32,
+            y: (caret.y * scale).round() as i32,
+        };
+        // 安全：HIMC 由 ImmGetContext 获取，两个结构都是本地值。
+        unsafe {
+            let himc = ImmGetContext(self.window.hwnd);
+            if himc.0.is_null() {
+                return;
+            }
+            let composition = COMPOSITIONFORM {
+                dwStyle: CFS_POINT,
+                ptCurrentPos: point,
+                rcArea: RECT::default(),
+            };
+            let candidate = CANDIDATEFORM {
+                dwIndex: 0,
+                dwStyle: CFS_CANDIDATEPOS,
+                ptCurrentPos: point,
+                rcArea: RECT::default(),
+            };
+            let _ = ImmSetCompositionWindow(himc, &composition);
+            let _ = ImmSetCandidateWindow(himc, &candidate);
+            let _ = ImmReleaseContext(self.window.hwnd, himc);
+        }
+    }
+
     fn ensure_surface(&mut self) -> Result<(), HostError> {
         let (width, height) = client_size(self.window.hwnd)?;
         if width == 0 || height == 0 {
@@ -574,14 +802,19 @@ impl Host {
         Ok(())
     }
 
-    fn current_scene(&self, width: u32, height: u32) -> Result<Scene, HostError> {
+    fn current_scene(
+        &self,
+        width: u32,
+        height: u32,
+    ) -> Result<(Scene, PresentationSnapshot), HostError> {
         // 安全：HWND 在 Host 生命周期内有效。
         let dpi = unsafe { GetDpiForWindow(self.window.hwnd) };
         let scale = if dpi == 0 { 1.0 } else { dpi as f32 / 96.0 };
         let viewport = Viewport::new(width as f32 / scale, height as f32 / scale, scale)
             .map_err(HostError::Scene)?;
         let snapshot = self.runtime.presentation().map_err(HostError::Runtime)?;
-        Scene::build(&snapshot, viewport).map_err(HostError::Scene)
+        let scene = Scene::build(&snapshot, viewport).map_err(HostError::Scene)?;
+        Ok((scene, snapshot))
     }
 }
 
@@ -797,6 +1030,20 @@ fn pointer_point(lparam: LPARAM, scale: f32) -> Point {
 enum CaretCommand {
     Caret(usize),
     Selection(usize, usize),
+}
+
+/// 一条 `WM_IME_COMPOSITION` 同时可能带结果串与新组合串。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ImeRequest {
+    commit: bool,
+    update: bool,
+}
+
+fn ime_request(flags: u32) -> ImeRequest {
+    ImeRequest {
+        commit: flags & GCS_RESULTSTR.0 != 0,
+        update: flags & GCS_COMPSTR.0 != 0,
+    }
 }
 
 fn focused_input(snapshot: &PresentationSnapshot) -> Option<NodeId> {
@@ -1241,6 +1488,244 @@ mod tests {
                 .expect("value")
                 .ends_with('🙂'),
             "the surrogate pair becomes one character"
+        );
+    }
+
+    fn composing_host() -> (Host, NodeId) {
+        let mut host = open_host();
+        host.runtime.focus("Edit Write tests").expect("focus");
+        let node = editor_node(&host);
+        host.ime_start().expect("start composition");
+        (host, node)
+    }
+
+    fn request(commit: bool, update: bool) -> ImeRequest {
+        ImeRequest { commit, update }
+    }
+
+    #[test]
+    fn ime_flags_recognize_the_composition_string() {
+        assert_eq!(ime_request(0), request(false, false));
+        assert_eq!(ime_request(GCS_COMPSTR.0), request(false, true));
+    }
+
+    #[test]
+    fn ime_flags_recognize_the_result_string() {
+        assert_eq!(ime_request(GCS_RESULTSTR.0), request(true, false));
+        assert_eq!(
+            ime_request(GCS_COMPSTR.0 | GCS_RESULTSTR.0),
+            request(true, true)
+        );
+    }
+
+    #[test]
+    fn ime_update_shows_preedit_without_writing_the_model() {
+        let (mut host, node) = composing_host();
+        host.apply_ime_composition(node, request(false, true), None, Some("ni".into()))
+            .expect("apply update");
+        let snapshot = host.runtime.presentation().expect("snapshot");
+        let element = snapshot.node(node).expect("editor");
+        assert_eq!(element.text_value(), Some("Write tests"));
+        let edit = element.edit().expect("edit");
+        assert_eq!(edit.preedit(), Some("ni"));
+        assert!(edit.composition().is_some());
+    }
+
+    #[test]
+    fn ime_commit_inserts_the_result() {
+        let (mut host, node) = composing_host();
+        host.apply_ime_composition(node, request(true, false), Some("你".into()), None)
+            .expect("apply commit");
+        let snapshot = host.runtime.presentation().expect("snapshot");
+        let element = snapshot.node(node).expect("editor");
+        assert_eq!(element.text_value(), Some("Write tests你"));
+        assert!(element.edit().expect("edit").composition().is_none());
+    }
+
+    #[test]
+    fn ime_commit_then_update_starts_the_next_composition() {
+        let (mut host, node) = composing_host();
+        host.apply_ime_composition(
+            node,
+            request(true, true),
+            Some("你".into()),
+            Some("ni".into()),
+        )
+        .expect("apply commit and update");
+        let snapshot = host.runtime.presentation().expect("snapshot");
+        let element = snapshot.node(node).expect("editor");
+        assert!(element.text_value().expect("value").ends_with('你'));
+        let edit = element.edit().expect("edit");
+        assert_eq!(edit.preedit(), Some("ni"));
+        assert!(edit.composition().is_some());
+    }
+
+    #[test]
+    fn an_empty_result_cancels_the_composition() {
+        let (mut host, node) = composing_host();
+        host.apply_ime_composition(node, request(true, false), None, None)
+            .expect("empty result");
+        let snapshot = host.runtime.presentation().expect("snapshot");
+        let element = snapshot.node(node).expect("editor");
+        assert_eq!(element.text_value(), Some("Write tests"));
+        assert!(element.edit().expect("edit").composition().is_none());
+    }
+
+    #[test]
+    fn escape_cancels_composition_without_writing_the_model() {
+        let (mut host, node) = composing_host();
+        host.runtime
+            .compose_update_node(node, "ni")
+            .expect("preedit");
+
+        host.key_down_with(VK_ESCAPE, false, false).expect("escape");
+        let snapshot = host.runtime.presentation().expect("snapshot");
+        let element = snapshot.node(node).expect("editor");
+        assert_eq!(element.text_value(), Some("Write tests"));
+        assert!(
+            element.edit().expect("edit").composition().is_none(),
+            "Escape ends the composition"
+        );
+    }
+
+    #[test]
+    fn wm_killfocus_cancels_composition() {
+        let (mut host, node) = composing_host();
+        host.runtime
+            .compose_update_node(node, "ni")
+            .expect("preedit");
+        let message = MSG {
+            message: WM_KILLFOCUS,
+            ..MSG::default()
+        };
+        assert!(
+            !host.process_message(&message).expect("handle message"),
+            "focus loss does not close the window"
+        );
+        let snapshot = host.runtime.presentation().expect("snapshot");
+        let element = snapshot.node(node).expect("editor");
+        assert_eq!(element.text_value(), Some("Write tests"));
+        assert!(element.edit().expect("edit").composition().is_none());
+    }
+
+    #[test]
+    fn ime_without_focus_is_a_no_op() {
+        let mut host = open_host();
+        host.ime_start().expect("no focus");
+        host.ime_composition(LPARAM(GCS_COMPSTR.0 as isize))
+            .expect("no focus");
+        host.ime_cancel().expect("no focus");
+    }
+
+    #[test]
+    fn ime_message_routing_starts_and_ends_composition() {
+        let mut host = open_host();
+        host.runtime.focus("Edit Write tests").expect("focus");
+        let node = editor_node(&host);
+
+        let start = MSG {
+            message: WM_IME_STARTCOMPOSITION,
+            ..MSG::default()
+        };
+        host.process_message(&start).expect("start message");
+        let snapshot = host.runtime.presentation().expect("snapshot");
+        assert!(
+            snapshot
+                .node(node)
+                .expect("editor")
+                .edit()
+                .expect("edit")
+                .composition()
+                .is_some(),
+            "WM_IME_STARTCOMPOSITION starts the composition"
+        );
+
+        let end = MSG {
+            message: WM_IME_ENDCOMPOSITION,
+            ..MSG::default()
+        };
+        host.process_message(&end).expect("end message");
+        let snapshot = host.runtime.presentation().expect("snapshot");
+        assert!(
+            snapshot
+                .node(node)
+                .expect("editor")
+                .edit()
+                .expect("edit")
+                .composition()
+                .is_none(),
+            "WM_IME_ENDCOMPOSITION cancels the composition"
+        );
+    }
+
+    #[test]
+    fn ime_composition_without_an_os_string_keeps_an_empty_composition() {
+        let mut host = open_host();
+        host.runtime.focus("Edit Write tests").expect("focus");
+        let node = editor_node(&host);
+        let message = MSG {
+            message: WM_IME_COMPOSITION,
+            lParam: LPARAM(GCS_COMPSTR.0 as isize),
+            ..MSG::default()
+        };
+        host.process_message(&message).expect("composition message");
+        let snapshot = host.runtime.presentation().expect("snapshot");
+        let element = snapshot.node(node).expect("editor");
+        assert_eq!(element.text_value(), Some("Write tests"));
+        assert!(
+            element.edit().expect("edit").composition().is_some(),
+            "the update path starts a composition even with an empty string"
+        );
+    }
+
+    #[test]
+    fn ime_char_is_ignored_to_avoid_double_commits() {
+        let mut host = open_host();
+        host.runtime.focus("Edit Write tests").expect("focus");
+        let node = editor_node(&host);
+        let message = MSG {
+            message: WM_IME_CHAR,
+            wParam: WPARAM('X' as usize),
+            ..MSG::default()
+        };
+        host.process_message(&message).expect("IME char");
+        let snapshot = host.runtime.presentation().expect("snapshot");
+        assert_eq!(
+            snapshot.node(node).expect("editor").text_value(),
+            Some("Write tests"),
+            "WM_IME_CHAR does not insert a second copy"
+        );
+    }
+
+    #[test]
+    fn tab_cancels_the_composition_before_moving_focus() {
+        let (mut host, node) = composing_host();
+        host.runtime
+            .compose_update_node(node, "ni")
+            .expect("preedit");
+        host.key_down_with(VK_TAB, false, false).expect("tab");
+        let snapshot = host.runtime.presentation().expect("snapshot");
+        let element = snapshot.node(node).expect("editor");
+        assert_eq!(element.text_value(), Some("Write tests"));
+        assert!(element.edit().expect("edit").composition().is_none());
+    }
+
+    #[test]
+    fn pointer_input_cancels_the_composition() {
+        let (mut host, node) = composing_host();
+        host.runtime
+            .compose_update_node(node, "ni")
+            .expect("preedit");
+        host.pointer_pressed(LPARAM(0)).expect("click blank space");
+        let snapshot = host.runtime.presentation().expect("snapshot");
+        assert!(
+            snapshot
+                .node(node)
+                .expect("editor")
+                .edit()
+                .expect("edit")
+                .composition()
+                .is_none()
         );
     }
 
