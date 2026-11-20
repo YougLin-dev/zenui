@@ -8,6 +8,7 @@
 extern crate self as zenui;
 
 mod context;
+pub mod dispatch;
 pub mod presentation;
 pub mod runtime;
 pub mod signal;
@@ -17,6 +18,7 @@ pub mod view;
 pub mod window;
 
 pub use context::Phase;
+pub use dispatch::{DispatchError, NodeOperation};
 pub use presentation::{
     NodeId, NodeStatus, PresentationSnapshot, SnapshotAttr, SnapshotElement, SnapshotNode,
     SnapshotValue, TextEditState,
@@ -35,11 +37,12 @@ pub use zenui_macro::{component, view};
 pub mod prelude {
     pub use crate::{
         BlurEvent, Children, ChildrenFactory, CompositionEvent, CompositionPhase, DeliveryReport,
-        Field, FieldError, FocusCause, FocusEvent, FocusInfo, Key, KeyEvent, Memo, MountError,
-        MountPlan, MountResult, NodeId, NodeStatus, Once, PresentationSnapshot, Runtime, Signal,
-        SnapshotAttr, SnapshotElement, SnapshotNode, SnapshotValue, Store, SubmitEvent, Task,
-        TaskError, TaskScope, TaskStatus, TaskToken, TextEditState, TodoId, Transaction, WindowCtx,
-        WindowError, WriteError, WriteOp, component, memo, once, signal, view,
+        DispatchError, Field, FieldError, FocusCause, FocusEvent, FocusInfo, Key, KeyEvent, Memo,
+        MountError, MountPlan, MountResult, NodeId, NodeOperation, NodeStatus, Once,
+        PresentationSnapshot, Runtime, Signal, SnapshotAttr, SnapshotElement, SnapshotNode,
+        SnapshotValue, Store, SubmitEvent, Task, TaskError, TaskScope, TaskStatus, TaskToken,
+        TextEditState, TodoId, Transaction, WindowCtx, WindowError, WriteError, WriteOp, component,
+        memo, once, signal, view,
     };
     pub use zenui_core::Filter;
 }
