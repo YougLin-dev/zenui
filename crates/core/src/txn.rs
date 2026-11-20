@@ -171,6 +171,9 @@ enum Outcome {
     Discarded,
 }
 
+/// 保留的最近发布数量；旧快照按提交序号淘汰，不保留无界历史。
+pub const PUBLICATION_HISTORY: usize = 16;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Publication {
     pub keys: Vec<RowKey>,
@@ -264,9 +267,14 @@ struct ViewDraft {
     next_view: u32,
     next_owner: u32,
     next_layout: u32,
+    /// `mounts` 保留提交顺序；其余三项必须与它同步维护。
     mounts: Vec<PlannedMount>,
+    mount_positions: BTreeMap<ViewId, usize>,
+    mount_keys: BTreeSet<RowKey>,
+    mount_ids: BTreeSet<ViewId>,
     owners: Vec<(OwnerId, OwnerId)>,
     unmounts: Vec<ViewId>,
+    unmounted: BTreeSet<ViewId>,
     order: Option<Vec<ViewId>>,
     focus: Option<Option<ViewId>>,
     caret: Option<(ViewId, usize)>,
@@ -390,6 +398,7 @@ impl Txn {
         &self.focus_settlements
     }
 
+    /// 最近 [`PUBLICATION_HISTORY`] 次提交的发布快照；更早的记录已被淘汰。
     pub fn publications(&self) -> &[Publication] {
         &self.publishes
     }
@@ -840,36 +849,25 @@ impl<'a> Tx<'a> {
             .views
             .row_views()
             .into_iter()
-            .filter(|(view, _)| !self.txn.view.unmounts.contains(view))
+            .filter(|(view, _)| !self.txn.view.unmounted.contains(view))
             .collect();
         for mount in &self.txn.view.mounts {
-            if !self.txn.view.unmounts.contains(&mount.id)
-                && !rows.iter().any(|(view, _)| *view == mount.id)
-            {
+            if !self.txn.view.unmounted.contains(&mount.id) {
                 rows.push((mount.id, mount.row));
             }
         }
         if let Some(order) = &self.txn.view.order {
-            let mut ordered = Vec::with_capacity(rows.len());
-            for view in order {
-                if let Some(entry) = rows.iter().find(|(candidate, _)| candidate == view) {
-                    ordered.push(*entry);
-                }
-            }
-            for entry in &rows {
-                if !ordered.iter().any(|(view, _)| view == &entry.0) {
-                    ordered.push(*entry);
-                }
-            }
-            return ordered;
+            return ordered_rows(&rows, order);
         }
         rows
     }
 
     pub fn view_of_row(&self, row: RowKey) -> Option<ViewId> {
-        self.row_views()
-            .into_iter()
-            .find_map(|(view, key)| (key == row).then_some(view))
+        if let Some(mount) = self.txn.view.mounts.iter().find(|mount| mount.row == row) {
+            return Some(mount.id);
+        }
+        let view = self.views.view_of_row(row)?;
+        (!self.txn.view.unmounted.contains(&view)).then_some(view)
     }
 
     pub fn is_live(&self, view: ViewId) -> bool {
@@ -905,7 +903,7 @@ impl<'a> Tx<'a> {
 
     fn require_view(&self, view: ViewId) -> Result<(), Fatal> {
         // 暂存 mount 尚不在已提交树中；丢弃事务后，未发布身份可从原 checkpoint 重用。
-        if self.txn.view.mounts.iter().any(|mount| mount.id == view) {
+        if self.txn.view.mount_ids.contains(&view) {
             return Ok(());
         }
         self.views.require(view).map_err(Fatal::InvalidViewHandle)
@@ -935,8 +933,8 @@ impl<'a> Tx<'a> {
         let already_mounted = self
             .views
             .claiming_view(row)
-            .is_some_and(|view| !self.txn.view.unmounts.contains(&view));
-        if already_mounted || self.txn.view.mounts.iter().any(|mount| mount.row == row) {
+            .is_some_and(|view| !self.txn.view.unmounted.contains(&view));
+        if already_mounted || self.txn.view.mount_keys.contains(&row) {
             return Err(Fatal::DuplicateViewKey { key: row });
         }
         let view_id = self.views.mint(self.txn.view.next_view);
@@ -953,7 +951,10 @@ impl<'a> Tx<'a> {
 
         let draft = &mut self.txn.view;
         draft.next_owner += 1;
+        draft.mount_keys.insert(row);
+        draft.mount_ids.insert(view_id);
         draft.owners.push((owner_id, parent));
+        draft.mount_positions.insert(view_id, draft.mounts.len());
         draft.mounts.push(PlannedMount {
             id: view_id,
             row,
@@ -967,21 +968,21 @@ impl<'a> Tx<'a> {
     pub fn unmount(&mut self, view: ViewId) -> Result<(), Fatal> {
         self.require(WriteKind::ViewPatch)?;
         self.require_view(view)?;
-        if let Some(position) = self
-            .txn
-            .view
-            .mounts
-            .iter()
-            .position(|mount| mount.id == view)
-        {
+        if let Some(position) = self.txn.view.mount_positions.remove(&view) {
             let mount = self.txn.view.mounts.swap_remove(position);
+            if let Some(moved) = self.txn.view.mounts.get(position) {
+                self.txn.view.mount_positions.insert(moved.id, position);
+            }
             let owner = mount.owner;
+            self.txn.view.mount_keys.remove(&mount.row);
+            self.txn.view.mount_ids.remove(&mount.id);
             self.txn
                 .view
                 .owners
                 .retain(|(candidate, _)| *candidate != owner);
             self.txn.view.unmounts.push(view);
-        } else if !self.txn.view.unmounts.contains(&view) {
+            self.txn.view.unmounted.insert(view);
+        } else if self.txn.view.unmounted.insert(view) {
             let recovery = (self.views.focused() == Some(view)
                 && self.txn.focus_intents.is_empty())
             .then(|| FocusRecovery::new(&self.committed_order(), view))
@@ -1017,9 +1018,9 @@ impl<'a> Tx<'a> {
             .or_else(|| {
                 self.txn
                     .view
-                    .mounts
-                    .iter()
-                    .find(|mount| mount.id == view)
+                    .mount_positions
+                    .get(&view)
+                    .and_then(|position| self.txn.view.mounts.get(*position))
                     .map(|mount| mount.title_len as usize)
             })
             .unwrap_or(0);
@@ -1053,7 +1054,9 @@ impl<'a> Tx<'a> {
             });
         }
 
-        if let Err(fatal) = self.preflight() {
+        // 一次提交只物化一次有效行集；preflight、模型应用和发布共享它。
+        let final_rows = self.effective_rows();
+        if let Err(fatal) = self.preflight(&final_rows) {
             self.discard();
             return Err(fatal);
         }
@@ -1062,16 +1065,18 @@ impl<'a> Tx<'a> {
 
         self.txn.outcome = Outcome::Committed;
         self.txn.phase = Phase::Commit;
-        self.apply_model();
+        self.apply_model(&final_rows);
         self.apply_views();
         let revision = self.txn.staged_rev;
         let scratch = std::mem::take(&mut self.txn.graph);
         self.graph.commit_scratch(scratch, revision);
 
-        let values = self.effective_rows();
+        if self.txn.publishes.len() >= PUBLICATION_HISTORY {
+            self.txn.publishes.remove(0);
+        }
         self.txn.publishes.push(Publication {
             keys,
-            values,
+            values: final_rows,
             commit_seq: self.txn.commits,
         });
         self.txn.commits += 1;
@@ -1081,7 +1086,7 @@ impl<'a> Tx<'a> {
         Ok(())
     }
 
-    fn preflight(&mut self) -> Result<(), Fatal> {
+    fn preflight(&mut self, effective: &[(RowKey, bool)]) -> Result<(), Fatal> {
         self.txn.phase = Phase::Preflight;
 
         for key in &self.txn.model.removals {
@@ -1093,12 +1098,9 @@ impl<'a> Tx<'a> {
             }
         }
 
+        let live_rows: BTreeSet<RowKey> = effective.iter().map(|(key, _)| *key).collect();
+
         if let Some(order) = &self.txn.model.order {
-            let live: BTreeSet<RowKey> = self
-                .effective_rows()
-                .into_iter()
-                .map(|(key, _)| key)
-                .collect();
             let inserted: BTreeSet<RowKey> = self
                 .txn
                 .model
@@ -1108,21 +1110,16 @@ impl<'a> Tx<'a> {
                 .copied()
                 .collect();
             let listed: BTreeSet<RowKey> = order.iter().copied().collect();
-            let missing: BTreeSet<RowKey> = live.difference(&listed).copied().collect();
+            let missing: BTreeSet<RowKey> = live_rows.difference(&listed).copied().collect();
 
             if listed.len() != order.len()
-                || !listed.is_subset(&live)
+                || !listed.is_subset(&live_rows)
                 || !missing.is_subset(&inserted)
             {
                 return Err(Fatal::OrderNotAPermutation);
             }
         }
 
-        let live_rows: BTreeSet<RowKey> = self
-            .effective_rows()
-            .into_iter()
-            .map(|(key, _)| key)
-            .collect();
         let mut seen_keys: BTreeSet<RowKey> = BTreeSet::new();
         for mount in &self.txn.view.mounts {
             if !live_rows.contains(&mount.row) {
@@ -1133,7 +1130,7 @@ impl<'a> Tx<'a> {
             }
 
             if let Some(existing) = self.views.claiming_view(mount.row)
-                && !self.txn.view.unmounts.contains(&existing)
+                && !self.txn.view.unmounted.contains(&existing)
             {
                 return Err(Fatal::DuplicateViewKey { key: mount.row });
             }
@@ -1171,10 +1168,9 @@ impl<'a> Tx<'a> {
         Ok(())
     }
 
-    fn apply_model(&mut self) {
+    fn apply_model(&mut self, final_rows: &[(RowKey, bool)]) {
         let base_writes = self.store.counters().io_writes;
         let base_epoch = self.store.epoch();
-        let final_rows = self.effective_rows();
         let journal = std::mem::take(&mut self.txn.model);
 
         let epoch = if journal.writes > 0 {
@@ -1220,7 +1216,7 @@ impl<'a> Tx<'a> {
         }
 
         let mut order = Vec::with_capacity(final_rows.len());
-        for (key, _) in &final_rows {
+        for (key, _) in final_rows {
             let slot = journal
                 .reserved
                 .get(key)
@@ -1469,6 +1465,26 @@ impl<'a> Tx<'a> {
     }
 }
 
+/// 按显式顺序排列已有条目，并按输入顺序追加未被列出的条目；重复 key 只取一次。
+fn ordered_rows<K: Ord + Copy, V: Copy>(rows: &[(K, V)], order: &[K]) -> Vec<(K, V)> {
+    let positions: BTreeMap<K, V> = rows.iter().copied().collect();
+    let mut ordered = Vec::with_capacity(rows.len());
+    let mut included = BTreeSet::new();
+    for key in order {
+        if let Some(value) = positions.get(key)
+            && included.insert(*key)
+        {
+            ordered.push((*key, *value));
+        }
+    }
+    for entry in rows {
+        if !included.contains(&entry.0) {
+            ordered.push(*entry);
+        }
+    }
+    ordered
+}
+
 struct StagedView<'a> {
     store: &'a Store,
     journal: &'a ModelJournal,
@@ -1520,18 +1536,7 @@ impl<'a> StagedView<'a> {
         }
 
         if let Some(order) = &self.journal.order {
-            let mut ordered = Vec::with_capacity(rows.len());
-            for key in order {
-                if let Some(entry) = rows.iter().find(|(candidate, _)| candidate == key) {
-                    ordered.push(*entry);
-                }
-            }
-            for entry in &rows {
-                if !ordered.iter().any(|(key, _)| key == &entry.0) {
-                    ordered.push(*entry);
-                }
-            }
-            return ordered;
+            return ordered_rows(&rows, order);
         }
         rows
     }
@@ -1706,6 +1711,43 @@ mod tests {
             end,
             "the commit must adopt the staged order revision"
         );
+    }
+
+    #[test]
+    fn cancelling_a_staged_mount_updates_the_position_index() {
+        let mut runtime = Runtime::new();
+        runtime
+            .frame(|tx| {
+                tx.insert("A")?;
+                tx.insert("B")?;
+                tx.insert("C")?;
+                Ok(())
+            })
+            .expect("seed");
+        let keys: Vec<RowKey> = runtime.committed().keys().collect();
+
+        runtime
+            .frame(|tx| {
+                let a = tx.mount_row(keys[0], 1)?;
+                let b = tx.mount_row(keys[1], 1)?;
+                let c = tx.mount_row(keys[2], 1)?;
+                assert_eq!(tx.txn.view.mount_positions.get(&c), Some(&2));
+
+                tx.unmount(a)?;
+                assert_eq!(
+                    tx.txn.view.mount_positions.get(&c),
+                    Some(&0),
+                    "the swapped mount keeps its new position"
+                );
+                assert_eq!(tx.txn.view.mount_positions.get(&b), Some(&1));
+                assert!(!tx.txn.view.mount_positions.contains_key(&a));
+
+                tx.unmount(c)?;
+                assert!(!tx.txn.view.mount_positions.contains_key(&c));
+                tx.reorder_views(&[b])?;
+                Ok(())
+            })
+            .expect("the moved position stays addressable");
     }
 
     #[test]
@@ -2231,6 +2273,12 @@ mod tests {
         tx.txn.view.next_view += 1;
         tx.txn.view.next_owner += 1;
         tx.txn.view.owners.push((owner, parent));
+        tx.txn
+            .view
+            .mount_positions
+            .insert(view, tx.txn.view.mounts.len());
+        tx.txn.view.mount_keys.insert(row);
+        tx.txn.view.mount_ids.insert(view);
         tx.txn.view.mounts.push(PlannedMount {
             id: view,
             row,

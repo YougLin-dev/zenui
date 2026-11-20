@@ -105,6 +105,11 @@ impl Runtime {
         self.owners.live()
     }
 
+    /// Owner 节点存储量；释放后应回到存活 Owner 的规模。
+    pub fn owner_storage_len(&self) -> usize {
+        self.owners.storage_len()
+    }
+
     pub const fn cleanup_runs(&self) -> u64 {
         self.owners.cleanup_runs()
     }
@@ -189,6 +194,7 @@ impl fmt::Debug for Runtime {
     }
 }
 
+/// 最近 [`crate::txn::PUBLICATION_HISTORY`] 次提交的发布快照；消费者不能假设历史无界。
 pub fn publications(runtime: &Runtime) -> &[Publication] {
     runtime.txn.publications()
 }

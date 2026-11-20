@@ -470,6 +470,7 @@ fn churn_returns_to_the_baseline() {
         })
         .expect("warm-up");
     let baseline_owners = runtime.live_owners();
+    let baseline_owner_storage = runtime.owner_storage_len();
     let baseline_edges = runtime.edge_count();
     let baseline_sources = runtime.active_source_count();
     let baseline_layout = runtime.layout_pairs().len();
@@ -540,6 +541,11 @@ fn churn_returns_to_the_baseline() {
     assert_eq!(operations, 1200, "the fixture covers repeated churn");
 
     assert_eq!(runtime.live_owners(), baseline_owners, "owners leaked");
+    assert_eq!(
+        runtime.owner_storage_len(),
+        baseline_owner_storage,
+        "disposed Owner storage leaked"
+    );
     assert_eq!(runtime.edge_count(), baseline_edges, "edges leaked");
     assert_eq!(runtime.active_source_count(), baseline_sources);
     assert_eq!(

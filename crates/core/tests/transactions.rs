@@ -1,4 +1,4 @@
-use zenui_core::{Fatal, RowId, Runtime, StoreError, Tx, ValueError, ViewId};
+use zenui_core::{Fatal, PUBLICATION_HISTORY, RowId, Runtime, StoreError, Tx, ValueError, ViewId};
 
 fn fatal<T>(result: Result<T, ValueError>) -> Result<T, Fatal> {
     result.map_err(|_| Fatal::Aborted)
@@ -147,6 +147,50 @@ fn nested_batch_publishes_once_with_the_outer_value() {
         1,
         "the published snapshot must contain no intermediate value: {:?}",
         published.values
+    );
+}
+
+#[test]
+fn publication_history_is_bounded_and_keeps_newest_sequences() {
+    let mut runtime = Runtime::new();
+    runtime
+        .frame(|tx| {
+            tx.insert("A")?;
+            Ok(())
+        })
+        .expect("seed");
+
+    for _ in 0..PUBLICATION_HISTORY * 3 {
+        runtime.frame(|_| Ok(())).expect("empty commit");
+    }
+
+    let commits = runtime.txn().commits();
+    let publications = runtime.txn().publications();
+    assert_eq!(publications.len(), PUBLICATION_HISTORY);
+    assert_eq!(
+        publications[0].commit_seq,
+        commits - PUBLICATION_HISTORY as u64,
+        "the oldest retained sequence is bounded by the history window"
+    );
+    assert_eq!(publications.last().unwrap().commit_seq, commits - 1);
+    assert!(
+        publications
+            .windows(2)
+            .all(|pair| pair[0].commit_seq + 1 == pair[1].commit_seq),
+        "retained commits stay sequence-fresh"
+    );
+    assert!(
+        publications
+            .iter()
+            .all(|publication| publication.values.len() == 1),
+        "each snapshot still describes the full committed row set"
+    );
+    assert!(
+        publications
+            .iter()
+            .skip(1)
+            .all(|publication| publication.keys.is_empty()),
+        "empty frames publish no changed keys"
     );
 }
 

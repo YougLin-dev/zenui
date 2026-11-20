@@ -108,16 +108,6 @@ impl<T> Slots<T> {
         }
     }
 
-    pub(crate) fn find<F>(&self, mut predicate: F) -> Option<SlotIndex>
-    where
-        F: FnMut(&T) -> bool,
-    {
-        self.values.iter().enumerate().find_map(|(index, entry)| {
-            let value = entry.as_ref()?;
-            predicate(value).then(|| SlotIndex::from_index(index as u32))
-        })
-    }
-
     pub(crate) fn generation(&self, slot: SlotIndex) -> Option<Generation> {
         self.generations.get(slot.index() as usize).copied()
     }
