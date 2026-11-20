@@ -6,6 +6,10 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use zenui_core::{Counters, RowSet};
 
 use crate::context::{self, ContextFault, DepKey, Phase, with_state};
+use crate::presentation::{
+    NodeId, NodeStatus, PresentationSnapshot, SnapshotAttr, SnapshotElement, SnapshotNode,
+    SnapshotValue, TextEditState,
+};
 use crate::signal::{Memo, MemoCell, SignalCell};
 use crate::store::{TodoId, WriteError};
 use crate::task::TaskRecord;
@@ -57,6 +61,7 @@ pub(crate) struct State {
     pub(crate) next_task: u32,
     setup_counts: BTreeMap<&'static str, u64>,
     next_instance: u64,
+    next_node_mount: u64,
     unmounts: u64,
     focused: Option<usize>,
     settle_before: Option<Vec<usize>>,
@@ -122,10 +127,28 @@ impl State {
             next_task: 1,
             setup_counts: BTreeMap::new(),
             next_instance: 1,
+            next_node_mount: 0,
             unmounts: 0,
             focused: None,
             settle_before: None,
         }
+    }
+
+    /// 每次元素挂载分配新的 generation；旧挂载的身份不会命中重新挂载的元素。
+    fn mint_node(&mut self) -> NodeId {
+        let id = NodeId::mint(
+            self.id,
+            u32::try_from(self.elements.len()).expect("node identity exhausted"),
+            self.next_node_mount,
+        );
+        self.next_node_mount += 1;
+        id
+    }
+
+    /// 当前呈现焦点：仍在已提交树中且可聚焦。
+    fn presented_focus(&self) -> Option<usize> {
+        self.focused
+            .filter(|element| self.element_is_mounted(*element) && self.is_focusable(*element))
     }
 
     pub(crate) fn attach_to_owner(&mut self, resource: Resource) {
@@ -450,6 +473,7 @@ pub struct MountedText {
 }
 
 pub struct MountedElement {
+    id: NodeId,
     tag: &'static str,
     owner: u32,
     attrs: Vec<MountedAttr>,
@@ -1023,8 +1047,10 @@ impl Runtime {
                         "checkbox" => LocalState::Checkbox { checked: false },
                         _ => LocalState::None,
                     };
-                    let id = state.elements.len();
+                    let id = state.mint_node();
+                    let slot = state.elements.len();
                     state.elements.push(MountedElement {
+                        id,
                         tag,
                         owner,
                         attrs,
@@ -1032,7 +1058,7 @@ impl Runtime {
                         local,
                         children,
                     });
-                    id
+                    slot
                 });
                 Ok(MountedNode::Element(id))
             }
@@ -1887,11 +1913,7 @@ impl Runtime {
 
     pub fn focused(&self) -> Option<FocusInfo> {
         let state = self.state.borrow();
-        let id = state.focused?;
-        if !state.element_is_mounted(id) || !state.is_focusable(id) {
-            return None;
-        }
-        let element = &state.elements[id];
+        let element = &state.elements[state.presented_focus()?];
         Some(FocusInfo {
             tag: element.tag,
             label: element.label(),
@@ -1904,6 +1926,42 @@ impl Runtime {
         match state.elements[element].local {
             LocalState::Checkbox { checked } => Some(checked),
             _ => None,
+        }
+    }
+
+    /// 最近一次提交界面的只读呈现描述；生成过程不执行用户闭包，也不改变界面。
+    pub fn presentation(&self) -> Result<PresentationSnapshot, MountError> {
+        let state = self.state.borrow();
+        let Some(tree) = state.tree.as_ref() else {
+            return Err(MountError::Component(
+                "presentation snapshot requires a committed interface",
+            ));
+        };
+        let mut roots = Vec::new();
+        collect_snapshot(&state, tree, &mut roots);
+        let focus = state
+            .presented_focus()
+            .map(|element| state.elements[element].id);
+        Ok(PresentationSnapshot { roots, focus })
+    }
+
+    /// 对照当前已提交界面判定一个 Node ID：存活、已卸载或从未分配。
+    pub fn node_status(&self, node: NodeId) -> NodeStatus {
+        let state = self.state.borrow();
+        if node.runtime_id() != state.id {
+            return NodeStatus::Unknown;
+        }
+        let Some(element) = state.elements.get(node.slot() as usize) else {
+            return NodeStatus::Unknown;
+        };
+        // 槽位已由查表确定；代际仍须匹配，否则这是同一槽位更早一次挂载的身份。
+        if element.id.slot() != node.slot() || element.id.generation() != node.generation() {
+            return NodeStatus::Stale;
+        }
+        if state.element_is_mounted(node.slot() as usize) {
+            NodeStatus::Live
+        } else {
+            NodeStatus::Stale
         }
     }
 }
@@ -2033,6 +2091,86 @@ fn collect_focusable(state: &State, nodes: &[MountedNode], order: &mut Vec<usize
             }
         }
     }
+}
+
+/// 只复制已提交的文本、属性值与本地编辑状态；不重新求值 slot，也不改变任何界面状态。
+fn collect_snapshot(state: &State, nodes: &[MountedNode], out: &mut Vec<SnapshotNode>) {
+    for node in nodes {
+        match node {
+            MountedNode::Text(text) => out.push(SnapshotNode::Text(text.value.clone())),
+            MountedNode::Element(id) => {
+                let element = &state.elements[*id];
+                let mut children = Vec::new();
+                collect_snapshot(state, &element.children, &mut children);
+                out.push(SnapshotNode::Element(SnapshotElement {
+                    id: element.id,
+                    tag: element.tag,
+                    attrs: snapshot_attrs(element),
+                    edit: snapshot_edit(&element.local),
+                    children,
+                }));
+            }
+            MountedNode::Component(id) => {
+                collect_snapshot(state, &state.components[*id].children, out);
+            }
+            MountedNode::Show(show) => {
+                if let Some(branch) = &show.active {
+                    collect_snapshot(state, &branch.children, out);
+                }
+            }
+            MountedNode::For(for_node) => {
+                for key in &for_node.order {
+                    if let Some(item) = for_node.items.get(key) {
+                        collect_snapshot(state, &item.children, out);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn snapshot_edit(local: &LocalState) -> Option<TextEditState> {
+    match local {
+        LocalState::TextInput {
+            caret,
+            selection,
+            composition,
+        } => Some(TextEditState {
+            caret: *caret,
+            selection: *selection,
+            preedit: composition
+                .as_ref()
+                .map(|composition| composition.preedit.clone()),
+        }),
+        _ => None,
+    }
+}
+
+fn snapshot_attrs(element: &MountedElement) -> Vec<SnapshotAttr> {
+    let mut attrs: Vec<SnapshotAttr> = element
+        .attrs
+        .iter()
+        .filter_map(|attr| {
+            attr.current.as_ref().map(|current| SnapshotAttr {
+                name: attr.name,
+                value: match current {
+                    AttrCurrent::Text(text) => SnapshotValue::Text(text.clone()),
+                    AttrCurrent::Bool(value) => SnapshotValue::Bool(*value),
+                },
+            })
+        })
+        .collect();
+    // 无 `checked` 绑定的 checkbox 由本地编辑状态决定呈现；有绑定时两者在已提交帧一致。
+    if let LocalState::Checkbox { checked } = element.local {
+        match attrs.iter_mut().find(|attr| attr.name == "checked") {
+            Some(attr) => attr.value = SnapshotValue::Bool(checked),
+            None => attrs.push(SnapshotAttr {
+                name: "checked",
+                value: SnapshotValue::Bool(checked),
+            }),
+        }
+    }
+    attrs
 }
 
 fn collect_texts(state: &State, nodes: &[MountedNode], texts: &mut Vec<String>) {
