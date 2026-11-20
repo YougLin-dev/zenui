@@ -44,6 +44,10 @@ _Avoid_: element index, view ID
 在 caret/selection 上执行的平台无关编辑操作，例如插入、退格、删除；每次编辑派发一次 `on:input`。
 _Avoid_: input event, keystroke
 
+**Selection anchor**:
+selection 的固定端；caret 是活动端（焦点）。Shift+方向键移动活动端而 anchor 不动，折叠时两者相等。
+_Avoid_: origin, base offset
+
 **Transaction frame**:
 core 的一次事务提交单位；无修饰的 “frame” 不用于 presentation。
 _Avoid_: frame

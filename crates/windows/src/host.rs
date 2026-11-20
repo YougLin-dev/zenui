@@ -10,19 +10,25 @@ use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForSystem, GetDpiForWindow,
     SetProcessDpiAwarenessContext,
 };
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetKeyState, VIRTUAL_KEY, VK_A, VK_BACK, VK_CONTROL, VK_DELETE, VK_END, VK_HOME, VK_LEFT,
+    VK_RETURN, VK_RIGHT, VK_SHIFT, VK_TAB,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRect, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW,
     DestroyWindow, DispatchMessageW, GetClientRect, GetMessageW, IDC_ARROW, LoadCursorW, MSG,
     PM_REMOVE, PeekMessageW, PostMessageW, PostQuitMessage, RegisterClassExW, SW_HIDE, SW_SHOW,
     SWP_NOACTIVATE, SWP_NOZORDER, SetWindowPos, ShowWindow, TranslateMessage, WINDOW_EX_STYLE,
-    WM_CLOSE, WM_DESTROY, WM_DPICHANGED, WM_LBUTTONDOWN, WM_PAINT, WM_SIZE, WNDCLASSEXW,
-    WS_OVERLAPPEDWINDOW,
+    WM_CHAR, WM_CLOSE, WM_DESTROY, WM_DPICHANGED, WM_KEYDOWN, WM_LBUTTONDOWN, WM_PAINT, WM_SIZE,
+    WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
 };
 use windows::core::{HSTRING, w};
 use zenui::prelude::*;
 use zenui_render::{
     GpuRenderer, Point, RenderPalette, RenderTargetConfig, Scene, Viewport, Visual, wgpu,
 };
+
+use zenui_demo::TodoApp;
 
 /// 打开宿主窗口的选项。
 #[derive(Clone, Copy, Debug)]
@@ -107,10 +113,11 @@ pub struct Host {
     renderer: GpuRenderer,
     window: Window,
     scene: Option<Scene>,
+    pending_high_surrogate: Option<u16>,
 }
 
 impl Host {
-    /// 创建窗口、挂载静态 Todo，并配置 DX12 surface；优先硬件适配器，失败时回退 WARP。
+    /// 创建窗口、挂载共享 Todo demo，并配置 DX12 surface；优先硬件适配器，失败时回退 WARP。
     pub fn open(config: HostConfig) -> Result<Self, HostError> {
         // 安全：进程级 DPI 设置；重复设置失败时保持已有策略。
         unsafe {
@@ -118,8 +125,9 @@ impl Host {
         }
         let mut runtime = Runtime::new();
         let window_ctx = runtime
-            .open_window("main", |_window| view! { <TodoScreen /> })
+            .open_window("main", |window| view! { <TodoApp window=window /> })
             .map_err(|error| HostError::Window(error.to_string()))?;
+        zenui_demo::seed(&mut runtime).map_err(HostError::Runtime)?;
 
         let hinstance = module_handle()?;
         register_class(hinstance)?;
@@ -183,6 +191,7 @@ impl Host {
             renderer,
             window,
             scene: None,
+            pending_high_surrogate: None,
         })
     }
 
@@ -249,6 +258,10 @@ impl Host {
         if message.message == WM_LBUTTONDOWN {
             self.pointer_pressed(message.lParam)?;
             self.render()?;
+        } else if message.message == WM_CHAR {
+            self.char_typed(message.wParam)?;
+        } else if message.message == WM_KEYDOWN {
+            self.key_down(message.wParam)?;
         } else if message.message == WM_CLOSE {
             // 窗口的 HWND 仍然有效；Window::drop 在 surface 释放后才销毁它。
             self.runtime
@@ -431,6 +444,113 @@ impl Host {
             height,
             pixels,
         })
+    }
+
+    /// 一次 `WM_CHAR`：把可打印字符插入当前聚焦的文本输入；控制字符忽略。
+    ///
+    /// Windows 用两条 UTF-16 代理项消息发送非 BMP 字符；宿主缓存高代理项并在
+    /// 低代理项到达时组合。
+    fn char_typed(&mut self, wparam: WPARAM) -> Result<(), HostError> {
+        let unit = wparam.0 as u16;
+        let character = match unit {
+            0xD800..=0xDBFF => {
+                self.pending_high_surrogate = Some(unit);
+                return Ok(());
+            }
+            0xDC00..=0xDFFF => {
+                let Some(high) = self.pending_high_surrogate.take() else {
+                    return Ok(());
+                };
+                char::decode_utf16([high, unit]).next().and_then(Result::ok)
+            }
+            _ => {
+                self.pending_high_surrogate = None;
+                char::from_u32(u32::from(unit))
+            }
+        };
+        let Some(character) = character else {
+            return Ok(());
+        };
+        if character.is_control() {
+            return Ok(());
+        }
+        let snapshot = self.runtime.presentation().map_err(HostError::Runtime)?;
+        let Some(focused) = focused_input(&snapshot) else {
+            return Ok(());
+        };
+        let mut buffer = [0_u8; 4];
+        pointer_dispatch(
+            self.runtime
+                .insert_text_node(focused, character.encode_utf8(&mut buffer)),
+        )?;
+        self.render()
+    }
+
+    /// 一次 `WM_KEYDOWN`：从线程消息队列读取修饰键后进入映射本体。
+    fn key_down(&mut self, wparam: WPARAM) -> Result<(), HostError> {
+        // 安全：GetKeyState 只查询本线程最近一条键盘消息的修饰键状态。
+        let shift = unsafe { GetKeyState(i32::from(VK_SHIFT.0)) } < 0;
+        let control = unsafe { GetKeyState(i32::from(VK_CONTROL.0)) } < 0;
+        self.key_down_with(VIRTUAL_KEY(wparam.0 as u16), shift, control)
+    }
+
+    /// 键盘映射本体：编辑、caret/selection、焦点遍历与表单提交。
+    ///
+    /// Shift+方向键保留 anchor、移动焦点端；Ctrl+A 全选。
+    fn key_down_with(
+        &mut self,
+        key: VIRTUAL_KEY,
+        shift: bool,
+        control: bool,
+    ) -> Result<(), HostError> {
+        if key == VK_TAB {
+            if shift {
+                self.runtime.focus_previous()
+            } else {
+                self.runtime.focus_next()
+            }
+            .map_err(HostError::Runtime)?;
+            return self.render();
+        }
+
+        let snapshot = self.runtime.presentation().map_err(HostError::Runtime)?;
+        let Some(focused) = focused_input(&snapshot) else {
+            return Ok(());
+        };
+        if control && key == VK_A {
+            pointer_dispatch(self.runtime.select_all_node(focused))?;
+            return self.render();
+        }
+        if key == VK_RETURN {
+            if !is_composing(&snapshot, focused) {
+                pointer_dispatch(self.runtime.keydown_node(focused, Key::Enter))?;
+                if let Some(form) = ancestor_form(&snapshot, focused) {
+                    pointer_dispatch(self.runtime.submit_node(form))?;
+                }
+            }
+            return self.render();
+        }
+        if key == VK_BACK {
+            pointer_dispatch(self.runtime.backspace_node(focused))?;
+            return self.render();
+        }
+        if key == VK_DELETE {
+            pointer_dispatch(self.runtime.delete_forward_node(focused))?;
+            return self.render();
+        }
+
+        let Some(command) = caret_command_for(&snapshot, focused, key, shift) else {
+            return Ok(());
+        };
+        match command {
+            CaretCommand::Caret(offset) => {
+                pointer_dispatch(self.runtime.set_caret_node(focused, offset))?;
+            }
+            CaretCommand::Selection(anchor, focus) => {
+                pointer_dispatch(self.runtime.set_selection_node(focused, anchor, focus))?;
+            }
+        }
+        self.render()
     }
 
     fn ensure_surface(&mut self) -> Result<(), HostError> {
@@ -671,6 +791,96 @@ fn pointer_point(lparam: LPARAM, scale: f32) -> Point {
     Point::new(x / scale, y / scale)
 }
 
+/// 一次导航键对 caret/selection 的目标；运行时的 selection 是归一化区间，
+/// 因此 Shift+左键扩展左端、Shift+右键扩展右端。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CaretCommand {
+    Caret(usize),
+    Selection(usize, usize),
+}
+
+fn focused_input(snapshot: &PresentationSnapshot) -> Option<NodeId> {
+    snapshot
+        .focus()
+        .and_then(|node| snapshot.node(node))
+        .filter(|element| element.tag() == "text-input" && !element.disabled())
+        .map(SnapshotElement::id)
+}
+
+fn is_composing(snapshot: &PresentationSnapshot, node: NodeId) -> bool {
+    snapshot
+        .node(node)
+        .and_then(SnapshotElement::edit)
+        .is_some_and(|edit| edit.composition().is_some())
+}
+
+fn caret_command_for(
+    snapshot: &PresentationSnapshot,
+    node: NodeId,
+    key: VIRTUAL_KEY,
+    shift: bool,
+) -> Option<CaretCommand> {
+    let element = snapshot.node(node)?;
+    let edit = element.edit()?;
+    let length = element.text_value().unwrap_or_default().chars().count();
+    caret_command(edit, length, key, shift)
+}
+
+fn caret_command(
+    edit: &TextEditState,
+    length: usize,
+    key: VIRTUAL_KEY,
+    shift: bool,
+) -> Option<CaretCommand> {
+    let caret = edit.caret().min(length);
+    let anchor = edit.anchor().min(length);
+    // set_caret 会留下折叠的 (offset, offset)；只有非折叠区间才算选择。
+    let selection = edit
+        .selection()
+        .filter(|(start, end)| start != end)
+        .map(|(start, end)| (start.min(length), end.min(length)));
+    if shift {
+        return match key {
+            k if k == VK_LEFT => Some(CaretCommand::Selection(anchor, caret.saturating_sub(1))),
+            k if k == VK_RIGHT => Some(CaretCommand::Selection(anchor, (caret + 1).min(length))),
+            k if k == VK_HOME => Some(CaretCommand::Selection(anchor, 0)),
+            k if k == VK_END => Some(CaretCommand::Selection(anchor, length)),
+            _ => None,
+        };
+    }
+    let offset = match key {
+        k if k == VK_LEFT => selection.map_or_else(|| caret.saturating_sub(1), |(start, _)| start),
+        k if k == VK_RIGHT => selection.map_or_else(|| (caret + 1).min(length), |(_, end)| end),
+        k if k == VK_HOME => 0,
+        k if k == VK_END => length,
+        _ => return None,
+    };
+    Some(CaretCommand::Caret(offset))
+}
+
+fn ancestor_form(snapshot: &PresentationSnapshot, node: NodeId) -> Option<NodeId> {
+    fn walk(nodes: &[SnapshotNode], target: NodeId, form: Option<NodeId>) -> Option<NodeId> {
+        for candidate in nodes {
+            let SnapshotNode::Element(element) = candidate else {
+                continue;
+            };
+            let form = if element.tag() == "form" {
+                Some(element.id())
+            } else {
+                form
+            };
+            if element.id() == target {
+                return form;
+            }
+            if let Some(found) = walk(element.children(), target, form) {
+                return Some(found);
+            }
+        }
+        None
+    }
+    walk(snapshot.roots(), node, None)
+}
+
 fn client_size(hwnd: HWND) -> Result<(u32, u32), HostError> {
     let mut rect = RECT::default();
     // 安全：rect 是有效的输出缓冲。
@@ -759,75 +969,6 @@ unsafe extern "system" fn wndproc(
     }
 }
 
-#[component]
-fn TodoScreen() -> MountResult<MountPlan> {
-    let write_tests = signal(true);
-    let read_docs = signal(false);
-    let filter = signal(Filter::All);
-    let draft = signal(String::new());
-
-    let write_tests_checked = memo(move || write_tests.get());
-    let read_docs_checked = memo(move || read_docs.get());
-    let remaining = memo(move || usize::from(!write_tests.get()) + usize::from(!read_docs.get()));
-    let remaining_text = memo(move || format!("{} remaining", remaining.get()));
-    let all = memo(move || filter.get() == Filter::All);
-    let active = memo(move || filter.get() == Filter::Active);
-    let done = memo(move || filter.get() == Filter::Completed);
-    let show_write = memo(move || match filter.get() {
-        Filter::All => true,
-        Filter::Active => !write_tests.get(),
-        Filter::Completed => write_tests.get(),
-    });
-    let show_read = memo(move || match filter.get() {
-        Filter::All => true,
-        Filter::Active => !read_docs.get(),
-        Filter::Completed => read_docs.get(),
-    });
-
-    view! {
-        <view role="main">
-            <text>{remaining_text}</text>
-            <form aria:label="Add task">
-                <text-input
-                    value=draft
-                    aria:label="What needs to be done?"
-                    on:input=move |value: String| draft.set(value)
-                />
-                <button on:click=move || draft.set(String::new())>"Add"</button>
-            </form>
-            <view role="group" aria:label="Filter">
-                <button aria:pressed=all on:click=move || filter.set(Filter::All)>"All"</button>
-                <button aria:pressed=active on:click=move || filter.set(Filter::Active)>"Active"</button>
-                <button aria:pressed=done on:click=move || filter.set(Filter::Completed)>"Done"</button>
-            </view>
-            <Show when=show_write>
-                <view role="listitem">
-                    <checkbox
-                        checked=write_tests_checked
-                        aria:label="Complete Write tests"
-                        on:change=move |done: bool| write_tests.set(done)
-                    />
-                    <text>"Write tests"</text>
-                    <text-input value="Write tests" aria:label="Edit Write tests" />
-                    <button aria:label="Delete Write tests">"Delete"</button>
-                </view>
-            </Show>
-            <Show when=show_read>
-                <view role="listitem">
-                    <checkbox
-                        checked=read_docs_checked
-                        aria:label="Complete Read docs"
-                        on:change=move |done: bool| read_docs.set(done)
-                    />
-                    <text>"Read docs"</text>
-                    <text-input value="Read docs" aria:label="Edit Read docs" />
-                    <button aria:label="Delete Read docs">"Delete"</button>
-                </view>
-            </Show>
-        </view>
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -842,6 +983,291 @@ mod tests {
     fn pointer_points_preserve_negative_coordinates() {
         let packed = (-5isize & 0xffff) | ((-9isize & 0xffff) << 16);
         assert_eq!(pointer_point(LPARAM(packed), 1.0), Point::new(-5.0, -9.0));
+    }
+
+    fn edit_state(caret: usize, selection: Option<(usize, usize)>) -> (Runtime, NodeId) {
+        let mut app = Runtime::new();
+        app.open_window("main", |_| {
+            view! { <text-input value="Alpha" aria:label="Input" /> }
+        })
+        .expect("open window");
+        let id = app
+            .presentation()
+            .expect("snapshot")
+            .find_label("Input")
+            .expect("input")
+            .id();
+        app.focus_node(id).expect("focus");
+        match selection {
+            Some((start, end)) => app.set_selection_node(id, start, end).expect("selection"),
+            None => app.set_caret_node(id, caret).expect("caret"),
+        }
+        (app, id)
+    }
+
+    fn command(
+        caret: usize,
+        selection: Option<(usize, usize)>,
+        key: VIRTUAL_KEY,
+        shift: bool,
+    ) -> Option<CaretCommand> {
+        let (app, id) = edit_state(caret, selection);
+        let snapshot = app.presentation().expect("snapshot");
+        let element = snapshot.node(id).expect("input");
+        let edit = element.edit().expect("edit");
+        let length = element.text_value().unwrap_or_default().chars().count();
+        caret_command(edit, length, key, shift)
+    }
+
+    #[test]
+    fn caret_commands_step_collapse_and_clamp() {
+        assert_eq!(
+            command(3, None, VK_LEFT, false),
+            Some(CaretCommand::Caret(2))
+        );
+        assert_eq!(
+            command(3, None, VK_RIGHT, false),
+            Some(CaretCommand::Caret(4))
+        );
+        assert_eq!(
+            command(0, None, VK_LEFT, false),
+            Some(CaretCommand::Caret(0)),
+            "left clamps at the start"
+        );
+        assert_eq!(
+            command(5, None, VK_RIGHT, false),
+            Some(CaretCommand::Caret(5)),
+            "right clamps at the end"
+        );
+        assert_eq!(
+            command(3, Some((1, 3)), VK_LEFT, false),
+            Some(CaretCommand::Caret(1)),
+            "left collapses the selection to its left edge"
+        );
+        assert_eq!(
+            command(3, Some((1, 3)), VK_RIGHT, false),
+            Some(CaretCommand::Caret(3)),
+            "right collapses the selection to its right edge"
+        );
+        assert_eq!(
+            command(3, None, VK_HOME, false),
+            Some(CaretCommand::Caret(0))
+        );
+        assert_eq!(
+            command(3, None, VK_END, false),
+            Some(CaretCommand::Caret(5))
+        );
+        assert_eq!(command(3, None, VK_RETURN, false), None);
+    }
+
+    #[test]
+    fn shift_caret_commands_keep_the_anchor_and_move_the_focus() {
+        assert_eq!(
+            command(3, None, VK_LEFT, true),
+            Some(CaretCommand::Selection(3, 2))
+        );
+        assert_eq!(
+            command(3, None, VK_RIGHT, true),
+            Some(CaretCommand::Selection(3, 4))
+        );
+        assert_eq!(
+            command(3, Some((1, 3)), VK_LEFT, true),
+            Some(CaretCommand::Selection(1, 2)),
+            "shift-left shrinks toward the anchor"
+        );
+        assert_eq!(
+            command(3, Some((1, 3)), VK_RIGHT, true),
+            Some(CaretCommand::Selection(1, 4)),
+            "shift-right extends away from the anchor"
+        );
+        assert_eq!(
+            command(3, Some((1, 3)), VK_HOME, true),
+            Some(CaretCommand::Selection(1, 0))
+        );
+        assert_eq!(
+            command(3, Some((1, 3)), VK_END, true),
+            Some(CaretCommand::Selection(1, 5))
+        );
+        assert_eq!(
+            command(0, None, VK_LEFT, true),
+            Some(CaretCommand::Selection(0, 0)),
+            "shift-left at the start stays collapsed"
+        );
+    }
+
+    #[test]
+    fn a_backward_selection_keeps_its_direction() {
+        assert_eq!(
+            command(1, Some((3, 1)), VK_LEFT, true),
+            Some(CaretCommand::Selection(3, 0)),
+            "the anchor stays at 3 and the focus moves left"
+        );
+        assert_eq!(
+            command(1, Some((3, 1)), VK_RIGHT, true),
+            Some(CaretCommand::Selection(3, 2))
+        );
+        assert_eq!(
+            command(1, Some((3, 1)), VK_LEFT, false),
+            Some(CaretCommand::Caret(1)),
+            "plain left collapses to the normalized left edge"
+        );
+    }
+
+    fn open_host() -> Host {
+        Host::open(HostConfig::hidden("ZenUI host keyboard")).expect("open host")
+    }
+
+    fn editor_node(host: &Host) -> NodeId {
+        host.runtime
+            .presentation()
+            .expect("snapshot")
+            .find_label("Edit Write tests")
+            .expect("editor")
+            .id()
+    }
+
+    #[test]
+    fn ctrl_a_selects_all_and_shift_left_shrinks_from_the_right() {
+        let mut host = open_host();
+        host.runtime.focus("Edit Write tests").expect("focus");
+        let node = editor_node(&host);
+
+        host.key_down_with(VK_A, false, true).expect("select all");
+        let snapshot = host.runtime.presentation().expect("snapshot");
+        let edit = snapshot.node(node).expect("editor").edit().expect("edit");
+        assert_eq!(edit.selection(), Some((0, 11)));
+        assert_eq!(edit.anchor(), 0);
+        assert_eq!(edit.caret(), 11);
+
+        host.key_down_with(VK_LEFT, true, false).expect("shrink");
+        let snapshot = host.runtime.presentation().expect("snapshot");
+        let edit = snapshot.node(node).expect("editor").edit().expect("edit");
+        assert_eq!(edit.selection(), Some((0, 10)));
+        assert_eq!(edit.anchor(), 0);
+        assert_eq!(edit.caret(), 10);
+    }
+
+    #[test]
+    fn typing_replaces_the_selection() {
+        let mut host = open_host();
+        host.runtime.focus("Edit Write tests").expect("focus");
+        let node = editor_node(&host);
+
+        host.key_down_with(VK_A, false, true).expect("select all");
+        host.char_typed(WPARAM('X' as usize)).expect("type");
+        let snapshot = host.runtime.presentation().expect("snapshot");
+        let element = snapshot.node(node).expect("editor");
+        assert_eq!(element.text_value(), Some("X"));
+        let edit = element.edit().expect("edit");
+        assert_eq!(edit.caret(), 1);
+        assert_eq!(edit.selection(), None, "typing collapses the selection");
+    }
+
+    #[test]
+    fn shift_tab_moves_focus_backward() {
+        let mut host = open_host();
+        host.runtime.focus("Edit Write tests").expect("focus");
+        let before = host.runtime.presentation().expect("snapshot").focus();
+        host.key_down_with(VK_TAB, true, false).expect("shift tab");
+        let after = host.runtime.presentation().expect("snapshot").focus();
+        assert!(after.is_some());
+        assert_ne!(after, before, "Shift+Tab walks the focus order backwards");
+    }
+
+    #[test]
+    fn enter_is_ignored_while_composing() {
+        let mut host = open_host();
+        host.runtime.focus("Edit Write tests").expect("focus");
+        let node = editor_node(&host);
+        host.runtime.compose_start_node(node).expect("start");
+        host.runtime
+            .compose_update_node(node, "ni")
+            .expect("update");
+
+        host.key_down_with(VK_RETURN, false, false)
+            .expect("press enter");
+        let snapshot = host.runtime.presentation().expect("snapshot");
+        assert_eq!(
+            snapshot
+                .elements()
+                .filter(|element| element.tag() == "checkbox")
+                .count(),
+            2,
+            "Enter during composition does not submit"
+        );
+        assert!(
+            snapshot
+                .node(node)
+                .expect("editor")
+                .edit()
+                .expect("edit")
+                .composition()
+                .is_some(),
+            "the composition survives"
+        );
+    }
+
+    #[test]
+    fn control_characters_and_stray_surrogates_do_not_insert() {
+        let mut host = open_host();
+        host.runtime.focus("Edit Write tests").expect("focus");
+        let node = editor_node(&host);
+
+        host.char_typed(WPARAM(0x0009)).expect("tab character");
+        host.char_typed(WPARAM(0xDC00))
+            .expect("stray low surrogate");
+        let snapshot = host.runtime.presentation().expect("snapshot");
+        assert_eq!(
+            snapshot.node(node).expect("editor").text_value(),
+            Some("Write tests"),
+            "control characters and stray surrogates are ignored"
+        );
+    }
+
+    #[test]
+    fn surrogate_pairs_insert_one_non_bmp_character() {
+        let mut host = open_host();
+        host.runtime.focus("Edit Write tests").expect("focus");
+        let node = editor_node(&host);
+
+        host.char_typed(WPARAM(0xD83D)).expect("high surrogate");
+        host.char_typed(WPARAM(0xDE42)).expect("low surrogate");
+        let snapshot = host.runtime.presentation().expect("snapshot");
+        assert!(
+            snapshot
+                .node(node)
+                .expect("editor")
+                .text_value()
+                .expect("value")
+                .ends_with('🙂'),
+            "the surrogate pair becomes one character"
+        );
+    }
+
+    #[test]
+    fn ancestor_form_finds_the_nearest_enclosing_form() {
+        let mut app = Runtime::new();
+        app.open_window("main", |_| {
+            view! {
+                <view>
+                    <form aria:label="Form">
+                        <text-input value="a" aria:label="Inside" />
+                    </form>
+                    <text-input value="b" aria:label="Outside" />
+                </view>
+            }
+        })
+        .expect("open window");
+        let snapshot = app.presentation().expect("snapshot");
+        let inside = snapshot.find_label("Inside").expect("inside").id();
+        let outside = snapshot.find_label("Outside").expect("outside").id();
+        let form = snapshot
+            .elements()
+            .find(|element| element.tag() == "form")
+            .expect("form")
+            .id();
+        assert_eq!(ancestor_form(&snapshot, inside), Some(form));
+        assert_eq!(ancestor_form(&snapshot, outside), None);
     }
 
     #[test]

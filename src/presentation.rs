@@ -196,17 +196,24 @@ impl SnapshotElement {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TextEditState {
     pub(crate) caret: usize,
+    pub(crate) anchor: usize,
     pub(crate) selection: Option<(usize, usize)>,
     pub(crate) preedit: Option<String>,
     pub(crate) composition: Option<(usize, usize)>,
 }
 
 impl TextEditState {
+    /// 选择的活动端（焦点）；折叠时与 `anchor` 相同。
     pub const fn caret(&self) -> usize {
         self.caret
     }
 
-    /// 未选择时为 `None`；`set_caret` 折叠为 `(offset, offset)`。
+    /// 选择的活动端（焦点）；折叠时等于 `caret`。Shift 扩展选择时另一端保持不动。
+    pub const fn anchor(&self) -> usize {
+        self.anchor
+    }
+
+    /// 归一化的选择区间，未选择时为 `None`；`set_caret` 折叠为 `(offset, offset)`。
     pub const fn selection(&self) -> Option<(usize, usize)> {
         self.selection
     }

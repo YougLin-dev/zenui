@@ -325,11 +325,15 @@ impl State {
         match (&mut self.elements[element].local, value) {
             (
                 LocalState::TextInput {
-                    caret, selection, ..
+                    caret,
+                    anchor,
+                    selection,
+                    ..
                 },
                 LocalUpdate::Input(value),
             ) => {
                 *caret = value.chars().count();
+                *anchor = *caret;
                 *selection = None;
             }
             (LocalState::Checkbox { checked }, LocalUpdate::Change(value)) => {
@@ -449,6 +453,7 @@ impl State {
         };
         if let LocalState::TextInput {
             caret,
+            anchor,
             selection,
             composition,
         } = &mut self.elements[element].local
@@ -457,6 +462,7 @@ impl State {
                 return false;
             }
             *caret = offset;
+            *anchor = offset;
             *selection = Some((offset, offset));
             true
         } else {
@@ -613,6 +619,8 @@ enum LocalState {
     None,
     TextInput {
         caret: usize,
+        /// 选择的活动端（焦点）；`caret` 与它相同表示折叠。
+        anchor: usize,
         selection: Option<(usize, usize)>,
         composition: Option<Composition>,
     },
@@ -636,6 +644,7 @@ impl LocalState {
 /// preedit 只存在于编辑器本地；`base_*` 记录组合开始时的已提交状态，取消时恢复。
 struct Composition {
     base_caret: usize,
+    base_anchor: usize,
     base_selection: Option<(usize, usize)>,
     preedit: String,
 }
@@ -1120,6 +1129,7 @@ impl Runtime {
                     let local = match tag {
                         "text-input" => LocalState::TextInput {
                             caret: 0,
+                            anchor: 0,
                             selection: None,
                             composition: None,
                         },
@@ -1620,9 +1630,16 @@ impl Runtime {
         let mut state = self.state.borrow_mut();
         let element = state.element_for_node(node)?;
         state.require_editable_text_input(node, element, operation)?;
-        let (start, end) =
-            text_edit::movement_range(text_length(&state.elements[element]), movement);
-        set_local_selection(&mut state.elements[element].local, start, end);
+        let length = text_length(&state.elements[element]);
+        let (anchor, focus) = match movement {
+            Movement::Caret(offset) => {
+                let offset = offset.min(length);
+                (offset, offset)
+            }
+            Movement::Selection(anchor, focus) => (anchor.min(length), focus.min(length)),
+            Movement::SelectAll => (0, length),
+        };
+        set_local_selection(&mut state.elements[element].local, anchor, focus);
         Ok(())
     }
 
@@ -1661,12 +1678,16 @@ impl Runtime {
             self.take_node_event(node, element, EventKind::Input, operation)?;
         with_state(|state| {
             let LocalState::TextInput {
-                caret, selection, ..
+                caret,
+                anchor,
+                selection,
+                ..
             } = &mut state.elements[element].local
             else {
                 unreachable!("require_editable_text_input validated the input");
             };
             *caret = next_caret;
+            *anchor = next_caret;
             *selection = None;
         });
         // handler unwind 不能把占位事件或 Event 阶段留在槽位里。
@@ -1708,6 +1729,7 @@ impl Runtime {
             let (caret, selection) = with_state(|state| {
                 let LocalState::TextInput {
                     caret,
+                    anchor,
                     selection,
                     composition,
                 } = &mut state.elements[element].local
@@ -1723,6 +1745,7 @@ impl Runtime {
                 }
                 *composition = Some(Composition {
                     base_caret: *caret,
+                    base_anchor: *anchor,
                     base_selection: *selection,
                     preedit: String::new(),
                 });
@@ -1768,6 +1791,7 @@ impl Runtime {
             let (caret, selection) = with_state(|state| {
                 let LocalState::TextInput {
                     caret,
+                    anchor,
                     selection,
                     composition,
                 } = &mut state.elements[element].local
@@ -1783,6 +1807,7 @@ impl Runtime {
                 };
                 composition.preedit = preedit.to_owned();
                 *caret = composition.base_range().0 + preedit.chars().count();
+                *anchor = *caret;
                 *selection = None;
                 Ok((*caret, *selection))
             })?;
@@ -1873,6 +1898,7 @@ impl Runtime {
         let (new_text, caret) = with_state(|state| {
             let LocalState::TextInput {
                 caret,
+                anchor,
                 selection,
                 composition,
             } = &mut state.elements[element].local
@@ -1892,6 +1918,7 @@ impl Runtime {
             let (start, end) = composition.base_range();
             let (new_text, next_caret) = text_edit::replace_range(&current_text, start, end, text);
             *caret = next_caret;
+            *anchor = next_caret;
             *selection = None;
             Ok((new_text, *caret))
         })?;
@@ -1917,6 +1944,7 @@ impl Runtime {
         let (discarded, caret, selection) = with_state(|state| {
             let LocalState::TextInput {
                 caret,
+                anchor,
                 selection,
                 composition,
             } = &mut state.elements[element].local
@@ -1934,6 +1962,7 @@ impl Runtime {
                 });
             };
             *caret = composition.base_caret;
+            *anchor = composition.base_anchor;
             *selection = composition.base_selection;
             Ok((composition.preedit, *caret, *selection))
         })?;
@@ -2409,23 +2438,31 @@ fn text_length(element: &MountedElement) -> usize {
 fn clamp_local_edit(state: &mut State, element: usize) {
     let length = text_length(&state.elements[element]);
     if let LocalState::TextInput {
-        caret, selection, ..
+        caret,
+        anchor,
+        selection,
+        ..
     } = &mut state.elements[element].local
     {
         *caret = (*caret).min(length);
+        *anchor = (*anchor).min(length);
         if let Some((start, end)) = *selection {
             *selection = Some(text_edit::normalized_range(start, end, length));
         }
     }
 }
 
-fn set_local_selection(local: &mut LocalState, start: usize, end: usize) {
+fn set_local_selection(local: &mut LocalState, anchor: usize, focus: usize) {
     if let LocalState::TextInput {
-        caret, selection, ..
+        caret,
+        anchor: fixed,
+        selection,
+        ..
     } = local
     {
-        *caret = end;
-        *selection = Some((start, end));
+        *caret = focus;
+        *fixed = anchor;
+        *selection = Some((anchor.min(focus), anchor.max(focus)));
     }
 }
 
@@ -2525,10 +2562,12 @@ fn snapshot_edit(local: &LocalState) -> Option<TextEditState> {
     match local {
         LocalState::TextInput {
             caret,
+            anchor,
             selection,
             composition,
         } => Some(TextEditState {
             caret: *caret,
+            anchor: *anchor,
             selection: *selection,
             preedit: composition
                 .as_ref()

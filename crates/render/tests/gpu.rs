@@ -1,10 +1,7 @@
 #![allow(dead_code, unused_braces)]
 
-#[path = "../../../examples/minimal_todo.rs"]
-mod todo;
-
-use todo::*;
 use zenui::prelude::*;
+use zenui_demo::*;
 use zenui_render::{
     GpuContext, GpuRenderer, RenderError, RenderPalette, RenderTargetConfig, Scene, SceneElement,
     Viewport, wgpu,

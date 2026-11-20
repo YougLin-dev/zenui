@@ -1,10 +1,7 @@
 #![allow(dead_code, unused_braces)]
 
-#[path = "../../../examples/minimal_todo.rs"]
-mod todo;
-
-use todo::*;
 use zenui::prelude::*;
+use zenui_demo::*;
 use zenui_render::{DecorationKind, Point, Scene, SceneElement, SceneError, Viewport};
 
 fn runtime() -> Runtime {
