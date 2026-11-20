@@ -206,6 +206,8 @@ pub enum Event {
     Change(Box<dyn FnMut(bool)>),
     Submit(Box<dyn FnMut(SubmitEvent)>),
     KeyDown(Box<dyn FnMut(KeyEvent)>),
+    Focus(Box<dyn FnMut(FocusEvent)>),
+    Blur(Box<dyn FnMut(BlurEvent)>),
 }
 
 pub trait IntoText {
@@ -435,6 +437,14 @@ pub fn on_keydown(handler: impl FnMut(KeyEvent) + 'static) -> Attr {
     Attr::Event(Event::KeyDown(Box::new(handler)))
 }
 
+pub fn on_focus(handler: impl FnMut(FocusEvent) + 'static) -> Attr {
+    Attr::Event(Event::Focus(Box::new(handler)))
+}
+
+pub fn on_blur(handler: impl FnMut(BlurEvent) + 'static) -> Attr {
+    Attr::Event(Event::Blur(Box::new(handler)))
+}
+
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub struct SubmitEvent {
     prevented: bool,
@@ -447,6 +457,43 @@ impl SubmitEvent {
 
     pub const fn is_prevented(self) -> bool {
         self.prevented
+    }
+}
+
+/// 焦点移动的来源：显式命令，或旧目标离开可见集合后的自动结算。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FocusCause {
+    Command,
+    Settlement,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct FocusEvent {
+    cause: FocusCause,
+}
+
+impl FocusEvent {
+    pub(crate) const fn new(cause: FocusCause) -> Self {
+        Self { cause }
+    }
+
+    pub const fn cause(self) -> FocusCause {
+        self.cause
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct BlurEvent {
+    cause: FocusCause,
+}
+
+impl BlurEvent {
+    pub(crate) const fn new(cause: FocusCause) -> Self {
+        Self { cause }
+    }
+
+    pub const fn cause(self) -> FocusCause {
+        self.cause
     }
 }
 

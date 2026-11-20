@@ -139,6 +139,72 @@ fn reorder_keeps_row_identity_owner_and_local_editing_state() {
 }
 
 #[test]
+fn focus_survives_reorder_and_settles_after_delete() {
+    let mut app = runtime();
+    add(&mut app, "A");
+    add(&mut app, "B");
+    assert!(app.set_caret("Edit A", 2), "row A has a text input");
+
+    app.focus("Edit A").expect("focus row A editor");
+    app.click_text("Reverse").expect("reorder");
+
+    assert_eq!(
+        app.focused().and_then(|focus| focus.label),
+        Some(String::from("Edit A")),
+        "the surviving row keeps focus across reorder"
+    );
+    assert_eq!(app.caret("Edit A"), Some(2), "caret survives with focus");
+
+    app.click_label("Delete A").expect("delete the focused row");
+
+    assert_eq!(app.for_items().len(), 1);
+    assert_eq!(
+        app.focused().and_then(|focus| focus.label),
+        Some(String::from("Edit B")),
+        "settlement picks the previous same-tag control"
+    );
+}
+
+#[test]
+fn filtering_out_the_focused_row_does_not_let_the_remount_steal_focus() {
+    let mut app = runtime();
+    add(&mut app, "A");
+    add(&mut app, "B");
+    let first = app.for_items()[0].todo;
+
+    app.focus("Edit A").expect("focus row A editor");
+    app.change("Complete A", true).expect("complete A");
+    assert_eq!(
+        app.focused().and_then(|focus| focus.label),
+        Some(String::from("Edit A")),
+        "a model write does not move focus"
+    );
+
+    app.click_text("Active").expect("filter active");
+    assert!(
+        !app.for_items().iter().any(|item| item.todo == first),
+        "row A is unmounted"
+    );
+    assert_eq!(
+        app.focused().and_then(|focus| focus.label),
+        Some(String::from("Edit B")),
+        "settlement stays within the old generation and picks the surviving editor"
+    );
+
+    let before = app.focused();
+    app.click_text("All").expect("filter all");
+    assert!(
+        app.texts().iter().any(|text| text == "A"),
+        "the completed row returns"
+    );
+    assert_eq!(
+        app.focused(),
+        before,
+        "the returning row does not take focus from the new generation"
+    );
+}
+
+#[test]
 fn a_field_update_does_not_rerun_the_row_component() {
     let mut app = runtime();
     add(&mut app, "A");

@@ -10,8 +10,8 @@ use crate::signal::{Memo, MemoCell, SignalCell};
 use crate::store::{TodoId, WriteError};
 use crate::task::TaskRecord;
 use crate::view::{
-    Attr, AttrValue, ChildrenFactory, Event, Key, KeyEvent, MountError, MountPlan, MountResult,
-    PlanNode, ResultBoolValue, SubmitEvent, TextSlot,
+    Attr, AttrValue, BlurEvent, ChildrenFactory, Event, FocusCause, FocusEvent, Key, KeyEvent,
+    MountError, MountPlan, MountResult, PlanNode, ResultBoolValue, SubmitEvent, TextSlot,
 };
 use crate::window::{WindowCtx, WindowError, WindowRecord};
 
@@ -57,6 +57,16 @@ pub(crate) struct State {
     setup_counts: BTreeMap<&'static str, u64>,
     next_instance: u64,
     unmounts: u64,
+    focused: Option<usize>,
+    focus_before: Option<Vec<usize>>,
+}
+
+/// 旧焦点离开可见集合后的一次结算：旧目标（可选 blur）与接任目标。
+struct FocusSettlement {
+    old: usize,
+    /// 旧目标仍在挂载树中（例如刚被禁用）时，需要向它派发一次 blur。
+    blur_old: bool,
+    target: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -64,6 +74,13 @@ pub struct ItemInfo {
     pub todo: TodoId,
     pub instance: u64,
     pub owner: u32,
+}
+
+/// 当前焦点目标的公开身份；`label` 为空表示只有遍历顺序和标签名可用。
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct FocusInfo {
+    pub tag: &'static str,
+    pub label: Option<String>,
 }
 
 impl State {
@@ -105,6 +122,8 @@ impl State {
             setup_counts: BTreeMap::new(),
             next_instance: 1,
             unmounts: 0,
+            focused: None,
+            focus_before: None,
         }
     }
 
@@ -272,15 +291,7 @@ impl State {
     /// handler 在 State 借用之外执行，因此先用占位事件换出，调用后再放回原槽位。
     fn take_event(&mut self, kind: EventKind, target: &FindTarget) -> Option<(usize, Event)> {
         let element = self.find_element(target)?;
-        let event = self.elements[element]
-            .events
-            .iter()
-            .copied()
-            .find(|id| event_kind(&self.events[*id]) == kind)?;
-        Some((
-            event,
-            std::mem::replace(&mut self.events[event], Event::Click(Box::new(|| {}))),
-        ))
+        self.take_element_event(element, kind)
     }
 
     fn put_event(&mut self, id: usize, event: Event) {
@@ -322,6 +333,69 @@ impl State {
             false
         }
     }
+
+    /// 原生控件与显式挂接 focus/blur 的元素参与遍历；禁用元素不参与接任或 Tab 顺序。
+    fn is_focusable(&self, element: usize) -> bool {
+        let element = &self.elements[element];
+        if element.is_disabled() {
+            return false;
+        }
+        matches!(element.tag, "button" | "text-input" | "checkbox")
+            || element.events.iter().any(|id| {
+                matches!(
+                    event_kind(&self.events[*id]),
+                    EventKind::Focus | EventKind::Blur
+                )
+            })
+    }
+
+    /// Tab/方向键共用的确定性前序：控件先于自己的子树，Show 只看活动分支，For 按业务顺序。
+    fn focus_order(&self) -> Vec<usize> {
+        let mut order = Vec::new();
+        if let Some(tree) = &self.tree {
+            collect_focusable(self, tree, &mut order);
+        }
+        order
+    }
+
+    fn element_is_mounted(&self, element: usize) -> bool {
+        self.tree
+            .as_ref()
+            .is_some_and(|tree| contains_element(self, tree, element))
+    }
+
+    /// 旧焦点不在新的可见集合时，下一次结算才产生接任目标。
+    ///
+    /// 只在旧一代的存活控件里选：同 tag 的下一控件、同 tag 的上一控件，
+    /// 再退到任意下一控件、任意上一控件；新挂载的控件不会因返场抢焦点。
+    fn focus_settlement(&mut self) -> Option<FocusSettlement> {
+        let old = self.focused?;
+        let after = self.focus_order();
+        if after.contains(&old) {
+            return None;
+        }
+        let before = self.focus_before.take().unwrap_or_default();
+        let target = focus_replacement(self, &before, &after, old);
+        Some(FocusSettlement {
+            old,
+            blur_old: self.element_is_mounted(old),
+            target,
+        })
+    }
+
+    fn take_element_event(&mut self, element: usize, kind: EventKind) -> Option<(usize, Event)> {
+        let event = self
+            .elements
+            .get(element)?
+            .events
+            .iter()
+            .copied()
+            .find(|id| event_kind(&self.events[*id]) == kind)?;
+        Some((
+            event,
+            std::mem::replace(&mut self.events[event], Event::Click(Box::new(|| {}))),
+        ))
+    }
 }
 
 pub enum MountedNode {
@@ -338,11 +412,37 @@ pub struct MountedText {
 }
 
 pub struct MountedElement {
+    tag: &'static str,
     owner: u32,
     attrs: Vec<MountedAttr>,
     events: Vec<usize>,
     local: LocalState,
     children: Vec<MountedNode>,
+}
+
+impl MountedElement {
+    fn label(&self) -> Option<String> {
+        self.label_text().map(ToOwned::to_owned)
+    }
+
+    fn label_text(&self) -> Option<&str> {
+        self.attrs
+            .iter()
+            .find(|attr| attr.name == "aria:label")
+            .and_then(|attr| attr.current.as_ref())
+            .and_then(|current| match current {
+                AttrCurrent::Text(text) => Some(text.as_str()),
+                AttrCurrent::Bool(_) => None,
+            })
+    }
+
+    fn is_disabled(&self) -> bool {
+        self.attrs
+            .iter()
+            .find(|attr| attr.name == "disabled")
+            .and_then(|attr| attr.current.as_ref())
+            .is_some_and(|current| matches!(current, AttrCurrent::Bool(true)))
+    }
 }
 
 pub struct MountedAttr {
@@ -415,6 +515,8 @@ enum EventKind {
     Change,
     Submit,
     KeyDown,
+    Focus,
+    Blur,
 }
 
 fn event_kind(event: &Event) -> EventKind {
@@ -424,6 +526,8 @@ fn event_kind(event: &Event) -> EventKind {
         Event::Change(_) => EventKind::Change,
         Event::Submit(_) => EventKind::Submit,
         Event::KeyDown(_) => EventKind::KeyDown,
+        Event::Focus(_) => EventKind::Focus,
+        Event::Blur(_) => EventKind::Blur,
     }
 }
 
@@ -451,14 +555,9 @@ fn find_element(state: &State, nodes: &[MountedNode], target: &FindTarget) -> Op
             MountedNode::Element(id) => {
                 let element = &state.elements[*id];
                 let matches = match target {
-                    FindTarget::Label(label) => element
-                        .attrs
-                        .iter()
-                        .find(|attr| attr.name == "aria:label")
-                        .and_then(|attr| attr.current.as_ref())
-                        .is_some_and(
-                            |current| matches!(current, AttrCurrent::Text(text) if text == label),
-                        ),
+                    FindTarget::Label(label) => {
+                        element.label_text().is_some_and(|value| value == label)
+                    }
                     FindTarget::Text(text) => element.children.iter().any(
                         |child| matches!(child, MountedNode::Text(node) if node.value == *text),
                     ),
@@ -654,6 +753,7 @@ impl Runtime {
                 self.release_nodes(&mut nodes);
             }
             with_state(|state| {
+                state.focused = None;
                 state.dispose_owner(window.owner);
                 state.tree_owner = None;
                 state.tree_window = None;
@@ -669,11 +769,25 @@ impl Runtime {
     }
 
     pub fn refresh(&mut self) -> Result<(), MountError> {
+        if let Err(error) = self.refresh_once() {
+            // 失败的帧可能已经移除了旧目标；不能让焦点身份指向不可见节点。
+            let mut state = self.state.borrow_mut();
+            let focused = state.focused;
+            if focused.is_some_and(|id| !state.element_is_mounted(id)) {
+                state.focused = None;
+            }
+            return Err(error);
+        }
+        self.settle_focus()
+    }
+
+    fn refresh_once(&mut self) -> Result<(), MountError> {
         let state = self.state.clone();
         context::install(&state, || {
             let Some(mut tree) = with_state(|state| {
                 state.fault = None;
                 state.phase = Phase::Binding;
+                state.focus_before = state.focused.is_some().then(|| state.focus_order());
                 state.tree.take()
             }) else {
                 return Err(MountError::Component("root is not mounted"));
@@ -687,6 +801,58 @@ impl Runtime {
             result?;
             if let Some(fault) = fault {
                 return Err(State::context_error(fault));
+            }
+            Ok(())
+        })
+    }
+
+    /// 结构变化后的焦点结算只做一次批量决定；handler 造成的进一步变化在下一轮结算。
+    fn settle_focus(&mut self) -> Result<(), MountError> {
+        const MAX_SETTLEMENTS: usize = 8;
+
+        let state = self.state.clone();
+        context::install(&state, || {
+            for _ in 0..MAX_SETTLEMENTS {
+                let Some(settlement) = with_state(|state| state.focus_settlement()) else {
+                    return Ok(());
+                };
+                with_state(|state| {
+                    state.phase = Phase::Event;
+                    state.fault = None;
+                    state.write_error = None;
+                });
+                if settlement.blur_old {
+                    with_state(|state| state.focused = None);
+                    self.fire_blur(settlement.old, FocusCause::Settlement);
+                }
+                match settlement.target {
+                    Some(target) => {
+                        with_state(|state| state.focused = Some(target));
+                        self.fire_focus(target, FocusCause::Settlement);
+                    }
+                    None => with_state(|state| state.focused = None),
+                }
+                with_state(|state| state.phase = Phase::Idle);
+                if let Some(fault) = with_state(|state| state.fault) {
+                    return Err(State::context_error(fault));
+                }
+                if let Some(error) = with_state(|state| state.write_error.take()) {
+                    return Err(MountError::Write(error));
+                }
+                self.refresh_once()?;
+            }
+            // 病态的 focus handler 连续制造新结构时停止级联，但仍让可见目标收到 blur。
+            if let Some(old) = with_state(|state| state.focused) {
+                if with_state(|state| state.element_is_mounted(old)) {
+                    with_state(|state| {
+                        state.phase = Phase::Event;
+                        state.focused = None;
+                    });
+                    self.fire_blur(old, FocusCause::Settlement);
+                    with_state(|state| state.phase = Phase::Idle);
+                } else {
+                    with_state(|state| state.focused = None);
+                }
             }
             Ok(())
         })
@@ -762,6 +928,7 @@ impl Runtime {
                     };
                     let id = state.elements.len();
                     state.elements.push(MountedElement {
+                        tag,
                         owner,
                         attrs,
                         events,
@@ -1196,6 +1363,111 @@ impl Runtime {
         })
     }
 
+    /// headless 焦点命令：先对旧目标派发一次 blur，再对新目标派发一次 focus。
+    pub fn focus(&mut self, label: &str) -> Result<(), MountError> {
+        let state = self.state.clone();
+        context::install(&state, || {
+            let target = FindTarget::Label(label.to_owned());
+            let Some(element) = with_state(|state| state.find_element(&target)) else {
+                return Err(MountError::Component("focus target not found"));
+            };
+            if !with_state(|state| state.is_focusable(element)) {
+                return Err(MountError::Component("focus target is not focusable"));
+            }
+            self.move_focus(Some(element))
+        })
+    }
+
+    /// 清空焦点；没有当前目标时不派发事件。
+    pub fn blur(&mut self) -> Result<(), MountError> {
+        let state = self.state.clone();
+        context::install(&state, || self.move_focus(None))
+    }
+
+    /// Tab / 方向键的向前遍历；到末尾后回到第一个可聚焦控件。
+    pub fn focus_next(&mut self) -> Result<(), MountError> {
+        self.traverse_focus(true)
+    }
+
+    /// Tab / 方向键的向后遍历；到开头后回到最后一个可聚焦控件。
+    pub fn focus_previous(&mut self) -> Result<(), MountError> {
+        self.traverse_focus(false)
+    }
+
+    fn traverse_focus(&mut self, forward: bool) -> Result<(), MountError> {
+        let state = self.state.clone();
+        context::install(&state, || {
+            let order = with_state(|state| state.focus_order());
+            if order.is_empty() {
+                return Err(MountError::Component("no focusable target"));
+            }
+            let current = with_state(|state| state.focused)
+                .and_then(|focused| order.iter().position(|id| *id == focused));
+            let index = match (forward, current) {
+                (true, Some(index)) => (index + 1) % order.len(),
+                (true, None) => 0,
+                (false, Some(0)) => order.len() - 1,
+                (false, Some(index)) => index - 1,
+                (false, None) => order.len() - 1,
+            };
+            self.move_focus(Some(order[index]))
+        })
+    }
+
+    fn move_focus(&mut self, target: Option<usize>) -> Result<(), MountError> {
+        let current = with_state(|state| state.focused);
+        if current == target {
+            return Ok(());
+        }
+        with_state(|state| {
+            state.phase = Phase::Event;
+            state.fault = None;
+            state.write_error = None;
+        });
+        if let Some(old) = current {
+            with_state(|state| state.focused = None);
+            if with_state(|state| state.element_is_mounted(old)) {
+                self.fire_blur(old, FocusCause::Command);
+            }
+        }
+        if let Some(target) = target {
+            with_state(|state| state.focused = Some(target));
+            self.fire_focus(target, FocusCause::Command);
+        }
+        with_state(|state| state.phase = Phase::Idle);
+        self.finish_command()
+    }
+
+    fn fire_blur(&mut self, element: usize, cause: FocusCause) {
+        self.dispatch_element_event(element, EventKind::Blur, |event| {
+            if let Event::Blur(handler) = event {
+                handler(BlurEvent::new(cause));
+            }
+        });
+    }
+
+    fn fire_focus(&mut self, element: usize, cause: FocusCause) {
+        self.dispatch_element_event(element, EventKind::Focus, |event| {
+            if let Event::Focus(handler) = event {
+                handler(FocusEvent::new(cause));
+            }
+        });
+    }
+
+    fn dispatch_element_event(
+        &mut self,
+        element: usize,
+        kind: EventKind,
+        invoke: impl FnOnce(&mut Event),
+    ) {
+        let Some((id, mut event)) = with_state(|state| state.take_element_event(element, kind))
+        else {
+            return;
+        };
+        invoke(&mut event);
+        with_state(|state| state.put_event(id, event));
+    }
+
     fn finish_command(&mut self) -> Result<(), MountError> {
         let fault = with_state(|state| state.fault);
         if let Some(fault) = fault {
@@ -1277,6 +1549,19 @@ impl Runtime {
             .set_text_input_caret(&FindTarget::Label(label.to_owned()), offset)
     }
 
+    pub fn focused(&self) -> Option<FocusInfo> {
+        let state = self.state.borrow();
+        let id = state.focused?;
+        if !state.element_is_mounted(id) {
+            return None;
+        }
+        let element = &state.elements[id];
+        Some(FocusInfo {
+            tag: element.tag,
+            label: element.label(),
+        })
+    }
+
     pub fn checked(&self, label: &str) -> Option<bool> {
         let state = self.state.borrow();
         let element = state.find_element(&FindTarget::Label(label.to_owned()))?;
@@ -1290,6 +1575,93 @@ impl Runtime {
 impl Default for Runtime {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+fn contains_element(state: &State, nodes: &[MountedNode], wanted: usize) -> bool {
+    nodes.iter().any(|node| match node {
+        MountedNode::Text(_) => false,
+        MountedNode::Element(id) => {
+            *id == wanted || contains_element(state, &state.elements[*id].children, wanted)
+        }
+        MountedNode::Component(id) => {
+            contains_element(state, &state.components[*id].children, wanted)
+        }
+        MountedNode::Show(show) => show
+            .active
+            .as_ref()
+            .is_some_and(|branch| contains_element(state, &branch.children, wanted)),
+        MountedNode::For(for_node) => for_node.order.iter().any(|key| {
+            for_node
+                .items
+                .get(key)
+                .is_some_and(|item| contains_element(state, &item.children, wanted))
+        }),
+    })
+}
+
+fn focus_replacement(
+    state: &State,
+    before: &[usize],
+    after: &[usize],
+    old: usize,
+) -> Option<usize> {
+    let index = before.iter().position(|id| *id == old)?;
+    let tag = state.elements[old].tag;
+    let live: BTreeSet<usize> = after.iter().copied().collect();
+    let same_tag = |id: &usize| live.contains(id) && state.elements[*id].tag == tag;
+    before[index + 1..]
+        .iter()
+        .find(|id| same_tag(id))
+        .copied()
+        .or_else(|| {
+            before[..index]
+                .iter()
+                .rev()
+                .find(|id| same_tag(id))
+                .copied()
+        })
+        .or_else(|| {
+            before[index + 1..]
+                .iter()
+                .find(|id| live.contains(id))
+                .copied()
+        })
+        .or_else(|| {
+            before[..index]
+                .iter()
+                .rev()
+                .find(|id| live.contains(id))
+                .copied()
+        })
+}
+
+fn collect_focusable(state: &State, nodes: &[MountedNode], order: &mut Vec<usize>) {
+    for node in nodes {
+        match node {
+            MountedNode::Text(_) => {}
+            MountedNode::Element(id) => {
+                if state.is_focusable(*id) {
+                    order.push(*id);
+                }
+                collect_focusable(state, &state.elements[*id].children, order);
+            }
+            MountedNode::Component(id) => {
+                collect_focusable(state, &state.components[*id].children, order);
+            }
+            MountedNode::Show(show) => {
+                if let Some(branch) = &show.active {
+                    collect_focusable(state, &branch.children, order);
+                }
+            }
+            MountedNode::For(for_node) => {
+                for key in &for_node.order {
+                    if let Some(item) = for_node.items.get(key) {
+                        collect_focusable(state, &item.children, order);
+                    }
+                }
+            }
+        }
     }
 }
 

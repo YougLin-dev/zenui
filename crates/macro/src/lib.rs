@@ -123,6 +123,8 @@ fn lower_attribute(attribute: &NodeAttribute) -> syn::Result<TokenStream> {
             "change" => quote! { on_change },
             "submit" => quote! { on_submit },
             "keydown" => quote! { on_keydown },
+            "focus" => quote! { on_focus },
+            "blur" => quote! { on_blur },
             other => {
                 return Err(syn::Error::new_spanned(
                     &attribute.key,
@@ -420,6 +422,17 @@ mod tests {
     fn unsupported_events_are_rejected() {
         let error = expand(quote! { <button on:paste={move || {}} /> }).unwrap_err();
         assert!(error.to_string().contains("unsupported event"));
+    }
+
+    #[test]
+    fn focus_and_blur_events_are_supported() {
+        expand(quote! {
+            <button
+                on:focus={move |_event: FocusEvent| {}}
+                on:blur={move |_event: BlurEvent| {}}
+            />
+        })
+        .expect("focus and blur lower to typed handlers");
     }
 
     #[test]
