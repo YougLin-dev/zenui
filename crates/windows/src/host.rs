@@ -1,6 +1,8 @@
 use std::error::Error;
 use std::fmt;
 use std::num::NonZeroIsize;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use windows::Win32::Foundation::{
     ERROR_CLASS_ALREADY_EXISTS, GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
@@ -24,10 +26,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetClientRect, GetMessageW, IDC_ARROW, LoadCursorW, MSG, PM_REMOVE,
     PeekMessageW, PostMessageW, PostQuitMessage, RegisterClassExW, SW_HIDE, SW_SHOW,
     SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SetWindowPos, ShowWindow, TranslateMessage,
-    WINDOW_EX_STYLE, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_DPICHANGED, WM_IME_CHAR, WM_IME_COMPOSITION,
-    WM_IME_ENDCOMPOSITION, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN,
-    WM_PAINT, WM_SIZE, WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
+    WINDOW_EX_STYLE, WM_APP, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_DPICHANGED, WM_IME_CHAR,
+    WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KILLFOCUS,
+    WM_LBUTTONDOWN, WM_PAINT, WM_SIZE, WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
 };
+
 use windows::core::{HSTRING, w};
 use zenui::prelude::*;
 use zenui_render::{
@@ -35,6 +38,9 @@ use zenui_render::{
 };
 
 use zenui_demo::TodoApp;
+
+/// worker 唤醒只投递这一条消息；`WM_APP` 起是应用私有的消息区间。
+const HOST_WAKE_MESSAGE: u32 = WM_APP + 1;
 
 /// 打开宿主窗口的选项。
 #[derive(Clone, Copy, Debug)]
@@ -107,6 +113,35 @@ impl Frame {
     }
 }
 
+/// worker 与 UI 线程共享的唤醒状态。
+///
+/// 至多一条消息在途：第一个唤醒登记 `pending` 并投递，其余唤醒合并；关闭后
+/// 不再投递。两个标志总是一起构造、捕获和查询，因此放在同一个 `Arc` 里。
+struct WakeState {
+    pending: AtomicBool,
+    closed: AtomicBool,
+}
+
+impl WakeState {
+    /// 若没有在途唤醒则登记并返回 `true`；否则本次唤醒合并进已有消息。
+    fn claim(&self) -> bool {
+        !self.pending.swap(true, Ordering::SeqCst)
+    }
+
+    /// 宿主已处理或放弃这条唤醒，下一次唤醒需要重新投递。
+    fn observed(&self) {
+        self.pending.store(false, Ordering::SeqCst);
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
+
+    fn close(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+    }
+}
+
 /// Win32 宿主：一个 HWND、一个 activation、一个 DX12 surface。
 pub struct Host {
     runtime: Runtime,
@@ -120,6 +155,7 @@ pub struct Host {
     window: Window,
     scene: Option<Scene>,
     pending_high_surrogate: Option<u16>,
+    wake: Arc<WakeState>,
 }
 
 impl Host {
@@ -140,6 +176,39 @@ impl Host {
         let window = Window::new(config, hinstance)?;
         let hwnd = window.hwnd;
 
+        // worker 只向宿主窗口投递一条合并后的消息；runtime 访问留在 UI 线程，
+        // 关闭标志阻止窗口关闭后的迟到投递。
+        let wake = Arc::new(WakeState {
+            pending: AtomicBool::new(false),
+            closed: AtomicBool::new(false),
+        });
+        {
+            let wake = Arc::clone(&wake);
+            // HWND 本身不实现 Send；回调只保存句柄值并在 worker 线程投递。
+            let hwnd_value = hwnd.0 as isize;
+            runtime.set_wake_callback(move || {
+                if wake.is_closed() || !wake.claim() {
+                    return;
+                }
+                // 安全：PostMessageW 是线程安全的；关闭标志尽量阻止窗口关闭后
+                // 的新投递，竞态下已销毁窗口的句柄值只让调用返回错误，不会解引用。
+                if unsafe {
+                    PostMessageW(
+                        Some(HWND(hwnd_value as *mut core::ffi::c_void)),
+                        HOST_WAKE_MESSAGE,
+                        WPARAM(0),
+                        LPARAM(0),
+                    )
+                }
+                .is_err()
+                {
+                    // 投递失败说明窗口已不能接收唤醒；释放合并标志，
+                    // 避免之后的唤醒被永久吞掉。
+                    wake.observed();
+                }
+            });
+        }
+
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::DX12,
             ..wgpu::InstanceDescriptor::new_without_display_handle()
@@ -159,6 +228,7 @@ impl Host {
             window,
             scene: None,
             pending_high_surrogate: None,
+            wake,
         })
     }
 
@@ -240,16 +310,46 @@ impl Host {
             self.ime_composition(message.lParam)?;
         } else if matches!(message.message, WM_IME_ENDCOMPOSITION | WM_KILLFOCUS) {
             self.ime_cancel()?;
+        } else if message.message == HOST_WAKE_MESSAGE {
+            self.deliver_tasks()?;
         } else if message.message == WM_CLOSE {
             // 窗口的 HWND 仍然有效；Window::drop 在 surface 释放后才销毁它。
-            self.runtime
-                .close_window(self.window_ctx)
-                .map_err(HostError::Close)?;
+            self.close_activation()?;
             return Ok(true);
         } else if matches!(message.message, WM_SIZE | WM_PAINT | WM_DPICHANGED) {
             self.render()?;
         }
         Ok(false)
+    }
+
+    /// 交付已排队的 worker 结果，并只在快照确实变化时重绘。
+    ///
+    /// 每条唤醒消息都会交付全部已排队结果，因此多次完成只产生一次重绘；
+    /// 已关闭的窗口只丢弃结果，不再读取快照或绘制。
+    fn deliver_tasks(&mut self) -> Result<(), HostError> {
+        self.wake.observed();
+        if self.wake.is_closed() {
+            self.runtime.drive_tasks().map_err(HostError::Runtime)?;
+            return Ok(());
+        }
+        let before = self.runtime.presentation().map_err(HostError::Runtime)?;
+        let report = self.runtime.drive_tasks().map_err(HostError::Runtime)?;
+        if report.delivered == 0 {
+            return Ok(());
+        }
+        let after = self.runtime.presentation().map_err(HostError::Runtime)?;
+        if before == after {
+            return Ok(());
+        }
+        self.render()
+    }
+
+    /// 结束 activation 并拒绝后续唤醒；`WM_CLOSE` 与 `Drop` 共用。
+    fn close_activation(&mut self) -> Result<(), HostError> {
+        self.wake.close();
+        self.runtime
+            .close_window(self.window_ctx)
+            .map_err(HostError::Close)
     }
 
     /// 请求关闭窗口；消息循环会在处理 WM_CLOSE 后释放 activation。
@@ -885,8 +985,9 @@ impl Host {
 
 impl Drop for Host {
     fn drop(&mut self) {
-        // Drop 不能返回错误；未通过 run 关闭的宿主在这里尽力释放 activation。
-        let _ = self.runtime.close_window(self.window_ctx);
+        // Drop 不能返回错误；未通过 run 关闭的宿主在这里尽力释放 activation，
+        // 并阻止仍在运行的 worker 继续投递唤醒。
+        let _ = self.close_activation();
     }
 }
 
@@ -1396,6 +1497,65 @@ mod tests {
         host.resize(320, 240).expect("restore size");
         let frame = host.read_frame().expect("frame after restore");
         assert!(frame.width() > 0 && frame.height() > 0);
+    }
+
+    fn wake_state() -> WakeState {
+        WakeState {
+            pending: AtomicBool::new(false),
+            closed: AtomicBool::new(false),
+        }
+    }
+
+    #[test]
+    fn wake_notifications_coalesce_until_the_host_observes_them() {
+        let wake = wake_state();
+        assert!(wake.claim(), "the first wake posts one message");
+        assert!(
+            !wake.claim(),
+            "further wakes coalesce into the queued message"
+        );
+        wake.observed();
+        assert!(wake.claim(), "a wake after handling posts again");
+    }
+
+    #[test]
+    fn concurrent_wakes_claim_exactly_one_message() {
+        let wake = Arc::new(wake_state());
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let workers: Vec<_> = (0..2)
+            .map(|_| {
+                let wake = Arc::clone(&wake);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    wake.claim()
+                })
+            })
+            .collect();
+        barrier.wait();
+        let claimed = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("worker"))
+            .filter(|claimed| *claimed)
+            .count();
+        assert_eq!(claimed, 1, "exactly one concurrent wake posts a message");
+    }
+
+    #[test]
+    fn closing_the_window_cancels_window_owned_tasks() {
+        let mut host = open_host();
+        // 事件 handler 在已安装的运行时上下文里启动窗口所有权任务；
+        // 不 pump 唤醒消息，确保关闭发生在交付之前。
+        host.runtime
+            .click_text("Preview import")
+            .expect("spawn a window-owned task");
+
+        host.close_activation().expect("close the activation");
+        host.runtime.wait_for_tasks();
+
+        let report = host.runtime.drive_tasks().expect("drive after close");
+        assert_eq!(report.delivered, 0, "a closed window receives no delivery");
+        assert_eq!(report.discarded, 1, "the finished result is discarded");
     }
 
     #[test]
