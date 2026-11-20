@@ -11,22 +11,27 @@ mod context;
 pub mod runtime;
 pub mod signal;
 pub mod store;
+pub mod task;
 pub mod view;
+pub mod window;
 
 pub use context::Phase;
 pub use runtime::Runtime;
 pub use signal::{Memo, Once, Signal, memo, once, signal};
 pub use store::{Field, FieldError, Store, TodoId, Transaction, WriteError, WriteOp};
+pub use task::{DeliveryReport, Task, TaskError, TaskScope, TaskStatus, TaskToken};
 pub use view::{
     Children, ChildrenFactory, Key, KeyEvent, MountError, MountPlan, MountResult, SubmitEvent,
 };
+pub use window::{WindowCtx, WindowError};
 pub use zenui_macro::{component, view};
 
 pub mod prelude {
     pub use crate::{
-        Children, ChildrenFactory, Field, FieldError, Key, KeyEvent, Memo, MountError, MountPlan,
-        MountResult, Once, Runtime, Signal, Store, SubmitEvent, TodoId, Transaction, WriteError,
-        WriteOp, component, memo, once, signal, view,
+        Children, ChildrenFactory, DeliveryReport, Field, FieldError, Key, KeyEvent, Memo,
+        MountError, MountPlan, MountResult, Once, Runtime, Signal, Store, SubmitEvent, Task,
+        TaskError, TaskScope, TaskStatus, TaskToken, TodoId, Transaction, WindowCtx, WindowError,
+        WriteError, WriteOp, component, memo, once, signal, view,
     };
     pub use zenui_core::Filter;
 }

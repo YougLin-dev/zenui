@@ -1,0 +1,646 @@
+use std::any::Any;
+use std::cell::RefCell;
+use std::error::Error;
+use std::fmt;
+use std::marker::PhantomData;
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
+
+use crate::context::{Phase, with_state, with_state_of};
+use crate::runtime::{Runtime, State};
+use crate::view::MountError;
+use crate::window::WindowCtx;
+
+/// `App` 拥有的工作可以跨窗口关闭继续提交模型；
+/// `Window` 拥有的工作在 activation 关闭时取消交付。
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum TaskOwner {
+    App,
+    Window(WindowCtx),
+}
+
+impl TaskOwner {
+    /// 交付期间创建的 UI 资源归属其任务所有者，而不是上一次命令的 Owner。
+    const fn owner_id(self) -> u32 {
+        match self {
+            Self::App => 0,
+            Self::Window(window) => window.owner,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct TaskScope {
+    pub(crate) runtime: u32,
+    owner: TaskOwner,
+    _not_send: PhantomData<*const ()>,
+}
+
+impl TaskScope {
+    pub(crate) const fn app(runtime: u32) -> Self {
+        Self {
+            runtime,
+            owner: TaskOwner::App,
+            _not_send: PhantomData,
+        }
+    }
+
+    pub(crate) const fn for_window(runtime: u32, window: WindowCtx) -> Self {
+        Self {
+            runtime,
+            owner: TaskOwner::Window(window),
+            _not_send: PhantomData,
+        }
+    }
+
+    /// worker 只接收可 Send 的 job；UI 句柄不满足 `Send`，在编译期被拒绝。
+    ///
+    /// ```compile_fail
+    /// use zenui::prelude::*;
+    ///
+    /// fn capture_ui_handle(scope: TaskScope, draft: Signal<String>) {
+    ///     let _ = scope.spawn(move || draft.get());
+    /// }
+    /// ```
+    ///
+    /// ```compile_fail
+    /// use zenui::prelude::*;
+    ///
+    /// fn capture_store(scope: TaskScope, todos: Store) {
+    ///     let _ = scope.spawn(move || todos.is_empty(Filter::All));
+    /// }
+    /// ```
+    ///
+    /// ```compile_fail
+    /// use zenui::prelude::*;
+    ///
+    /// fn capture_window(scope: TaskScope, window: WindowCtx) {
+    ///     let _ = scope.spawn(move || window.activation());
+    /// }
+    /// ```
+    ///
+    /// ```compile_fail
+    /// use zenui::prelude::*;
+    ///
+    /// fn capture_memo(scope: TaskScope, label: Memo<String>) {
+    ///     let _ = scope.spawn(move || label.get());
+    /// }
+    /// ```
+    pub fn spawn<T, F>(self, job: F) -> Result<Task<T>, TaskError>
+    where
+        T: Send + 'static,
+        F: FnOnce(TaskToken) -> T + Send + 'static,
+    {
+        if crate::context::installed_runtime().is_some_and(|current| current != self.runtime) {
+            return Err(TaskError::WrongRuntime);
+        }
+        let TaskStart { id, sender, token } =
+            with_state_of(self.runtime, |state| state.begin_task(self.owner))?;
+        let _worker = std::thread::spawn(move || {
+            let outcome = catch_unwind(AssertUnwindSafe(|| job(TaskToken { cancelled: token })));
+            let message = match outcome {
+                Ok(value) => WorkerMessage::Value(Box::new(value)),
+                Err(_) => WorkerMessage::Panicked,
+            };
+            let _ = sender.send(message);
+        });
+        Ok(Task {
+            runtime: self.runtime,
+            id,
+            _marker: PhantomData,
+            _not_send: PhantomData,
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct TaskToken {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl TaskToken {
+    /// 窗口关闭后，窗口所有权的工作会看到取消标志；worker 可据此提前结束。
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TaskStatus {
+    Running,
+    /// worker 已返回，结果等待 continuation 或交付检查。
+    Completed,
+    /// continuation 已在 delivery command turn 中执行。
+    Delivered,
+    /// 所属窗口在交付前关闭，或启动它的失败窗口 setup 被撤销。
+    Cancelled,
+    /// 完成结果在交付时因目标失效或任务已取消而被丢弃。
+    Stale,
+    /// worker 发生 panic；结果不会进入交付。
+    Panicked,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum TaskError {
+    WrongRuntime,
+    /// 目标窗口 activation 已关闭；拒绝而不是空成功。
+    TargetClosed,
+    AlreadySettled,
+    Context {
+        operation: &'static str,
+        phase: Phase,
+    },
+}
+
+impl fmt::Display for TaskError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::WrongRuntime => {
+                f.write_str("a task handle from another ZenUI Runtime cannot access this one")
+            }
+            Self::TargetClosed => f.write_str("the task target is no longer live"),
+            Self::AlreadySettled => f.write_str("the task already has a continuation or delivery"),
+            Self::Context { operation, phase } => {
+                write!(f, "{operation} is not allowed during {phase:?}")
+            }
+        }
+    }
+}
+
+impl Error for TaskError {}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DeliveryReport {
+    pub delivered: usize,
+    pub discarded: usize,
+}
+
+impl DeliveryReport {
+    fn absorb(&mut self, other: Self) {
+        self.delivered += other.delivered;
+        self.discarded += other.discarded;
+    }
+}
+
+pub struct Task<T> {
+    runtime: u32,
+    id: u32,
+    _marker: PhantomData<fn() -> T>,
+    _not_send: PhantomData<*const ()>,
+}
+
+impl<T> Copy for Task<T> {}
+impl<T> Clone for Task<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T> fmt::Debug for Task<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Task")
+            .field("runtime", &self.runtime)
+            .field("id", &self.id)
+            .finish()
+    }
+}
+
+impl<T: Send + 'static> Task<T> {
+    /// continuation 在 UI 线程的 delivery command turn 中运行；
+    /// 它可以提交模型或写仍存活的 UI Signal，但不具有 worker 侧的类型入口。
+    pub fn on_done<F>(self, f: F) -> Result<(), TaskError>
+    where
+        F: FnOnce(T) -> Result<(), MountError> + 'static,
+    {
+        if crate::context::installed_runtime().is_some_and(|current| current != self.runtime) {
+            return Err(TaskError::WrongRuntime);
+        }
+        let continuation: Continuation = Box::new(move |value: Box<dyn Any + Send>| {
+            let value: T = *value
+                .downcast::<T>()
+                .map_err(|_| MountError::Delivery("task result has a different type"))?;
+            f(value)
+        });
+        with_state_of(self.runtime, |state| {
+            state.register_continuation(self.id, continuation)
+        })
+    }
+}
+
+pub(crate) type Continuation = Box<dyn FnOnce(Box<dyn Any + Send>) -> Result<(), MountError>>;
+
+pub(crate) enum WorkerMessage {
+    Value(Box<dyn Any + Send>),
+    Panicked,
+}
+
+pub(crate) struct TaskStart {
+    id: u32,
+    sender: Sender<WorkerMessage>,
+    token: Arc<AtomicBool>,
+}
+
+pub(crate) struct TaskRecord {
+    owner: TaskOwner,
+    /// 启动位置的 Owner；失败的挂载会取消在该 setup 子树中创建的任务。
+    origin: Option<u32>,
+    status: TaskStatus,
+    token: Arc<AtomicBool>,
+    receiver: Option<Receiver<WorkerMessage>>,
+    completion: Option<Box<dyn Any + Send>>,
+    continuation: Option<Continuation>,
+}
+
+impl TaskRecord {
+    fn accept(&mut self, message: WorkerMessage) {
+        match message {
+            WorkerMessage::Value(value) => match self.status {
+                TaskStatus::Running => {
+                    self.completion = Some(value);
+                    self.status = TaskStatus::Completed;
+                }
+                TaskStatus::Cancelled => {
+                    self.completion = Some(value);
+                }
+                _ => {}
+            },
+            WorkerMessage::Panicked => {
+                self.status = TaskStatus::Panicked;
+                self.completion = None;
+                self.continuation = None;
+            }
+        }
+    }
+}
+
+pub(crate) enum DeliveryStep {
+    Discard,
+    Run {
+        id: u32,
+        owner: u32,
+        value: Box<dyn Any + Send>,
+        continuation: Continuation,
+    },
+}
+
+impl State {
+    pub(crate) fn begin_task(&mut self, owner: TaskOwner) -> Result<TaskStart, TaskError> {
+        if matches!(self.phase, Phase::Binding | Phase::Memo) {
+            return Err(TaskError::Context {
+                operation: "TaskScope::spawn",
+                phase: self.phase,
+            });
+        }
+        if !self.task_target_live(owner) {
+            return Err(TaskError::TargetClosed);
+        }
+        let id = self.next_task;
+        self.next_task += 1;
+        let (sender, receiver) = channel();
+        let token = Arc::new(AtomicBool::new(false));
+        self.tasks.insert(
+            id,
+            TaskRecord {
+                owner,
+                origin: self.current_owner,
+                status: TaskStatus::Running,
+                token: Arc::clone(&token),
+                receiver: Some(receiver),
+                completion: None,
+                continuation: None,
+            },
+        );
+        Ok(TaskStart { id, sender, token })
+    }
+
+    pub(crate) fn register_continuation(
+        &mut self,
+        id: u32,
+        continuation: Continuation,
+    ) -> Result<(), TaskError> {
+        let Some((owner, status, registered)) = self
+            .tasks
+            .get(&id)
+            .map(|record| (record.owner, record.status, record.continuation.is_some()))
+        else {
+            return Err(TaskError::AlreadySettled);
+        };
+        if !self.task_target_live(owner) {
+            return Err(TaskError::TargetClosed);
+        }
+        if registered || !matches!(status, TaskStatus::Running | TaskStatus::Completed) {
+            return Err(TaskError::AlreadySettled);
+        }
+        self.tasks
+            .get_mut(&id)
+            .expect("task is registered")
+            .continuation = Some(continuation);
+        Ok(())
+    }
+
+    /// 失败的窗口计划会取消在它 setup 子树中启动的所有任务，包括 app 所有权任务。
+    pub(crate) fn cancel_tasks_started_under(&mut self, ancestor: u32) {
+        let ids: Vec<u32> = self.tasks.keys().copied().collect();
+        for id in ids {
+            let cancel = self.tasks.get(&id).is_some_and(|record| {
+                matches!(record.status, TaskStatus::Running | TaskStatus::Completed)
+                    && record
+                        .origin
+                        .is_some_and(|origin| self.owner_is_within(origin, ancestor))
+            });
+            if cancel {
+                let record = self.tasks.get_mut(&id).expect("task is registered");
+                record.status = TaskStatus::Cancelled;
+                record.token.store(true, Ordering::SeqCst);
+                record.continuation = None;
+            }
+        }
+    }
+
+    pub(crate) fn cancel_window_tasks(&mut self, key: &'static str, activation: u32) {
+        for record in self.tasks.values_mut() {
+            if !matches!(record.status, TaskStatus::Running | TaskStatus::Completed) {
+                continue;
+            }
+            if let TaskOwner::Window(window) = record.owner
+                && window.key == key
+                && window.activation == activation
+            {
+                record.status = TaskStatus::Cancelled;
+                record.token.store(true, Ordering::SeqCst);
+                record.continuation = None;
+            }
+        }
+    }
+
+    fn task_target_live(&self, owner: TaskOwner) -> bool {
+        match owner {
+            TaskOwner::App => true,
+            TaskOwner::Window(window) => {
+                self.window_is_live(window.key, window.activation, window.owner)
+            }
+        }
+    }
+
+    /// 每次只取一个可执行的交付，避免在 State 借用内调用 continuation。
+    pub(crate) fn next_delivery(&mut self) -> Option<DeliveryStep> {
+        let candidates: Vec<u32> = self
+            .tasks
+            .iter()
+            .filter(|(_, record)| record.completion.is_some())
+            .map(|(id, _)| *id)
+            .collect();
+        for id in candidates {
+            let (owner, status, registered) = {
+                let record = self.tasks.get(&id)?;
+                (record.owner, record.status, record.continuation.is_some())
+            };
+            if status == TaskStatus::Panicked {
+                continue;
+            }
+            if status == TaskStatus::Cancelled || !self.task_target_live(owner) {
+                let record = self.tasks.get_mut(&id)?;
+                record.completion = None;
+                record.continuation = None;
+                record.status = TaskStatus::Stale;
+                return Some(DeliveryStep::Discard);
+            }
+            if registered {
+                let owner = owner.owner_id();
+                let record = self.tasks.get_mut(&id)?;
+                let value = record.completion.take()?;
+                let continuation = record.continuation.take()?;
+                return Some(DeliveryStep::Run {
+                    id,
+                    owner,
+                    value,
+                    continuation,
+                });
+            }
+        }
+        None
+    }
+
+    pub(crate) fn mark_delivered(&mut self, id: u32) {
+        if let Some(record) = self.tasks.get_mut(&id) {
+            record.status = TaskStatus::Delivered;
+            record.completion = None;
+            record.continuation = None;
+            record.receiver = None;
+        }
+    }
+
+    pub(crate) fn mark_panicked(&mut self, id: u32) {
+        if let Some(record) = self.tasks.get_mut(&id) {
+            record.status = TaskStatus::Panicked;
+            record.completion = None;
+            record.continuation = None;
+            record.receiver = None;
+        }
+    }
+
+    /// 非阻塞地接收已经返回的 worker 结果，供真实事件循环轮询。
+    pub(crate) fn accept_ready_tasks(&mut self) {
+        for record in self.tasks.values_mut() {
+            if record.completion.is_some() || record.receiver.is_none() {
+                continue;
+            }
+            let outcome = record.receiver.as_ref().expect("checked").try_recv();
+            match outcome {
+                Ok(message) => {
+                    record.receiver = None;
+                    record.accept(message);
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    record.receiver = None;
+                    record.status = TaskStatus::Panicked;
+                }
+            }
+        }
+    }
+}
+
+/// continuation 可能 panic；恢复执行上下文不能依赖调用方正常返回。
+struct DeliveryContext {
+    state: Rc<RefCell<State>>,
+    owner: Option<u32>,
+    read_only: u32,
+    phase: Phase,
+}
+
+impl Drop for DeliveryContext {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.state.try_borrow_mut() {
+            state.current_owner = self.owner;
+            state.read_only = self.read_only;
+            state.phase = self.phase;
+        }
+    }
+}
+
+impl Runtime {
+    pub fn task_scope(&self) -> TaskScope {
+        TaskScope::app(self.state.borrow().id)
+    }
+
+    pub fn task_status<T>(&self, task: Task<T>) -> Option<TaskStatus> {
+        let state = self.state.borrow();
+        if task.runtime != state.id {
+            return None;
+        }
+        state.tasks.get(&task.id).map(|record| record.status)
+    }
+
+    /// headless 驱动入口：没有平台事件循环时可直接创建 app 所有权任务。
+    pub fn spawn_task<T, F>(&mut self, scope: TaskScope, job: F) -> Result<Task<T>, TaskError>
+    where
+        T: Send + 'static,
+        F: FnOnce(TaskToken) -> T + Send + 'static,
+    {
+        let state = self.state.clone();
+        if scope.runtime != state.borrow().id {
+            return Err(TaskError::WrongRuntime);
+        }
+        crate::context::install(&state, || scope.spawn(job))
+    }
+
+    pub fn task_done<T, F>(&mut self, task: Task<T>, f: F) -> Result<(), TaskError>
+    where
+        T: Send + 'static,
+        F: FnOnce(T) -> Result<(), MountError> + 'static,
+    {
+        let state = self.state.clone();
+        if task.runtime != state.borrow().id {
+            return Err(TaskError::WrongRuntime);
+        }
+        crate::context::install(&state, || task.on_done(f))
+    }
+
+    /// 等待所有 worker 返回；窗口已取消的任务也会等到其完成，以便确认结果被丢弃。
+    pub fn wait_for_tasks(&mut self) {
+        loop {
+            let next = {
+                let mut state = self.state.borrow_mut();
+                let id = state
+                    .tasks
+                    .iter()
+                    .find(|(_, record)| record.receiver.is_some() && record.completion.is_none())
+                    .map(|(id, _)| *id);
+                let Some(id) = id else {
+                    break;
+                };
+                let receiver = state
+                    .tasks
+                    .get_mut(&id)
+                    .and_then(|record| record.receiver.take());
+                match receiver {
+                    Some(receiver) => (id, receiver),
+                    None => continue,
+                }
+            };
+            let message = next.1.recv();
+            let mut state = self.state.borrow_mut();
+            if let Some(record) = state.tasks.get_mut(&next.0) {
+                match message {
+                    Ok(message) => record.accept(message),
+                    Err(_) => record.status = TaskStatus::Panicked,
+                }
+            }
+        }
+    }
+
+    /// 在当前线程交付已完成的结果；旧 activation 的结果在交付前被丢弃。
+    pub fn drive_tasks(&mut self) -> Result<DeliveryReport, MountError> {
+        let state = self.state.clone();
+        crate::context::install(&state, || {
+            with_state(State::accept_ready_tasks);
+            let mut report = DeliveryReport::default();
+            loop {
+                let Some(step) = with_state(State::next_delivery) else {
+                    break;
+                };
+                match step {
+                    DeliveryStep::Discard => {
+                        report.discarded += 1;
+                    }
+                    DeliveryStep::Run {
+                        id,
+                        owner,
+                        value,
+                        continuation,
+                    } => {
+                        let previous = with_state(|state| {
+                            let previous = (state.current_owner, state.read_only, state.phase);
+                            state.current_owner = Some(owner);
+                            state.phase = Phase::Delivery;
+                            state.fault = None;
+                            state.write_error = None;
+                            previous
+                        });
+                        let context = DeliveryContext {
+                            state: Rc::clone(&state),
+                            owner: previous.0,
+                            read_only: previous.1,
+                            phase: previous.2,
+                        };
+                        let outcome = catch_unwind(AssertUnwindSafe(|| continuation(value)));
+                        let (fault, write_error) =
+                            with_state(|state| (state.fault.take(), state.write_error.take()));
+                        drop(context);
+                        let outcome = match outcome {
+                            Ok(result) => result,
+                            Err(_) => {
+                                with_state(|state| state.mark_panicked(id));
+                                return Err(MountError::Delivery("task continuation panicked"));
+                            }
+                        };
+                        with_state(|state| state.mark_delivered(id));
+                        report.delivered += 1;
+
+                        let refresh_error = with_state(State::has_tree)
+                            .then(|| self.refresh().err())
+                            .flatten();
+                        if let Some(error) = outcome
+                            .err()
+                            .or(fault.map(|fault| MountError::Context {
+                                operation: fault.operation,
+                                phase: fault.phase,
+                            }))
+                            .or(write_error.map(MountError::Write))
+                            .or(refresh_error)
+                        {
+                            return Err(error);
+                        }
+                    }
+                }
+            }
+            Ok(report)
+        })
+    }
+
+    /// headless 驱动入口：等待 worker，然后按 delivery 检查交付。
+    pub fn settle_tasks(&mut self) -> Result<DeliveryReport, MountError> {
+        let mut report = DeliveryReport::default();
+        loop {
+            self.wait_for_tasks();
+            let delivered = self.drive_tasks()?;
+            report.absorb(delivered);
+            if !self.has_pending_tasks() {
+                break;
+            }
+        }
+        Ok(report)
+    }
+
+    fn has_pending_tasks(&self) -> bool {
+        self.state
+            .borrow()
+            .tasks
+            .values()
+            .any(|record| record.receiver.is_some())
+    }
+}

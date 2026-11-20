@@ -10,6 +10,7 @@ pub struct Signal<T> {
     runtime: u32,
     id: u32,
     _marker: PhantomData<fn() -> T>,
+    _not_send: PhantomData<*const ()>,
 }
 
 impl<T> Copy for Signal<T> {}
@@ -39,13 +40,13 @@ impl<T: Clone + PartialEq + 'static> Signal<T> {
             }
         }
 
+        let _guard = Guard {
+            runtime: self.runtime,
+        };
         let value = with_state_of(self.runtime, |state| {
             state.read_only += 1;
             state.read_signal(self.id)
         });
-        let _guard = Guard {
-            runtime: self.runtime,
-        };
         f(&value)
     }
 }
@@ -63,6 +64,7 @@ pub struct Memo<T> {
     runtime: u32,
     id: u32,
     _marker: PhantomData<fn() -> T>,
+    _not_send: PhantomData<*const ()>,
 }
 
 impl<T> Copy for Memo<T> {}
@@ -127,6 +129,7 @@ pub fn signal<T: Clone + PartialEq + 'static>(value: T) -> Signal<T> {
         runtime,
         id,
         _marker: PhantomData,
+        _not_send: PhantomData,
     }
 }
 
@@ -139,6 +142,7 @@ pub fn memo<T: Clone + PartialEq + 'static>(compute: impl Fn() -> T + 'static) -
         runtime,
         id,
         _marker: PhantomData,
+        _not_send: PhantomData,
     }
 }
 
@@ -207,12 +211,16 @@ impl crate::runtime::State {
     }
 
     pub(crate) fn write_signal<T: Clone + PartialEq + 'static>(&mut self, id: u32, value: T) {
-        if self.phase != Phase::Event || self.read_only > 0 {
+        if !matches!(self.phase, Phase::Event | Phase::Delivery) || self.read_only > 0 {
             self.record_fault("Signal::set", self.phase);
             return;
         }
-        let cell = &self.signals[self.signal_index(id)];
-        assert!(!cell.disposed, "signal belongs to a disposed owner");
+        let index = self.signal_index(id);
+        if self.signals[index].disposed {
+            self.record_fault("Signal::set", self.phase);
+            return;
+        }
+        let cell = &self.signals[index];
         let current = cell
             .value
             .clone()

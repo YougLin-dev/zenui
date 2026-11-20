@@ -13,6 +13,7 @@ pub enum Phase {
     Binding,
     Memo,
     Event,
+    Delivery,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -62,6 +63,11 @@ pub(crate) fn install<R>(state: &Rc<RefCell<State>>, f: impl FnOnce() -> R) -> R
     let result = f();
     drop(guard);
     result
+}
+
+pub(crate) fn installed_runtime() -> Option<u32> {
+    let state = CURRENT.with(|current| current.borrow().last().cloned());
+    state.and_then(|state| state.try_borrow().ok().map(|state| state.id))
 }
 
 pub(crate) fn with_state<R>(f: impl FnOnce(&mut State) -> R) -> R {

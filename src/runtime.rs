@@ -8,10 +8,12 @@ use zenui_core::{Counters, RowSet};
 use crate::context::{self, ContextFault, DepKey, Phase, with_state};
 use crate::signal::{Memo, MemoCell, SignalCell};
 use crate::store::{TodoId, WriteError};
+use crate::task::TaskRecord;
 use crate::view::{
     Attr, AttrValue, ChildrenFactory, Event, Key, KeyEvent, MountError, MountPlan, MountResult,
     PlanNode, ResultBoolValue, SubmitEvent, TextSlot,
 };
+use crate::window::{WindowCtx, WindowError, WindowRecord};
 
 pub(crate) enum Resource {
     Signal(u32),
@@ -42,11 +44,16 @@ pub(crate) struct State {
     pub(crate) once_reads: u64,
     owners: BTreeMap<u32, OwnerRecord>,
     next_owner: u32,
-    current_owner: Option<u32>,
+    pub(crate) current_owner: Option<u32>,
     events: Vec<Event>,
     elements: Vec<MountedElement>,
     components: Vec<MountedComponent>,
     tree: Option<Vec<MountedNode>>,
+    tree_owner: Option<u32>,
+    tree_window: Option<&'static str>,
+    windows: BTreeMap<&'static str, WindowRecord>,
+    pub(crate) tasks: BTreeMap<u32, TaskRecord>,
+    pub(crate) next_task: u32,
     setup_counts: BTreeMap<&'static str, u64>,
     next_instance: u64,
     unmounts: u64,
@@ -90,6 +97,11 @@ impl State {
             elements: Vec::new(),
             components: Vec::new(),
             tree: None,
+            tree_owner: None,
+            tree_window: None,
+            windows: BTreeMap::new(),
+            tasks: BTreeMap::new(),
+            next_task: 1,
             setup_counts: BTreeMap::new(),
             next_instance: 1,
             unmounts: 0,
@@ -104,7 +116,7 @@ impl State {
         }
     }
 
-    fn create_owner(&mut self, parent: Option<u32>) -> u32 {
+    pub(crate) fn create_owner(&mut self, parent: Option<u32>) -> u32 {
         let id = self.next_owner;
         self.next_owner += 1;
         self.owners.insert(
@@ -126,7 +138,7 @@ impl State {
 
     /// 先释放本 Owner 的订阅/信号/Memo/事件，再递归释放子 Owner；
     /// 这样已卸载分支的旧回调不会命中新一代界面。
-    fn dispose_owner(&mut self, id: u32) {
+    pub(crate) fn dispose_owner(&mut self, id: u32) {
         let Some(record) = self.owners.get_mut(&id) else {
             return;
         };
@@ -181,6 +193,67 @@ impl State {
             .map(|record| std::mem::take(&mut record.resources))
             .unwrap_or_default();
         self.release_resources(resources);
+    }
+
+    pub(crate) fn window_is_live(&self, key: &'static str, activation: u32, owner: u32) -> bool {
+        let open = self.windows.get(key).is_some_and(|record| {
+            record.open && record.activation == activation && record.owner == owner
+        });
+        open && self
+            .owners
+            .get(&owner)
+            .is_some_and(|record| !record.disposed)
+    }
+
+    pub(crate) fn owner_is_within(&self, owner: u32, ancestor: u32) -> bool {
+        let mut current = Some(owner);
+        while let Some(id) = current {
+            if id == ancestor {
+                return true;
+            }
+            current = self.owners.get(&id).and_then(|record| record.parent);
+        }
+        false
+    }
+
+    pub(crate) fn begin_window(&mut self, key: &'static str) -> (u32, u32) {
+        let activation = self
+            .windows
+            .get(key)
+            .map_or(1, |record| record.activation + 1);
+        let owner = self.create_owner(Some(0));
+        self.windows.insert(
+            key,
+            WindowRecord {
+                activation,
+                owner,
+                open: true,
+            },
+        );
+        (activation, owner)
+    }
+
+    pub(crate) fn mark_window_closed(&mut self, key: &'static str) {
+        if let Some(record) = self.windows.get_mut(key) {
+            record.open = false;
+        }
+    }
+
+    /// 正常关闭只取消窗口所有权交付；app 所有权任务按声明继续存活。
+    pub(crate) fn cancel_window(&mut self, key: &'static str, activation: u32) {
+        self.cancel_window_tasks(key, activation);
+        self.mark_window_closed(key);
+    }
+
+    /// 失败的挂载还取消在该 setup 子树中启动的任务，包括 app 所有权任务。
+    pub(crate) fn abort_window(&mut self, key: &'static str, activation: u32, owner: u32) {
+        self.cancel_window_tasks(key, activation);
+        self.cancel_tasks_started_under(owner);
+        self.mark_window_closed(key);
+    }
+
+    pub(crate) fn has_tree(&mut self) -> bool {
+        self.tree.is_some()
     }
 
     fn context_error(fault: ContextFault) -> MountError {
@@ -424,7 +497,7 @@ fn find_element(state: &State, nodes: &[MountedNode], target: &FindTarget) -> Op
 }
 
 pub struct Runtime {
-    state: Rc<RefCell<State>>,
+    pub(crate) state: Rc<RefCell<State>>,
 }
 
 impl Runtime {
@@ -443,6 +516,7 @@ impl Runtime {
         }
         let state = self.state.clone();
         context::install(&state, || {
+            with_state(|state| state.fault = None);
             let plan = match with_owner(0, root) {
                 Ok(plan) => plan,
                 Err(error) => {
@@ -463,10 +537,135 @@ impl Runtime {
             }
             with_state(|state| {
                 state.tree = Some(tree);
+                state.tree_owner = Some(0);
+                state.tree_window = None;
                 state.phase = Phase::Idle;
             });
             self.refresh()
         })
+    }
+
+    /// 失败的计划先撤销交付，再释放已创建的界面与 Owner。
+    fn abort_open(
+        &mut self,
+        key: &'static str,
+        activation: u32,
+        owner: u32,
+        tree: Option<Vec<MountedNode>>,
+    ) {
+        with_state(|state| {
+            state.abort_window(key, activation, owner);
+            state.fault = None;
+        });
+        if let Some(mut nodes) = tree {
+            self.release_nodes(&mut nodes);
+        }
+        with_state(|state| state.dispose_owner(owner));
+    }
+
+    /// 打开一个 headless 窗口 activation；factory 每次打开都会重新执行。
+    ///
+    /// stage-one 一次只支持一个已挂载窗口，其他宿主能力返回明确错误。
+    pub fn open_window(
+        &mut self,
+        key: &'static str,
+        factory: impl Fn(WindowCtx) -> MountResult<MountPlan> + 'static,
+    ) -> Result<WindowCtx, WindowError> {
+        if self.state.borrow().tree.is_some() {
+            return Err(WindowError::Unsupported(
+                "a second headless window while one is mounted",
+            ));
+        }
+        let state = self.state.clone();
+        context::install(&state, || {
+            with_state(|state| state.fault = None);
+            let (activation, owner) = with_state(|state| state.begin_window(key));
+            let window = WindowCtx::new(state.borrow().id, key, activation, owner);
+            let previous = with_state(|state| {
+                let previous = (state.current_owner, state.phase);
+                state.current_owner = Some(owner);
+                state.phase = Phase::Setup;
+                previous
+            });
+            let plan = factory(window);
+            with_state(|state| {
+                state.current_owner = previous.0;
+                state.phase = previous.1;
+            });
+            let tree = match plan {
+                Ok(plan) => match self.mount_plan(plan, owner) {
+                    Ok(tree) => tree,
+                    Err(error) => {
+                        self.abort_open(key, activation, owner, None);
+                        return Err(WindowError::Mount(error));
+                    }
+                },
+                Err(error) => {
+                    self.abort_open(key, activation, owner, None);
+                    return Err(WindowError::Mount(error));
+                }
+            };
+            if let Some(fault) = with_state(|state| state.fault.take()) {
+                self.abort_open(key, activation, owner, Some(tree));
+                return Err(WindowError::Mount(MountError::Context {
+                    operation: fault.operation,
+                    phase: fault.phase,
+                }));
+            }
+            with_state(|state| {
+                state.tree = Some(tree);
+                state.tree_owner = Some(owner);
+                state.tree_window = Some(key);
+                state.phase = Phase::Idle;
+            });
+            if let Err(error) = self.refresh() {
+                let nodes = with_state(|state| state.tree.take());
+                self.abort_open(key, activation, owner, nodes);
+                with_state(|state| {
+                    state.tree_owner = None;
+                    state.tree_window = None;
+                });
+                return Err(WindowError::Mount(error));
+            }
+            Ok(window)
+        })
+    }
+
+    /// 关闭 activation：释放窗口 UI、取消窗口所有权交付；应用级模型保留。
+    pub fn close_window(&mut self, window: WindowCtx) -> Result<(), WindowError> {
+        let state = self.state.clone();
+        if window.runtime != state.borrow().id {
+            return Err(WindowError::WrongRuntime);
+        }
+        context::install(&state, || {
+            let live = {
+                let state = state.borrow();
+                state.window_is_live(window.key, window.activation, window.owner)
+                    && state.tree_window == Some(window.key)
+            };
+            if !live {
+                return Err(WindowError::Stale);
+            }
+            with_state(|state| {
+                state.cancel_window(window.key, window.activation);
+            });
+            let nodes = with_state(|state| state.tree.take());
+            if let Some(mut nodes) = nodes {
+                self.release_nodes(&mut nodes);
+            }
+            with_state(|state| {
+                state.dispose_owner(window.owner);
+                state.tree_owner = None;
+                state.tree_window = None;
+            });
+            Ok(())
+        })
+    }
+
+    pub fn window_alive(&self, window: WindowCtx) -> bool {
+        let state = self.state.borrow();
+        window.runtime == state.id
+            && state.window_is_live(window.key, window.activation, window.owner)
     }
 
     pub fn refresh(&mut self) -> Result<(), MountError> {

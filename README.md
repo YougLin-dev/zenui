@@ -12,6 +12,7 @@ ZenUI 处在开发阶段。阶段一 target API 的 headless Todo 已可运行�
 
 - headless Runtime：模型、行集、代际句柄、Owner、Memo 和事务；
 - 阶段一 target API：Copy Signal/Memo/Store Field、mount-once 组件、`view!` 数据位、`Show`/`For` 与共享 RowSet；
+- headless 窗口 activation 与任务交付边界：app/window 所有权、Send worker、代际检查后的 UI continuation；窗口关闭取消其交付，共享模型仍可由 app 所有权任务提交；
 - 可复现的 Todo 场景：插入、删除、筛选、重排、焦点与拒绝句柄后的恢复；
 - 独立的宏、文本、布局和 GPU 原型；
 - 目标界面语法的预览。
@@ -23,7 +24,7 @@ cargo run -p zenui-app --example todolist_headless --locked
 cargo run -p zenui --example minimal_todo --locked
 ```
 
-target API 的公开行为测试位于根包 `tests/`；它不声明原生窗口、IME 或 Windows 完成。
+target API 的公开行为测试位于根包 `tests/`，其中 `tests/tasks.rs` 覆盖窗口关闭、重开代际、过期交付与 app 所有权模型提交；它不声明原生窗口、IME 或 Windows 完成。
 
 根工程的二进制只保留最小入口，不会打开桌面窗口。目标语法的预览文件不参与默认 workspace 构建，因为只有部分所需 API 已经存在。
 
