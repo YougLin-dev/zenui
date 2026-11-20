@@ -68,6 +68,14 @@ pub struct SceneElement {
     disabled: bool,
     focused: bool,
     text: Vec<TextRun>,
+    caret_stops: Option<Vec<CaretStop>>,
+}
+
+/// 显示文本的一个字符边界；`value_index` 已换算回编辑器的字符偏移。
+#[derive(Clone, Copy, Debug)]
+struct CaretStop {
+    value_index: usize,
+    caret: Rect,
 }
 
 impl SceneElement {
@@ -105,6 +113,31 @@ impl SceneElement {
     pub fn text(&self) -> &[TextRun] {
         &self.text
     }
+
+    /// 文本输入内离 `point` 最近的字符边界；其他元素返回 `None`。
+    ///
+    /// 组合中的 preedit 不属于 value，落在 preedit 内的点击夹到组合起点。
+    pub fn caret_index(&self, point: Point) -> Option<usize> {
+        let stops = self.caret_stops.as_ref()?;
+        stops
+            .iter()
+            .min_by(|left, right| {
+                caret_distance(left.caret, point).total_cmp(&caret_distance(right.caret, point))
+            })
+            .map(|stop| stop.value_index)
+    }
+}
+
+fn caret_distance(caret: Rect, point: Point) -> f32 {
+    let dx = point.x - caret.x;
+    let dy = if point.y < caret.y {
+        caret.y - point.y
+    } else if point.y > caret.bottom() {
+        point.y - caret.bottom()
+    } else {
+        0.0
+    };
+    dx * dx + dy * dy
 }
 
 /// 后端为该元素绘制哪一种内建视觉。
@@ -298,6 +331,7 @@ struct EditView<'a> {
     element: &'a SnapshotElement,
     display: String,
     preedit: Option<CharRange>,
+    composition: Option<(usize, usize)>,
     layout: parley::Layout<()>,
     origin: Point,
 }
@@ -378,7 +412,7 @@ impl<'a> Builder<'a> {
 
         let node = match intrinsic {
             Intrinsic::TextInput => {
-                let (display, _) = display_text(element);
+                let (display, _, _) = display_text(element);
                 self.tree
                     .new_leaf_with_context(
                         with_grow(input_style(), top_level),
@@ -496,19 +530,34 @@ impl<'a> Builder<'a> {
                         tag: element.tag(),
                     }
                 })?;
+                let mut caret_stops = None;
                 if intrinsic == Intrinsic::TextInput {
                     let (content, width) = content_box(rect, layout);
-                    let (display, preedit) = display_text(element);
+                    let (display, preedit, composition) = display_text(element);
                     let layout = shaper.shape(&display, width);
                     let view = EditView {
                         element,
                         display,
                         preedit,
+                        composition,
                         layout,
                         origin: content,
                     };
                     runs.extend(text::runs(&view.layout, content));
                     add_edit_decorations(&view, &mut scene.decorations);
+                    caret_stops = Some(
+                        text::caret_stops(&view.layout, view.origin, &view.display)
+                            .into_iter()
+                            .map(|(display_index, caret)| CaretStop {
+                                value_index: value_index(
+                                    display_index,
+                                    view.preedit,
+                                    view.composition,
+                                ),
+                                caret,
+                            })
+                            .collect(),
+                    );
                 }
 
                 let focused = self.snapshot.focus() == Some(id);
@@ -520,6 +569,7 @@ impl<'a> Builder<'a> {
                     disabled: element.disabled(),
                     focused,
                     text: runs,
+                    caret_stops,
                 });
 
                 for child in children {
@@ -593,15 +643,40 @@ fn add_edit_decorations(view: &EditView<'_>, out: &mut Vec<Decoration>) {
     });
 }
 
+/// 把显示文本的字符偏移换算回编辑器 value 的字符偏移。
+///
+/// preedit 的长度与被替换的组合区间无关：显示文本是
+/// `value[..start] + preedit + value[end..]`。preedit 之前的偏移不变，
+/// 之后按 `end + (display - preedit.end)` 平移；preedit 内部（含空
+/// preedit 的插入点）的点击夹到组合起点，preedit 末尾映射到 `end`。
+fn value_index(
+    display_index: usize,
+    preedit: Option<CharRange>,
+    composition: Option<(usize, usize)>,
+) -> usize {
+    let (Some(preedit), Some((start, end))) = (preedit, composition) else {
+        return display_index;
+    };
+    if display_index < preedit.start() {
+        display_index
+    } else if display_index > preedit.end() {
+        end + (display_index - preedit.end())
+    } else if display_index == preedit.end() && preedit.end() > preedit.start() {
+        end
+    } else {
+        start
+    }
+}
+
 /// 组合中的显示文本在 value 的 base range 插入 preedit；运行时让 caret
 /// 落在 preedit 末尾，因此起点由 caret 反推。
-fn display_text(element: &SnapshotElement) -> (String, Option<CharRange>) {
+fn display_text(element: &SnapshotElement) -> (String, Option<CharRange>, Option<(usize, usize)>) {
     let value = element.text_value().unwrap_or("");
     let Some(edit) = element.edit() else {
-        return (value.to_owned(), None);
+        return (value.to_owned(), None, None);
     };
     let Some(preedit) = edit.preedit() else {
-        return (value.to_owned(), None);
+        return (value.to_owned(), None, None);
     };
     let chars = value.chars().count();
     let preedit_chars = preedit.chars().count();
@@ -614,7 +689,11 @@ fn display_text(element: &SnapshotElement) -> (String, Option<CharRange>) {
     display.push_str(&value[..byte_at(value, start)]);
     display.push_str(preedit);
     display.push_str(&value[byte_at(value, end)..]);
-    (display, Some(CharRange::new(start, start + preedit_chars)))
+    (
+        display,
+        Some(CharRange::new(start, start + preedit_chars)),
+        Some((start, end)),
+    )
 }
 
 fn byte_at(value: &str, char_offset: usize) -> usize {

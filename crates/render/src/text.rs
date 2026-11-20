@@ -33,6 +33,14 @@ impl CharRange {
     const fn is_empty(self) -> bool {
         self.start == self.end
     }
+
+    pub(crate) const fn start(self) -> usize {
+        self.start
+    }
+
+    pub(crate) const fn end(self) -> usize {
+        self.end
+    }
 }
 
 pub(crate) struct TextShaper {
@@ -133,7 +141,21 @@ pub(crate) fn runs(layout: &Layout<()>, origin: Point) -> Vec<TextRun> {
 
 /// caret 的字符偏移按显示文本计；Parley 的索引是 UTF-8 字节。
 pub(crate) fn caret(layout: &Layout<()>, origin: Point, text: &str, char_offset: usize) -> Rect {
-    let byte = byte_of_char(text, char_offset);
+    caret_at_byte(layout, origin, byte_of_char(text, char_offset))
+}
+
+/// 显示文本每个字符边界（含两端）的 caret 矩形，索引是字符偏移。
+pub(crate) fn caret_stops(layout: &Layout<()>, origin: Point, text: &str) -> Vec<(usize, Rect)> {
+    let mut boundaries: Vec<usize> = text.char_indices().map(|(byte, _)| byte).collect();
+    boundaries.push(text.len());
+    boundaries
+        .into_iter()
+        .enumerate()
+        .map(|(offset, byte)| (offset, caret_at_byte(layout, origin, byte)))
+        .collect()
+}
+
+fn caret_at_byte(layout: &Layout<()>, origin: Point, byte: usize) -> Rect {
     let geometry =
         Cursor::from_byte_index(layout, byte, Affinity::Downstream).geometry(layout, 1.0);
     let rect = to_rect(geometry, origin);

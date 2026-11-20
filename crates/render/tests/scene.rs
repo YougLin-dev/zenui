@@ -250,6 +250,122 @@ fn caret_and_selection_geometry_follow_local_edit_state() {
     );
 }
 
+fn seeded_editor() -> (Runtime, NodeId) {
+    let mut app = runtime();
+    add(&mut app, "Alpha");
+    app.input("Edit Alpha", "Alpha").expect("seed the editor");
+    app.focus("Edit Alpha").expect("focus");
+    let id = app
+        .presentation()
+        .expect("snapshot")
+        .find_label("Edit Alpha")
+        .expect("editor")
+        .id();
+    (app, id)
+}
+
+#[test]
+fn caret_clicks_snap_to_the_nearest_character_boundary() {
+    let (mut app, id) = seeded_editor();
+    for offset in [0, 3, 5] {
+        assert!(app.set_caret("Edit Alpha", offset), "place caret {offset}");
+        let snapshot = app.presentation().expect("snapshot");
+        let scene = build_scene(&snapshot, 800.0);
+        let caret = scene.caret(id).expect("caret geometry");
+        let point = Point::new(caret.x, caret.y + caret.height / 2.0);
+        assert_eq!(
+            scene.node(id).expect("editor").caret_index(point),
+            Some(offset),
+            "clicking the caret {offset} boundary selects offset {offset}"
+        );
+    }
+}
+
+#[test]
+fn caret_clicks_past_the_text_clamp_and_non_text_elements_have_no_index() {
+    let (app, id) = seeded_editor();
+    let snapshot = app.presentation().expect("snapshot");
+    let scene = build_scene(&snapshot, 800.0);
+    let editor = scene.node(id).expect("editor");
+    let rect = editor.rect();
+    assert_eq!(
+        editor.caret_index(Point::new(rect.right() + 40.0, rect.y + rect.height / 2.0)),
+        Some(5),
+        "clicking past the end clamps to the last boundary"
+    );
+
+    let all = scene
+        .node(by_text(&snapshot, "button", "All"))
+        .expect("All button");
+    assert_eq!(
+        all.caret_index(Point::new(all.rect().x, all.rect().y)),
+        None,
+        "non-text elements have no caret index"
+    );
+}
+
+#[test]
+fn caret_clicks_map_a_longer_preedit_back_to_the_value() {
+    let (mut app, id) = seeded_editor();
+    app.set_selection_node(id, 1, 3)
+        .expect("select for composition");
+    app.compose_start("Edit Alpha").expect("start composing");
+    app.compose_update("Edit Alpha", "XYZ")
+        .expect("update preedit");
+
+    let snapshot = app.presentation().expect("snapshot");
+    let scene = build_scene(&snapshot, 800.0);
+    let editor = scene.node(id).expect("editor");
+    let caret = scene.caret(id).expect("composition caret");
+    let caret_point = Point::new(caret.x, caret.y + caret.height / 2.0);
+    let glyphs: Vec<_> = editor.text().iter().flat_map(|run| run.glyphs()).collect();
+
+    assert_eq!(
+        editor.caret_index(caret_point),
+        Some(3),
+        "the preedit end maps to the end of the replaced range"
+    );
+
+    let preedit = glyphs.get(1).expect("the first preedit glyph");
+    let inside = Point::new(
+        preedit.x + preedit.advance / 2.0,
+        caret.y + caret.height / 2.0,
+    );
+    assert_eq!(
+        editor.caret_index(inside),
+        Some(1),
+        "a click inside the preedit clamps to the composition base"
+    );
+
+    let after = glyphs.get(4).expect("the glyph after the preedit");
+    let shifted = Point::new(after.x + after.advance * 0.9, caret.y + caret.height / 2.0);
+    assert_eq!(
+        editor.caret_index(shifted),
+        Some(4),
+        "clicks after the preedit shift by the replaced range"
+    );
+}
+
+#[test]
+fn an_empty_preedit_click_clamps_to_the_composition_base() {
+    let (mut app, id) = seeded_editor();
+    app.set_selection_node(id, 1, 3)
+        .expect("select for composition");
+    app.compose_start("Edit Alpha").expect("start composing");
+    let snapshot = app.presentation().expect("snapshot");
+    let scene = build_scene(&snapshot, 800.0);
+    let editor = scene.node(id).expect("editor");
+    let caret = scene.caret(id).expect("composition caret");
+    let glyphs: Vec<_> = editor.text().iter().flat_map(|run| run.glyphs()).collect();
+    let first_remaining = glyphs.get(1).expect("the first glyph after the base");
+    let point = Point::new(first_remaining.x + 1.0, caret.y + caret.height / 2.0);
+    assert_eq!(
+        editor.caret_index(point),
+        Some(1),
+        "an empty preedit clamps to its insertion point"
+    );
+}
+
 #[test]
 fn a_viewport_resize_relayouts_while_node_ids_stay_stable() {
     let mut app = runtime();
