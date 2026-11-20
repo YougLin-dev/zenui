@@ -3,11 +3,8 @@
 use std::cell::Cell;
 use std::rc::Rc;
 
-#[path = "../examples/minimal_todo.rs"]
-mod todo;
-
-use todo::*;
 use zenui::prelude::*;
+use zenui_demo::*;
 
 fn runtime() -> Runtime {
     let mut app = Runtime::new();

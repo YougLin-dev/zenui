@@ -1,10 +1,7 @@
 #![allow(dead_code, unused_braces)]
 
-#[path = "../examples/minimal_todo.rs"]
-mod todo;
-
-use todo::*;
 use zenui::prelude::*;
+use zenui_demo::*;
 
 fn runtime() -> Runtime {
     let mut app = Runtime::new();

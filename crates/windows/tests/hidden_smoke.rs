@@ -3,7 +3,12 @@
 use std::collections::BTreeSet;
 
 use windows::Win32::Foundation::{LPARAM, WPARAM};
-use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_CLOSE, WM_LBUTTONDOWN};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    VIRTUAL_KEY, VK_BACK, VK_DELETE, VK_END, VK_HOME, VK_RETURN, VK_RIGHT, VK_TAB,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
+    PostMessageW, WM_CHAR, WM_CLOSE, WM_KEYDOWN, WM_LBUTTONDOWN,
+};
 use zenui::NodeId;
 use zenui_render::{Point, SceneElement, Visual};
 use zenui_windows::{Host, HostConfig, HostError};
@@ -19,22 +24,50 @@ fn post_click(host: &Host, point: Point, scale: f32) {
     }
 }
 
+fn post_char(host: &Host, character: char) {
+    let hwnd = host.hwnd();
+    // 安全：HWND 由 Host 持有，消息只排队，不跨线程解引用。
+    unsafe {
+        PostMessageW(Some(hwnd), WM_CHAR, WPARAM(character as usize), LPARAM(0))
+            .expect("post the character");
+    }
+}
+
+fn post_key(host: &Host, key: VIRTUAL_KEY) {
+    let hwnd = host.hwnd();
+    // 安全：HWND 由 Host 持有，消息只排队，不跨线程解引用。
+    unsafe {
+        PostMessageW(Some(hwnd), WM_KEYDOWN, WPARAM(key.0 as usize), LPARAM(0))
+            .expect("post the key");
+    }
+}
+
+fn glyphs(host: &Host, id: NodeId) -> usize {
+    host.scene()
+        .expect("a rendered scene")
+        .node(id)
+        .expect("element")
+        .text()
+        .iter()
+        .map(|run| run.glyphs().len())
+        .sum()
+}
+
+fn focused_id(host: &Host) -> Option<NodeId> {
+    host.scene()
+        .expect("a rendered scene")
+        .elements()
+        .iter()
+        .find(|element| element.focused())
+        .map(SceneElement::id)
+}
+
 fn post_close(host: &Host) {
     let hwnd = host.hwnd();
     // 安全：HWND 由 Host 持有，消息只排队，不跨线程解引用。
     unsafe {
         PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)).expect("post the close");
     }
-}
-
-fn point_in(host: &Host, id: NodeId, fraction: f32) -> Point {
-    let rect = host
-        .scene()
-        .expect("a rendered scene")
-        .node(id)
-        .expect("element")
-        .rect();
-    Point::new(rect.x + rect.width * fraction, rect.y + rect.height / 2.0)
 }
 
 fn first_text_glyph(host: &Host) -> u32 {
@@ -47,6 +80,43 @@ fn first_text_glyph(host: &Host) -> u32 {
         .and_then(|run| run.glyphs().first())
         .expect("a text glyph")
         .id
+}
+
+fn point_in_text(host: &Host, id: NodeId, fraction: f32) -> Point {
+    let scene = host.scene().expect("a rendered scene");
+    let element = scene.node(id).expect("element");
+    let glyphs: Vec<_> = element.text().iter().flat_map(|run| run.glyphs()).collect();
+    let start = glyphs.first().map_or(element.rect().x, |glyph| glyph.x);
+    let end = glyphs.last().map_or(start, |glyph| glyph.x + glyph.advance);
+    Point::new(
+        start + (end - start) * fraction,
+        element.rect().y + element.rect().height / 2.0,
+    )
+}
+
+fn checkbox_ids(host: &Host) -> Vec<NodeId> {
+    host.scene()
+        .expect("a rendered scene")
+        .elements()
+        .iter()
+        .filter(|element| matches!(element.visual(), Visual::Checkbox { .. }))
+        .map(SceneElement::id)
+        .collect()
+}
+
+fn button_at(host: &Host, index: usize) -> (Point, f32) {
+    let scene = host.scene().expect("a rendered scene");
+    let button = scene
+        .elements()
+        .iter()
+        .filter(|element| matches!(element.visual(), Visual::Button { .. }))
+        .nth(index)
+        .expect("a button");
+    let rect = button.rect();
+    (
+        Point::new(rect.x + rect.width / 2.0, rect.y + rect.height / 2.0),
+        scene.viewport().scale(),
+    )
 }
 
 fn center_of(host: &Host, predicate: impl Fn(&SceneElement) -> bool) -> (NodeId, Point, f32) {
@@ -125,9 +195,9 @@ fn clicking_a_text_input_focuses_it_and_changes_the_frame() {
     let (id, _, scale) = center_of(&host, |element| {
         matches!(element.visual(), Visual::TextInput) && !element.text().is_empty()
     });
+    // 种子输入把 caret 留在文本末尾；点击靠左处应把它移回文本内部。
     let initial_caret = host.scene().expect("scene").caret(id).expect("caret").x;
-    // 有内容的输入在点击靠右处会把 caret 移到非零偏移，帧因此变化。
-    post_click(&host, point_in(&host, id, 0.8), scale);
+    post_click(&host, point_in_text(&host, id, 0.2), scale);
     assert!(
         !host.pump().expect("process the click"),
         "no close was posted"
@@ -142,15 +212,15 @@ fn clicking_a_text_input_focuses_it_and_changes_the_frame() {
             .focused(),
         "the click focuses the text input"
     );
+    let placed_caret = host.scene().expect("scene").caret(id).expect("caret").x;
+    assert!(
+        placed_caret < initial_caret - 10.0,
+        "the click moves the caret into the text"
+    );
     assert_ne!(
         before.pixels(),
         focused.pixels(),
         "the focused caret changes the frame"
-    );
-    let placed_caret = host.scene().expect("scene").caret(id).expect("caret").x;
-    assert!(
-        placed_caret > initial_caret + 10.0,
-        "the click moves the caret into the text"
     );
 
     post_close(&host);
@@ -165,7 +235,7 @@ fn clicking_blank_space_clears_focus() {
     let (id, _, scale) = center_of(&host, |element| {
         matches!(element.visual(), Visual::TextInput) && !element.text().is_empty()
     });
-    post_click(&host, point_in(&host, id, 0.8), scale);
+    post_click(&host, point_in_text(&host, id, 0.8), scale);
     host.pump().expect("process the focus click");
     assert!(
         host.scene()
@@ -294,4 +364,185 @@ fn clicking_the_active_filter_hides_completed_items() {
         1,
         "the Active filter hides the completed item"
     );
+}
+
+#[test]
+fn typing_and_enter_add_a_todo() {
+    let mut host = Host::open(HostConfig::hidden("ZenUI keyboard add")).expect("open a host");
+    host.render().expect("render the initial frame");
+
+    let (draft, point, scale) = center_of(&host, |element| {
+        matches!(element.visual(), Visual::TextInput) && element.text().is_empty()
+    });
+    post_click(&host, point, scale);
+    host.pump().expect("focus the draft input");
+    let before = host.read_frame().expect("focused frame");
+
+    for character in "Read".chars() {
+        post_char(&host, character);
+    }
+    host.pump().expect("process the typed characters");
+    assert_eq!(glyphs(&host, draft), 4, "typing inserts the characters");
+
+    let typed = host.read_frame().expect("frame after typing");
+    assert_ne!(
+        before.pixels(),
+        typed.pixels(),
+        "typed text changes the frame"
+    );
+
+    post_key(&host, VK_RETURN);
+    host.pump().expect("submit the draft");
+    assert_eq!(checkbox_ids(&host).len(), 3, "Enter adds the typed Todo");
+    assert_eq!(glyphs(&host, draft), 0, "submitting clears the draft");
+
+    post_close(&host);
+    host.run().expect("process the close");
+}
+
+#[test]
+fn backspace_delete_and_navigation_edit_the_focused_input() {
+    let mut host = Host::open(HostConfig::hidden("ZenUI keyboard edit")).expect("open a host");
+    host.render().expect("render the initial frame");
+
+    let (editor, _, scale) = center_of(&host, |element| {
+        matches!(element.visual(), Visual::TextInput) && !element.text().is_empty()
+    });
+    post_click(&host, point_in_text(&host, editor, 0.2), scale);
+    host.pump().expect("focus the editor");
+    let length = glyphs(&host, editor);
+    assert!(length >= 3, "the seeded editor has text");
+
+    post_key(&host, VK_END);
+    host.pump().expect("move to the end");
+    post_key(&host, VK_BACK);
+    host.pump().expect("backspace");
+    assert_eq!(glyphs(&host, editor), length - 1, "backspace deletes");
+
+    post_key(&host, VK_DELETE);
+    host.pump().expect("delete at the end");
+    assert_eq!(
+        glyphs(&host, editor),
+        length - 1,
+        "delete at the end changes nothing"
+    );
+
+    post_key(&host, VK_HOME);
+    host.pump().expect("move to the start");
+    let home = host.scene().expect("scene").caret(editor).expect("caret").x;
+    post_key(&host, VK_RIGHT);
+    host.pump().expect("step right");
+    let stepped = host.scene().expect("scene").caret(editor).expect("caret").x;
+    assert!(stepped > home, "right arrow moves the caret");
+    assert_eq!(
+        glyphs(&host, editor),
+        length - 1,
+        "navigation keeps the text"
+    );
+
+    post_key(&host, VK_DELETE);
+    host.pump().expect("delete at the caret");
+    assert_eq!(glyphs(&host, editor), length - 2, "delete removes a glyph");
+
+    post_close(&host);
+    host.run().expect("process the close");
+}
+
+#[test]
+fn tab_moves_focus_to_the_next_control() {
+    let mut host = Host::open(HostConfig::hidden("ZenUI keyboard tab")).expect("open a host");
+    host.render().expect("render the initial frame");
+    let (editor, _, scale) = center_of(&host, |element| {
+        matches!(element.visual(), Visual::TextInput) && !element.text().is_empty()
+    });
+    post_click(&host, point_in_text(&host, editor, 0.2), scale);
+    host.pump().expect("focus the editor");
+    assert_eq!(focused_id(&host), Some(editor));
+
+    post_key(&host, VK_TAB);
+    host.pump().expect("tab forward");
+    let second = focused_id(&host).expect("a focused control");
+    assert_ne!(second, editor, "Tab moves focus");
+
+    post_key(&host, VK_TAB);
+    host.pump().expect("tab forward again");
+    assert_ne!(
+        focused_id(&host),
+        Some(second),
+        "the next Tab moves focus again"
+    );
+
+    post_close(&host);
+    host.run().expect("process the close");
+}
+
+#[test]
+fn reverse_reorders_the_native_rows() {
+    let mut host = Host::open(HostConfig::hidden("ZenUI native reorder")).expect("open a host");
+    host.render().expect("render the initial frame");
+    let original = checkbox_ids(&host);
+    assert_eq!(original.len(), 2);
+
+    let (reverse, scale) = button_at(&host, 4);
+    post_click(&host, reverse, scale);
+    host.pump().expect("reverse the list");
+    let mut expected = original;
+    expected.reverse();
+    assert_eq!(
+        checkbox_ids(&host),
+        expected,
+        "Reverse reorders the native rows"
+    );
+
+    post_close(&host);
+    host.run().expect("process the close");
+}
+
+#[test]
+fn reorder_keeps_focus_and_caret_on_the_same_row() {
+    let mut host = Host::open(HostConfig::hidden("ZenUI native focus row")).expect("open a host");
+    host.render().expect("render the initial frame");
+    let (editor, _, scale) = center_of(&host, |element| {
+        matches!(element.visual(), Visual::TextInput) && !element.text().is_empty()
+    });
+    post_click(&host, point_in_text(&host, editor, 0.2), scale);
+    host.pump().expect("focus the editor");
+    let caret = host.scene().expect("scene").caret(editor).expect("caret").x;
+
+    let (reverse, scale) = button_at(&host, 4);
+    post_click(&host, reverse, scale);
+    host.pump().expect("reverse the list");
+
+    assert_eq!(
+        focused_id(&host),
+        Some(editor),
+        "the focused row keeps its Node ID"
+    );
+    assert_eq!(
+        host.scene().expect("scene").caret(editor).expect("caret").x,
+        caret,
+        "the caret stays in the same logical row"
+    );
+
+    post_close(&host);
+    host.run().expect("process the close");
+}
+
+#[test]
+fn delete_removes_a_native_row() {
+    let mut host = Host::open(HostConfig::hidden("ZenUI native delete")).expect("open a host");
+    host.render().expect("render the initial frame");
+    assert_eq!(checkbox_ids(&host).len(), 2);
+
+    let (delete, scale) = button_at(&host, 8);
+    post_click(&host, delete, scale);
+    host.pump().expect("delete the first row");
+    assert_eq!(
+        checkbox_ids(&host).len(),
+        1,
+        "Delete removes the row from the native list"
+    );
+
+    post_close(&host);
+    host.run().expect("process the close");
 }

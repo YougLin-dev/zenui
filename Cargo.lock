@@ -2312,6 +2312,7 @@ name = "zenui"
 version = "0.1.0"
 dependencies = [
  "zenui-core",
+ "zenui-demo",
  "zenui-macro",
 ]
 
@@ -2325,6 +2326,13 @@ dependencies = [
 [[package]]
 name = "zenui-core"
 version = "0.1.0"
+
+[[package]]
+name = "zenui-demo"
+version = "0.1.0"
+dependencies = [
+ "zenui",
+]
 
 [[package]]
 name = "zenui-macro"
@@ -2347,6 +2355,7 @@ dependencies = [
  "vello_gpu",
  "wgpu",
  "zenui",
+ "zenui-demo",
 ]
 
 [[package]]
@@ -2357,6 +2366,7 @@ dependencies = [
  "wgpu",
  "windows",
  "zenui",
+ "zenui-demo",
  "zenui-render",
 ]
 

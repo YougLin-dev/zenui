@@ -14,3 +14,6 @@ taffy = "=0.15.1"
 vello_gpu = "=0.4.0"
 wgpu = "=30.0.2"
 zenui = { path = "../.." }
+
+[dev-dependencies]
+zenui-demo = { path = "../demo" }

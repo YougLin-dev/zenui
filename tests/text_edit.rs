@@ -215,7 +215,19 @@ fn movement_clamps_offsets_and_dispatches_no_input() {
 
     app.set_selection_node(editor, 3, 1)
         .expect("normalized selection");
-    assert_eq!(edit(&app, "editor"), (3, Some((1, 3)), None));
+    assert_eq!(edit(&app, "editor"), (1, Some((1, 3)), None));
+    let snapshot = app.presentation().expect("snapshot");
+    let state = snapshot
+        .find_label("editor")
+        .expect("editor")
+        .edit()
+        .expect("edit state");
+    assert_eq!(
+        state.anchor(),
+        3,
+        "the anchor keeps the selection direction"
+    );
+    assert_eq!(state.caret(), 1, "the caret stays at the focus end");
 
     app.select_all_node(editor).expect("select all");
     assert_eq!(edit(&app, "editor"), (4, Some((0, 4)), None));
