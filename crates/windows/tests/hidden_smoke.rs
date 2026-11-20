@@ -157,6 +157,38 @@ fn a_hidden_window_configures_a_surface_and_reads_back_a_frame() {
 }
 
 #[test]
+fn resizing_relayouts_and_reads_back_a_matching_frame() {
+    let mut host = Host::open(HostConfig::hidden("ZenUI resize smoke")).expect("open a host");
+    host.render().expect("render the initial frame");
+    let before = host.scene().expect("scene").viewport().width();
+
+    host.resize(640, 480).expect("resize the host");
+    let scene = host.scene().expect("scene after resize");
+    let scale = scene.viewport().scale();
+    assert!(
+        (scene.viewport().width() - 640.0).abs() < 2.0,
+        "the logical viewport follows the requested size"
+    );
+    assert_ne!(scene.viewport().width(), before);
+
+    let frame = host.read_frame().expect("frame after resize");
+    let expected_width = (640.0 * scale).round() as u32;
+    assert!(
+        frame.width().abs_diff(expected_width) <= 1,
+        "frame width {} matches the physical size {expected_width}",
+        frame.width()
+    );
+    assert_eq!(
+        frame.pixel(4, 4),
+        Some([255, 255, 255, 255]),
+        "the resized frame paints the root surface"
+    );
+
+    post_close(&host);
+    host.run().expect("process the close");
+}
+
+#[test]
 fn closing_the_window_ends_the_loop_and_reopening_mounts_fresh() {
     let mut host = Host::open(HostConfig::hidden("ZenUI close smoke")).expect("open a host");
     host.request_close().expect("post WM_CLOSE");

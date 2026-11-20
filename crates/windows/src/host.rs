@@ -7,8 +7,8 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
-    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForSystem, GetDpiForWindow,
-    SetProcessDpiAwarenessContext,
+    AdjustWindowRectExForDpi, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForSystem,
+    GetDpiForWindow, SetProcessDpiAwarenessContext,
 };
 use windows::Win32::UI::Input::Ime::{
     CANDIDATEFORM, CFS_CANDIDATEPOS, CFS_POINT, COMPOSITIONFORM, CPS_CANCEL, GCS_COMPSTR,
@@ -20,11 +20,11 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_LEFT, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_TAB,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AdjustWindowRect, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW,
-    DestroyWindow, DispatchMessageW, GetClientRect, GetMessageW, IDC_ARROW, LoadCursorW, MSG,
-    PM_REMOVE, PeekMessageW, PostMessageW, PostQuitMessage, RegisterClassExW, SW_HIDE, SW_SHOW,
-    SWP_NOACTIVATE, SWP_NOZORDER, SetWindowPos, ShowWindow, TranslateMessage, WINDOW_EX_STYLE,
-    WM_CHAR, WM_CLOSE, WM_DESTROY, WM_DPICHANGED, WM_IME_CHAR, WM_IME_COMPOSITION,
+    CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow,
+    DispatchMessageW, GetClientRect, GetMessageW, IDC_ARROW, LoadCursorW, MSG, PM_REMOVE,
+    PeekMessageW, PostMessageW, PostQuitMessage, RegisterClassExW, SW_HIDE, SW_SHOW,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SetWindowPos, ShowWindow, TranslateMessage,
+    WINDOW_EX_STYLE, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_DPICHANGED, WM_IME_CHAR, WM_IME_COMPOSITION,
     WM_IME_ENDCOMPOSITION, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN,
     WM_PAINT, WM_SIZE, WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
 };
@@ -114,7 +114,7 @@ pub struct Host {
     _instance: wgpu::Instance,
     device: wgpu::Device,
     queue: wgpu::Queue,
-    surface: wgpu::Surface<'static>,
+    surface: Option<wgpu::Surface<'static>>,
     surface_config: wgpu::SurfaceConfiguration,
     renderer: GpuRenderer,
     window: Window,
@@ -144,57 +144,18 @@ impl Host {
             backends: wgpu::Backends::DX12,
             ..wgpu::InstanceDescriptor::new_without_display_handle()
         });
-        let raw_window = raw_window_handle(hwnd, hinstance)?;
-        // 安全：HWND 由 `window` 持有，销毁推迟到 Window::drop；surface 字段在
-        // window 之前声明，因此 surface 先于 HWND 释放。
-        let surface = unsafe {
-            instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
-                raw_display_handle: Some(raw_display_handle()),
-                raw_window_handle: raw_window,
-            })
-        }
-        .map_err(|error| HostError::Surface(error.to_string()))?;
-
-        let (width, height) = client_size(hwnd)?;
-        let (adapter, device, queue) = request_backend(&instance, &surface)?;
-
-        let capabilities = surface.get_capabilities(&adapter);
-        // RenderPalette 的字节是 sRGB 编码值；只有非 sRGB 视图能原样保存它们。
-        // sRGB 视图会再做一次编码，因此这里明确拒绝而不是静默产出错误颜色。
-        if !capabilities
-            .formats
-            .contains(&wgpu::TextureFormat::Bgra8Unorm)
-        {
-            return Err(HostError::Surface(String::from(
-                "the DX12 surface offers no non-sRGB BGRA format; an sRGB-only surface needs an explicit conversion",
-            )));
-        }
-        let format = wgpu::TextureFormat::Bgra8Unorm;
-        let mut surface_config = surface
-            .get_default_config(&adapter, width.max(1), height.max(1))
-            .ok_or_else(|| {
-                HostError::Surface(String::from("the surface has no default configuration"))
-            })?;
-        surface_config.format = format;
-        surface_config.present_mode = wgpu::PresentMode::Fifo;
-        surface.configure(&device, &surface_config);
-        let renderer = new_renderer(
-            &device,
-            &queue,
-            format,
-            surface_config.width,
-            surface_config.height,
-        )?;
+        let surface = create_surface(&instance, hwnd, hinstance)?;
+        let presentation = configure_presentation(&instance, &surface, hwnd)?;
 
         Ok(Self {
             runtime,
             window_ctx,
             _instance: instance,
-            device,
-            queue,
-            surface,
-            surface_config,
-            renderer,
+            device: presentation.device,
+            queue: presentation.queue,
+            surface: Some(surface),
+            surface_config: presentation.config,
+            renderer: presentation.renderer,
             window,
             scene: None,
             pending_high_surrogate: None,
@@ -298,40 +259,117 @@ impl Host {
             .map_err(|error| HostError::Window(error.to_string()))
     }
 
+    /// 按逻辑尺寸调整客户区并立即重绘；供嵌入方与测试使用。
+    ///
+    /// # Errors
+    ///
+    /// 窗口尺寸调整失败时返回 [`HostError::Window`]；随后的重绘可能返回
+    /// surface 或渲染错误。
+    pub fn resize(&mut self, logical_width: u32, logical_height: u32) -> Result<(), HostError> {
+        // 安全：HWND 在 Host 生命周期内有效。
+        let dpi = unsafe { GetDpiForWindow(self.window.hwnd) };
+        let dpi = dpi.max(96);
+        let scale = dpi as f32 / 96.0;
+        let mut rect = RECT {
+            left: 0,
+            top: 0,
+            right: (logical_width as f32 * scale) as i32,
+            bottom: (logical_height as f32 * scale) as i32,
+        };
+        // 安全：rect 由本地值初始化；按窗口 DPI 计算非客户区。
+        unsafe {
+            AdjustWindowRectExForDpi(
+                &mut rect,
+                WS_OVERLAPPEDWINDOW,
+                false,
+                WINDOW_EX_STYLE::default(),
+                dpi,
+            )
+        }
+        .map_err(|error| HostError::Window(error.to_string()))?;
+        let physical_width = rect.right - rect.left;
+        let physical_height = rect.bottom - rect.top;
+        // 只调整窗口尺寸，位置与 Z 序不变。
+        unsafe {
+            SetWindowPos(
+                self.window.hwnd,
+                None,
+                0,
+                0,
+                physical_width,
+                physical_height,
+                SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+            )
+        }
+        .map_err(|error| HostError::Window(error.to_string()))?;
+        self.render()
+    }
+
     /// 向 surface 渲染并呈现一帧；最小化或零尺寸时什么也不做。
+    ///
+    /// # Errors
+    ///
+    /// surface 或 device 无法获取、重配置或重建时返回 [`HostError::Surface`]；
+    /// 场景构建与 GPU 绘制失败分别返回对应的错误。
     pub fn render(&mut self) -> Result<(), HostError> {
-        self.ensure_surface()?;
-        let (width, height) = client_size(self.window.hwnd)?;
-        if width == 0 || height == 0 {
+        let mut recovered = false;
+        loop {
+            self.ensure_surface()?;
+            let (width, height) = client_size(self.window.hwnd)?;
+            if width == 0 || height == 0 {
+                return Ok(());
+            }
+            let (scene, snapshot) = self.current_scene(width, height)?;
+            let status = self.current_surface()?.get_current_texture();
+            let frame = match status {
+                wgpu::CurrentSurfaceTexture::Success(frame)
+                | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
+                wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+                    return Ok(());
+                }
+                wgpu::CurrentSurfaceTexture::Outdated => {
+                    if recovered {
+                        return Err(HostError::Surface(String::from(
+                            "the surface stayed outdated after reconfiguration",
+                        )));
+                    }
+                    self.current_surface()?
+                        .configure(&self.device, &self.surface_config);
+                    recovered = true;
+                    continue;
+                }
+                wgpu::CurrentSurfaceTexture::Lost => {
+                    if recovered {
+                        return Err(HostError::Surface(String::from(
+                            "the surface stayed lost after rebuilding",
+                        )));
+                    }
+                    self.rebuild_presentation()?;
+                    recovered = true;
+                    continue;
+                }
+                wgpu::CurrentSurfaceTexture::Validation => {
+                    return Err(HostError::Surface(String::from(
+                        "the surface failed validation; rebuilding would mask an API misuse",
+                    )));
+                }
+            };
+            let view = frame.texture.create_view(&Default::default());
+            let mut encoder = self.device.create_command_encoder(&Default::default());
+            if let Err(error) = self.renderer.render(&scene, &view, &mut encoder) {
+                if recovered {
+                    return Err(HostError::Render(error));
+                }
+                self.rebuild_presentation()?;
+                recovered = true;
+                continue;
+            }
+            self.queue.submit([encoder.finish()]);
+            self.queue.present(frame);
+            self.scene = Some(scene);
+            self.position_ime(&snapshot);
             return Ok(());
         }
-        let (scene, snapshot) = self.current_scene(width, height)?;
-        let frame = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(frame)
-            | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
-            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
-                return Ok(());
-            }
-            wgpu::CurrentSurfaceTexture::Outdated => {
-                self.surface.configure(&self.device, &self.surface_config);
-                return Ok(());
-            }
-            wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Validation => {
-                return Err(HostError::Surface(String::from(
-                    "the surface texture could not be acquired",
-                )));
-            }
-        };
-        let view = frame.texture.create_view(&Default::default());
-        let mut encoder = self.device.create_command_encoder(&Default::default());
-        self.renderer
-            .render(&scene, &view, &mut encoder)
-            .map_err(HostError::Render)?;
-        self.queue.submit([encoder.finish()]);
-        self.queue.present(frame);
-        self.scene = Some(scene);
-        self.position_ime(&snapshot);
-        Ok(())
     }
 
     /// 一次左键按下：命中测试后按元素类型聚焦、放置 caret 或派发控件事件。
@@ -781,9 +819,35 @@ impl Host {
         }
     }
 
+    /// 重建 device、surface 与 renderer；运行时状态（Node ID、焦点、caret）
+    /// 留在 Runtime 中，因此恢复后保持不变。
+    fn current_surface(&self) -> Result<&wgpu::Surface<'static>, HostError> {
+        self.surface
+            .as_ref()
+            .ok_or_else(|| HostError::Surface(String::from("the surface is not available")))
+    }
+
+    fn rebuild_presentation(&mut self) -> Result<(), HostError> {
+        // 释放旧 surface 的交换链后再配置新 surface。失败时保持 None，
+        // 下一次重绘会再次尝试重建，而不是留下未配置的 surface。
+        self.surface = None;
+        let surface = create_surface(&self._instance, self.window.hwnd, module_handle()?)?;
+        let presentation = configure_presentation(&self._instance, &surface, self.window.hwnd)?;
+        self.surface = Some(surface);
+        self.device = presentation.device;
+        self.queue = presentation.queue;
+        self.surface_config = presentation.config;
+        self.renderer = presentation.renderer;
+        Ok(())
+    }
+
     fn ensure_surface(&mut self) -> Result<(), HostError> {
         let (width, height) = client_size(self.window.hwnd)?;
         if width == 0 || height == 0 {
+            return Ok(());
+        }
+        if self.surface.is_none() {
+            self.rebuild_presentation()?;
             return Ok(());
         }
         if self.surface_config.width == width && self.surface_config.height == height {
@@ -798,7 +862,8 @@ impl Host {
         )?;
         self.surface_config.width = width;
         self.surface_config.height = height;
-        self.surface.configure(&self.device, &self.surface_config);
+        self.current_surface()?
+            .configure(&self.device, &self.surface_config);
         Ok(())
     }
 
@@ -892,8 +957,16 @@ impl Window {
             bottom: (config.height as f32 * scale) as i32,
         };
         // 安全：rect 与 style 来自本地值；bmenu=false。
-        unsafe { AdjustWindowRect(&mut rect, style, false) }
-            .map_err(|error| HostError::Window(error.to_string()))?;
+        unsafe {
+            AdjustWindowRectExForDpi(
+                &mut rect,
+                style,
+                false,
+                WINDOW_EX_STYLE::default(),
+                dpi.max(96),
+            )
+        }
+        .map_err(|error| HostError::Window(error.to_string()))?;
         // 安全：类名已在 register_class 注册；标题与实例句柄在调用期间有效。
         let hwnd = unsafe {
             CreateWindowExW(
@@ -1139,6 +1212,69 @@ fn client_size(hwnd: HWND) -> Result<(u32, u32), HostError> {
     ))
 }
 
+/// 从 HWND 创建 DX12 surface；重建时先换掉旧 surface 再配置。
+fn create_surface(
+    instance: &wgpu::Instance,
+    hwnd: HWND,
+    hinstance: HINSTANCE,
+) -> Result<wgpu::Surface<'static>, HostError> {
+    let raw_window = raw_window_handle(hwnd, hinstance)?;
+    // 安全：HWND 由 Host 的 Window 持有，销毁推迟到 Window::drop；Host 的
+    // surface 字段在 window 之前声明，因此 surface 先于 HWND 释放。
+    unsafe {
+        instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
+            raw_display_handle: Some(raw_display_handle()),
+            raw_window_handle: raw_window,
+        })
+    }
+    .map_err(|error| HostError::Surface(error.to_string()))
+}
+
+/// 一次 surface 配置产生的 GPU 资源；首次打开与丢失恢复共用。
+struct Presentation {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    config: wgpu::SurfaceConfiguration,
+    renderer: GpuRenderer,
+}
+
+/// 为已存在的 surface 请求适配器/设备并配置交换链。
+fn configure_presentation(
+    instance: &wgpu::Instance,
+    surface: &wgpu::Surface<'_>,
+    hwnd: HWND,
+) -> Result<Presentation, HostError> {
+    let (width, height) = client_size(hwnd)?;
+    let (adapter, device, queue) = request_backend(instance, surface)?;
+    let capabilities = surface.get_capabilities(&adapter);
+    // RenderPalette 的字节是 sRGB 编码值；只有非 sRGB 视图能原样保存它们。
+    // sRGB 视图会再做一次编码，因此这里明确拒绝而不是静默产出错误颜色。
+    if !capabilities
+        .formats
+        .contains(&wgpu::TextureFormat::Bgra8Unorm)
+    {
+        return Err(HostError::Surface(String::from(
+            "the DX12 surface offers no non-sRGB BGRA format; an sRGB-only surface needs an explicit conversion",
+        )));
+    }
+    let format = wgpu::TextureFormat::Bgra8Unorm;
+    let mut config = surface
+        .get_default_config(&adapter, width.max(1), height.max(1))
+        .ok_or_else(|| {
+            HostError::Surface(String::from("the surface has no default configuration"))
+        })?;
+    config.format = format;
+    config.present_mode = wgpu::PresentMode::Fifo;
+    surface.configure(&device, &config);
+    let renderer = new_renderer(&device, &queue, format, config.width, config.height)?;
+    Ok(Presentation {
+        device,
+        queue,
+        config,
+        renderer,
+    })
+}
+
 fn new_renderer(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -1219,6 +1355,92 @@ unsafe extern "system" fn wndproc(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resizing_relayouts_the_scene_and_surface() {
+        let mut host = open_host();
+        host.render().expect("render");
+        let before = host.scene().expect("scene").viewport().width();
+
+        host.resize(640, 480).expect("resize");
+        let scene = host.scene().expect("scene");
+        let scale = scene.viewport().scale();
+        assert!(
+            (scene.viewport().width() - 640.0).abs() < 2.0,
+            "the viewport follows the new logical width"
+        );
+        assert!(
+            (scene.viewport().width() * scale - 640.0 * scale).abs() < 2.0,
+            "logical width times scale stays the physical width"
+        );
+        assert_eq!(
+            scene.elements()[0].rect().width,
+            scene.viewport().width(),
+            "the root fills the resized viewport"
+        );
+        assert!(before > 0.0);
+
+        let (width, height) = client_size(host.window.hwnd).expect("client size");
+        let frame = host.read_frame().expect("frame after resize");
+        assert_eq!((frame.width(), frame.height()), (width, height));
+    }
+
+    #[test]
+    fn resizing_to_zero_renders_nothing_and_refuses_readback() {
+        let mut host = open_host();
+        host.resize(0, 0).expect("zero resize");
+        assert!(
+            matches!(host.read_frame(), Err(HostError::Readback(_))),
+            "a zero client area cannot be read back"
+        );
+        host.resize(320, 240).expect("restore size");
+        let frame = host.read_frame().expect("frame after restore");
+        assert!(frame.width() > 0 && frame.height() > 0);
+    }
+
+    #[test]
+    fn a_surface_rebuild_preserves_focus_and_caret() {
+        let mut host = open_host();
+        host.runtime.focus("Edit Write tests").expect("focus");
+        let node = editor_node(&host);
+        host.runtime
+            .set_selection_node(node, 1, 3)
+            .expect("selection");
+        host.render().expect("render");
+        let ids: Vec<_> = host
+            .scene()
+            .expect("scene")
+            .elements()
+            .iter()
+            .map(|element| element.id())
+            .collect();
+        let before = host.read_frame().expect("frame");
+        let caret_before = host.scene().expect("scene").caret(node).expect("caret").x;
+
+        host.rebuild_presentation().expect("rebuild");
+        host.render().expect("render after rebuild");
+
+        let scene = host.scene().expect("scene after rebuild");
+        assert_eq!(
+            scene
+                .elements()
+                .iter()
+                .map(|element| element.id())
+                .collect::<Vec<_>>(),
+            ids,
+            "Node IDs survive the rebuild"
+        );
+        let snapshot = host.runtime.presentation().expect("snapshot");
+        assert_eq!(snapshot.focus(), Some(node));
+        let edit = snapshot.node(node).expect("editor").edit().expect("edit");
+        assert_eq!(edit.selection(), Some((1, 3)));
+        assert_eq!(edit.anchor(), 1);
+        assert_eq!(edit.caret(), 3);
+        let caret_after = scene.caret(node).expect("caret").x;
+        assert_eq!(caret_before, caret_after);
+        let after = host.read_frame().expect("frame after rebuild");
+        assert_eq!(before.pixels(), after.pixels());
+    }
 
     #[test]
     fn pointer_points_scale_from_physical_to_logical() {
