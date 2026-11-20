@@ -10,12 +10,15 @@
 
 mod error;
 mod geometry;
+pub mod gpu;
 mod scene;
 mod text;
 
 pub use error::SceneError;
 pub use geometry::{Point, Rect, Viewport};
+pub use gpu::{GpuContext, GpuRenderer, RenderError, RenderPalette, RenderTargetConfig};
 pub use parley::FontData;
 pub use scene::{
     Decoration, DecorationKind, PositionedGlyph, Scene, SceneElement, TextRun, Visual,
 };
+pub use wgpu;

@@ -7,6 +7,10 @@ description = "Platform-neutral Taffy/Parley scene construction for ZenUI presen
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+glifo = "=0.5.0"
 parley = { version = "=0.13.0", features = ["complex-scripts"] }
+pollster = "=0.4.0"
 taffy = "=0.15.1"
+vello_gpu = "=0.4.0"
+wgpu = "=30.0.2"
 zenui = { path = "../.." }
