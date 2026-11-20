@@ -157,8 +157,17 @@ pub struct GpuRenderer {
 impl GpuRenderer {
     /// 为目标配置创建渲染器；视图必须与该配置的格式和尺寸一致。
     pub fn new(context: &GpuContext, config: RenderTargetConfig, palette: RenderPalette) -> Self {
-        let (renderer, resources) =
-            vello_gpu::Renderer::new(context.device(), context.queue(), &config.vello());
+        Self::from_parts(context.device(), context.queue(), config, palette)
+    }
+
+    /// 用已有的 device/queue 创建渲染器；surface 宿主可复用它的适配器。
+    pub fn from_parts(
+        device: &Device,
+        queue: &Queue,
+        config: RenderTargetConfig,
+        palette: RenderPalette,
+    ) -> Self {
+        let (renderer, resources) = vello_gpu::Renderer::new(device, queue, &config.vello());
         let depth = renderer.create_depth_texture_view(&RenderSize {
             width: config.width,
             height: config.height,
