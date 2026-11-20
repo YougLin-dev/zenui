@@ -1,0 +1,12 @@
+[package]
+name = "zenui-render"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Platform-neutral Taffy/Parley scene construction for ZenUI presentation snapshots"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+parley = { version = "=0.13.0", features = ["complex-scripts"] }
+taffy = "=0.15.1"
+zenui = { path = "../.." }

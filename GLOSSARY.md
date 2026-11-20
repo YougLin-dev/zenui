@@ -20,6 +20,14 @@ _Avoid_: render tree, view tree, frame
 `zenui-render` 根据 presentation snapshot 产出的布局几何、文本 run 与绘制指令；与 GPU 后端无关。
 _Avoid_: display list, frame
 
+**Viewport**:
+一次场景构建使用的逻辑视口尺寸与 Window scale；布局始终使用逻辑像素。
+_Avoid_: screen size, resolution
+
+**Text run**:
+场景中同一字体、字号与 shaping 结果的一段文本，携带绝对字形位置；不是平台文本句柄。
+_Avoid_: glyph line, paragraph
+
 **Surface**:
 一个顶层窗口的呈现目标；随窗口尺寸、DPI 或设备代际变化重建。
 _Avoid_: swapchain, render target

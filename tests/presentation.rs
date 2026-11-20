@@ -291,6 +291,11 @@ fn focus_and_local_text_edit_state_appear_in_the_snapshot() {
         .edit()
         .expect("edit state");
     assert_eq!(edit.preedit(), Some("ni"));
+    assert_eq!(
+        edit.composition(),
+        Some((1, 1)),
+        "composition replaces its base range"
+    );
     assert_eq!(edit.caret(), 3, "the caret follows the preedit end");
     assert_eq!(edit.selection(), None);
 
@@ -302,6 +307,7 @@ fn focus_and_local_text_edit_state_appear_in_the_snapshot() {
         .edit()
         .expect("edit state");
     assert_eq!(edit.preedit(), None);
+    assert_eq!(edit.composition(), None);
     assert_eq!(edit.caret(), 1, "cancel restores the caret");
     assert_eq!(edit.selection(), Some((1, 1)));
 

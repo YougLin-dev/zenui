@@ -33,6 +33,12 @@ jobs:
           rustc --version --verbose
           rustup component add clippy rustfmt
 
+      - name: Install Linux font dependencies
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes libfontconfig1-dev
+
       - name: Format
         run: cargo fmt --all -- --check
 
