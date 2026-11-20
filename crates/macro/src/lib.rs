@@ -125,6 +125,10 @@ fn lower_attribute(attribute: &NodeAttribute) -> syn::Result<TokenStream> {
             "keydown" => quote! { on_keydown },
             "focus" => quote! { on_focus },
             "blur" => quote! { on_blur },
+            "compositionstart" => quote! { on_composition_start },
+            "compositionupdate" => quote! { on_composition_update },
+            "compositionend" => quote! { on_composition_end },
+            "compositioncancel" => quote! { on_composition_cancel },
             other => {
                 return Err(syn::Error::new_spanned(
                     &attribute.key,
@@ -433,6 +437,19 @@ mod tests {
             />
         })
         .expect("focus and blur lower to typed handlers");
+    }
+
+    #[test]
+    fn composition_events_are_supported() {
+        expand(quote! {
+            <text-input
+                on:compositionstart={move |_event: CompositionEvent| {}}
+                on:compositionupdate={move |_event: CompositionEvent| {}}
+                on:compositionend={move |_event: CompositionEvent| {}}
+                on:compositioncancel={move |_event: CompositionEvent| {}}
+            />
+        })
+        .expect("composition events lower to typed handlers");
     }
 
     #[test]

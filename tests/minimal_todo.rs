@@ -205,6 +205,46 @@ fn filtering_out_the_focused_row_does_not_let_the_remount_steal_focus() {
 }
 
 #[test]
+fn a_chinese_composition_confirms_without_submitting_the_form() {
+    let mut app = runtime();
+    let label = "What needs to be done?";
+
+    app.compose_start(label).expect("start composition");
+    app.compose_update(label, "nihao").expect("preedit");
+    assert_eq!(app.preedit(label), Some(String::from("nihao")));
+    assert!(app.for_items().is_empty(), "preedit does not add a row");
+
+    app.keydown(label, Key::Enter)
+        .expect("candidate Enter is consumed");
+    assert_eq!(
+        app.preedit(label),
+        Some(String::from("nihao")),
+        "the candidate still belongs to the IME"
+    );
+    assert!(
+        app.for_items().is_empty(),
+        "candidate Enter does not submit the Add form"
+    );
+
+    app.compose_commit(label, "你好")
+        .expect("confirm the candidate");
+    assert_eq!(app.preedit(label), None);
+    assert_eq!(app.caret(label), Some(2), "the caret follows the candidate");
+    assert!(
+        app.for_items().is_empty(),
+        "candidate confirmation does not submit the Add form"
+    );
+
+    app.submit("Add task").expect("the subsequent plain Enter");
+    assert_eq!(app.for_items().len(), 1);
+    assert!(app.texts().iter().any(|text| text == "你好"));
+    assert!(app.texts().iter().any(|text| text == "1 remaining"));
+
+    app.submit("Add task").expect("an empty plain Enter");
+    assert_eq!(app.for_items().len(), 1, "the form adds exactly once");
+}
+
+#[test]
 fn a_field_update_does_not_rerun_the_row_component() {
     let mut app = runtime();
     add(&mut app, "A");

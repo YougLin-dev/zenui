@@ -1,7 +1,7 @@
 //! 目标 SDK 的最小 stage-one 实现：Copy 句柄、安装的执行上下文、
 //! mount-once 组件、`view!` 数据位和 retain 的行键结构。
 //!
-//! 本 crate 只覆盖 headless Todo 所需的行为；原生窗口、IME 与平台能力不在其中。
+//! 本 crate 只覆盖 headless Todo 所需的行为；原生窗口、平台 IME 适配与平台能力不在其中。
 
 #![forbid(unsafe_code)]
 
@@ -21,19 +21,19 @@ pub use signal::{Memo, Once, Signal, memo, once, signal};
 pub use store::{Field, FieldError, Store, TodoId, Transaction, WriteError, WriteOp};
 pub use task::{DeliveryReport, Task, TaskError, TaskScope, TaskStatus, TaskToken};
 pub use view::{
-    BlurEvent, Children, ChildrenFactory, FocusCause, FocusEvent, Key, KeyEvent, MountError,
-    MountPlan, MountResult, SubmitEvent,
+    BlurEvent, Children, ChildrenFactory, CompositionEvent, CompositionPhase, FocusCause,
+    FocusEvent, Key, KeyEvent, MountError, MountPlan, MountResult, SubmitEvent,
 };
 pub use window::{WindowCtx, WindowError};
 pub use zenui_macro::{component, view};
 
 pub mod prelude {
     pub use crate::{
-        BlurEvent, Children, ChildrenFactory, DeliveryReport, Field, FieldError, FocusCause,
-        FocusEvent, FocusInfo, Key, KeyEvent, Memo, MountError, MountPlan, MountResult, Once,
-        Runtime, Signal, Store, SubmitEvent, Task, TaskError, TaskScope, TaskStatus, TaskToken,
-        TodoId, Transaction, WindowCtx, WindowError, WriteError, WriteOp, component, memo, once,
-        signal, view,
+        BlurEvent, Children, ChildrenFactory, CompositionEvent, CompositionPhase, DeliveryReport,
+        Field, FieldError, FocusCause, FocusEvent, FocusInfo, Key, KeyEvent, Memo, MountError,
+        MountPlan, MountResult, Once, Runtime, Signal, Store, SubmitEvent, Task, TaskError,
+        TaskScope, TaskStatus, TaskToken, TodoId, Transaction, WindowCtx, WindowError, WriteError,
+        WriteOp, component, memo, once, signal, view,
     };
     pub use zenui_core::Filter;
 }
