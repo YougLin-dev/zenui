@@ -119,6 +119,21 @@ fn button_at(host: &Host, index: usize) -> (Point, f32) {
     )
 }
 
+/// 处理排队消息直到条件成立；超出时限说明唤醒链路没有把状态送达。
+fn pump_until(host: &mut Host, mut reached: impl FnMut(&Host) -> bool) {
+    for _ in 0..500 {
+        if reached(host) {
+            return;
+        }
+        assert!(
+            !host.pump().expect("process queued messages"),
+            "no close was posted"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert!(reached(host), "the expected state did not arrive");
+}
+
 fn center_of(host: &Host, predicate: impl Fn(&SceneElement) -> bool) -> (NodeId, Point, f32) {
     let scene = host.scene().expect("a rendered scene");
     let element = scene
@@ -558,6 +573,62 @@ fn reorder_keeps_focus_and_caret_on_the_same_row() {
 
     post_close(&host);
     host.run().expect("process the close");
+}
+
+#[test]
+fn a_delivered_task_wakes_the_host_and_repaints() {
+    let mut host = Host::open(HostConfig::hidden("ZenUI task wake")).expect("open a host");
+    host.render().expect("render the initial frame");
+    let before = host.read_frame().expect("baseline frame");
+    assert_eq!(checkbox_ids(&host).len(), 2);
+
+    let (load, scale) = button_at(&host, 6);
+    post_click(&host, load, scale);
+    // 不轮询任务状态：只有 worker 投递的唤醒消息会触发交付与重绘。
+    pump_until(&mut host, |host| checkbox_ids(host).len() == 4);
+
+    let after = host.read_frame().expect("frame after delivery");
+    assert_ne!(
+        before.pixels(),
+        after.pixels(),
+        "the delivered rows repaint the native window"
+    );
+
+    post_close(&host);
+    host.run().expect("process the close");
+}
+
+#[test]
+fn closing_while_a_task_runs_keeps_the_last_scene_and_reopens_fresh() {
+    let mut host = Host::open(HostConfig::hidden("ZenUI task close")).expect("open a host");
+    host.render().expect("render the initial frame");
+    let (preview, scale) = button_at(&host, 7);
+    post_click(&host, preview, scale);
+    host.pump().expect("start the preview task");
+    post_close(&host);
+    host.run().expect("process the close");
+    // run() 可能在处理 WM_CLOSE 之前交付任务；关闭后的场景才是最终基线。
+    let elements = host.scene().expect("last scene").elements().len();
+    // 关闭之后到达的唤醒只丢弃结果，不能重绘。
+    host.pump()
+        .expect("process any late wake without repainting");
+    assert_eq!(
+        host.scene()
+            .expect("scene after the late wake")
+            .elements()
+            .len(),
+        elements,
+        "the closed window keeps its last scene"
+    );
+    drop(host);
+
+    let mut reopened = Host::open(HostConfig::hidden("ZenUI task reopen")).expect("reopen");
+    reopened.render().expect("render the reopened window");
+    assert_eq!(
+        checkbox_ids(&reopened).len(),
+        2,
+        "reopening mounts a fresh seeded activation"
+    );
 }
 
 #[test]
