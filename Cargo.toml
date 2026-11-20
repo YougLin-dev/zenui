@@ -16,3 +16,7 @@ zenui-macro = { path = "crates/macro" }
 [[example]]
 name = "minimal_todo"
 path = "examples/minimal_todo.rs"
+
+[[example]]
+name = "presentation_snapshot"
+path = "examples/presentation_snapshot.rs"
