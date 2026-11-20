@@ -8,11 +8,14 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
+use std::thread::JoinHandle;
 
 use crate::context::{Phase, with_state, with_state_of};
 use crate::runtime::{Runtime, State};
 use crate::view::MountError;
 use crate::window::WindowCtx;
+
+pub(crate) type WakeCallback = Arc<dyn Fn() + Send + Sync>;
 
 /// `App` 拥有的工作可以跨窗口关闭继续提交模型；
 /// `Window` 拥有的工作在 activation 关闭时取消交付。
@@ -99,14 +102,25 @@ impl TaskScope {
         }
         let TaskStart { id, sender, token } =
             with_state_of(self.runtime, |state| state.begin_task(self.owner))?;
-        let _worker = std::thread::spawn(move || {
+        let wake_callback = with_state_of(self.runtime, |state| Arc::clone(&state.wake_callback));
+        let cancellation = Arc::clone(&token);
+        let worker = std::thread::spawn(move || {
             let outcome = catch_unwind(AssertUnwindSafe(|| job(TaskToken { cancelled: token })));
+            let deliverable = outcome.is_ok();
             let message = match outcome {
                 Ok(value) => WorkerMessage::Value(Box::new(value)),
                 Err(_) => WorkerMessage::Panicked,
             };
-            let _ = sender.send(message);
+            let sent = sender.send(message).is_ok();
+            // 回调在结果入队之后、State 借用之外执行；已观察到取消或无法交付的结果不唤醒。
+            if deliverable && sent && !cancellation.load(Ordering::SeqCst) {
+                let wake = wake_callback.read().ok().and_then(|slot| slot.clone());
+                if let Some(wake) = wake {
+                    let _ = catch_unwind(AssertUnwindSafe(move || wake()));
+                }
+            }
         });
+        with_state_of(self.runtime, |state| state.attach_worker(id, worker));
         Ok(Task {
             runtime: self.runtime,
             id,
@@ -249,6 +263,7 @@ pub(crate) struct TaskRecord {
     origin: Option<u32>,
     status: TaskStatus,
     token: Arc<AtomicBool>,
+    worker: Option<JoinHandle<()>>,
     receiver: Option<Receiver<WorkerMessage>>,
     completion: Option<Box<dyn Any + Send>>,
     continuation: Option<Continuation>,
@@ -308,12 +323,19 @@ impl State {
                 origin: self.current_owner,
                 status: TaskStatus::Running,
                 token: Arc::clone(&token),
+                worker: None,
                 receiver: Some(receiver),
                 completion: None,
                 continuation: None,
             },
         );
         Ok(TaskStart { id, sender, token })
+    }
+
+    pub(crate) fn attach_worker(&mut self, id: u32, worker: JoinHandle<()>) {
+        if let Some(record) = self.tasks.get_mut(&id) {
+            record.worker = Some(worker);
+        }
     }
 
     pub(crate) fn register_continuation(
@@ -487,6 +509,21 @@ impl Runtime {
         TaskScope::app(self.state.borrow().id)
     }
 
+    /// 设置 worker 结果就绪时的唤醒回调。
+    ///
+    /// 回调在结果发送到交付通道之后由 worker 线程调用，因此必须线程安全，且不能
+    /// 借用或修改运行时状态；它只通知宿主调用 `drive_tasks`，不交付结果。
+    /// 运行时不做合并：每个已发送结果且未观察到取消的任务唤醒一次，worker panic
+    /// 不唤醒。回调 panic 会被捕获，已发送的结果仍可交付。替换回调会影响之后
+    /// 完成的任务。
+    pub fn set_wake_callback(&mut self, callback: impl Fn() + Send + Sync + 'static) {
+        let slot = Arc::clone(&self.state.borrow().wake_callback);
+        let mut slot = slot
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *slot = Some(Arc::new(callback));
+    }
+
     pub fn task_status<T>(&self, task: Task<T>) -> Option<TaskStatus> {
         let state = self.state.borrow();
         if task.runtime != state.id {
@@ -520,7 +557,8 @@ impl Runtime {
         crate::context::install(&state, || task.on_done(f))
     }
 
-    /// 等待所有 worker 返回；窗口已取消的任务也会等到其完成，以便确认结果被丢弃。
+    /// 等待所有 worker 返回，包括结果发送之后的唤醒步骤；窗口已取消的任务也会
+    /// 等到其完成，以便确认结果被丢弃。
     pub fn wait_for_tasks(&mut self) {
         loop {
             let next = {
@@ -543,12 +581,19 @@ impl Runtime {
                 }
             };
             let message = next.1.recv();
-            let mut state = self.state.borrow_mut();
-            if let Some(record) = state.tasks.get_mut(&next.0) {
+            let worker = {
+                let mut state = self.state.borrow_mut();
+                let Some(record) = state.tasks.get_mut(&next.0) else {
+                    continue;
+                };
                 match message {
                     Ok(message) => record.accept(message),
                     Err(_) => record.status = TaskStatus::Panicked,
                 }
+                record.worker.take()
+            };
+            if let Some(worker) = worker {
+                let _ = worker.join();
             }
         }
     }

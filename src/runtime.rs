@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, RwLock};
 
 use zenui_core::{Counters, RowSet};
 
@@ -13,7 +14,7 @@ use crate::presentation::{
 };
 use crate::signal::{Memo, MemoCell, SignalCell};
 use crate::store::{TodoId, WriteError};
-use crate::task::TaskRecord;
+use crate::task::{TaskRecord, WakeCallback};
 use crate::view::{
     Attr, AttrValue, BlurEvent, ChildrenFactory, CompositionEvent, CompositionPhase, Event,
     FocusCause, FocusEvent, Key, KeyEvent, MountError, MountPlan, MountResult, PlanNode,
@@ -60,6 +61,7 @@ pub(crate) struct State {
     windows: BTreeMap<&'static str, WindowRecord>,
     pub(crate) tasks: BTreeMap<u32, TaskRecord>,
     pub(crate) next_task: u32,
+    pub(crate) wake_callback: Arc<RwLock<Option<WakeCallback>>>,
     setup_counts: BTreeMap<&'static str, u64>,
     next_instance: u64,
     next_node_mount: u64,
@@ -126,6 +128,7 @@ impl State {
             windows: BTreeMap::new(),
             tasks: BTreeMap::new(),
             next_task: 1,
+            wake_callback: Arc::new(RwLock::new(None)),
             setup_counts: BTreeMap::new(),
             next_instance: 1,
             next_node_mount: 0,
