@@ -18,6 +18,7 @@ pub enum MountError {
     Field(FieldError),
     DuplicateKey,
     Write(WriteError),
+    Delivery(&'static str),
     Component(&'static str),
 }
 
@@ -37,6 +38,7 @@ impl fmt::Display for MountError {
             Self::Field(error) => write!(f, "{error}"),
             Self::DuplicateKey => f.write_str("duplicate For key before interface publication"),
             Self::Write(error) => write!(f, "{error}"),
+            Self::Delivery(message) => f.write_str(message),
             Self::Component(label) => write!(f, "component {label} rejected its mount"),
         }
     }

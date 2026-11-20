@@ -8,7 +8,8 @@ use zenui::prelude::*;
 
 fn runtime() -> Runtime {
     let mut app = Runtime::new();
-    app.mount(|| view! { <TodoApp /> }).expect("mount");
+    app.open_window("main", |window| view! { <TodoApp window={window} /> })
+        .expect("open window");
     app
 }
 

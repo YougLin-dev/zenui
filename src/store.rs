@@ -21,12 +21,14 @@ impl TodoId {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Store {
     runtime: u32,
+    _not_send: PhantomData<*const ()>,
 }
 
 impl Store {
     pub fn new() -> Self {
         Self {
             runtime: with_state(|state| state.id),
+            _not_send: PhantomData,
         }
     }
 
@@ -123,6 +125,7 @@ pub struct Field<T> {
     id: TodoId,
     kind: FieldKind,
     _marker: PhantomData<fn() -> T>,
+    _not_send: PhantomData<*const ()>,
 }
 
 impl<T> Field<T> {
@@ -132,6 +135,7 @@ impl<T> Field<T> {
             id,
             kind,
             _marker: PhantomData,
+            _not_send: PhantomData,
         }
     }
 }
@@ -340,7 +344,7 @@ impl crate::runtime::State {
     /// 事务只在 Event command turn 中执行；失败不改变模型，但会记录到命令边界，
     /// 即使调用方忽略返回值，dispatch 仍会报告这个错误。
     pub(crate) fn finish_transaction(&mut self, ops: Vec<Op>) -> Result<(), WriteError> {
-        if self.phase != Phase::Event || self.read_only > 0 {
+        if !matches!(self.phase, Phase::Event | Phase::Delivery) || self.read_only > 0 {
             let error = WriteError::Context {
                 operation: "Transaction::finish",
                 phase: self.phase,
