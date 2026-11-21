@@ -35,8 +35,7 @@ const RED_BGRA: [u8; 4] = [0, 0, 255, 255];
 
 fn runtime() -> Runtime {
     let mut app = Runtime::new();
-    app.open_window("main", |window| view! { <TodoApp window={window} /> })
-        .expect("open window");
+    open_todo_window(&mut app).expect("open window");
     app
 }
 

@@ -6,8 +6,7 @@ use zenui_render::{DecorationKind, Point, Scene, SceneElement, SceneEnv, SceneEr
 
 fn runtime() -> Runtime {
     let mut app = Runtime::new();
-    app.open_window("main", |window| view! { <TodoApp window={window} /> })
-        .expect("open window");
+    open_todo_window(&mut app).expect("open window");
     app
 }
 

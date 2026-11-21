@@ -79,20 +79,81 @@ pub fn TodoItem(todo: TodoId, todos: Store) -> MountResult<MountPlan> {
     }
 }
 
+/// 应用层共享的 Todo 状态；在窗口挂载前通过 `Runtime::setup` 创建。
+///
+/// 所有字段都是 Copy handle；窗口关闭只释放窗口 owner，应用状态保留。
+#[derive(Clone, Copy)]
+pub struct TodoState {
+    pub todos: Store,
+    pub draft: Signal<String>,
+    pub filter: Signal<Filter>,
+    pub preview: Signal<String>,
+    pub task_error: Signal<String>,
+    remaining_txt: Memo<String>,
+    no_tasks: Memo<bool>,
+    no_matches: Memo<bool>,
+    has_error: Memo<bool>,
+    has_preview: Memo<bool>,
+}
+
+impl TodoState {
+    /// 在 `Runtime::setup` 中调用，创建归属于应用 owner 的 Store 与派生值。
+    #[expect(
+        clippy::new_without_default,
+        reason = "TodoState is only valid inside Runtime::setup, so it has no Default"
+    )]
+    pub fn new() -> Self {
+        let todos = Store::new();
+        let filter = signal(Filter::All);
+        let remaining = memo(move || todos.rows(Filter::Active).len());
+        let remaining_txt = memo(move || format!("{} remaining", remaining.get()));
+        let no_tasks = memo(move || todos.is_empty(Filter::All));
+        let no_matches = memo(move || !no_tasks.get() && todos.is_empty(filter.get()));
+        let task_error = signal(String::new());
+        let preview = signal(String::new());
+        let has_error = memo(move || !task_error.get().is_empty());
+        let has_preview = memo(move || !preview.get().is_empty());
+        Self {
+            todos,
+            draft: signal(String::new()),
+            filter,
+            preview,
+            task_error,
+            remaining_txt,
+            no_tasks,
+            no_matches,
+            has_error,
+            has_preview,
+        }
+    }
+}
+
+/// 创建应用级 Todo 状态并打开主窗口。
+///
+/// 状态必须先于窗口 factory 运行创建，因此本函数内部先运行 `Runtime::setup`，
+/// 再把共享状态交给窗口 factory。
+pub fn open_todo_window(runtime: &mut Runtime) -> Result<WindowCtx, WindowError> {
+    let state = runtime.setup(TodoState::new)?;
+    runtime.open_window("main", move |window| {
+        view! { <TodoApp window=window state=state /> }
+    })
+}
+
 #[component]
-pub fn TodoApp(window: WindowCtx) -> MountResult<MountPlan> {
-    let todos = Store::new();
-    let draft = signal(String::new());
-    let filter = signal(Filter::All);
-    let preview = signal(String::new());
-    let task_error = signal(String::new());
+pub fn TodoApp(window: WindowCtx, state: TodoState) -> MountResult<MountPlan> {
+    let TodoState {
+        todos,
+        draft,
+        filter,
+        preview,
+        task_error,
+        remaining_txt,
+        no_tasks,
+        no_matches,
+        has_error,
+        has_preview,
+    } = state;
     let visible = memo(move || todos.rows(filter.get()));
-    let remaining = memo(move || todos.rows(Filter::Active).len());
-    let remaining_txt = memo(move || format!("{} remaining", remaining.get()));
-    let no_tasks = memo(move || todos.is_empty(Filter::All));
-    let no_matches = memo(move || !todos.is_empty(Filter::All) && todos.is_empty(filter.get()));
-    let has_error = memo(move || !task_error.get().is_empty());
-    let has_preview = memo(move || !preview.get().is_empty());
     let dark = memo(move || {
         window
             .appearance()

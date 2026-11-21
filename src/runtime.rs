@@ -60,6 +60,8 @@ pub(crate) struct State {
     tree: Option<Vec<MountedNode>>,
     tree_owner: Option<u32>,
     tree_window: Option<&'static str>,
+    app_setup: bool,
+    window_factory_ran: bool,
     windows: BTreeMap<&'static str, WindowRecord>,
     pub(crate) tasks: BTreeMap<u32, TaskRecord>,
     pub(crate) next_task: u32,
@@ -128,6 +130,8 @@ impl State {
             tree: None,
             tree_owner: None,
             tree_window: None,
+            app_setup: false,
+            window_factory_ran: false,
             windows: BTreeMap::new(),
             tasks: BTreeMap::new(),
             next_task: 1,
@@ -284,6 +288,7 @@ impl State {
     }
 
     pub(crate) fn begin_window(&mut self, key: &'static str) -> (u32, u32) {
+        self.window_factory_ran = true;
         let activation = self
             .windows
             .get(key)
@@ -832,10 +837,50 @@ impl Runtime {
         }
     }
 
+    /// 在任何窗口 factory 运行前运行一次应用级 setup，返回值由窗口 factory 捕获。
+    ///
+    /// setup 中的 Signal、Memo 与 Store 归属于应用 owner；窗口关闭不会释放它们。
+    /// setup 只成功运行一次；失败时不保留本次创建的资源，可以重试。
+    /// 应用级 setup 之后不能再调用 [`Runtime::mount`]。
+    pub fn setup<R>(&mut self, setup: impl FnOnce() -> R) -> Result<R, MountError> {
+        {
+            let state = self.state.borrow();
+            if state.app_setup {
+                return Err(MountError::Setup("application setup already ran"));
+            }
+            if state.window_factory_ran || state.tree.is_some() {
+                return Err(MountError::Setup(
+                    "application setup must run before any window factory",
+                ));
+            }
+        }
+        let state = self.state.clone();
+        context::install(&state, || {
+            with_state(|state| state.fault = None);
+            let value = with_owner(0, || {
+                with_state(|state| state.phase = Phase::Setup);
+                let value = setup();
+                with_state(|state| state.phase = Phase::Idle);
+                value
+            });
+            if let Some(fault) = with_state(|state| state.fault.take()) {
+                with_state(State::release_root_resources);
+                return Err(State::context_error(fault));
+            }
+            with_state(|state| state.app_setup = true);
+            Ok(value)
+        })
+    }
+
     pub fn mount(
         &mut self,
         root: impl FnOnce() -> MountResult<MountPlan> + 'static,
     ) -> Result<(), MountError> {
+        if self.state.borrow().app_setup {
+            return Err(MountError::Setup(
+                "cannot mount a headless root after application setup",
+            ));
+        }
         if self.state.borrow().tree.is_some() {
             return Err(MountError::Component("root is already mounted"));
         }
