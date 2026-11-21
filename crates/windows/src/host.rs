@@ -155,17 +155,14 @@ impl WakeState {
     }
 }
 
-/// Win32 宿主：一个 HWND、一个 activation、一个 DX12 surface。
-pub struct Host {
-    runtime: Runtime,
-    window_ctx: WindowCtx,
-    _instance: wgpu::Instance,
-    device: wgpu::Device,
-    queue: wgpu::Queue,
+/// 一个窗口的全部宿主状态；单窗口阶段 `Host` 恰好持有一个条目。
+struct WindowHost {
+    // 字段顺序是安全约束：surface 必须先于 HWND 释放，因为它的安全契约
+    // 要求创建 surface 的 HWND 在 surface 存活期间保持有效。
     surface: Option<wgpu::Surface<'static>>,
     surface_config: wgpu::SurfaceConfiguration,
-    renderer: GpuRenderer,
-    window: Window,
+    native: NativeWindow,
+    ctx: WindowCtx,
     scene: Option<Scene>,
     pointer: Option<Point>,
     hovered: Option<NodeId>,
@@ -174,11 +171,34 @@ pub struct Host {
     tracking_leave: bool,
     keyboard_modality: bool,
     pending_high_surrogate: Option<u16>,
-    wake: Arc<WakeState>,
     caret_visible: bool,
     blink_timer: Option<usize>,
     close_requested: bool,
     deferred_error: Option<HostError>,
+    /// 最近一次构建的呈现快照；任务交付据此跳过快照未变的重绘。
+    ///
+    /// 场景构建发生在获取 surface 图像之前，所以 `Timeout` / `Occluded` 时
+    /// 这里可能比屏幕上的帧更新。
+    last_snapshot: Option<PresentationSnapshot>,
+}
+
+impl WindowHost {
+    const fn hwnd(&self) -> HWND {
+        self.native.hwnd
+    }
+}
+
+/// Win32 宿主：一个 HWND、一个 activation、一个 DX12 surface。
+pub struct Host {
+    runtime: Runtime,
+    _instance: wgpu::Instance,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    renderer: GpuRenderer,
+    /// runtime 只安装一个唤醒回调，合并标志也属于整条交付通道而不是某个窗口；
+    /// 单窗口阶段它服务唯一的 `window`，多窗口阶段由宿主统一路由。
+    wake: Arc<WakeState>,
+    window: WindowHost,
 }
 
 impl Host {
@@ -201,7 +221,7 @@ impl Host {
 
         let hinstance = module_handle()?;
         register_class(hinstance)?;
-        let window = Window::new(config, hinstance)?;
+        let window = NativeWindow::new(config, hinstance)?;
         let hwnd = window.hwnd;
         // 安全：HWND 在 Host 生命周期内有效；定时器在 close_activation 中销毁。
         let blink_timer = unsafe { SetTimer(Some(hwnd), CARET_BLINK_TIMER, CARET_BLINK_MS, None) };
@@ -259,50 +279,53 @@ impl Host {
 
         Ok(Self {
             runtime,
-            window_ctx,
             _instance: instance,
             device: presentation.device,
             queue: presentation.queue,
-            surface: Some(surface),
-            surface_config: presentation.config,
             renderer: presentation.renderer,
-            window,
-            scene: None,
-            pointer: None,
-            hovered: None,
-            pressed: None,
-            release_capture: false,
-            tracking_leave: false,
-            keyboard_modality: false,
-            pending_high_surrogate: None,
             wake,
-            caret_visible: true,
-            blink_timer,
-            close_requested: false,
-            deferred_error: None,
+            window: WindowHost {
+                surface: Some(surface),
+                surface_config: presentation.config,
+                native: window,
+                ctx: window_ctx,
+                scene: None,
+                pointer: None,
+                hovered: None,
+                pressed: None,
+                release_capture: false,
+                tracking_leave: false,
+                keyboard_modality: false,
+                pending_high_surrogate: None,
+                caret_visible: true,
+                blink_timer,
+                close_requested: false,
+                deferred_error: None,
+                last_snapshot: None,
+            },
         })
     }
 
     /// 窗口句柄；测试与平台集成用它在原生消息循环里投递消息。
     pub const fn hwnd(&self) -> HWND {
-        self.window.hwnd
+        self.window.hwnd()
     }
 
     /// 最近一次呈现的场景；指针命中与几何查询使用。
     pub const fn scene(&self) -> Option<&Scene> {
-        self.scene.as_ref()
+        self.window.scene.as_ref()
     }
 
     /// 显示窗口（若配置为可见）并进入消息循环，直到窗口关闭。
     pub fn run(&mut self) -> Result<(), HostError> {
-        if self.window.visible {
+        if self.window.native.visible {
             // 安全：HWND 在 Host 生命周期内有效。
             unsafe {
-                let _ = ShowWindow(self.window.hwnd, SW_SHOW);
+                let _ = ShowWindow(self.window.hwnd(), SW_SHOW);
             }
         }
         self.render()?;
-        let hwnd = self.window.hwnd;
+        let hwnd = self.window.hwnd();
         // 窗口过程要能在系统自己的拖动/缩放循环里重绘；指针只在循环期间安装。
         let host = self as *mut Self;
         let _pointer = HostPointer::install(hwnd, host);
@@ -315,7 +338,7 @@ impl Host {
     ///
     /// 把宿主嵌进别的消息循环，或在测试里驱动一次输入而不阻塞时使用。
     pub fn pump(&mut self) -> Result<bool, HostError> {
-        let hwnd = self.window.hwnd;
+        let hwnd = self.window.hwnd();
         let host = self as *mut Self;
         let _pointer = HostPointer::install(hwnd, host);
         // 安全：与 `run` 相同。
@@ -327,12 +350,12 @@ impl Host {
     /// 输入处理放在窗口过程而不是消息循环里，因为系统的模态拖动/缩放循环会
     /// 直接调用窗口过程，消息循环在此期间收不到任何消息。
     fn handle_message(&mut self, message: u32, wparam: WPARAM, lparam: LPARAM) {
-        if self.close_requested {
+        if self.window.close_requested {
             // 关闭后只交付排队结果（由运行时丢弃），不再编辑或绘制。
             if message == HOST_WAKE_MESSAGE
                 && let Err(error) = self.deliver_tasks()
             {
-                self.deferred_error.get_or_insert(error);
+                self.window.deferred_error.get_or_insert(error);
             }
             return;
         }
@@ -341,12 +364,12 @@ impl Host {
             message,
             WM_LBUTTONDOWN | WM_LBUTTONUP | WM_MOUSEMOVE | WM_CHAR | WM_KEYDOWN
         ) {
-            self.caret_visible = true;
+            self.window.caret_visible = true;
         }
         if matches!(message, WM_CHAR | WM_KEYDOWN) {
-            self.keyboard_modality = true;
+            self.window.keyboard_modality = true;
         } else if message == WM_LBUTTONDOWN {
-            self.keyboard_modality = false;
+            self.window.keyboard_modality = false;
         }
         let result = if message == WM_LBUTTONDOWN {
             self.pointer_pressed(lparam).and_then(|()| self.render())
@@ -367,40 +390,40 @@ impl Host {
         } else if message == WM_IME_COMPOSITION {
             self.ime_composition(lparam)
         } else if message == WM_IME_ENDCOMPOSITION {
-            self.pressed = None;
+            self.window.pressed = None;
             self.ime_cancel()
         } else if message == WM_KILLFOCUS {
             self.focus_lost()
         } else if message == HOST_WAKE_MESSAGE {
             self.deliver_tasks()
-        } else if message == WM_TIMER && Some(wparam.0) == self.blink_timer {
+        } else if message == WM_TIMER && Some(wparam.0) == self.window.blink_timer {
             self.blink_caret()
         } else {
             Ok(())
         };
         if let Err(error) = result {
-            self.deferred_error.get_or_insert(error);
+            self.window.deferred_error.get_or_insert(error);
         }
     }
 
     /// `WM_PAINT` 的宿主处理；错误留给消息循环返回。
     fn paint(&mut self) {
-        if self.close_requested {
+        if self.window.close_requested {
             return;
         }
         if let Err(error) = self.render() {
-            self.deferred_error.get_or_insert(error);
+            self.window.deferred_error.get_or_insert(error);
         }
     }
 
     /// `WM_CLOSE` 的宿主处理：结束 activation 并标记关闭。
     fn close_from_window(&mut self) {
-        self.close_requested = true;
-        self.pressed = None;
-        self.hovered = None;
-        self.pointer = None;
+        self.window.close_requested = true;
+        self.window.pressed = None;
+        self.window.hovered = None;
+        self.window.pointer = None;
         if let Err(error) = self.close_activation() {
-            self.deferred_error.get_or_insert(error);
+            self.window.deferred_error.get_or_insert(error);
         }
     }
 
@@ -414,13 +437,12 @@ impl Host {
             self.runtime.drive_tasks().map_err(HostError::Runtime)?;
             return Ok(());
         }
-        let before = self.runtime.presentation().map_err(HostError::Runtime)?;
         let report = self.runtime.drive_tasks().map_err(HostError::Runtime)?;
         if report.delivered == 0 {
             return Ok(());
         }
         let after = self.runtime.presentation().map_err(HostError::Runtime)?;
-        if before == after {
+        if self.window.last_snapshot.as_ref() == Some(&after) {
             return Ok(());
         }
         self.render()
@@ -432,33 +454,33 @@ impl Host {
         let focused = focused_input(&snapshot).is_some();
         let composing = focused_composition(&snapshot);
         // 安全：只读取前台窗口句柄用于比较。
-        let foreground = unsafe { GetForegroundWindow() } == self.window.hwnd;
-        let visible = blinked(self.caret_visible, focused, composing, foreground);
-        if visible == self.caret_visible {
+        let foreground = unsafe { GetForegroundWindow() } == self.window.hwnd();
+        let visible = blinked(self.window.caret_visible, focused, composing, foreground);
+        if visible == self.window.caret_visible {
             return Ok(());
         }
-        self.caret_visible = visible;
+        self.window.caret_visible = visible;
         self.render()
     }
 
     /// 结束 activation 并拒绝后续唤醒；`WM_CLOSE` 与 `Drop` 共用。
     fn close_activation(&mut self) -> Result<(), HostError> {
         self.wake.close();
-        if let Some(timer) = self.blink_timer.take() {
+        if let Some(timer) = self.window.blink_timer.take() {
             // 安全：HWND 与定时器都属于本宿主；重复销毁安全。
             unsafe {
-                let _ = KillTimer(Some(self.window.hwnd), timer);
+                let _ = KillTimer(Some(self.window.hwnd()), timer);
             }
         }
         self.runtime
-            .close_window(self.window_ctx)
+            .close_window(self.window.ctx)
             .map_err(HostError::Close)
     }
 
     /// 请求关闭窗口；消息循环会在处理 WM_CLOSE 后释放 activation。
     pub fn request_close(&self) -> Result<(), HostError> {
         // 安全：HWND 在 Host 生命周期内有效。
-        unsafe { PostMessageW(Some(self.window.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)) }
+        unsafe { PostMessageW(Some(self.window.hwnd()), WM_CLOSE, WPARAM(0), LPARAM(0)) }
             .map_err(|error| HostError::Window(error.to_string()))
     }
 
@@ -470,7 +492,7 @@ impl Host {
     /// surface 或渲染错误。
     pub fn resize(&mut self, logical_width: u32, logical_height: u32) -> Result<(), HostError> {
         // 安全：HWND 在 Host 生命周期内有效。
-        let dpi = unsafe { GetDpiForWindow(self.window.hwnd) };
+        let dpi = unsafe { GetDpiForWindow(self.window.hwnd()) };
         let dpi = dpi.max(96);
         let scale = dpi as f32 / 96.0;
         let mut rect = RECT {
@@ -495,7 +517,7 @@ impl Host {
         // 只调整窗口尺寸，位置与 Z 序不变。
         unsafe {
             SetWindowPos(
-                self.window.hwnd,
+                self.window.hwnd(),
                 None,
                 0,
                 0,
@@ -518,7 +540,7 @@ impl Host {
         let mut recovered = false;
         loop {
             self.ensure_surface()?;
-            let (width, height) = client_size(self.window.hwnd)?;
+            let (width, height) = client_size(self.window.hwnd())?;
             if width == 0 || height == 0 {
                 return Ok(());
             }
@@ -539,7 +561,7 @@ impl Host {
                         )));
                     }
                     self.current_surface()?
-                        .configure(&self.device, &self.surface_config);
+                        .configure(&self.device, &self.window.surface_config);
                     recovered = true;
                     continue;
                 }
@@ -571,7 +593,7 @@ impl Host {
             }
             self.queue.submit([encoder.finish()]);
             self.queue.present(frame);
-            self.scene = Some(scene);
+            self.window.scene = Some(scene);
             self.position_ime(&snapshot);
             return Ok(());
         }
@@ -585,13 +607,14 @@ impl Host {
         // 指针操作会移动焦点或 caret；先结束任何组合，避免 preedit 跟随到别处。
         self.cancel_compositions()?;
         let scale = self
+            .window
             .scene
             .as_ref()
             .map_or(1.0, |scene| scene.viewport().scale());
         let point = pointer_point(lparam, scale);
-        self.pointer = Some(point);
+        self.window.pointer = Some(point);
 
-        let Some((node, visual, caret, disabled)) = self.scene.as_ref().and_then(|scene| {
+        let Some((node, visual, caret, disabled)) = self.window.scene.as_ref().and_then(|scene| {
             let node = scene.hit_test(point)?;
             let element = scene.node(node)?;
             Some((
@@ -601,18 +624,18 @@ impl Host {
                 element.disabled(),
             ))
         }) else {
-            self.hovered = None;
-            self.pressed = None;
+            self.window.hovered = None;
+            self.window.pressed = None;
             return self.runtime.blur().map_err(HostError::Runtime);
         };
 
         // disabled 控件不聚焦、不激活，也不改变焦点。
         if disabled {
-            self.hovered = None;
-            self.pressed = None;
+            self.window.hovered = None;
+            self.window.pressed = None;
             return Ok(());
         }
-        self.hovered = Some(node);
+        self.window.hovered = Some(node);
 
         match visual {
             Visual::TextInput => {
@@ -622,14 +645,14 @@ impl Host {
                 }
             }
             Visual::Checkbox { .. } | Visual::Button { .. } => {
-                self.pressed = Some(node);
+                self.window.pressed = Some(node);
                 // 安全：捕获指针，拖动离开后的松开仍回到本窗口，但不再激活。
                 unsafe {
-                    SetCapture(self.window.hwnd);
+                    SetCapture(self.window.hwnd());
                 }
             }
             Visual::Container | Visual::Text => {
-                self.pressed = None;
+                self.window.pressed = None;
                 self.runtime.blur().map_err(HostError::Runtime)?;
             }
         }
@@ -639,21 +662,22 @@ impl Host {
     /// 指针移动：更新悬停目标；按住时离开原目标会清除按住状态。
     fn pointer_moved(&mut self, lparam: LPARAM) -> Result<(), HostError> {
         let scale = self
+            .window
             .scene
             .as_ref()
             .map_or(1.0, |scene| scene.viewport().scale());
         let point = pointer_point(lparam, scale);
-        self.pointer = Some(point);
+        self.window.pointer = Some(point);
         self.arm_leave_tracking();
 
-        let hovered = self.scene.as_ref().and_then(|scene| {
+        let hovered = self.window.scene.as_ref().and_then(|scene| {
             let node = scene.hit_test(point)?;
             (!scene.node(node)?.disabled()).then_some(node)
         });
-        let mut changed = hovered != self.hovered;
-        self.hovered = hovered;
-        if self.pressed.is_some() && self.pressed != hovered {
-            self.pressed = None;
+        let mut changed = hovered != self.window.hovered;
+        self.window.hovered = hovered;
+        if self.window.pressed.is_some() && self.window.pressed != hovered {
+            self.window.pressed = None;
             changed = true;
         }
         if !changed {
@@ -664,9 +688,9 @@ impl Host {
 
     /// 指针离开客户区：清除悬停；按住目标由松开或捕获丢失结束。
     fn pointer_left(&mut self) -> Result<(), HostError> {
-        self.tracking_leave = false;
-        self.pointer = None;
-        if self.hovered.take().is_none() {
+        self.window.tracking_leave = false;
+        self.window.pointer = None;
+        if self.window.hovered.take().is_none() {
             return Ok(());
         }
         self.render()
@@ -675,25 +699,27 @@ impl Host {
     /// 左键松开：只有仍命中同一个启用节点时才激活按钮或复选框。
     fn pointer_released(&mut self, lparam: LPARAM) -> Result<(), HostError> {
         let scale = self
+            .window
             .scene
             .as_ref()
             .map_or(1.0, |scene| scene.viewport().scale());
         let point = pointer_point(lparam, scale);
-        self.pointer = Some(point);
+        self.window.pointer = Some(point);
         // 先取走目标：松开后的捕获释放会同步送出 WM_CAPTURECHANGED，
         // 那条消息不能把这次松开要激活的目标一起清掉。
-        let target = self.pressed.take();
+        let target = self.window.pressed.take();
         // 捕获释放在窗口过程借出宿主之后进行：`ReleaseCapture` 会同步送达
         // `WM_CAPTURECHANGED`，嵌套的 `with_host` 不能与外层 `&mut Host` 重叠。
-        self.release_capture = true;
+        self.window.release_capture = true;
         let activated = target.is_some_and(|node| {
-            self.scene.as_ref().is_some_and(|scene| {
+            self.window.scene.as_ref().is_some_and(|scene| {
                 scene.hit_test(point) == Some(node)
                     && scene.node(node).is_some_and(|element| !element.disabled())
             })
         });
         if activated && let Some(node) = target {
             let visual = self
+                .window
                 .scene
                 .as_ref()
                 .and_then(|scene| scene.node(node))
@@ -707,7 +733,7 @@ impl Host {
             }
         }
 
-        self.hovered = self.scene.as_ref().and_then(|scene| {
+        self.window.hovered = self.window.scene.as_ref().and_then(|scene| {
             let node = scene.hit_test(point)?;
             (!scene.node(node)?.disabled()).then_some(node)
         });
@@ -716,7 +742,7 @@ impl Host {
 
     /// 捕获丢失（例如系统抢走指针）：按住状态不能残留。
     fn capture_lost(&mut self) -> Result<(), HostError> {
-        if self.pressed.take().is_some() {
+        if self.window.pressed.take().is_some() {
             self.render()?;
         }
         Ok(())
@@ -724,9 +750,9 @@ impl Host {
 
     /// 焦点丢失：清除按住瞬态与组合，并让下一帧不再绘制按下状态。
     fn focus_lost(&mut self) -> Result<(), HostError> {
-        let was_pressed = self.pressed.take().is_some();
+        let was_pressed = self.window.pressed.take().is_some();
         if was_pressed {
-            self.release_capture = true;
+            self.window.release_capture = true;
         }
         let cancelled = self.cancel_compositions()?;
         if cancelled || was_pressed {
@@ -738,25 +764,25 @@ impl Host {
     /// 只在第一次进入客户区时请求一次 `WM_MOUSELEAVE`。
     fn arm_leave_tracking(&mut self) {
         // 隐藏窗口没有真实光标；注册跟踪会让系统立即投递 leave。
-        if self.tracking_leave || !self.window.visible {
+        if self.window.tracking_leave || !self.window.native.visible {
             return;
         }
         let mut event = TRACKMOUSEEVENT {
             cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
             dwFlags: TME_LEAVE,
-            hwndTrack: self.window.hwnd,
+            hwndTrack: self.window.hwnd(),
             dwHoverTime: 0,
         };
         // 安全：结构由本地值初始化；失败时下一次移动会重试。
         if unsafe { TrackMouseEvent(&mut event) }.is_ok() {
-            self.tracking_leave = true;
+            self.window.tracking_leave = true;
         }
     }
 
     /// 用同一场景渲染到离屏纹理并读回 BGRA 像素；隐藏 CI smoke 使用。
     pub fn read_frame(&mut self) -> Result<Frame, HostError> {
         self.ensure_surface()?;
-        let (width, height) = client_size(self.window.hwnd)?;
+        let (width, height) = client_size(self.window.hwnd())?;
         if width == 0 || height == 0 {
             return Err(HostError::Readback(String::from(
                 "cannot read a frame from an empty client area",
@@ -765,7 +791,7 @@ impl Host {
         let (scene, snapshot) = self.current_scene(width, height)?;
         self.renderer
             .set_palette(palette_for(snapshot.appearance()));
-        let format = self.surface_config.format;
+        let format = self.window.surface_config.format;
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("zenui host readback"),
             size: wgpu::Extent3d {
@@ -831,7 +857,7 @@ impl Host {
         }
         drop(mapped);
         buffer.unmap();
-        self.scene = Some(scene);
+        self.window.scene = Some(scene);
         Ok(Frame {
             width,
             height,
@@ -847,17 +873,17 @@ impl Host {
         let unit = wparam.0 as u16;
         let character = match unit {
             0xD800..=0xDBFF => {
-                self.pending_high_surrogate = Some(unit);
+                self.window.pending_high_surrogate = Some(unit);
                 return Ok(());
             }
             0xDC00..=0xDFFF => {
-                let Some(high) = self.pending_high_surrogate.take() else {
+                let Some(high) = self.window.pending_high_surrogate.take() else {
                     return Ok(());
                 };
                 char::decode_utf16([high, unit]).next().and_then(Result::ok)
             }
             _ => {
-                self.pending_high_surrogate = None;
+                self.window.pending_high_surrogate = None;
                 char::from_u32(u32::from(unit))
             }
         };
@@ -1085,10 +1111,10 @@ impl Host {
     fn notify_ime_cancel(&self) {
         // 安全：HIMC 由 ImmGetContext 获取并与 HWND 配对释放。
         unsafe {
-            let himc = ImmGetContext(self.window.hwnd);
+            let himc = ImmGetContext(self.window.hwnd());
             if !himc.0.is_null() {
                 let _ = ImmNotifyIME(himc, NI_COMPOSITIONSTR, CPS_CANCEL, 0);
-                let _ = ImmReleaseContext(self.window.hwnd, himc);
+                let _ = ImmReleaseContext(self.window.hwnd(), himc);
             }
         }
     }
@@ -1102,13 +1128,13 @@ impl Host {
     /// OS IME 当前是否仍有组合串；Escape 取消后部分 IME 直接清空它。
     fn os_composition_active(&self) -> bool {
         // 安全：himc 与 HWND 配对；只查询组合串长度，不读取缓冲。
-        let himc = unsafe { ImmGetContext(self.window.hwnd) };
+        let himc = unsafe { ImmGetContext(self.window.hwnd()) };
         if himc.0.is_null() {
             return false;
         }
         let bytes = unsafe { ImmGetCompositionStringW(himc, GCS_COMPSTR, None, 0) };
         unsafe {
-            let _ = ImmReleaseContext(self.window.hwnd, himc);
+            let _ = ImmReleaseContext(self.window.hwnd(), himc);
         }
         bytes > 0
     }
@@ -1118,7 +1144,7 @@ impl Host {
         kind: IME_COMPOSITION_STRING,
     ) -> Result<Option<String>, HostError> {
         // 安全：himc 由 ImmGetContext 返回，读取的缓冲在调用期间有效。
-        let himc = unsafe { ImmGetContext(self.window.hwnd) };
+        let himc = unsafe { ImmGetContext(self.window.hwnd()) };
         if himc.0.is_null() {
             return Ok(None);
         }
@@ -1141,7 +1167,7 @@ impl Host {
         })();
         // 安全：himc 与获取它的 HWND 配对释放。
         unsafe {
-            let _ = ImmReleaseContext(self.window.hwnd, himc);
+            let _ = ImmReleaseContext(self.window.hwnd(), himc);
         }
         result
     }
@@ -1157,7 +1183,7 @@ impl Host {
         if !is_composing(snapshot, node) {
             return;
         }
-        let Some(scene) = &self.scene else {
+        let Some(scene) = &self.window.scene else {
             return;
         };
         // 候选窗锚在 preedit 起点，而不是 caret（preedit 末尾）。
@@ -1183,7 +1209,7 @@ impl Host {
         };
         // 安全：HIMC 由 ImmGetContext 获取，两个结构都是本地值。
         unsafe {
-            let himc = ImmGetContext(self.window.hwnd);
+            let himc = ImmGetContext(self.window.hwnd());
             if himc.0.is_null() {
                 return;
             }
@@ -1200,14 +1226,15 @@ impl Host {
             };
             let _ = ImmSetCompositionWindow(himc, &composition);
             let _ = ImmSetCandidateWindow(himc, &candidate);
-            let _ = ImmReleaseContext(self.window.hwnd, himc);
+            let _ = ImmReleaseContext(self.window.hwnd(), himc);
         }
     }
 
     /// 重建 device、surface 与 renderer；运行时状态（Node ID、焦点、caret）
     /// 留在 Runtime 中，因此恢复后保持不变。
     fn current_surface(&self) -> Result<&wgpu::Surface<'static>, HostError> {
-        self.surface
+        self.window
+            .surface
             .as_ref()
             .ok_or_else(|| HostError::Surface(String::from("the surface is not available")))
     }
@@ -1215,35 +1242,36 @@ impl Host {
     fn rebuild_presentation(&mut self) -> Result<(), HostError> {
         // 释放旧 surface 的交换链后再配置新 surface。失败时保持 None，
         // 下一次重绘会再次尝试重建，而不是留下未配置的 surface。
-        self.surface = None;
-        let surface = create_surface(&self._instance, self.window.hwnd, module_handle()?)?;
-        let presentation = configure_presentation(&self._instance, &surface, self.window.hwnd)?;
-        self.surface = Some(surface);
+        self.window.surface = None;
+        let surface = create_surface(&self._instance, self.window.hwnd(), module_handle()?)?;
+        let presentation = configure_presentation(&self._instance, &surface, self.window.hwnd())?;
+        self.window.surface = Some(surface);
         self.device = presentation.device;
         self.queue = presentation.queue;
-        self.surface_config = presentation.config;
+        self.window.surface_config = presentation.config;
         self.renderer = presentation.renderer;
         Ok(())
     }
 
     fn ensure_surface(&mut self) -> Result<(), HostError> {
-        let (width, height) = client_size(self.window.hwnd)?;
+        let (width, height) = client_size(self.window.hwnd())?;
         if width == 0 || height == 0 {
             return Ok(());
         }
-        if self.surface.is_none() {
+        if self.window.surface.is_none() {
             self.rebuild_presentation()?;
             return Ok(());
         }
-        if self.surface_config.width == width && self.surface_config.height == height {
+        if self.window.surface_config.width == width && self.window.surface_config.height == height
+        {
             return Ok(());
         }
-        let target = target_config(self.surface_config.format, width, height)?;
+        let target = target_config(self.window.surface_config.format, width, height)?;
         self.renderer.resize(target);
-        self.surface_config.width = width;
-        self.surface_config.height = height;
+        self.window.surface_config.width = width;
+        self.window.surface_config.height = height;
         self.current_surface()?
-            .configure(&self.device, &self.surface_config);
+            .configure(&self.device, &self.window.surface_config);
         Ok(())
     }
 
@@ -1253,7 +1281,7 @@ impl Host {
         height: u32,
     ) -> Result<(Scene, PresentationSnapshot), HostError> {
         // 安全：HWND 在 Host 生命周期内有效。
-        let dpi = unsafe { GetDpiForWindow(self.window.hwnd) };
+        let dpi = unsafe { GetDpiForWindow(self.window.hwnd()) };
         let scale = if dpi == 0 { 1.0 } else { dpi as f32 / 96.0 };
         let viewport = Viewport::new(width as f32 / scale, height as f32 / scale, scale)
             .map_err(HostError::Scene)?;
@@ -1267,34 +1295,35 @@ impl Host {
         }
         // 组合期间不绘制 caret，草稿由 preedit 下划线标识；闪烁只在非组合状态生效。
         let composing = focused_composition(&snapshot);
-        scene.set_caret_visible(self.caret_visible && !composing);
+        scene.set_caret_visible(self.window.caret_visible && !composing);
+        self.window.last_snapshot = Some(snapshot.clone());
         Ok((scene, snapshot))
     }
 
     fn scene_env(&self) -> SceneEnv {
         SceneEnv::default()
-            .with_hovered(self.hovered)
-            .with_pressed(self.pressed)
-            .with_focus_visible(self.keyboard_modality)
+            .with_hovered(self.window.hovered)
+            .with_pressed(self.window.pressed)
+            .with_focus_visible(self.window.keyboard_modality)
     }
 
     /// 用新场景重新命中最后的指针位置；返回是否需要按新瞬态重建。
     fn revalidate_pointer(&mut self, scene: &Scene) -> bool {
-        let Some(point) = self.pointer else {
+        let Some(point) = self.window.pointer else {
             return false;
         };
         let hit = scene.hit_test(point);
         let enabled = hit.filter(|node| scene.node(*node).is_some_and(|e| !e.disabled()));
-        let hover_changed = enabled != self.hovered;
-        let press_cleared = self.pressed.is_some_and(|pressed| {
+        let hover_changed = enabled != self.window.hovered;
+        let press_cleared = self.window.pressed.is_some_and(|pressed| {
             hit != Some(pressed) || scene.node(pressed).is_none_or(|element| element.disabled())
         });
         if !hover_changed && !press_cleared {
             return false;
         }
-        self.hovered = enabled;
+        self.window.hovered = enabled;
         if press_cleared {
-            self.pressed = None;
+            self.window.pressed = None;
         }
         true
     }
@@ -1355,12 +1384,12 @@ impl fmt::Display for HostError {
 
 impl Error for HostError {}
 
-struct Window {
+struct NativeWindow {
     hwnd: HWND,
     visible: bool,
 }
 
-impl Window {
+impl NativeWindow {
     fn new(config: HostConfig, hinstance: HINSTANCE) -> Result<Self, HostError> {
         let title: HSTRING = config.title.into();
         let style = WS_OVERLAPPEDWINDOW;
@@ -1410,7 +1439,7 @@ impl Window {
     }
 }
 
-impl Drop for Window {
+impl Drop for NativeWindow {
     fn drop(&mut self) {
         // 安全：HWND 由本结构独占；重复销毁只返回错误。
         unsafe {
@@ -1661,8 +1690,9 @@ fn create_surface(
     hinstance: HINSTANCE,
 ) -> Result<wgpu::Surface<'static>, HostError> {
     let raw_window = raw_window_handle(hwnd, hinstance)?;
-    // 安全：HWND 由 Host 的 Window 持有，销毁推迟到 Window::drop；Host 的
-    // surface 字段在 window 之前声明，因此 surface 先于 HWND 释放。
+    // 安全：HWND 由 WindowHost 的 NativeWindow 持有，销毁推迟到
+    // NativeWindow::drop；WindowHost 的 surface 字段先于 native 声明，
+    // 因此 surface 先于 HWND 释放。
     unsafe {
         instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
             raw_display_handle: Some(raw_display_handle()),
@@ -1810,7 +1840,7 @@ unsafe fn take_capture_release(hwnd: HWND) -> bool {
         return false;
     }
     // 安全：指针由 HostPointer 安装；调用方不持有宿主引用。
-    unsafe { std::mem::take(&mut (*pointer).release_capture) }
+    unsafe { std::mem::take(&mut (*pointer).window.release_capture) }
 }
 
 /// 翻译并派发一条消息；窗口过程负责处理。
@@ -1841,10 +1871,10 @@ unsafe fn run_loop(host: *mut Host) -> Result<(), HostError> {
         dispatch_message(&message);
         // 安全：派发已返回，重新借出宿主读取处理结果。
         let host = unsafe { &mut *host };
-        if let Some(error) = host.deferred_error.take() {
+        if let Some(error) = host.window.deferred_error.take() {
             return Err(error);
         }
-        if host.close_requested {
+        if host.window.close_requested {
             return Ok(());
         }
     }
@@ -1866,10 +1896,10 @@ unsafe fn pump_loop(host: *mut Host) -> Result<bool, HostError> {
         dispatch_message(&message);
         // 安全：派发已返回，重新借出宿主读取处理结果。
         let host = unsafe { &mut *host };
-        if let Some(error) = host.deferred_error.take() {
+        if let Some(error) = host.window.deferred_error.take() {
             return Err(error);
         }
-        if host.close_requested {
+        if host.window.close_requested {
             return Ok(true);
         }
     }
@@ -1927,7 +1957,7 @@ unsafe extern "system" fn wndproc(
         WM_CLOSE => {
             // 安全：派发期间不持有宿主引用；结束 activation 并标记关闭。
             unsafe { with_host(hwnd, Host::close_from_window) };
-            // 隐藏窗口并结束消息循环；销毁推迟到 Window::drop，使 HWND 在 surface
+            // 隐藏窗口并结束消息循环；销毁推迟到 NativeWindow::drop，使 HWND 在 surface
             // 存活期间保持有效。
             // 安全：hwnd 来自系统回调。
             unsafe {
@@ -2069,7 +2099,7 @@ mod tests {
         );
         assert!(before > 0.0);
 
-        let (width, height) = client_size(host.window.hwnd).expect("client size");
+        let (width, height) = client_size(host.window.hwnd()).expect("client size");
         let frame = host.read_frame().expect("frame after resize");
         assert_eq!((frame.width(), frame.height()), (width, height));
     }
@@ -2192,13 +2222,13 @@ mod tests {
         let mut host = open_host();
         host.render().expect("initial render");
         host.close_from_window();
-        assert!(host.close_requested);
+        assert!(host.window.close_requested);
 
         // 关闭后 runtime 已释放 activation；再绘制或输入若没被跳过会记录错误。
         host.handle_message(WM_CHAR, WPARAM('X' as usize), LPARAM(0));
         host.paint();
         assert!(
-            host.deferred_error.is_none(),
+            host.window.deferred_error.is_none(),
             "a closed host does not touch the runtime"
         );
     }
@@ -2465,7 +2495,7 @@ mod tests {
                 );
             }
         }
-        if let Some(error) = host.deferred_error.take() {
+        if let Some(error) = host.window.deferred_error.take() {
             panic!("the window procedure failed: {error}");
         }
     }
@@ -2742,7 +2772,7 @@ mod tests {
         };
         send_msg(&mut host, message);
         assert!(
-            !host.close_requested,
+            !host.window.close_requested,
             "focus loss does not close the window"
         );
         let snapshot = host.runtime.presentation().expect("snapshot");
