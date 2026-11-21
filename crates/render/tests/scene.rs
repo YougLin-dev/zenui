@@ -1286,6 +1286,39 @@ fn pointer_and_modality_conditions_select_from_the_scene_environment() {
 }
 
 #[test]
+fn dark_conditions_follow_the_snapshot_appearance() {
+    let mut app = Runtime::new();
+    app.mount(|| view! { <view aria:label="themed" class="bg-surface dark:bg-accent" /> })
+        .expect("mount");
+    let snapshot = app.presentation().expect("snapshot");
+    let viewport = viewport(400.0);
+    let id = snapshot.find_label("themed").expect("themed view").id();
+    let light = Scene::build_with(&snapshot, viewport, &SceneEnv::default()).expect("scene");
+    assert_eq!(
+        light
+            .node(id)
+            .expect("element")
+            .resolved_style()
+            .background(),
+        Some(Color::Role(ColorRole::Surface))
+    );
+
+    app.set_appearance(Appearance::Dark).expect("switch theme");
+    let dark = app.presentation().expect("snapshot");
+    assert_eq!(dark.appearance(), Appearance::Dark);
+    let scene = Scene::build_with(&dark, viewport, &SceneEnv::default()).expect("scene");
+    assert_eq!(
+        scene
+            .node(id)
+            .expect("element")
+            .resolved_style()
+            .background(),
+        Some(Color::Role(ColorRole::Accent)),
+        "dark: declarations follow the committed appearance"
+    );
+}
+
+#[test]
 fn a_mismatched_style_declaration_is_an_explicit_error() {
     const STYLE: &[StyleDeclaration] = &[StyleDeclaration::new(
         Property::Gap,

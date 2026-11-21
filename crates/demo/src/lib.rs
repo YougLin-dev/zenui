@@ -93,6 +93,11 @@ pub fn TodoApp(window: WindowCtx) -> MountResult<MountPlan> {
     let no_matches = memo(move || !todos.is_empty(Filter::All) && todos.is_empty(filter.get()));
     let has_error = memo(move || !task_error.get().is_empty());
     let has_preview = memo(move || !preview.get().is_empty());
+    let dark = memo(move || {
+        window
+            .appearance()
+            .is_ok_and(|value| value == Appearance::Dark)
+    });
 
     let add = move || {
         let title = draft.with(|text| text.trim().to_owned());
@@ -140,7 +145,7 @@ pub fn TodoApp(window: WindowCtx) -> MountResult<MountPlan> {
 
     view! {
         <view role="main">
-            <text class="text-sm">{remaining_txt}</text>
+            <text class="text-sm dark:text-muted">{remaining_txt}</text>
             <form
                 aria:label="Add task"
                 on:submit={move |event: SubmitEvent| {
@@ -172,6 +177,13 @@ pub fn TodoApp(window: WindowCtx) -> MountResult<MountPlan> {
                 }}>"Clear done"</button>
                 <button on:click={move || load_sample()}>"Load sample"</button>
                 <button on:click={move || preview_import()}>"Preview import"</button>
+                <button
+                    aria:label="Toggle theme"
+                    on:click={move || {
+                        let next = if dark.get() { Appearance::Light } else { Appearance::Dark };
+                        let _ = window.set_appearance(next);
+                    }}
+                >"Theme"</button>
             </view>
             <Show when={has_error}>
                 <text>{task_error}</text>

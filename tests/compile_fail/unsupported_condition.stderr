@@ -1,5 +1,5 @@
-error: class condition is not supported yet `dark:bg-accent` at character 0
+error: unknown class condition `pressed:bg-accent` at character 0
  --> tests/compile_fail/unsupported_condition.rs:4:59
   |
-4 |     let _: MountResult<MountPlan> = view! { <button class="dark:bg-accent">"Add"</button> };
-  |                                                           ^^^^^^^^^^^^^^^^
+4 |     let _: MountResult<MountPlan> = view! { <button class="pressed:bg-accent">"Add"</button> };
+  |                                                           ^^^^^^^^^^^^^^^^^^^

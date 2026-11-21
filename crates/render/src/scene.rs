@@ -10,7 +10,7 @@ use taffy::{
     Baselines, LayoutInput, LayoutOutput, NodeId as TaffyNodeId, Rect as TaffyRect, ResolveOrZero,
     Size as TaffySize, compute_leaf_layout,
 };
-use zenui::{NodeId, PresentationSnapshot, SnapshotElement, SnapshotNode};
+use zenui::{Appearance, NodeId, PresentationSnapshot, SnapshotElement, SnapshotNode};
 use zenui_style::{Color, Condition, Property, StyleDeclaration, StyleOrigin, StyleValue};
 
 use crate::SceneError;
@@ -495,6 +495,7 @@ impl TextContext {
 /// 一条声明在解析时能看到的控件状态；来自已提交的快照，不含宿主瞬态。
 #[derive(Clone, Copy, Debug, Default)]
 struct ElementState {
+    dark: bool,
     hovered: bool,
     focus: bool,
     focus_visible: bool,
@@ -508,7 +509,7 @@ impl ElementState {
     const fn active(self, condition: Condition) -> bool {
         match condition {
             Condition::Base => true,
-            Condition::Dark => false,
+            Condition::Dark => self.dark,
             Condition::Hover => self.hovered,
             Condition::Focus => self.focus,
             Condition::FocusVisible => self.focus_visible,
@@ -624,6 +625,7 @@ impl<'a> Builder<'a> {
             Intrinsic::View | Intrinsic::Form => container_style(intrinsic, element),
         };
         let state = ElementState {
+            dark: self.snapshot.appearance() == Appearance::Dark,
             hovered: self.env.hovered == Some(element.id()),
             focus: self.snapshot.focus() == Some(element.id()),
             focus_visible: self.env.focus_visible && self.snapshot.focus() == Some(element.id()),

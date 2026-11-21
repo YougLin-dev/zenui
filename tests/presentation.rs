@@ -74,6 +74,8 @@ fn a_mounted_todo_exposes_committed_elements_text_attributes_and_order() {
             ("-", "Load sample"),
             ("button", "Preview import"),
             ("-", "Preview import"),
+            ("button", "Theme"),
+            ("-", "Theme"),
             ("text", "Nothing here yet"),
             ("-", "Nothing here yet"),
         ]),
@@ -666,6 +668,103 @@ fn typed_dynamic_styles_travel_through_the_snapshot_and_update_in_place() {
         StyleDeclaration::inline(Property::Width, StyleValue::Length(px(160.0)))
     );
     assert_ne!(before, after, "the committed snapshot reflects the change");
+}
+
+#[component]
+fn ThemeProbe(
+    window: WindowCtx,
+    themed: Rc<Cell<u32>>,
+    plain: Rc<Cell<u32>>,
+) -> MountResult<MountPlan> {
+    let label = memo(move || {
+        themed.set(themed.get() + 1);
+        if window.appearance() == Ok(Appearance::Dark) {
+            String::from("dark")
+        } else {
+            String::from("light")
+        }
+    });
+    let fixed = memo(move || {
+        plain.set(plain.get() + 1);
+        String::from("fixed")
+    });
+
+    view! {
+        <view>
+            <text aria:label="theme">{label}</text>
+            <text aria:label="fixed">{fixed}</text>
+        </view>
+    }
+}
+
+#[test]
+fn appearance_is_committed_state_and_only_theme_memos_recompute() {
+    let themed = Rc::new(Cell::new(0));
+    let plain = Rc::new(Cell::new(0));
+    let mut app = Runtime::new();
+    app.open_window("main", {
+        let themed = themed.clone();
+        let plain = plain.clone();
+        move |window| {
+            let themed = themed.clone();
+            let plain = plain.clone();
+            view! { <ThemeProbe window={window} themed={themed} plain={plain} /> }
+        }
+    })
+    .expect("open window");
+
+    let light = app.presentation().expect("snapshot");
+    assert_eq!(light.appearance(), Appearance::Light);
+    assert_eq!(
+        light.find_label("theme").expect("theme text").text(),
+        "light"
+    );
+    assert_eq!((themed.get(), plain.get()), (1, 1));
+
+    app.set_appearance(Appearance::Dark).expect("switch theme");
+    let dark = app.presentation().expect("snapshot");
+    assert_eq!(dark.appearance(), Appearance::Dark);
+    assert_eq!(dark.find_label("theme").expect("theme text").text(), "dark");
+    assert_ne!(light, dark, "appearance participates in snapshot equality");
+    assert_eq!(themed.get(), 2, "the theme memo recomputes");
+    assert_eq!(plain.get(), 1, "an unrelated memo does not recompute");
+}
+
+#[test]
+fn the_demo_theme_toggle_keeps_focus_caret_and_selection() {
+    let mut app = runtime();
+    add(&mut app, "A");
+    app.focus("Edit A").expect("focus the editor");
+    assert!(app.set_caret("Edit A", 1), "place the caret");
+    let before = app.presentation().expect("snapshot");
+    let editor = before.find_label("Edit A").expect("editor").id();
+    let edit = before
+        .find_label("Edit A")
+        .expect("editor")
+        .edit()
+        .expect("edit state");
+    let caret = (edit.caret(), edit.anchor());
+
+    app.click_label("Toggle theme").expect("toggle the theme");
+    let dark = app.presentation().expect("snapshot");
+    assert_eq!(dark.appearance(), Appearance::Dark);
+    assert_eq!(
+        dark.focus(),
+        Some(editor),
+        "focus survives the theme switch"
+    );
+    let edit = dark
+        .find_label("Edit A")
+        .expect("editor")
+        .edit()
+        .expect("edit state");
+    assert_eq!((edit.caret(), edit.anchor()), caret, "caret survives");
+
+    app.click_label("Toggle theme").expect("toggle back");
+    assert_eq!(
+        app.presentation().expect("snapshot").appearance(),
+        Appearance::Light
+    );
 }
 
 #[test]

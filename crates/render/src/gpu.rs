@@ -62,8 +62,9 @@ pub struct RenderPalette {
     pub caret: [u8; 4],
 }
 
-impl Default for RenderPalette {
-    fn default() -> Self {
+impl RenderPalette {
+    /// 浅色外观的默认调色板。
+    pub const fn light() -> Self {
         Self {
             background: [244, 244, 245, 255],
             surface: [255, 255, 255, 255],
@@ -83,6 +84,35 @@ impl Default for RenderPalette {
             selection: [37, 99, 235, 80],
             caret: [24, 24, 27, 255],
         }
+    }
+
+    /// 深色外观的调色板。
+    pub const fn dark() -> Self {
+        Self {
+            background: [9, 9, 11, 255],
+            surface: [24, 24, 27, 255],
+            control: [39, 39, 42, 255],
+            control_hover: [63, 63, 70, 255],
+            control_pressed: [82, 82, 91, 255],
+            text: [250, 250, 250, 255],
+            text_muted: [161, 161, 170, 255],
+            text_inverse: [24, 24, 27, 255],
+            text_disabled: [82, 82, 91, 255],
+            border: [63, 63, 70, 255],
+            accent: [96, 165, 250, 255],
+            accent_hover: [59, 130, 246, 255],
+            accent_pressed: [37, 99, 235, 255],
+            danger: [248, 113, 113, 255],
+            danger_hover: [239, 68, 68, 255],
+            selection: [96, 165, 250, 80],
+            caret: [250, 250, 250, 255],
+        }
+    }
+}
+
+impl Default for RenderPalette {
+    fn default() -> Self {
+        Self::light()
     }
 }
 
@@ -208,6 +238,11 @@ impl GpuRenderer {
             config,
             palette,
         }
+    }
+
+    /// 切换调色板；下一帧生效。
+    pub const fn set_palette(&mut self, palette: RenderPalette) {
+        self.palette = palette;
     }
 
     /// 调整目标尺寸；复用已有的 vello 渲染器与资源，只重建深度视图。
