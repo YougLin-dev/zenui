@@ -5,7 +5,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use windows::Win32::Foundation::{
-    ERROR_CLASS_ALREADY_EXISTS, GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
+    ERROR_CLASS_ALREADY_EXISTS, GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE,
+    WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, PAINTSTRUCT, ValidateRect};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -25,12 +26,13 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow,
     DispatchMessageW, GWLP_USERDATA, GetClientRect, GetForegroundWindow, GetMessageW,
-    GetWindowLongPtrW, IDC_ARROW, KillTimer, LoadCursorW, MSG, PM_REMOVE, PeekMessageW,
-    PostMessageW, PostQuitMessage, RegisterClassExW, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOZORDER, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage,
-    WINDOW_EX_STYLE, WM_APP, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_DPICHANGED, WM_IME_CHAR,
-    WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KILLFOCUS,
-    WM_LBUTTONDOWN, WM_PAINT, WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
+    GetWindowLongPtrW, IDC_ARROW, IsIconic, IsZoomed, KillTimer, LoadCursorW, MSG, PM_REMOVE,
+    PeekMessageW, PostMessageW, PostQuitMessage, RegisterClassExW, SW_HIDE, SW_SHOW,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SetTimer, SetWindowLongPtrW, SetWindowPos,
+    ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WM_APP, WM_CHAR, WM_CLOSE, WM_DESTROY,
+    WM_DPICHANGED, WM_GETDPISCALEDSIZE, WM_IME_CHAR, WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION,
+    WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_PAINT, WM_SIZE, WM_TIMER,
+    WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
 };
 
 use windows::core::{HSTRING, w};
@@ -1433,6 +1435,15 @@ fn client_size(hwnd: HWND) -> Result<(u32, u32), HostError> {
     ))
 }
 
+/// 按新旧 DPI 比例换算物理客户区，使 DPI 变化后的逻辑客户区保持不变。
+fn scaled_client_size(width: i32, height: i32, current_dpi: u32, new_dpi: u32) -> (i32, i32) {
+    let scale = new_dpi as f32 / current_dpi as f32;
+    (
+        (width as f32 * scale).round() as i32,
+        (height as f32 * scale).round() as i32,
+    )
+}
+
 /// 从 HWND 创建 DX12 surface；重建时先换掉旧 surface 再配置。
 fn create_surface(
     instance: &wgpu::Instance,
@@ -1698,6 +1709,58 @@ unsafe extern "system" fn wndproc(
             unsafe { PostQuitMessage(0) };
             LRESULT(0)
         }
+        WM_GETDPISCALEDSIZE => {
+            // 系统默认按 DPI 比例线性缩放外框，非客户区取整会让客户区的逻辑
+            // 尺寸漂移一两像素。这里按当前物理客户区的比例算出目标客户区，
+            // 再按新 DPI 加上非客户区，把外框作为候选尺寸交给 WM_DPICHANGED。
+            let size = lparam.0 as *mut SIZE;
+            let new_dpi = (wparam.0 & 0xFFFF) as u32;
+            // 最大化/最小化时由系统按工作区调整；无效参数同样交回默认过程。
+            // 安全：hwnd 来自系统回调。
+            let special = unsafe { IsIconic(hwnd).as_bool() || IsZoomed(hwnd).as_bool() };
+            if size.is_null() || new_dpi == 0 || special {
+                return unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
+            }
+            let mut client = RECT::default();
+            // 安全：client 是有效的输出缓冲；hwnd 来自系统回调。
+            let current_dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
+            // 安全：client 是有效的输出缓冲。
+            if unsafe { GetClientRect(hwnd, &mut client) }.is_err() {
+                return unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
+            }
+            let (width, height) = scaled_client_size(
+                client.right - client.left,
+                client.bottom - client.top,
+                current_dpi,
+                new_dpi,
+            );
+            let mut outer = RECT {
+                left: 0,
+                top: 0,
+                right: width,
+                bottom: height,
+            };
+            // 安全：outer 是本地值；样式与窗口创建时一致。
+            if unsafe {
+                AdjustWindowRectExForDpi(
+                    &mut outer,
+                    WS_OVERLAPPEDWINDOW,
+                    false,
+                    WINDOW_EX_STYLE::default(),
+                    new_dpi,
+                )
+            }
+            .is_err()
+            {
+                return unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
+            }
+            // 安全：lParam 是系统的 in/out SIZE；上面已检查非空。
+            unsafe {
+                (*size).cx = outer.right - outer.left;
+                (*size).cy = outer.bottom - outer.top;
+            }
+            LRESULT(1)
+        }
         WM_DPICHANGED => {
             let suggested = lparam.0 as *const RECT;
             if !suggested.is_null() {
@@ -1716,7 +1779,9 @@ unsafe extern "system" fn wndproc(
                     );
                 }
             }
-            // DPI 改变可能不改变窗口尺寸，因而没有 WM_SIZE；这里同步按新 scale 重绘。
+            // WM_GETDPISCALEDSIZE 不保证送达（常见于交互拖动），所以这里仍以
+            // 系统建议矩形为准。DPI 改变可能不改变窗口尺寸，因而没有 WM_SIZE；
+            // 这里同步按新 scale 重绘。
             // 安全：派发期间不持有宿主引用，窗口过程可以借出一次。
             unsafe { with_host(hwnd, Host::paint) };
             // 安全：只清除本窗口的更新区域。
@@ -1767,6 +1832,50 @@ mod tests {
         let (width, height) = client_size(host.window.hwnd).expect("client size");
         let frame = host.read_frame().expect("frame after resize");
         assert_eq!((frame.width(), frame.height()), (width, height));
+    }
+
+    #[test]
+    fn get_dpi_scaled_size_preserves_the_logical_client_size() {
+        let mut host = open_host();
+        host.resize(640, 480).expect("resize");
+        let hwnd = host.hwnd();
+        let new_dpi = 192;
+        let mut size = SIZE::default();
+        // 安全：hwnd 属于本线程；WM_GETDPISCALEDSIZE 的 lParam 是 SIZE 的 in/out 指针。
+        let result = unsafe {
+            SendMessageW(
+                hwnd,
+                WM_GETDPISCALEDSIZE,
+                Some(WPARAM(new_dpi as usize)),
+                Some(LPARAM(&mut size as *mut SIZE as isize)),
+            )
+        };
+        assert_eq!(result.0, 1, "the host computes the DPI-scaled size");
+
+        // 640×480 逻辑客户区在 192 DPI 下是 1280×960 物理像素；
+        // 目标外框由系统按新 DPI 的窗口样式加出。
+        let mut outer = RECT {
+            left: 0,
+            top: 0,
+            right: 1280,
+            bottom: 960,
+        };
+        // 安全：outer 是本地值；样式与窗口创建时一致。
+        unsafe {
+            AdjustWindowRectExForDpi(
+                &mut outer,
+                WS_OVERLAPPEDWINDOW,
+                false,
+                WINDOW_EX_STYLE::default(),
+                new_dpi,
+            )
+        }
+        .expect("frame metrics");
+        assert_eq!(
+            (size.cx, size.cy),
+            (outer.right - outer.left, outer.bottom - outer.top),
+            "the candidate outer size keeps the logical client size"
+        );
     }
 
     #[test]
