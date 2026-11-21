@@ -32,7 +32,7 @@ pub use view::{
     BlurEvent, Children, ChildrenFactory, CompositionEvent, CompositionPhase, FocusCause,
     FocusEvent, Key, KeyEvent, MountError, MountPlan, MountResult, SubmitEvent,
 };
-pub use window::{CatalogError, WindowCatalog, WindowCtx, WindowError, WindowSpec};
+pub use window::{CatalogError, WindowCatalog, WindowCtx, WindowError, WindowInfo, WindowSpec};
 pub use zenui_macro::{component, view};
 pub use zenui_style as style;
 pub use zenui_style::{
@@ -49,8 +49,8 @@ pub mod prelude {
         PresentationSnapshot, Property, Runtime, Signal, SnapshotAttr, SnapshotElement,
         SnapshotNode, SnapshotValue, Store, StyleDeclaration, StyleOrigin, StyleValue, SubmitEvent,
         Task, TaskError, TaskScope, TaskStatus, TaskToken, TextEditState, TodoId, Transaction,
-        WindowCatalog, WindowCtx, WindowError, WindowSpec, WriteError, WriteOp, component, em,
-        memo, once, px, signal, view,
+        WindowCatalog, WindowCtx, WindowError, WindowInfo, WindowSpec, WriteError, WriteOp,
+        component, em, memo, once, px, signal, view,
     };
     pub use zenui_core::Filter;
 }
