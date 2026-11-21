@@ -38,6 +38,21 @@ pub(crate) struct OwnerRecord {
 
 static NEXT_RUNTIME: AtomicU32 = AtomicU32::new(1);
 
+/// 一棵已提交树的身份：headless 根，或目录中的窗口键。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum TreeKey {
+    Root,
+    Window(&'static str),
+}
+
+/// 一棵已提交界面，以及它拥有的 Owner、焦点与结算前序。
+struct MountedTree {
+    nodes: Vec<MountedNode>,
+    owner: u32,
+    focused: Option<usize>,
+    settle_before: Option<Vec<usize>>,
+}
+
 pub(crate) struct State {
     pub(crate) id: u32,
     pub(crate) read_only: u32,
@@ -57,9 +72,7 @@ pub(crate) struct State {
     events: Vec<Event>,
     elements: Vec<MountedElement>,
     components: Vec<MountedComponent>,
-    tree: Option<Vec<MountedNode>>,
-    tree_owner: Option<u32>,
-    tree_window: Option<&'static str>,
+    trees: BTreeMap<TreeKey, MountedTree>,
     app_setup: bool,
     window_factory_ran: bool,
     windows: BTreeMap<&'static str, WindowRecord>,
@@ -70,8 +83,6 @@ pub(crate) struct State {
     next_instance: u64,
     next_node_mount: u64,
     unmounts: u64,
-    focused: Option<usize>,
-    settle_before: Option<Vec<usize>>,
 }
 
 /// 旧焦点离开可见集合后的一次结算：旧目标（可选 blur）与接任目标。
@@ -127,9 +138,7 @@ impl State {
             events: Vec::new(),
             elements: Vec::new(),
             components: Vec::new(),
-            tree: None,
-            tree_owner: None,
-            tree_window: None,
+            trees: BTreeMap::new(),
             app_setup: false,
             window_factory_ran: false,
             windows: BTreeMap::new(),
@@ -140,8 +149,6 @@ impl State {
             next_instance: 1,
             next_node_mount: 0,
             unmounts: 0,
-            focused: None,
-            settle_before: None,
         }
     }
 
@@ -156,9 +163,55 @@ impl State {
         id
     }
 
+    /// 当前唯一的已提交树；多窗口目录落地前，单窗口路径恰好一个条目。
+    fn sole_tree(&self) -> Option<&MountedTree> {
+        debug_assert!(
+            self.trees.len() <= 1,
+            "the single-window runtime stores at most one tree"
+        );
+        self.trees.values().next()
+    }
+
+    fn sole_tree_mut(&mut self) -> Option<&mut MountedTree> {
+        debug_assert!(
+            self.trees.len() <= 1,
+            "the single-window runtime stores at most one tree"
+        );
+        self.trees.values_mut().next()
+    }
+
+    /// 取走唯一的树供刷新使用，保留它的键以便放回同一窗口。
+    fn take_tree(&mut self) -> Option<(TreeKey, MountedTree)> {
+        debug_assert!(
+            self.trees.len() <= 1,
+            "the single-window runtime stores at most one tree"
+        );
+        let key = *self.trees.keys().next()?;
+        self.trees.remove(&key).map(|tree| (key, tree))
+    }
+
+    fn put_tree(&mut self, key: TreeKey, tree: MountedTree) {
+        debug_assert!(
+            self.trees.is_empty(),
+            "the single-window runtime stores one tree"
+        );
+        self.trees.insert(key, tree);
+    }
+
+    /// 当前焦点目标；焦点属于树，而不是整个应用。
+    fn focused(&self) -> Option<usize> {
+        self.sole_tree().and_then(|tree| tree.focused)
+    }
+
+    fn set_focused(&mut self, focused: Option<usize>) {
+        if let Some(tree) = self.sole_tree_mut() {
+            tree.focused = focused;
+        }
+    }
+
     /// 当前呈现焦点：仍在已提交树中且可聚焦。
     fn presented_focus(&self) -> Option<usize> {
-        self.focused
+        self.focused()
             .filter(|element| self.element_is_mounted(*element) && self.is_focusable(*element))
     }
 
@@ -325,7 +378,7 @@ impl State {
     }
 
     pub(crate) fn has_tree(&mut self) -> bool {
-        self.tree.is_some()
+        !self.trees.is_empty()
     }
 
     fn context_error(fault: ContextFault) -> MountError {
@@ -336,9 +389,9 @@ impl State {
     }
 
     fn find_element(&self, target: &FindTarget) -> Option<usize> {
-        self.tree
-            .as_ref()
-            .and_then(|tree| find_element(self, tree, target))
+        self.trees
+            .values()
+            .find_map(|tree| find_element(self, &tree.nodes, target))
     }
 
     fn put_event(&mut self, id: usize, event: Event) {
@@ -512,8 +565,8 @@ impl State {
     /// Tab/方向键共用的确定性前序：控件先于自己的子树，Show 只看活动分支，For 按业务顺序。
     fn focus_order(&self) -> Vec<usize> {
         let mut order = Vec::new();
-        if let Some(tree) = &self.tree {
-            collect_focusable(self, tree, &mut order);
+        if let Some(tree) = self.sole_tree() {
+            collect_focusable(self, &tree.nodes, &mut order);
         }
         order
     }
@@ -521,16 +574,16 @@ impl State {
     /// 结算快照包含旧一代的全部挂载元素；某个控件当时禁用、本帧重新启用时仍可接任。
     fn element_order(&self) -> Vec<usize> {
         let mut order = Vec::new();
-        if let Some(tree) = &self.tree {
-            collect_elements(self, tree, &mut order);
+        if let Some(tree) = self.sole_tree() {
+            collect_elements(self, &tree.nodes, &mut order);
         }
         order
     }
 
     fn element_is_mounted(&self, element: usize) -> bool {
-        self.tree
-            .as_ref()
-            .is_some_and(|tree| contains_element(self, tree, element))
+        self.trees
+            .values()
+            .any(|tree| contains_element(self, &tree.nodes, element))
     }
 
     /// 旧焦点不在新的可聚焦集合时，下一次结算才产生接任目标。
@@ -539,12 +592,16 @@ impl State {
     /// 再退到任意下一控件、任意上一控件；本帧新挂载的控件不会因返场抢焦点，
     /// 当时禁用、本帧重新启用的旧控件仍然可以接任。
     fn focus_settlement(&mut self) -> Option<FocusSettlement> {
-        let old = self.focused?;
+        let old = self.focused()?;
         let after = self.focus_order();
         if after.contains(&old) {
             return None;
         }
-        let before = self.settle_before.take().unwrap_or_default();
+        let before = self
+            .sole_tree_mut()?
+            .settle_before
+            .take()
+            .unwrap_or_default();
         let target = focus_replacement(self, &before, &after, old);
         Some(FocusSettlement {
             old,
@@ -848,7 +905,7 @@ impl Runtime {
             if state.app_setup {
                 return Err(MountError::Setup("application setup already ran"));
             }
-            if state.window_factory_ran || state.tree.is_some() {
+            if state.window_factory_ran || !state.trees.is_empty() {
                 return Err(MountError::Setup(
                     "application setup must run before any window factory",
                 ));
@@ -881,7 +938,7 @@ impl Runtime {
                 "cannot mount a headless root after application setup",
             ));
         }
-        if self.state.borrow().tree.is_some() {
+        if !self.state.borrow().trees.is_empty() {
             return Err(MountError::Component("root is already mounted"));
         }
         let state = self.state.clone();
@@ -906,9 +963,15 @@ impl Runtime {
                 return Err(State::context_error(fault));
             }
             with_state(|state| {
-                state.tree = Some(tree);
-                state.tree_owner = Some(0);
-                state.tree_window = None;
+                state.put_tree(
+                    TreeKey::Root,
+                    MountedTree {
+                        nodes: tree,
+                        owner: 0,
+                        focused: None,
+                        settle_before: None,
+                    },
+                );
                 state.phase = Phase::Idle;
             });
             self.refresh()
@@ -941,7 +1004,7 @@ impl Runtime {
         key: &'static str,
         factory: impl Fn(WindowCtx) -> MountResult<MountPlan> + 'static,
     ) -> Result<WindowCtx, WindowError> {
-        if self.state.borrow().tree.is_some() {
+        if !self.state.borrow().trees.is_empty() {
             return Err(WindowError::Unsupported(
                 "a second headless window while one is mounted",
             ));
@@ -983,18 +1046,25 @@ impl Runtime {
                 }));
             }
             with_state(|state| {
-                state.tree = Some(tree);
-                state.tree_owner = Some(owner);
-                state.tree_window = Some(key);
+                state.put_tree(
+                    TreeKey::Window(key),
+                    MountedTree {
+                        nodes: tree,
+                        owner,
+                        focused: None,
+                        settle_before: None,
+                    },
+                );
                 state.phase = Phase::Idle;
             });
             if let Err(error) = self.refresh() {
-                let nodes = with_state(|state| state.tree.take());
-                self.abort_open(key, activation, owner, nodes);
-                with_state(|state| {
-                    state.tree_owner = None;
-                    state.tree_window = None;
+                let nodes = with_state(|state| {
+                    state
+                        .trees
+                        .remove(&TreeKey::Window(key))
+                        .map(|tree| tree.nodes)
                 });
+                self.abort_open(key, activation, owner, nodes);
                 return Err(WindowError::Mount(error));
             }
             Ok(window)
@@ -1011,24 +1081,23 @@ impl Runtime {
             let live = {
                 let state = state.borrow();
                 state.window_is_live(window.key, window.activation, window.owner)
-                    && state.tree_window == Some(window.key)
+                    && state
+                        .trees
+                        .get(&TreeKey::Window(window.key))
+                        .is_some_and(|tree| tree.owner == window.owner)
             };
             if !live {
                 return Err(WindowError::Stale);
             }
+            let tree = with_state(|state| state.trees.remove(&TreeKey::Window(window.key)));
+            let Some(MountedTree { mut nodes, .. }) = tree else {
+                return Err(WindowError::Stale);
+            };
             with_state(|state| {
                 state.cancel_window(window.key, window.activation);
             });
-            let nodes = with_state(|state| state.tree.take());
-            if let Some(mut nodes) = nodes {
-                self.release_nodes(&mut nodes);
-            }
-            with_state(|state| {
-                state.focused = None;
-                state.dispose_owner(window.owner);
-                state.tree_owner = None;
-                state.tree_window = None;
-            });
+            self.release_nodes(&mut nodes);
+            with_state(|state| state.dispose_owner(window.owner));
             Ok(())
         })
     }
@@ -1043,9 +1112,9 @@ impl Runtime {
         if let Err(error) = self.refresh_once() {
             // 失败的帧没有发布；不能让焦点身份停留在已被移除或禁用的旧目标上。
             let mut state = self.state.borrow_mut();
-            let focused = state.focused;
+            let focused = state.focused();
             if focused.is_some_and(|id| !state.element_is_mounted(id) || !state.is_focusable(id)) {
-                state.focused = None;
+                state.set_focused(None);
             }
             return Err(error);
         }
@@ -1055,17 +1124,21 @@ impl Runtime {
     fn refresh_once(&mut self) -> Result<(), MountError> {
         let state = self.state.clone();
         context::install(&state, || {
-            let Some(mut tree) = with_state(|state| {
+            let Some((key, mut tree)) = with_state(|state| {
                 state.fault = None;
                 state.phase = Phase::Binding;
-                state.settle_before = state.focused.is_some().then(|| state.element_order());
-                state.tree.take()
+                let focused = state.focused();
+                let settle_before = focused.is_some().then(|| state.element_order());
+                if let Some(entry) = state.sole_tree_mut() {
+                    entry.settle_before = settle_before;
+                }
+                state.take_tree()
             }) else {
                 return Err(MountError::Component("root is not mounted"));
             };
-            let result = self.refresh_nodes(&mut tree);
+            let result = self.refresh_nodes(&mut tree.nodes);
             let fault = with_state(|state| {
-                state.tree = Some(tree);
+                state.put_tree(key, tree);
                 state.phase = Phase::Idle;
                 state.fault
             });
@@ -1093,15 +1166,15 @@ impl Runtime {
                     state.write_error = None;
                 });
                 if settlement.blur_old {
-                    with_state(|state| state.focused = None);
+                    with_state(|state| state.set_focused(None));
                     self.fire_blur(settlement.old, FocusCause::Settlement);
                 }
                 match settlement.target {
                     Some(target) => {
-                        with_state(|state| state.focused = Some(target));
+                        with_state(|state| state.set_focused(Some(target)));
                         self.fire_focus(target, FocusCause::Settlement);
                     }
-                    None => with_state(|state| state.focused = None),
+                    None => with_state(|state| state.set_focused(None)),
                 }
                 with_state(|state| state.phase = Phase::Idle);
                 if let Some(fault) = with_state(|state| state.fault) {
@@ -1122,10 +1195,10 @@ impl Runtime {
                 state.write_error = None;
             });
             if settlement.blur_old {
-                with_state(|state| state.focused = None);
+                with_state(|state| state.set_focused(None));
                 self.fire_blur(settlement.old, FocusCause::Settlement);
             }
-            with_state(|state| state.focused = None);
+            with_state(|state| state.set_focused(None));
             with_state(|state| state.phase = Phase::Idle);
             if let Some(fault) = with_state(|state| state.fault) {
                 return Err(State::context_error(fault));
@@ -2199,7 +2272,7 @@ impl Runtime {
         let state = self.state.clone();
         context::install(&state, || {
             let element = with_state(|state| state.element_for_node(node))?;
-            let focused = with_state(|state| state.focused);
+            let focused = with_state(|state| state.focused());
             if focused != Some(element) {
                 return Err(DispatchError::Rejected {
                     node,
@@ -2234,7 +2307,7 @@ impl Runtime {
             if order.is_empty() {
                 return Err(MountError::Component("no focusable target"));
             }
-            let current = with_state(|state| state.focused)
+            let current = with_state(|state| state.focused())
                 .and_then(|focused| order.iter().position(|id| *id == focused));
             let index = match (forward, current) {
                 (true, Some(index)) => (index + 1) % order.len(),
@@ -2248,7 +2321,7 @@ impl Runtime {
     }
 
     fn move_focus(&mut self, target: Option<usize>) -> Result<(), MountError> {
-        let current = with_state(|state| state.focused);
+        let current = with_state(|state| state.focused());
         if current == target {
             return Ok(());
         }
@@ -2258,13 +2331,13 @@ impl Runtime {
             state.write_error = None;
         });
         if let Some(old) = current {
-            with_state(|state| state.focused = None);
+            with_state(|state| state.set_focused(None));
             if with_state(|state| state.element_is_mounted(old)) {
                 self.fire_blur(old, FocusCause::Command);
             }
         }
         if let Some(target) = target {
-            with_state(|state| state.focused = Some(target));
+            with_state(|state| state.set_focused(Some(target)));
             self.fire_focus(target, FocusCause::Command);
         }
         with_state(|state| state.phase = Phase::Idle);
@@ -2333,8 +2406,8 @@ impl Runtime {
     pub fn texts(&self) -> Vec<String> {
         let state = self.state.borrow();
         let mut texts = Vec::new();
-        if let Some(tree) = &state.tree {
-            collect_texts(&state, tree, &mut texts);
+        for tree in state.trees.values() {
+            collect_texts(&state, &tree.nodes, &mut texts);
         }
         texts
     }
@@ -2342,8 +2415,8 @@ impl Runtime {
     pub fn for_items(&self) -> Vec<ItemInfo> {
         let state = self.state.borrow();
         let mut items = Vec::new();
-        if let Some(tree) = &state.tree {
-            collect_items(&state, tree, &mut items);
+        for tree in state.trees.values() {
+            collect_items(&state, &tree.nodes, &mut items);
         }
         items
     }
@@ -2433,13 +2506,15 @@ impl Runtime {
     /// 最近一次提交界面的只读呈现描述；生成过程不执行用户闭包，也不改变界面。
     pub fn presentation(&self) -> Result<PresentationSnapshot, MountError> {
         let state = self.state.borrow();
-        let Some(tree) = state.tree.as_ref() else {
+        if state.trees.is_empty() {
             return Err(MountError::Component(
                 "presentation snapshot requires a committed interface",
             ));
-        };
+        }
         let mut roots = Vec::new();
-        collect_snapshot(&state, tree, &mut roots);
+        for tree in state.trees.values() {
+            collect_snapshot(&state, &tree.nodes, &mut roots);
+        }
         let focus = state
             .presented_focus()
             .map(|element| state.elements[element].id);
@@ -2458,7 +2533,7 @@ impl Runtime {
     /// 设置应用外观；只失效依赖外观的 memo，并在已挂载时刷新一帧。
     pub fn set_appearance(&mut self, appearance: Appearance) -> Result<(), MountError> {
         self.state.borrow_mut().set_appearance(appearance);
-        if self.state.borrow().tree.is_some() {
+        if !self.state.borrow().trees.is_empty() {
             self.refresh()?;
         }
         Ok(())
