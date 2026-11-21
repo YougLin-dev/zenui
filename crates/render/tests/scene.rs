@@ -1141,6 +1141,43 @@ fn a_mismatched_style_declaration_is_an_explicit_error() {
 }
 
 #[test]
+fn a_state_variant_cannot_set_a_layout_property() {
+    const STYLE: &[StyleDeclaration] = &[StyleDeclaration::new(
+        Property::PaddingX,
+        StyleValue::Points(8),
+        Condition::Focus,
+    )];
+    let mut app = Runtime::new();
+    app.open_window("main", |_| {
+        Ok(MountPlan::new(vec![zenui::view::styled_element(
+            "view",
+            Vec::new(),
+            STYLE,
+            Vec::new(),
+            Vec::new(),
+        )]))
+    })
+    .expect("window");
+    let snapshot = app.presentation().expect("snapshot");
+    let node = snapshot.roots()[0].id().expect("root element");
+    // 失效的条件同样被拒绝：错误不能取决于当前瞬态。
+    match Scene::build(&snapshot, viewport(800.0)) {
+        Err(SceneError::UnsupportedStyle {
+            node: failed,
+            property,
+            value,
+        }) => {
+            assert_eq!(failed, node);
+            assert_eq!(
+                (property, value),
+                (Property::PaddingX, StyleValue::Points(8))
+            );
+        }
+        other => panic!("expected UnsupportedStyle, got {other:?}"),
+    }
+}
+
+#[test]
 fn class_padding_moves_the_text_origin_but_keeps_the_hit_area() {
     let mut app = Runtime::new();
     app.mount(|| view! { <text-input aria:label="padded" class="px-4" value="abc" /> })

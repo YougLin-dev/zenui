@@ -24,7 +24,7 @@ pub enum Property {
 
 impl Property {
     /// 绘制属性不参与布局；状态变体只允许设置这些属性。
-    const fn is_paint(self) -> bool {
+    pub const fn is_paint(self) -> bool {
         matches!(
             self,
             Self::Background

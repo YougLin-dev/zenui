@@ -894,6 +894,15 @@ fn resolve_style(
     let mut winners: HashMap<Property, (StyleOrigin, Condition)> = HashMap::new();
     for declaration in declarations {
         let condition = declaration.condition();
+        // 宏在展开期就拒绝状态变体里的布局属性；手工构造的快照必须由场景
+        // 守同一规则，否则一次 hover 会改变几何。
+        if condition != Condition::Base && !declaration.property().is_paint() {
+            return Err(SceneError::UnsupportedStyle {
+                node,
+                property: declaration.property(),
+                value: declaration.value(),
+            });
+        }
         if !state.active(condition) {
             continue;
         }
