@@ -429,6 +429,77 @@ fn class_paint_renders_background_text_border_radius_and_opacity() {
 }
 
 #[test]
+fn text_classes_render_at_both_scales_without_clipping() {
+    let Some(context) = context() else {
+        return;
+    };
+    let mut app = Runtime::new();
+    app.mount(|| {
+        view! {
+            <view class="bg-surface">
+                <text aria:label="large" class="text-lg">"Large"</text>
+            </view>
+        }
+    })
+    .expect("mount");
+    let snapshot = app.presentation().expect("snapshot");
+
+    for scale in [1.0_f32, 1.5] {
+        let width = (120.0 * scale) as u16;
+        let height = (60.0 * scale) as u16;
+        let scene = scene(&snapshot, 120.0, 60.0, scale);
+        let pixels = render(
+            &context,
+            &scene,
+            wgpu::TextureFormat::Bgra8Unorm,
+            width,
+            height,
+        );
+        let text = scene
+            .node(snapshot.find_label("large").expect("text").id())
+            .expect("text");
+        assert_eq!(text.text()[0].font_size(), 16.0, "layout stays logical");
+        let rect = text.rect();
+        let physical = RectLike {
+            x: rect.x * scale,
+            y: rect.y * scale,
+            width: rect.width * scale,
+            height: rect.height * scale,
+        };
+        assert!(
+            pixels.any_in(
+                RectLike {
+                    x: physical.x,
+                    y: physical.y,
+                    width: physical.width,
+                    height: physical.height,
+                },
+                |pixel| pixel != GREEN_BGRA
+            ),
+            "glyph ink appears inside the 16-point box at {scale}x"
+        );
+        let below = physical.bottom() + 2.0;
+        assert!(
+            below < f32::from(height),
+            "the fixture leaves room below the box"
+        );
+        assert_eq!(
+            pixels.at((physical.x + 2.0) as u32, below as u32),
+            GREEN_BGRA,
+            "no ink leaks below the text box at {scale}x"
+        );
+        let right = physical.x + physical.width + 2.0;
+        if right < f32::from(width) {
+            assert_eq!(
+                pixels.at(right as u32, (physical.y + 2.0) as u32),
+                GREEN_BGRA,
+                "no ink leaks right of the text box at {scale}x"
+            );
+        }
+    }
+}
+
+#[test]
 fn both_bgra_formats_render_the_same_primary_colors() {
     let Some(context) = context() else {
         return;

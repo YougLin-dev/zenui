@@ -1,0 +1,5 @@
+error: state variants may only set paint properties `disabled:text-sm` at character 0
+ --> tests/compile_fail/state_variant_text.rs:4:57
+  |
+4 |     let _: MountResult<MountPlan> = view! { <text class="disabled:text-sm">"Add"</text> };
+  |                                                         ^^^^^^^^^^^^^^^^^^

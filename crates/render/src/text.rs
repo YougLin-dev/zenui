@@ -9,7 +9,23 @@ use crate::scene::{PositionedGlyph, TextRun};
 
 /// 正文与控件的默认字号；所有几何使用逻辑像素。
 pub(crate) const FONT_SIZE: f32 = 14.0;
+/// 未声明字重时的默认值。
+pub(crate) const FONT_WEIGHT: u16 = 400;
 const LINE_HEIGHT: f32 = 1.35;
+
+/// 一次整形使用的字号与字重。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct TextStyle {
+    pub(crate) size: f32,
+    pub(crate) weight: u16,
+}
+
+impl TextStyle {
+    pub(crate) const DEFAULT: Self = Self {
+        size: FONT_SIZE,
+        weight: FONT_WEIGHT,
+    };
+}
 
 /// 显示文本中的字符范围；构造时规范化顺序。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -56,16 +72,19 @@ impl TextShaper {
         }
     }
 
-    fn build(&mut self, text: &str) -> Layout<()> {
+    fn build(&mut self, text: &str, style: TextStyle) -> Layout<()> {
         let Self { fonts, layouts } = self;
         let mut builder = layouts.ranged_builder(fonts, text, 1.0, true);
-        builder.push_default(StyleProperty::FontSize(FONT_SIZE));
+        builder.push_default(StyleProperty::FontSize(style.size));
+        builder.push_default(StyleProperty::FontWeight(parley::FontWeight::new(
+            f32::from(style.weight),
+        )));
         builder.push_default(parley::LineHeight::FontSizeRelative(LINE_HEIGHT));
         builder.build(text)
     }
 
-    pub(crate) fn shape(&mut self, text: &str, max_width: f32) -> Layout<()> {
-        let mut layout = self.build(text);
+    pub(crate) fn shape(&mut self, text: &str, max_width: f32, style: TextStyle) -> Layout<()> {
+        let mut layout = self.build(text, style);
         layout.break_all_lines(Some(max_width.max(0.0)));
         layout
     }
@@ -76,8 +95,9 @@ impl TextShaper {
         text: &str,
         dimensions: TaffySize<Option<f32>>,
         available: TaffySize<AvailableSpace>,
+        style: TextStyle,
     ) -> (TaffySize<f32>, f32) {
-        let mut layout = self.build(text);
+        let mut layout = self.build(text, style);
         let content = layout.calculate_content_widths();
         let width = match available.width {
             AvailableSpace::MinContent => content.min,
@@ -225,7 +245,7 @@ mod tests {
     #[test]
     fn measured_widths_land_on_the_pixel_grid() {
         let mut shaper = TextShaper::new();
-        let layout = shaper.build("Load sample");
+        let layout = shaper.build("Load sample", TextStyle::DEFAULT);
         let max_content = layout.calculate_content_widths().max;
         assert!(
             max_content.fract() != 0.0,
@@ -242,6 +262,7 @@ mod tests {
                 width: AvailableSpace::MaxContent,
                 height: AvailableSpace::MaxContent,
             },
+            TextStyle::DEFAULT,
         );
         assert_eq!(size.width, max_content.ceil());
         assert!(
@@ -253,7 +274,7 @@ mod tests {
     #[test]
     fn a_non_collapsed_selection_produces_ordered_rects() {
         let mut shaper = TextShaper::new();
-        let layout = shaper.shape("hello world", 200.0);
+        let layout = shaper.shape("hello world", 200.0, TextStyle::DEFAULT);
         let origin = Point::new(10.0, 20.0);
         let rects = selection(&layout, origin, "hello world", CharRange::new(1, 4));
         assert!(!rects.is_empty(), "a selection has geometry");

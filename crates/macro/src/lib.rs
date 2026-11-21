@@ -251,6 +251,8 @@ fn property_tokens(property: Property) -> TokenStream {
         Property::BorderWidth => quote! { BorderWidth },
         Property::Radius => quote! { Radius },
         Property::Opacity => quote! { Opacity },
+        Property::FontSize => quote! { FontSize },
+        Property::FontWeight => quote! { FontWeight },
     }
 }
 
@@ -281,6 +283,9 @@ fn style_value_tokens(value: StyleValue) -> TokenStream {
         }
         StyleValue::Opacity(percent) => {
             quote! { ::zenui::style::StyleValue::Opacity(#percent) }
+        }
+        StyleValue::Weight(weight) => {
+            quote! { ::zenui::style::StyleValue::Weight(#weight) }
         }
     }
 }

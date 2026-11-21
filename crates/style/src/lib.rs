@@ -20,6 +20,8 @@ pub enum Property {
     BorderWidth,
     Radius,
     Opacity,
+    FontSize,
+    FontWeight,
 }
 
 impl Property {
@@ -202,6 +204,8 @@ pub enum StyleValue {
     Length(Length),
     /// 不透明度百分比（0–100）。
     Opacity(u8),
+    /// 字重。
+    Weight(u16),
 }
 
 /// 一条已解析的 class 声明。
@@ -368,6 +372,11 @@ fn parse_token(token: &str) -> Result<Vec<StyleDeclaration>, &'static str> {
         "rounded-sm" => push(Property::Radius, StyleValue::Points(4)),
         "rounded-md" => push(Property::Radius, StyleValue::Points(6)),
         "rounded-lg" => push(Property::Radius, StyleValue::Points(10)),
+        "text-sm" => push(Property::FontSize, StyleValue::Points(12)),
+        "text-base" => push(Property::FontSize, StyleValue::Points(14)),
+        "text-lg" => push(Property::FontSize, StyleValue::Points(16)),
+        "font-normal" => push(Property::FontWeight, StyleValue::Weight(400)),
+        "font-semibold" => push(Property::FontWeight, StyleValue::Weight(600)),
         "opacity-25" => push(Property::Opacity, StyleValue::Opacity(25)),
         "opacity-50" => push(Property::Opacity, StyleValue::Opacity(50)),
         "opacity-75" => push(Property::Opacity, StyleValue::Opacity(75)),
@@ -496,6 +505,22 @@ mod tests {
                 ),
                 declaration(Property::Radius, StyleValue::Points(6)),
                 declaration(Property::Opacity, StyleValue::Opacity(50)),
+            ]
+        );
+    }
+
+    #[test]
+    fn text_utilities_map_to_size_and_weight() {
+        let parsed = parse_class_literal("text-sm text-base text-lg font-normal font-semibold")
+            .expect("parse");
+        assert_eq!(
+            parsed,
+            vec![
+                declaration(Property::FontSize, StyleValue::Points(12)),
+                declaration(Property::FontSize, StyleValue::Points(14)),
+                declaration(Property::FontSize, StyleValue::Points(16)),
+                declaration(Property::FontWeight, StyleValue::Weight(400)),
+                declaration(Property::FontWeight, StyleValue::Weight(600)),
             ]
         );
     }

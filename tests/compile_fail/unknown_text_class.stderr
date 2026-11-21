@@ -1,0 +1,5 @@
+error: unknown class token `text-xl` at character 0
+ --> tests/compile_fail/unknown_text_class.rs:4:57
+  |
+4 |     let _: MountResult<MountPlan> = view! { <text class="text-xl">"Add"</text> };
+  |                                                         ^^^^^^^^^

@@ -1108,6 +1108,104 @@ fn the_demo_completed_row_text_follows_a_memo_driven_style() {
 }
 
 #[test]
+fn text_classes_change_glyph_size_height_and_caret_geometry() {
+    let mut app = Runtime::new();
+    app.mount(|| {
+        view! {
+            <view>
+                <text aria:label="small" class="text-sm">"Small"</text>
+                <text aria:label="large" class="text-lg">"Large"</text>
+                <text aria:label="base-text" class="text-lg text-base">"Base"</text>
+                <button aria:label="bold" class="font-semibold">"Bold"</button>
+                <button aria:label="normal" class="font-semibold font-normal">"Normal"</button>
+                <text-input aria:label="base" value="abc" />
+                <text-input aria:label="large-input" class="text-lg" value="abc" />
+                <view aria:label="em" class="text-lg" style:width={em(2.0)} />
+            </view>
+        }
+    })
+    .expect("mount");
+    let snapshot = app.presentation().expect("snapshot");
+    let scene = build_scene(&snapshot, 400.0);
+    let element = |label: &str| {
+        scene
+            .node(snapshot.find_label(label).expect(label).id())
+            .expect(label)
+    };
+    let font_size = |label: &str| element(label).text()[0].font_size();
+
+    assert_eq!(font_size("small"), 12.0, "text-sm shapes at 12 points");
+    assert_eq!(font_size("large"), 16.0, "text-lg shapes at 16 points");
+    assert_eq!(
+        font_size("base-text"),
+        14.0,
+        "a later text-base overrides text-lg"
+    );
+    assert!(
+        element("large").rect().height > element("small").rect().height,
+        "measurement follows the larger font"
+    );
+    assert_eq!(
+        element("bold").resolved_style().font_weight(),
+        600,
+        "font-semibold sets the weight"
+    );
+    assert_eq!(
+        element("normal").resolved_style().font_weight(),
+        400,
+        "a later font-normal overrides font-semibold"
+    );
+    assert!(
+        element("bold")
+            .text()
+            .first()
+            .is_some_and(|run| !run.glyphs().is_empty()),
+        "the weighted label still shapes glyphs"
+    );
+    assert!(
+        (element("em").rect().width - 32.0).abs() < 0.01,
+        "em resolves against the element's 16-point font"
+    );
+
+    let caret_height = |app: &mut Runtime, label: &str| {
+        app.focus(label).expect("focus");
+        let snapshot = app.presentation().expect("snapshot");
+        let scene = build_scene(&snapshot, 400.0);
+        let id = snapshot.find_label(label).expect("input").id();
+        scene.caret(id).expect("caret").height
+    };
+    let base = caret_height(&mut app, "base");
+    let large = caret_height(&mut app, "large-input");
+    assert!(
+        large > base,
+        "the caret grows with the font: base={base} large={large}"
+    );
+}
+
+#[test]
+fn the_demo_count_and_add_button_use_text_utilities() {
+    let app = runtime();
+    let snapshot = app.presentation().expect("snapshot");
+    let scene = build_scene(&snapshot, 800.0);
+    let count = scene
+        .node(by_text(&snapshot, "text", "0 remaining"))
+        .expect("count label");
+    assert_eq!(
+        count.resolved_style().font_size(),
+        12.0,
+        "the remaining count uses text-sm"
+    );
+    let add = scene
+        .node(by_text(&snapshot, "button", "Add"))
+        .expect("Add button");
+    assert_eq!(
+        add.resolved_style().font_weight(),
+        600,
+        "the primary button uses font-semibold"
+    );
+}
+
+#[test]
 fn a_mismatched_style_declaration_is_an_explicit_error() {
     const STYLE: &[StyleDeclaration] = &[StyleDeclaration::new(
         Property::Gap,
