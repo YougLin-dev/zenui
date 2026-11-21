@@ -837,7 +837,7 @@ impl Runtime {
         }
     }
 
-    /// 在任何窗口挂载前运行一次应用级 setup，返回值由窗口 factory 捕获。
+    /// 在任何窗口 factory 运行前运行一次应用级 setup，返回值由窗口 factory 捕获。
     ///
     /// setup 中的 Signal、Memo 与 Store 归属于应用 owner；窗口关闭不会释放它们。
     /// setup 只成功运行一次；失败时不保留本次创建的资源，可以重试。
@@ -850,7 +850,7 @@ impl Runtime {
             }
             if state.window_factory_ran || state.tree.is_some() {
                 return Err(MountError::Setup(
-                    "application setup must run before a window opens",
+                    "application setup must run before any window factory",
                 ));
             }
         }

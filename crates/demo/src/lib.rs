@@ -130,7 +130,7 @@ impl TodoState {
 
 /// 创建应用级 Todo 状态并打开主窗口。
 ///
-/// 状态必须先于窗口挂载创建，因此本函数内部先运行 `Runtime::setup`，
+/// 状态必须先于窗口 factory 运行创建，因此本函数内部先运行 `Runtime::setup`，
 /// 再把共享状态交给窗口 factory。
 pub fn open_todo_window(runtime: &mut Runtime) -> Result<WindowCtx, WindowError> {
     let state = runtime.setup(TodoState::new)?;
