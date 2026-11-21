@@ -59,10 +59,10 @@ const SUPPORTED_ATTRS: &[&str] = &[
     "id",
 ];
 
-/// class 声明解析后的绘制值；未声明的属性不参与覆盖。
+/// class 与 inline 声明解析后的值；未声明的属性不参与覆盖。
 ///
-/// 颜色保留角色或字面量形式，由后端按当前调色板解析；几何与命中测试
-/// 只消费 Taffy 样式，不读取这里的不透明度或圆角。
+/// 颜色保留角色或字面量形式，由后端按当前调色板解析。字号与字重进入
+/// 文本整形、测量与 caret 几何；不透明度与圆角只影响绘制。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ResolvedStyle {
     background: Option<Color>,
@@ -71,10 +71,12 @@ pub struct ResolvedStyle {
     border_width: Option<f32>,
     radius: f32,
     opacity: f32,
+    text: text::TextStyle,
 }
 
 impl ResolvedStyle {
-    /// 没有任何声明的起点：颜色与边框未设置，圆角为 0，不透明度为 1。
+    /// 没有任何声明的起点：颜色与边框未设置，圆角为 0，不透明度为 1，
+    /// 文本使用 14 点、400 字重。
     const fn initial() -> Self {
         Self {
             background: None,
@@ -83,6 +85,7 @@ impl ResolvedStyle {
             border_width: None,
             radius: 0.0,
             opacity: 1.0,
+            text: text::TextStyle::DEFAULT,
         }
     }
 
@@ -114,6 +117,16 @@ impl ResolvedStyle {
     /// 元素自身绘制的不透明度（0–1）；不作用于子节点。
     pub const fn opacity(self) -> f32 {
         self.opacity
+    }
+
+    /// 文本字号（逻辑点）。
+    pub const fn font_size(self) -> f32 {
+        self.text.size
+    }
+
+    /// 文本字重。
+    pub const fn font_weight(self) -> u16 {
+        self.text.weight
     }
 }
 
@@ -403,6 +416,13 @@ impl Scene {
 
 struct TextContext {
     text: String,
+    style: text::TextStyle,
+}
+
+impl TextContext {
+    fn new(text: String, style: text::TextStyle) -> Self {
+        Self { text, style }
+    }
 }
 
 /// 一条声明在解析时能看到的控件状态；来自已提交的快照，不含宿主瞬态。
@@ -543,12 +563,12 @@ impl<'a> Builder<'a> {
             Intrinsic::TextInput => {
                 let (display, _, _) = display_text(element);
                 self.tree
-                    .new_leaf_with_context(style, TextContext { text: display })
+                    .new_leaf_with_context(style, TextContext::new(display, resolved.text))
                     .map_err(layout_error)?
             }
             Intrinsic::Checkbox => self.tree.new_leaf(style).map_err(layout_error)?,
             Intrinsic::Button | Intrinsic::Text | Intrinsic::View | Intrinsic::Form => {
-                self.container(element, style)?
+                self.container(element, style, resolved)?
             }
         };
         self.kinds.insert(node, Kind::Element(element.id()));
@@ -560,6 +580,7 @@ impl<'a> Builder<'a> {
         &mut self,
         element: &SnapshotElement,
         style: Style,
+        resolved: ResolvedStyle,
     ) -> Result<TaffyNodeId, SceneError> {
         let mut children = Vec::new();
         for child in element.children() {
@@ -567,7 +588,7 @@ impl<'a> Builder<'a> {
                 SnapshotNode::Element(element) => {
                     children.push(self.build_element(element, false)?)
                 }
-                SnapshotNode::Text(text) => children.push(self.build_text(text)?),
+                SnapshotNode::Text(text) => children.push(self.build_text(text, resolved)?),
             }
         }
         self.tree
@@ -575,14 +596,16 @@ impl<'a> Builder<'a> {
             .map_err(layout_error)
     }
 
-    fn build_text(&mut self, text: &str) -> Result<TaffyNodeId, SceneError> {
+    fn build_text(
+        &mut self,
+        text: &str,
+        resolved: ResolvedStyle,
+    ) -> Result<TaffyNodeId, SceneError> {
         let node = self
             .tree
             .new_leaf_with_context(
                 text_leaf_style(),
-                TextContext {
-                    text: text.to_owned(),
-                },
+                TextContext::new(text.to_owned(), resolved.text),
             )
             .map_err(layout_error)?;
         self.kinds.insert(node, Kind::Text);
@@ -621,6 +644,13 @@ impl<'a> Builder<'a> {
                     message: String::from("the snapshot lost a laid-out element"),
                 })?;
                 let children = self.tree.children(node).map_err(layout_error)?;
+                let resolved =
+                    self.resolved
+                        .get(&node)
+                        .copied()
+                        .ok_or_else(|| SceneError::Layout {
+                            message: String::from("a laid-out element has no resolved style"),
+                        })?;
                 let mut runs = Vec::new();
                 for child in &children {
                     if self.kinds.get(child) != Some(&Kind::Text) {
@@ -639,7 +669,7 @@ impl<'a> Builder<'a> {
                             .ok_or_else(|| SceneError::Layout {
                                 message: String::from("a text leaf has no content"),
                             })?;
-                    let shaped = shaper.shape(&context.text, child_rect.width);
+                    let shaped = shaper.shape(&context.text, child_rect.width, context.style);
                     runs.extend(text::runs(&shaped, Point::new(child_rect.x, child_rect.y)));
                 }
 
@@ -654,7 +684,7 @@ impl<'a> Builder<'a> {
                 if intrinsic == Intrinsic::TextInput {
                     let (content, width) = content_box(rect, layout);
                     let (display, preedit, composition) = display_text(element);
-                    let layout = shaper.shape(&display, width);
+                    let layout = shaper.shape(&display, width, resolved.text);
                     let view = EditView {
                         element,
                         display,
@@ -680,13 +710,6 @@ impl<'a> Builder<'a> {
                     );
                 }
 
-                let resolved =
-                    self.resolved
-                        .get(&node)
-                        .copied()
-                        .ok_or_else(|| SceneError::Layout {
-                            message: String::from("a laid-out element has no resolved style"),
-                        })?;
                 scene.elements.push(SceneElement {
                     id,
                     tag: element.tag(),
@@ -743,7 +766,8 @@ fn measure_leaf(
             padding.bottom + border.bottom,
         ),
     };
-    let (size, baseline) = shaper.measure(&context.text, known, inputs.available_space);
+    let (size, baseline) =
+        shaper.measure(&context.text, known, inputs.available_space, context.style);
     let mut output = compute_leaf_layout(inputs, style, |_, _| 0.0, |_, _| size);
     output.baselines = Baselines::from_first(Some(baseline + padding.top + border.top));
     output
@@ -891,6 +915,7 @@ fn resolve_style(
     state: ElementState,
 ) -> Result<(Style, ResolvedStyle), SceneError> {
     let mut resolved = ResolvedStyle::initial();
+    let mut width = None;
     let mut winners: HashMap<Property, (StyleOrigin, Condition)> = HashMap::new();
     for declaration in declarations {
         let condition = declaration.condition();
@@ -919,7 +944,11 @@ fn resolve_style(
             continue;
         }
         winners.insert(declaration.property(), (origin, condition));
-        apply_declaration(&mut style, &mut resolved, node, *declaration)?;
+        apply_declaration(&mut style, &mut resolved, &mut width, node, *declaration)?;
+    }
+    // `em` 宽度依赖最终字号，所以等所有声明处理完再换成 Taffy 长度。
+    if let Some(width) = width {
+        style.size.width = length(width.resolve(resolved.text.size));
     }
     Ok((style, resolved))
 }
@@ -927,6 +956,7 @@ fn resolve_style(
 fn apply_declaration(
     style: &mut Style,
     resolved: &mut ResolvedStyle,
+    width: &mut Option<zenui_style::Length>,
     node: NodeId,
     declaration: StyleDeclaration,
 ) -> Result<(), SceneError> {
@@ -955,10 +985,11 @@ fn apply_declaration(
         (Property::JustifyContent, StyleValue::SpaceBetween) => {
             style.justify_content = JustifyContent::SPACE_BETWEEN;
         }
-        (Property::Width, StyleValue::FullWidth) => style.size.width = percent(1.0),
-        (Property::Width, StyleValue::Length(extent)) => {
-            style.size.width = length(extent.resolve(text::FONT_SIZE));
+        (Property::Width, StyleValue::FullWidth) => {
+            style.size.width = percent(1.0);
+            *width = None;
         }
+        (Property::Width, StyleValue::Length(extent)) => *width = Some(extent),
         (Property::FlexGrow, StyleValue::Grow) => {
             style.flex_grow = 1.0;
             style.flex_shrink = 1.0;
@@ -973,6 +1004,12 @@ fn apply_declaration(
         (Property::Radius, StyleValue::Points(points)) => resolved.radius = points as f32,
         (Property::Opacity, StyleValue::Opacity(percent)) => {
             resolved.opacity = f32::from(percent) / 100.0;
+        }
+        (Property::FontSize, StyleValue::Points(points)) => {
+            resolved.text.size = points as f32;
+        }
+        (Property::FontWeight, StyleValue::Weight(weight)) => {
+            resolved.text.weight = weight;
         }
         _ => {
             return Err(SceneError::UnsupportedStyle {

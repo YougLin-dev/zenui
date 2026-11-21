@@ -139,7 +139,7 @@ pub fn TodoApp(window: WindowCtx) -> MountResult<MountPlan> {
 
     view! {
         <view role="main">
-            <text>{remaining_txt}</text>
+            <text class="text-sm">{remaining_txt}</text>
             <form
                 aria:label="Add task"
                 on:submit={move |event: SubmitEvent| {
@@ -154,7 +154,7 @@ pub fn TodoApp(window: WindowCtx) -> MountResult<MountPlan> {
                     on:input={move |value: String| draft.set(value)}
                 />
                 <button
-                    class="px-4 py-2 bg-accent text-inverse rounded-md"
+                    class="px-4 py-2 bg-accent text-inverse rounded-md font-semibold"
                     on:click={move || add()}
                 >"Add"</button>
             </form>
