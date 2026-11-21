@@ -1,10 +1,11 @@
 use proc_macro::TokenStream as TokenStream1;
-use proc_macro2::TokenStream;
+use proc_macro2::{Span, TokenStream};
 use quote::{format_ident, quote, quote_spanned};
 use rstml::node::{
     KVAttributeValue, KeyedAttributeValue, Node, NodeAttribute, NodeBlock, NodeElement,
 };
 use syn::{Block, Expr, FnArg, ItemFn, Pat, ReturnType, Type, spanned::Spanned};
+use zenui_style::{Property, StyleDeclaration, StyleValue};
 
 #[proc_macro]
 pub fn view(input: TokenStream1) -> TokenStream1 {
@@ -90,7 +91,22 @@ fn lower_intrinsic(
     tag: &str,
 ) -> syn::Result<TokenStream> {
     let mut attributes = Vec::new();
+    let mut styles = Vec::new();
+    let mut class_seen = false;
     for attribute in element.attributes() {
+        if let NodeAttribute::Attribute(attribute) = attribute
+            && attribute.key.to_string() == "class"
+        {
+            if class_seen {
+                return Err(syn::Error::new_spanned(
+                    &attribute.key,
+                    "duplicate class attribute",
+                ));
+            }
+            class_seen = true;
+            styles = lower_class(attribute)?;
+            continue;
+        }
         attributes.push(lower_attribute(attribute)?);
     }
     let children = element
@@ -98,13 +114,90 @@ fn lower_intrinsic(
         .iter()
         .map(lower_node)
         .collect::<syn::Result<Vec<_>>>()?;
+    if styles.is_empty() {
+        return Ok(quote! {
+            ::zenui::view::element(
+                #tag,
+                ::std::vec![#(#attributes),*],
+                ::std::vec![#(#children),*],
+            )
+        });
+    }
+    let declarations = styles.iter().map(declaration_tokens);
     Ok(quote! {
-        ::zenui::view::element(
+        ::zenui::view::styled_element(
             #tag,
             ::std::vec![#(#attributes),*],
+            const { &[#(#declarations),*] },
             ::std::vec![#(#children),*],
         )
     })
+}
+
+/// 把 `class="..."` 字面量解析成类型化声明；不是字面量时给出定位到表达式的错误。
+fn lower_class(attribute: &rstml::node::KeyedAttribute) -> syn::Result<Vec<StyleDeclaration>> {
+    let span = expression(attribute)?.span();
+    let Some(text) = literal_string(attribute) else {
+        return Err(syn::Error::new(span, "class must be a string literal"));
+    };
+    zenui_style::parse_class_literal(&text).map_err(|errors| class_errors(span, &errors))
+}
+
+/// 字面量里的全部坏 token 合成一条诊断，保持它们在字面量中的顺序。
+/// 所有消息共享同一个字面量 span；表达式位置的 `view!` 不能展开成多条
+/// 并列的 `compile_error!`，否则后续 token 会被当成宏展开的一部分解析。
+fn class_errors(span: Span, errors: &[zenui_style::ClassError]) -> syn::Error {
+    let message = errors
+        .iter()
+        .map(class_error_message)
+        .collect::<Vec<_>>()
+        .join("\n");
+    syn::Error::new(span, message)
+}
+
+fn class_error_message(error: &zenui_style::ClassError) -> String {
+    format!(
+        "{} `{}` at character {}",
+        error.message(),
+        error.token(),
+        error.offset()
+    )
+}
+
+fn declaration_tokens(declaration: &StyleDeclaration) -> TokenStream {
+    let property = property_tokens(declaration.property());
+    let value = style_value_tokens(declaration.value());
+    quote! {
+        ::zenui::style::StyleDeclaration::new(
+            ::zenui::style::Property::#property,
+            #value,
+        )
+    }
+}
+
+fn property_tokens(property: Property) -> TokenStream {
+    match property {
+        Property::PaddingX => quote! { PaddingX },
+        Property::PaddingY => quote! { PaddingY },
+        Property::Gap => quote! { Gap },
+        Property::FlexDirection => quote! { FlexDirection },
+        Property::AlignItems => quote! { AlignItems },
+        Property::JustifyContent => quote! { JustifyContent },
+        Property::Width => quote! { Width },
+        Property::FlexGrow => quote! { FlexGrow },
+    }
+}
+
+fn style_value_tokens(value: StyleValue) -> TokenStream {
+    match value {
+        StyleValue::Points(points) => quote! { ::zenui::style::StyleValue::Points(#points) },
+        StyleValue::Row => quote! { ::zenui::style::StyleValue::Row },
+        StyleValue::Column => quote! { ::zenui::style::StyleValue::Column },
+        StyleValue::CenterItems => quote! { ::zenui::style::StyleValue::CenterItems },
+        StyleValue::SpaceBetween => quote! { ::zenui::style::StyleValue::SpaceBetween },
+        StyleValue::FullWidth => quote! { ::zenui::style::StyleValue::FullWidth },
+        StyleValue::Grow => quote! { ::zenui::style::StyleValue::Grow },
+    }
 }
 
 fn lower_attribute(attribute: &NodeAttribute) -> syn::Result<TokenStream> {

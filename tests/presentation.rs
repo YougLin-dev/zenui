@@ -606,3 +606,28 @@ fn presentation_attributes_include_disabled() {
         Some(true)
     );
 }
+
+#[test]
+fn class_literals_become_typed_layout_declarations() {
+    let mut app = Runtime::new();
+    app.mount(|| view! { <button class="px-3 py-2 flex-row">"Add"</button> })
+        .expect("mount");
+
+    let snapshot = app.presentation().expect("snapshot");
+    let button = snapshot
+        .elements()
+        .find(|element| element.tag() == "button")
+        .expect("button");
+    assert_eq!(
+        button.styles(),
+        &[
+            StyleDeclaration::new(Property::PaddingX, StyleValue::Points(12)),
+            StyleDeclaration::new(Property::PaddingY, StyleValue::Points(8)),
+            StyleDeclaration::new(Property::FlexDirection, StyleValue::Row),
+        ]
+    );
+    assert!(
+        button.attr("class").is_none(),
+        "class is compiled away, not a presentation attribute"
+    );
+}

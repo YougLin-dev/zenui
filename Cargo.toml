@@ -3,6 +3,7 @@ members = [
     "crates/core",
     "crates/app",
     "crates/macro",
+    "crates/style",
     "crates/render",
     "crates/windows",
     "crates/demo",
@@ -24,6 +25,7 @@ publish = false
 [dependencies]
 zenui-core = { path = "crates/core" }
 zenui-macro = { path = "crates/macro" }
+zenui-style = { path = "crates/style" }
 
 [dev-dependencies]
 zenui-demo = { path = "crates/demo" }

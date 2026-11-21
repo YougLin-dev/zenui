@@ -2,6 +2,8 @@ use std::fmt;
 
 use zenui_core::RowSet;
 
+use zenui_style::StyleDeclaration;
+
 use crate::context::Phase;
 use crate::signal::{Memo, Once, Signal};
 use crate::store::{Field, FieldError, TodoId, WriteError};
@@ -81,6 +83,7 @@ pub enum PlanNode {
 pub struct ElementPlan {
     pub(crate) tag: &'static str,
     pub(crate) attrs: Vec<Attr>,
+    pub(crate) styles: &'static [StyleDeclaration],
     pub(crate) children: Vec<PlanNode>,
 }
 
@@ -383,6 +386,22 @@ pub fn element(tag: &'static str, attrs: Vec<Attr>, children: Vec<PlanNode>) -> 
     PlanNode::Element(ElementPlan {
         tag,
         attrs,
+        styles: &[],
+        children,
+    })
+}
+
+/// 带编译期 class 声明的元素；声明已由 `view!` 解析为类型化字段。
+pub fn styled_element(
+    tag: &'static str,
+    attrs: Vec<Attr>,
+    styles: &'static [StyleDeclaration],
+    children: Vec<PlanNode>,
+) -> PlanNode {
+    PlanNode::Element(ElementPlan {
+        tag,
+        attrs,
+        styles,
         children,
     })
 }

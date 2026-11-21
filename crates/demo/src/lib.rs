@@ -141,14 +141,14 @@ pub fn TodoApp(window: WindowCtx) -> MountResult<MountPlan> {
                     aria:label="What needs to be done?"
                     on:input={move |value: String| draft.set(value)}
                 />
-                <button on:click={move || add()}>"Add"</button>
+                <button class="px-4 py-2" on:click={move || add()}>"Add"</button>
             </form>
             <view role="group" aria:label="Filter">
                 <FilterButton current={filter} value={Filter::All} label="All" />
                 <FilterButton current={filter} value={Filter::Active} label="Active" />
                 <FilterButton current={filter} value={Filter::Completed} label="Done" />
             </view>
-            <view role="toolbar">
+            <view role="toolbar" class="gap-3">
                 <button on:click={move || reverse()}>"Reverse"</button>
                 <button on:click={move || {
                     let _ = Transaction::new().write(todos.clear_completed()).finish();

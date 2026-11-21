@@ -1,0 +1,9 @@
+[package]
+name = "zenui-style"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Compile-time class vocabulary and typed style declarations for ZenUI"
+license = "MIT OR Apache-2.0"
+
+[dependencies]

@@ -14,3 +14,4 @@ proc-macro2 = "1"
 quote = "1"
 rstml = "=0.13.1"
 syn = { version = "3", features = ["full"] }
+zenui-style = { path = "../style" }

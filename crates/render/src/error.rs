@@ -4,6 +4,7 @@ use std::error::Error;
 use std::fmt;
 
 use zenui::NodeId;
+use zenui_style::{Property, StyleValue};
 
 /// 从 presentation snapshot 构建场景时的显式失败。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -26,6 +27,15 @@ pub enum SceneError {
         node: NodeId,
         /// 未知的属性名。
         name: &'static str,
+    },
+    /// 快照中有场景 seam 不理解的样式声明；不会静默丢弃。
+    UnsupportedStyle {
+        /// 携带该声明的元素。
+        node: NodeId,
+        /// 声明影响的属性。
+        property: Property,
+        /// 声明给出的取值。
+        value: StyleValue,
     },
     /// leaf intrinsic（`checkbox` / `text-input`）带有子节点。
     UnsupportedContent {
@@ -54,6 +64,13 @@ impl fmt::Display for SceneError {
             }
             Self::UnsupportedAttribute { node, name } => {
                 write!(f, "{node:?} has unsupported attribute {name:?}")
+            }
+            Self::UnsupportedStyle {
+                node,
+                property,
+                value,
+            } => {
+                write!(f, "{node:?} has unsupported style {property:?} = {value:?}")
             }
             Self::UnsupportedContent { node, reason } => {
                 write!(f, "{node:?} has unsupported content: {reason}")
