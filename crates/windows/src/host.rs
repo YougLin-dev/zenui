@@ -1050,13 +1050,8 @@ impl Host {
         if self.surface_config.width == width && self.surface_config.height == height {
             return Ok(());
         }
-        self.renderer = new_renderer(
-            &self.device,
-            &self.queue,
-            self.surface_config.format,
-            width,
-            height,
-        )?;
+        let target = target_config(self.surface_config.format, width, height)?;
+        self.renderer.resize(target);
         self.surface_config.width = width;
         self.surface_config.height = height;
         self.current_surface()?

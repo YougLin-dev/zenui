@@ -79,6 +79,18 @@ fn render_with(
     palette: RenderPalette,
 ) -> Pixels {
     let config = RenderTargetConfig::new(format, width, height).expect("target config");
+    let mut renderer = GpuRenderer::new(context, config, palette);
+    render_into(context, &mut renderer, scene, format, width, height)
+}
+
+fn render_into(
+    context: &GpuContext,
+    renderer: &mut GpuRenderer,
+    scene: &Scene,
+    format: wgpu::TextureFormat,
+    width: u16,
+    height: u16,
+) -> Pixels {
     let texture = context.device().create_texture(&wgpu::TextureDescriptor {
         label: Some("zenui render test target"),
         size: wgpu::Extent3d {
@@ -94,7 +106,6 @@ fn render_with(
         view_formats: &[],
     });
     let view = texture.create_view(&Default::default());
-    let mut renderer = GpuRenderer::new(context, config, palette);
     let mut encoder = context.device().create_command_encoder(&Default::default());
     renderer
         .render(scene, &view, &mut encoder)
@@ -199,6 +210,32 @@ impl From<zenui_render::Rect> for RectLike {
             width: rect.width,
             height: rect.height,
         }
+    }
+}
+
+#[test]
+fn resizing_the_renderer_draws_the_new_target_size() {
+    let Some(context) = context() else {
+        return;
+    };
+    let app = runtime();
+    let snapshot = app.presentation().expect("snapshot");
+    let format = wgpu::TextureFormat::Bgra8Unorm;
+    let mut renderer = GpuRenderer::new(
+        &context,
+        RenderTargetConfig::new(format, 320, 200).expect("target config"),
+        TEST_PALETTE,
+    );
+
+    for (width, height) in [(200_u16, 120_u16), (360, 240)] {
+        renderer.resize(RenderTargetConfig::new(format, width, height).expect("resized config"));
+        let scene = scene(&snapshot, f32::from(width), f32::from(height), 1.0);
+        let pixels = render_into(&context, &mut renderer, &scene, format, width, height);
+        assert_eq!(
+            pixels.at(4, 4),
+            GREEN_BGRA,
+            "the resized renderer fills {width}x{height}"
+        );
     }
 }
 
