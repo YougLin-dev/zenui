@@ -1,0 +1,5 @@
+error: unknown class token `bg-nonexistent` at character 0
+ --> tests/compile_fail/unknown_paint_class.rs:4:57
+  |
+4 |     let _: MountResult<MountPlan> = view! { <view class="bg-nonexistent">"Add"</view> };
+  |                                                         ^^^^^^^^^^^^^^^^

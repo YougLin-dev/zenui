@@ -185,6 +185,12 @@ fn property_tokens(property: Property) -> TokenStream {
         Property::JustifyContent => quote! { JustifyContent },
         Property::Width => quote! { Width },
         Property::FlexGrow => quote! { FlexGrow },
+        Property::Background => quote! { Background },
+        Property::TextColor => quote! { TextColor },
+        Property::BorderColor => quote! { BorderColor },
+        Property::BorderWidth => quote! { BorderWidth },
+        Property::Radius => quote! { Radius },
+        Property::Opacity => quote! { Opacity },
     }
 }
 
@@ -197,6 +203,46 @@ fn style_value_tokens(value: StyleValue) -> TokenStream {
         StyleValue::SpaceBetween => quote! { ::zenui::style::StyleValue::SpaceBetween },
         StyleValue::FullWidth => quote! { ::zenui::style::StyleValue::FullWidth },
         StyleValue::Grow => quote! { ::zenui::style::StyleValue::Grow },
+        StyleValue::Color(color) => {
+            let color = color_tokens(color);
+            quote! { ::zenui::style::StyleValue::Color(#color) }
+        }
+        StyleValue::Opacity(percent) => {
+            quote! { ::zenui::style::StyleValue::Opacity(#percent) }
+        }
+    }
+}
+
+fn color_tokens(color: zenui_style::Color) -> TokenStream {
+    match color {
+        zenui_style::Color::Role(role) => {
+            let role = role_tokens(role);
+            quote! { ::zenui::style::Color::Role(::zenui::style::ColorRole::#role) }
+        }
+        zenui_style::Color::Literal(bytes) => {
+            let [red, green, blue, alpha] = bytes;
+            quote! { ::zenui::style::Color::Literal([#red, #green, #blue, #alpha]) }
+        }
+    }
+}
+
+fn role_tokens(role: zenui_style::ColorRole) -> TokenStream {
+    match role {
+        zenui_style::ColorRole::Surface => quote! { Surface },
+        zenui_style::ColorRole::Control => quote! { Control },
+        zenui_style::ColorRole::ControlHover => quote! { ControlHover },
+        zenui_style::ColorRole::ControlPressed => quote! { ControlPressed },
+        zenui_style::ColorRole::Accent => quote! { Accent },
+        zenui_style::ColorRole::AccentHover => quote! { AccentHover },
+        zenui_style::ColorRole::AccentPressed => quote! { AccentPressed },
+        zenui_style::ColorRole::Danger => quote! { Danger },
+        zenui_style::ColorRole::DangerHover => quote! { DangerHover },
+        zenui_style::ColorRole::TextDefault => quote! { TextDefault },
+        zenui_style::ColorRole::TextMuted => quote! { TextMuted },
+        zenui_style::ColorRole::TextInverse => quote! { TextInverse },
+        zenui_style::ColorRole::TextDisabled => quote! { TextDisabled },
+        zenui_style::ColorRole::BorderDefault => quote! { BorderDefault },
+        zenui_style::ColorRole::BorderAccent => quote! { BorderAccent },
     }
 }
 

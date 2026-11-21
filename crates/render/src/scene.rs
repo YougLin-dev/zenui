@@ -11,7 +11,7 @@ use taffy::{
     Size as TaffySize, compute_leaf_layout,
 };
 use zenui::{NodeId, PresentationSnapshot, SnapshotElement, SnapshotNode};
-use zenui_style::{Property, StyleDeclaration, StyleValue};
+use zenui_style::{Color, Property, StyleDeclaration, StyleValue};
 
 use crate::SceneError;
 use crate::geometry::{Point, Rect, Viewport};
@@ -59,6 +59,64 @@ const SUPPORTED_ATTRS: &[&str] = &[
     "id",
 ];
 
+/// class 声明解析后的绘制值；未声明的属性不参与覆盖。
+///
+/// 颜色保留角色或字面量形式，由后端按当前调色板解析；几何与命中测试
+/// 只消费 Taffy 样式，不读取这里的不透明度或圆角。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ResolvedStyle {
+    background: Option<Color>,
+    text_color: Option<Color>,
+    border_color: Option<Color>,
+    border_width: Option<f32>,
+    radius: f32,
+    opacity: f32,
+}
+
+impl ResolvedStyle {
+    /// 没有任何声明的起点：颜色与边框未设置，圆角为 0，不透明度为 1。
+    const fn initial() -> Self {
+        Self {
+            background: None,
+            text_color: None,
+            border_color: None,
+            border_width: None,
+            radius: 0.0,
+            opacity: 1.0,
+        }
+    }
+
+    /// 背景色；`None` 表示沿用 intrinsic 的内建视觉。
+    pub const fn background(self) -> Option<Color> {
+        self.background
+    }
+
+    /// 文本颜色；`None` 表示使用调色板的文本色。
+    pub const fn text_color(self) -> Option<Color> {
+        self.text_color
+    }
+
+    /// 边框颜色；`None` 表示使用调色板的边框色。
+    pub const fn border_color(self) -> Option<Color> {
+        self.border_color
+    }
+
+    /// class 声明的边框宽度（逻辑点）；`None` 表示沿用 intrinsic 默认。
+    pub const fn border_width(self) -> Option<f32> {
+        self.border_width
+    }
+
+    /// 圆角半径（逻辑点）；只影响绘制，不裁剪子节点或命中区域。
+    pub const fn radius(self) -> f32 {
+        self.radius
+    }
+
+    /// 元素自身绘制的不透明度（0–1）；不作用于子节点。
+    pub const fn opacity(self) -> f32 {
+        self.opacity
+    }
+}
+
 /// 一个已提交元素的绝对逻辑几何与内建视觉。
 #[derive(Clone, Debug)]
 pub struct SceneElement {
@@ -66,6 +124,7 @@ pub struct SceneElement {
     tag: &'static str,
     rect: Rect,
     visual: Visual,
+    resolved: ResolvedStyle,
     disabled: bool,
     focused: bool,
     text: Vec<TextRun>,
@@ -98,6 +157,11 @@ impl SceneElement {
     /// 后端应绘制的内建视觉。
     pub const fn visual(&self) -> Visual {
         self.visual
+    }
+
+    /// class 声明解析后的绘制值。
+    pub const fn resolved_style(&self) -> ResolvedStyle {
+        self.resolved
     }
 
     /// 该元素在快照中是否 disabled。
@@ -362,6 +426,7 @@ struct Builder<'a> {
     snapshot: &'a PresentationSnapshot,
     tree: TaffyTree<TextContext>,
     kinds: HashMap<TaffyNodeId, Kind>,
+    resolved: HashMap<TaffyNodeId, ResolvedStyle>,
 }
 
 impl<'a> Builder<'a> {
@@ -370,6 +435,7 @@ impl<'a> Builder<'a> {
             snapshot,
             tree: TaffyTree::new(),
             kinds: HashMap::new(),
+            resolved: HashMap::new(),
         }
     }
 
@@ -440,7 +506,8 @@ impl<'a> Builder<'a> {
             Intrinsic::Text => text_container_style(),
             Intrinsic::View | Intrinsic::Form => container_style(intrinsic, element),
         };
-        let style = with_declarations(with_grow(base, top_level), element.id(), element.styles())?;
+        let (style, resolved) =
+            resolve_style(with_grow(base, top_level), element.id(), element.styles())?;
         let node = match intrinsic {
             Intrinsic::TextInput => {
                 let (display, _, _) = display_text(element);
@@ -454,6 +521,7 @@ impl<'a> Builder<'a> {
             }
         };
         self.kinds.insert(node, Kind::Element(element.id()));
+        self.resolved.insert(node, resolved);
         Ok(node)
     }
 
@@ -581,11 +649,19 @@ impl<'a> Builder<'a> {
                     );
                 }
 
+                let resolved =
+                    self.resolved
+                        .get(&node)
+                        .copied()
+                        .ok_or_else(|| SceneError::Layout {
+                            message: String::from("a laid-out element has no resolved style"),
+                        })?;
                 scene.elements.push(SceneElement {
                     id,
                     tag: element.tag(),
                     rect,
                     visual: visual(intrinsic, element),
+                    resolved,
                     disabled: element.disabled(),
                     focused,
                     text: runs,
@@ -778,19 +854,21 @@ fn with_grow(mut style: Style, top_level: bool) -> Style {
 }
 
 /// 按源码顺序把 class 声明合并到 intrinsic 默认样式上；后出现的声明覆盖先出现的。
-fn with_declarations(
+fn resolve_style(
     mut style: Style,
     node: NodeId,
     declarations: &[StyleDeclaration],
-) -> Result<Style, SceneError> {
+) -> Result<(Style, ResolvedStyle), SceneError> {
+    let mut resolved = ResolvedStyle::initial();
     for declaration in declarations {
-        apply_declaration(&mut style, node, *declaration)?;
+        apply_declaration(&mut style, &mut resolved, node, *declaration)?;
     }
-    Ok(style)
+    Ok((style, resolved))
 }
 
 fn apply_declaration(
     style: &mut Style,
+    resolved: &mut ResolvedStyle,
     node: NodeId,
     declaration: StyleDeclaration,
 ) -> Result<(), SceneError> {
@@ -824,6 +902,16 @@ fn apply_declaration(
             style.flex_grow = 1.0;
             style.flex_shrink = 1.0;
             style.flex_basis = length(0.0);
+        }
+        (Property::Background, StyleValue::Color(color)) => resolved.background = Some(color),
+        (Property::TextColor, StyleValue::Color(color)) => resolved.text_color = Some(color),
+        (Property::BorderColor, StyleValue::Color(color)) => resolved.border_color = Some(color),
+        (Property::BorderWidth, StyleValue::Points(points)) => {
+            resolved.border_width = Some(points as f32);
+        }
+        (Property::Radius, StyleValue::Points(points)) => resolved.radius = points as f32,
+        (Property::Opacity, StyleValue::Opacity(percent)) => {
+            resolved.opacity = f32::from(percent) / 100.0;
         }
         _ => {
             return Err(SceneError::UnsupportedStyle {
