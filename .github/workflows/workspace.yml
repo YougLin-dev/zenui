@@ -16,7 +16,8 @@ jobs:
   workspace:
     name: workspace (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    # trybuild 为每个 fixture 再构建一次 facade 及其依赖；Windows 冷缓存需要余量。
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:

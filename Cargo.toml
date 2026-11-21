@@ -27,6 +27,7 @@ zenui-macro = { path = "crates/macro" }
 
 [dev-dependencies]
 zenui-demo = { path = "crates/demo" }
+trybuild = "1.0"
 
 [[example]]
 name = "minimal_todo"
