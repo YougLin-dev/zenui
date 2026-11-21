@@ -13,7 +13,7 @@ _Avoid_: window instance, window generation
 _Avoid_: global state, app singleton
 
 **Window catalog**:
-启动时声明的静态窗口集合；每个窗口有稳定键、primary 标记与可重复执行的 factory，声明本身不挂载界面。
+启动时声明的静态窗口集合；每个窗口有稳定键、原生标题、初始逻辑尺寸、primary 标记与可重复执行的 factory，声明本身不挂载界面。
 _Avoid_: window list, registry
 
 **Primary window**:

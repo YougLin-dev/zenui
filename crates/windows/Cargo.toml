@@ -19,5 +19,7 @@ windows = { version = "=0.62.2", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 zenui = { path = "../.." }
-zenui-demo = { path = "../demo" }
 zenui-render = { path = "../render" }
+
+[dev-dependencies]
+zenui-demo = { path = "../demo" }

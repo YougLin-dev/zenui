@@ -128,15 +128,22 @@ impl TodoState {
     }
 }
 
-/// 创建应用级 Todo 状态并打开主窗口。
+/// 创建应用级 Todo 状态、声明单窗口目录并打开主窗口。
 ///
 /// 状态必须先于窗口 factory 运行创建，因此本函数内部先运行 `Runtime::setup`，
-/// 再把共享状态交给窗口 factory。
+/// 再把共享状态交给目录 factory。桌面宿主与 headless 示例共用这个入口。
 pub fn open_todo_window(runtime: &mut Runtime) -> Result<WindowCtx, WindowError> {
     let state = runtime.setup(TodoState::new)?;
-    runtime.open_window("main", move |window| {
-        view! { <TodoApp window=window state=state /> }
-    })
+    runtime.declare_windows(move |catalog| {
+        catalog.window(
+            WindowSpec::new("main")
+                .primary()
+                .titled("ZenUI Todo")
+                .sized(900, 700),
+            move |window| view! { <TodoApp window=window state=state /> },
+        )
+    })?;
+    runtime.show("main")
 }
 
 #[component]

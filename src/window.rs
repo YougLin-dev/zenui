@@ -8,7 +8,7 @@ use crate::task::TaskScope;
 use crate::view::{MountError, MountPlan, MountResult};
 
 /// 一次窗口打开的 identity；它不等于目录键，也不保证窗口仍然存活。
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct WindowCtx {
     pub(crate) runtime: u32,
     pub(crate) key: &'static str,
@@ -79,17 +79,24 @@ impl fmt::Debug for WindowCtx {
     }
 }
 
-/// 声明期的窗口描述；只登记身份与 primary 标记，不挂载界面。
+/// 声明期的窗口描述；登记身份、原生标题/尺寸与 primary 标记，不挂载界面。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WindowSpec {
     key: &'static str,
+    title: &'static str,
+    width: u32,
+    height: u32,
     primary: bool,
 }
 
 impl WindowSpec {
+    /// 以目录键作为标题、900×700 逻辑客户区的普通窗口。
     pub const fn new(key: &'static str) -> Self {
         Self {
             key,
+            title: key,
+            width: 900,
+            height: 700,
             primary: false,
         }
     }
@@ -99,6 +106,56 @@ impl WindowSpec {
         self.primary = true;
         self
     }
+
+    /// 原生窗口标题；缺省是目录键。
+    pub const fn titled(mut self, title: &'static str) -> Self {
+        self.title = title;
+        self
+    }
+
+    /// 初始客户区的逻辑尺寸；原生宿主按系统 DPI 换算为物理像素。
+    pub const fn sized(mut self, width: u32, height: u32) -> Self {
+        self.width = width;
+        self.height = height;
+        self
+    }
+
+    /// 目录中的稳定键。
+    pub const fn key(self) -> &'static str {
+        self.key
+    }
+
+    /// 原生窗口标题。
+    pub const fn title(self) -> &'static str {
+        self.title
+    }
+
+    /// 初始客户区的逻辑尺寸。
+    pub const fn size(self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+
+    /// 是否为目录中的 primary 窗口。
+    pub const fn is_primary(self) -> bool {
+        self.primary
+    }
+}
+
+/// 目录中的一个窗口：静态描述与每次打开都执行的 factory。
+pub(crate) struct CatalogEntry {
+    pub(crate) spec: WindowSpec,
+    pub(crate) factory: WindowFactory,
+}
+
+/// 一个仍然存活的窗口及它的目录描述；原生宿主据此同步 HWND。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WindowInfo {
+    /// 本次打开的 identity。
+    pub window: WindowCtx,
+    /// 目录声明的标题与初始尺寸。
+    pub spec: WindowSpec,
+    /// 运行时可见性；隐藏窗口保留 activation 与树。
+    pub visible: bool,
 }
 
 pub(crate) type WindowFactory = Rc<dyn Fn(WindowCtx) -> MountResult<MountPlan>>;
@@ -130,14 +187,14 @@ impl WindowCatalog {
 
     pub(crate) fn finish(
         self,
-    ) -> Result<(BTreeMap<&'static str, WindowFactory>, &'static str), CatalogError> {
+    ) -> Result<(BTreeMap<&'static str, CatalogEntry>, &'static str), CatalogError> {
         let mut primary = None;
         let mut entries = BTreeMap::new();
         for (spec, factory) in self.entries {
             if spec.primary && primary.replace(spec.key).is_some() {
                 return Err(CatalogError::MultiplePrimaries);
             }
-            entries.insert(spec.key, factory);
+            entries.insert(spec.key, CatalogEntry { spec, factory });
         }
         let Some(primary) = primary else {
             return Err(CatalogError::MissingPrimary);
@@ -193,6 +250,8 @@ pub enum WindowError {
     WrongRuntime,
     /// 目录中没有这个窗口键。
     UnknownWindow(&'static str),
+    /// 目录声明失败。
+    Catalog(CatalogError),
     Mount(MountError),
 }
 
@@ -212,6 +271,7 @@ impl fmt::Display for WindowError {
                 f.write_str("a WindowCtx from another ZenUI Runtime cannot access this one")
             }
             Self::UnknownWindow(key) => write!(f, "window key {key} is not in the catalog"),
+            Self::Catalog(error) => write!(f, "{error}"),
             Self::Mount(error) => write!(f, "{error}"),
         }
     }
@@ -220,6 +280,7 @@ impl fmt::Display for WindowError {
 impl std::error::Error for WindowError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::Catalog(error) => Some(error),
             Self::Mount(error) => Some(error),
             _ => None,
         }
@@ -229,6 +290,12 @@ impl std::error::Error for WindowError {
 impl From<MountError> for WindowError {
     fn from(error: MountError) -> Self {
         Self::Mount(error)
+    }
+}
+
+impl From<CatalogError> for WindowError {
+    fn from(error: CatalogError) -> Self {
+        Self::Catalog(error)
     }
 }
 

@@ -503,3 +503,208 @@ fn dispatch_and_tasks_belong_to_their_window() {
         "the app-owned task survives the window that started it"
     );
 }
+
+#[test]
+fn specs_carry_titles_and_sizes_and_live_windows_are_enumerable() {
+    let defaults = WindowSpec::new("plain");
+    assert_eq!(defaults.key(), "plain");
+    assert_eq!(defaults.title(), "plain");
+    assert_eq!(defaults.size(), (900, 700));
+    assert!(!defaults.is_primary());
+
+    let spec = WindowSpec::new("main")
+        .primary()
+        .titled("Main window")
+        .sized(640, 480);
+    assert_eq!(spec.title(), "Main window");
+    assert_eq!(spec.size(), (640, 480));
+    assert!(spec.is_primary());
+
+    let mut app = Runtime::new();
+    app.declare_windows(|catalog| {
+        catalog.window(spec, |_| view! { <text>"main"</text> })?;
+        catalog.window(
+            WindowSpec::new("second").titled("Details").sized(320, 240),
+            |_| view! { <text>"details"</text> },
+        )?;
+        Ok(())
+    })
+    .expect("catalog");
+
+    assert!(app.windows().is_empty(), "declaration mounts nothing");
+    let main = app.show("main").expect("show main");
+    let second = app.show("second").expect("show second");
+    let windows = app.windows();
+    assert_eq!(windows.len(), 2, "both windows are live");
+    assert_eq!(windows[0].window, main);
+    assert_eq!(windows[0].spec.title(), "Main window");
+    assert_eq!(windows[0].spec.size(), (640, 480));
+    assert!(windows[0].visible);
+    assert_eq!(windows[1].window, second);
+    assert_eq!(windows[1].spec.title(), "Details");
+    assert_eq!(windows[1].spec.size(), (320, 240));
+    assert!(windows[1].visible);
+
+    app.hide(second).expect("hide second");
+    let windows = app.windows();
+    assert_eq!(windows.len(), 2, "hide keeps the activation");
+    assert!(windows[1].window == second);
+    assert!(!windows[1].visible);
+
+    app.close_window(main).expect("close main");
+    let windows = app.windows();
+    assert_eq!(windows.len(), 1);
+    assert_eq!(windows[0].window, second);
+    assert!(!windows[0].visible, "main was closed, second stays hidden");
+}
+
+#[test]
+fn window_revision_tracks_open_hide_show_and_close() {
+    let mut app = Runtime::new();
+    assert_eq!(app.window_revision(), 0);
+
+    app.declare_windows(|catalog| {
+        catalog.window(WindowSpec::new("main").primary(), |_| {
+            view! { <view /> }
+        })?;
+        Ok(())
+    })
+    .expect("catalog");
+    assert_eq!(
+        app.window_revision(),
+        0,
+        "declaration changes no native state"
+    );
+
+    let main = app.show("main").expect("show main");
+    let after_open = app.window_revision();
+    assert!(after_open > 0, "opening a window bumps the revision");
+
+    let focused = app.show("main").expect("show focuses the same window");
+    assert_eq!(focused, main);
+    assert_eq!(
+        app.window_revision(),
+        after_open,
+        "focusing an already visible window changes nothing"
+    );
+
+    app.hide(main).expect("hide");
+    let after_hide = app.window_revision();
+    assert!(after_hide > after_open, "hiding bumps the revision");
+    app.hide(main).expect("hide is idempotent");
+    assert_eq!(
+        app.window_revision(),
+        after_hide,
+        "hiding twice changes nothing"
+    );
+
+    app.show("main").expect("restore");
+    let after_show = app.window_revision();
+    assert!(after_show > after_hide, "showing bumps the revision");
+    app.close_window(main).expect("close");
+    assert!(
+        app.window_revision() > after_show,
+        "closing bumps the revision"
+    );
+    assert!(app.windows().is_empty(), "a closed window is not live");
+}
+
+#[test]
+fn focus_traversal_and_blur_are_scoped_to_the_window() {
+    let mut app = Runtime::new();
+    app.declare_windows(|catalog| {
+        catalog.window(WindowSpec::new("main").primary(), |_| {
+            view! {
+                <view>
+                    <text-input aria:label="main-a" />
+                    <text-input aria:label="main-b" />
+                </view>
+            }
+        })?;
+        catalog.window(WindowSpec::new("second"), |_| {
+            view! {
+                <view>
+                    <text-input aria:label="second-a" />
+                    <text-input aria:label="second-b" />
+                </view>
+            }
+        })?;
+        catalog.window(
+            WindowSpec::new("empty"),
+            |_| view! { <text>"no controls"</text> },
+        )?;
+        Ok(())
+    })
+    .expect("catalog");
+
+    let main = app.show("main").expect("show main");
+    let second = app.show("second").expect("show second");
+    let empty = app.show("empty").expect("show empty");
+    let main_snapshot = app.presentation_of(main).expect("main snapshot");
+    let main_a = main_snapshot.find_label("main-a").expect("main a").id();
+    let main_b = main_snapshot.find_label("main-b").expect("main b").id();
+    let second_snapshot = app.presentation_of(second).expect("second snapshot");
+    let second_a = second_snapshot
+        .find_label("second-a")
+        .expect("second a")
+        .id();
+    let second_b = second_snapshot
+        .find_label("second-b")
+        .expect("second b")
+        .id();
+
+    app.focus_node(main_a).expect("focus main a");
+    app.focus_node(second_a).expect("focus second a");
+    assert_eq!(
+        app.presentation_of(main).expect("snapshot").focus(),
+        Some(main_a)
+    );
+    assert_eq!(
+        app.presentation_of(second).expect("snapshot").focus(),
+        Some(second_a)
+    );
+
+    app.focus_next_in(main).expect("tab inside main");
+    assert_eq!(
+        app.presentation_of(main).expect("snapshot").focus(),
+        Some(main_b),
+        "main advances its own focus order"
+    );
+    assert_eq!(
+        app.presentation_of(second).expect("snapshot").focus(),
+        Some(second_a),
+        "the other window keeps its focus"
+    );
+
+    app.blur_in(main).expect("blur main");
+    assert_eq!(app.presentation_of(main).expect("snapshot").focus(), None);
+    assert_eq!(
+        app.presentation_of(second).expect("snapshot").focus(),
+        Some(second_a),
+        "blurring main does not touch second"
+    );
+
+    app.focus_previous_in(second)
+        .expect("shift-tab inside second");
+    assert_eq!(
+        app.presentation_of(second).expect("snapshot").focus(),
+        Some(second_b),
+        "second wraps within its own focus order"
+    );
+
+    app.focus_next_in(empty)
+        .expect("a window without focusable controls ignores Tab");
+    assert_eq!(
+        app.presentation_of(empty).expect("empty snapshot").focus(),
+        None
+    );
+
+    app.close_window(main).expect("close main");
+    assert_eq!(app.focus_next_in(main), Err(WindowError::Stale));
+
+    let mut other = Runtime::new();
+    let foreign = other
+        .open_window("foreign", |_| view! { <view /> })
+        .expect("open a foreign window");
+    assert_eq!(app.focus_next_in(foreign), Err(WindowError::WrongRuntime));
+}

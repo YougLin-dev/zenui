@@ -22,7 +22,7 @@ use crate::view::{
     PlanNode, ResultBoolValue, StyleSlot, SubmitEvent, TextSlot,
 };
 use crate::window::{
-    CatalogError, WindowCatalog, WindowCtx, WindowError, WindowFactory, WindowRecord,
+    CatalogEntry, CatalogError, WindowCatalog, WindowCtx, WindowError, WindowInfo, WindowRecord,
 };
 
 const HIDDEN_TARGET: &str = "target window is hidden";
@@ -79,11 +79,13 @@ pub(crate) struct State {
     trees: BTreeMap<TreeKey, MountedTree>,
     app_setup: bool,
     window_factory_ran: bool,
-    catalog: BTreeMap<&'static str, WindowFactory>,
+    catalog: BTreeMap<&'static str, CatalogEntry>,
     primary: Option<&'static str>,
     catalog_declared: bool,
     focused_window: Option<&'static str>,
     windows: BTreeMap<&'static str, WindowRecord>,
+    /// 窗口打开/关闭/隐藏/显示时递增；原生宿主据此跳过无变化的扫描。
+    window_revision: u64,
     pub(crate) tasks: BTreeMap<u32, TaskRecord>,
     pub(crate) next_task: u32,
     pub(crate) wake_callback: Arc<RwLock<Option<WakeCallback>>>,
@@ -154,6 +156,7 @@ impl State {
             catalog_declared: false,
             focused_window: None,
             windows: BTreeMap::new(),
+            window_revision: 0,
             tasks: BTreeMap::new(),
             next_task: 1,
             wake_callback: Arc::new(RwLock::new(None)),
@@ -240,15 +243,27 @@ impl State {
     }
 
     fn hide_window(&mut self, key: &'static str) {
-        if let Some(record) = self.windows.get_mut(key) {
+        let Some(record) = self.windows.get_mut(key) else {
+            return;
+        };
+        if record.visible {
             record.visible = false;
+            self.bump_window_revision();
         }
     }
 
     fn show_window(&mut self, key: &'static str) {
-        if let Some(record) = self.windows.get_mut(key) {
+        let Some(record) = self.windows.get_mut(key) else {
+            return;
+        };
+        if !record.visible {
             record.visible = true;
+            self.bump_window_revision();
         }
+    }
+
+    fn bump_window_revision(&mut self) {
+        self.window_revision = self.window_revision.wrapping_add(1);
     }
 
     fn tree_for_element(&self, element: usize) -> Option<TreeKey> {
@@ -449,13 +464,18 @@ impl State {
                 visible: true,
             },
         );
+        self.bump_window_revision();
         (activation, owner)
     }
 
     pub(crate) fn mark_window_closed(&mut self, key: &'static str) {
-        if let Some(record) = self.windows.get_mut(key) {
+        let Some(record) = self.windows.get_mut(key) else {
+            return;
+        };
+        if record.open || record.visible {
             record.open = false;
             record.visible = false;
+            self.bump_window_revision();
         }
     }
 
@@ -1138,6 +1158,31 @@ impl Runtime {
         self.state.borrow().primary
     }
 
+    /// 窗口打开、关闭、隐藏或显示时递增的修订号；无变化时宿主可跳过扫描。
+    pub fn window_revision(&self) -> u64 {
+        self.state.borrow().window_revision
+    }
+
+    /// 当前仍存活的窗口及目录描述，按目录键排序。
+    ///
+    /// 原生宿主用它增量同步 HWND；headless 调用方通常直接按键操作。
+    pub fn windows(&self) -> Vec<WindowInfo> {
+        let state = self.state.borrow();
+        state
+            .windows
+            .keys()
+            .filter_map(|key| {
+                let window = state.window_ctx(key)?;
+                let spec = state.catalog.get(key)?.spec;
+                Some(WindowInfo {
+                    window,
+                    spec,
+                    visible: state.window_is_visible(key),
+                })
+            })
+            .collect()
+    }
+
     /// 显示目录中的窗口：未打开时运行 factory 产生新 activation；已打开时只聚焦，
     /// 隐藏的窗口恢复可见且不重跑 factory。
     ///
@@ -1147,11 +1192,11 @@ impl Runtime {
     pub fn show(&mut self, key: &'static str) -> Result<WindowCtx, WindowError> {
         let factory = {
             let state = self.state.borrow();
-            let factory = state
+            let entry = state
                 .catalog
                 .get(key)
                 .ok_or(WindowError::UnknownWindow(key))?;
-            Rc::clone(factory)
+            Rc::clone(&entry.factory)
         };
         if self.state.borrow().trees.contains_key(&TreeKey::Root) {
             return Err(WindowError::State(
@@ -2554,26 +2599,77 @@ impl Runtime {
         self.traverse_focus(false)
     }
 
+    /// 在指定窗口内向前遍历焦点；焦点不会越过窗口边界。
+    ///
+    /// 窗口没有可聚焦控件时什么也不做；原生输入不应因为一个空窗口而报错。
+    pub fn focus_next_in(&mut self, window: WindowCtx) -> Result<(), WindowError> {
+        self.traverse_focus_in(window, true)
+    }
+
+    /// 在指定窗口内向后遍历焦点；焦点不会越过窗口边界。
+    ///
+    /// 窗口没有可聚焦控件时什么也不做。
+    pub fn focus_previous_in(&mut self, window: WindowCtx) -> Result<(), WindowError> {
+        self.traverse_focus_in(window, false)
+    }
+
+    /// 只清除指定窗口的焦点；其他窗口的焦点保持不变。
+    pub fn blur_in(&mut self, window: WindowCtx) -> Result<(), WindowError> {
+        let state = self.state.clone();
+        if window.runtime != state.borrow().id {
+            return Err(WindowError::WrongRuntime);
+        }
+        context::install(&state, || {
+            if !with_state(|state| state.window_live_in_tree(window)) {
+                return Err(WindowError::Stale);
+            }
+            self.move_focus(TreeKey::Window(window.key), None)
+                .map_err(WindowError::Mount)
+        })
+    }
+
     fn traverse_focus(&mut self, forward: bool) -> Result<(), MountError> {
         let state = self.state.clone();
         context::install(&state, || {
             let tree = with_state(|state| state.active_tree_key())
                 .ok_or(MountError::Component("no focusable target"))?;
-            let order = with_state(|state| state.focus_order(tree));
-            if order.is_empty() {
-                return Err(MountError::Component("no focusable target"));
-            }
-            let current = with_state(|state| state.focused_in(tree))
-                .and_then(|focused| order.iter().position(|id| *id == focused));
-            let index = match (forward, current) {
-                (true, Some(index)) => (index + 1) % order.len(),
-                (true, None) => 0,
-                (false, Some(0)) => order.len() - 1,
-                (false, Some(index)) => index - 1,
-                (false, None) => order.len() - 1,
-            };
-            self.move_focus(tree, Some(order[index]))
+            self.traverse_focus_for(tree, forward)
         })
+    }
+
+    fn traverse_focus_in(&mut self, window: WindowCtx, forward: bool) -> Result<(), WindowError> {
+        let state = self.state.clone();
+        if window.runtime != state.borrow().id {
+            return Err(WindowError::WrongRuntime);
+        }
+        context::install(&state, || {
+            if !with_state(|state| state.window_live_in_tree(window)) {
+                return Err(WindowError::Stale);
+            }
+            let tree = TreeKey::Window(window.key);
+            if with_state(|state| state.focus_order(tree)).is_empty() {
+                return Ok(());
+            }
+            self.traverse_focus_for(tree, forward)
+                .map_err(WindowError::Mount)
+        })
+    }
+
+    fn traverse_focus_for(&mut self, tree: TreeKey, forward: bool) -> Result<(), MountError> {
+        let order = with_state(|state| state.focus_order(tree));
+        if order.is_empty() {
+            return Err(MountError::Component("no focusable target"));
+        }
+        let current = with_state(|state| state.focused_in(tree))
+            .and_then(|focused| order.iter().position(|id| *id == focused));
+        let index = match (forward, current) {
+            (true, Some(index)) => (index + 1) % order.len(),
+            (true, None) => 0,
+            (false, Some(0)) => order.len() - 1,
+            (false, Some(index)) => index - 1,
+            (false, None) => order.len() - 1,
+        };
+        self.move_focus(tree, Some(order[index]))
     }
 
     fn move_focus(&mut self, tree: TreeKey, target: Option<usize>) -> Result<(), MountError> {
