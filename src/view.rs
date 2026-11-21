@@ -2,7 +2,7 @@ use std::fmt;
 
 use zenui_core::RowSet;
 
-use zenui_style::StyleDeclaration;
+use zenui_style::{Color, Length, Opacity, Property, StyleDeclaration, StyleValue};
 
 use crate::context::Phase;
 use crate::signal::{Memo, Once, Signal};
@@ -83,8 +83,113 @@ pub enum PlanNode {
 pub struct ElementPlan {
     pub(crate) tag: &'static str,
     pub(crate) attrs: Vec<Attr>,
-    pub(crate) styles: &'static [StyleDeclaration],
+    pub(crate) class_styles: &'static [StyleDeclaration],
+    pub(crate) inline_styles: Vec<InlineStyle>,
     pub(crate) children: Vec<PlanNode>,
+}
+
+/// 一个值槽：静态值或可求值句柄；求值发生在提交帧，不在快照里执行闭包。
+pub enum ValueSlot<T> {
+    Static(T),
+    Signal(Signal<T>),
+    Memo(Memo<T>),
+}
+
+impl<T> From<T> for ValueSlot<T> {
+    fn from(value: T) -> Self {
+        Self::Static(value)
+    }
+}
+
+impl<T> From<Once<T>> for ValueSlot<T> {
+    fn from(value: Once<T>) -> Self {
+        Self::Static(value.into_inner())
+    }
+}
+
+impl<T> From<Signal<T>> for ValueSlot<T> {
+    fn from(value: Signal<T>) -> Self {
+        Self::Signal(value)
+    }
+}
+
+impl<T> From<Memo<T>> for ValueSlot<T> {
+    fn from(value: Memo<T>) -> Self {
+        Self::Memo(value)
+    }
+}
+
+impl<T: Clone + PartialEq + 'static> ValueSlot<T> {
+    pub(crate) fn evaluate(&self) -> T {
+        match self {
+            Self::Static(value) => value.clone(),
+            Self::Signal(signal) => signal.get(),
+            Self::Memo(memo) => memo.get(),
+        }
+    }
+}
+
+/// 一条 inline `style:` 声明的类型化值槽。
+pub enum StyleSlot {
+    Color(ValueSlot<Color>),
+    Length(ValueSlot<Length>),
+    Opacity(ValueSlot<Opacity>),
+}
+
+impl StyleSlot {
+    pub(crate) fn evaluate(&self) -> StyleValue {
+        match self {
+            Self::Color(slot) => StyleValue::Color(slot.evaluate()),
+            Self::Length(slot) => StyleValue::Length(slot.evaluate()),
+            Self::Opacity(slot) => StyleValue::Opacity(slot.evaluate().value()),
+        }
+    }
+}
+
+/// `ElementPlan` 里的一条 inline 声明。
+pub struct InlineStyle {
+    pub(crate) property: Property,
+    pub(crate) slot: StyleSlot,
+}
+
+/// `style:background` 的类型化值。
+pub fn style_background(value: impl Into<ValueSlot<Color>>) -> InlineStyle {
+    InlineStyle {
+        property: Property::Background,
+        slot: StyleSlot::Color(value.into()),
+    }
+}
+
+/// `style:color` 的类型化值。
+pub fn style_color(value: impl Into<ValueSlot<Color>>) -> InlineStyle {
+    InlineStyle {
+        property: Property::TextColor,
+        slot: StyleSlot::Color(value.into()),
+    }
+}
+
+/// `style:border-color` 的类型化值。
+pub fn style_border_color(value: impl Into<ValueSlot<Color>>) -> InlineStyle {
+    InlineStyle {
+        property: Property::BorderColor,
+        slot: StyleSlot::Color(value.into()),
+    }
+}
+
+/// `style:opacity` 的类型化值。
+pub fn style_opacity(value: impl Into<ValueSlot<Opacity>>) -> InlineStyle {
+    InlineStyle {
+        property: Property::Opacity,
+        slot: StyleSlot::Opacity(value.into()),
+    }
+}
+
+/// `style:width` 的类型化值。
+pub fn style_width(value: impl Into<ValueSlot<Length>>) -> InlineStyle {
+    InlineStyle {
+        property: Property::Width,
+        slot: StyleSlot::Length(value.into()),
+    }
 }
 
 pub struct ComponentPlan {
@@ -386,22 +491,25 @@ pub fn element(tag: &'static str, attrs: Vec<Attr>, children: Vec<PlanNode>) -> 
     PlanNode::Element(ElementPlan {
         tag,
         attrs,
-        styles: &[],
+        class_styles: &[],
+        inline_styles: Vec::new(),
         children,
     })
 }
 
-/// 带编译期 class 声明的元素；声明已由 `view!` 解析为类型化字段。
+/// 带 type-safe 样式的元素；class 声明来自展开期，inline 声明来自 `style:` 属性。
 pub fn styled_element(
     tag: &'static str,
     attrs: Vec<Attr>,
-    styles: &'static [StyleDeclaration],
+    class_styles: &'static [StyleDeclaration],
+    inline_styles: Vec<InlineStyle>,
     children: Vec<PlanNode>,
 ) -> PlanNode {
     PlanNode::Element(ElementPlan {
         tag,
         attrs,
-        styles,
+        class_styles,
+        inline_styles,
         children,
     })
 }

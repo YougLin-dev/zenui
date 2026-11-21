@@ -607,6 +607,67 @@ fn presentation_attributes_include_disabled() {
     );
 }
 
+#[component]
+fn DynamicStyles() -> MountResult<MountPlan> {
+    let width = signal(px(100.0));
+    let tint = signal(Color::Role(ColorRole::Accent));
+
+    view! {
+        <view>
+            <button aria:label="wider" on:click={move || width.set(px(160.0))}>"Wider"</button>
+            <button aria:label="recolor" on:click={move || tint.set(Color::Role(ColorRole::Danger))}>"Recolor"</button>
+            <view
+                aria:label="styled"
+                style:width={width}
+                style:background={tint}
+                style:color={once(Color::Role(ColorRole::TextMuted))}
+                style:border-color={Color::Role(ColorRole::BorderAccent)}
+                style:opacity={Opacity::percent(50)}
+            />
+        </view>
+    }
+}
+
+#[test]
+fn typed_dynamic_styles_travel_through_the_snapshot_and_update_in_place() {
+    let mut app = Runtime::new();
+    app.mount(|| view! { <DynamicStyles /> }).expect("mount");
+
+    let before = app.presentation().expect("snapshot");
+    let styled = before.find_label("styled").expect("styled view");
+    let id = styled.id();
+    assert_eq!(
+        styled.styles(),
+        &[
+            StyleDeclaration::inline(Property::Width, StyleValue::Length(px(100.0))),
+            StyleDeclaration::inline(
+                Property::Background,
+                StyleValue::Color(Color::Role(ColorRole::Accent))
+            ),
+            StyleDeclaration::inline(
+                Property::TextColor,
+                StyleValue::Color(Color::Role(ColorRole::TextMuted))
+            ),
+            StyleDeclaration::inline(
+                Property::BorderColor,
+                StyleValue::Color(Color::Role(ColorRole::BorderAccent))
+            ),
+            StyleDeclaration::inline(Property::Opacity, StyleValue::Opacity(50)),
+        ],
+        "plain, Once and Signal values reach the snapshot as inline declarations"
+    );
+
+    app.click_label("wider").expect("update the width");
+    let after = app.presentation().expect("snapshot");
+    let styled = after.find_label("styled").expect("styled view");
+    assert_eq!(styled.id(), id, "a value update does not remount");
+    assert_eq!(
+        styled.styles()[0],
+        StyleDeclaration::inline(Property::Width, StyleValue::Length(px(160.0)))
+    );
+    assert_ne!(before, after, "the committed snapshot reflects the change");
+}
+
 #[test]
 fn class_literals_become_typed_declarations() {
     let mut app = Runtime::new();

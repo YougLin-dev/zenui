@@ -11,7 +11,7 @@ use taffy::{
     Size as TaffySize, compute_leaf_layout,
 };
 use zenui::{NodeId, PresentationSnapshot, SnapshotElement, SnapshotNode};
-use zenui_style::{Color, Condition, Property, StyleDeclaration, StyleValue};
+use zenui_style::{Color, Condition, Property, StyleDeclaration, StyleOrigin, StyleValue};
 
 use crate::SceneError;
 use crate::geometry::{Point, Rect, Viewport};
@@ -891,19 +891,25 @@ fn resolve_style(
     state: ElementState,
 ) -> Result<(Style, ResolvedStyle), SceneError> {
     let mut resolved = ResolvedStyle::initial();
-    let mut winners: HashMap<Property, Condition> = HashMap::new();
+    let mut winners: HashMap<Property, (StyleOrigin, Condition)> = HashMap::new();
     for declaration in declarations {
         let condition = declaration.condition();
         if !state.active(condition) {
             continue;
         }
-        if winners
-            .get(&declaration.property())
-            .is_some_and(|best| condition.rank() < best.rank())
-        {
+        let origin = declaration.origin();
+        let beats = match winners.get(&declaration.property()) {
+            None => true,
+            Some((best_origin, best_condition)) => match (origin, best_origin) {
+                (StyleOrigin::Inline, StyleOrigin::Class) => true,
+                (StyleOrigin::Class, StyleOrigin::Inline) => false,
+                _ => condition.rank() >= best_condition.rank(),
+            },
+        };
+        if !beats {
             continue;
         }
-        winners.insert(declaration.property(), condition);
+        winners.insert(declaration.property(), (origin, condition));
         apply_declaration(&mut style, &mut resolved, node, *declaration)?;
     }
     Ok((style, resolved))
@@ -941,6 +947,9 @@ fn apply_declaration(
             style.justify_content = JustifyContent::SPACE_BETWEEN;
         }
         (Property::Width, StyleValue::FullWidth) => style.size.width = percent(1.0),
+        (Property::Width, StyleValue::Length(extent)) => {
+            style.size.width = length(extent.resolve(text::FONT_SIZE));
+        }
         (Property::FlexGrow, StyleValue::Grow) => {
             style.flex_grow = 1.0;
             style.flex_shrink = 1.0;

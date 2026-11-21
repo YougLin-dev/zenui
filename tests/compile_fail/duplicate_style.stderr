@@ -1,0 +1,5 @@
+error: duplicate style attribute `style:width`
+ --> tests/compile_fail/duplicate_style.rs:5:45
+  |
+5 |         view! { <view style:width={px(1.0)} style:width={px(2.0)}>"Add"</view> };
+  |                                             ^^^^^^^^^^^

@@ -18,8 +18,8 @@ use crate::task::{TaskRecord, WakeCallback};
 use crate::text_edit::{self, Edit, Movement};
 use crate::view::{
     Attr, AttrValue, BlurEvent, ChildrenFactory, CompositionEvent, CompositionPhase, Event,
-    FocusCause, FocusEvent, Key, KeyEvent, MountError, MountPlan, MountResult, PlanNode,
-    ResultBoolValue, SubmitEvent, TextSlot,
+    FocusCause, FocusEvent, InlineStyle, Key, KeyEvent, MountError, MountPlan, MountResult,
+    PlanNode, ResultBoolValue, StyleSlot, SubmitEvent, TextSlot,
 };
 use crate::window::{WindowCtx, WindowError, WindowRecord};
 
@@ -562,10 +562,17 @@ pub struct MountedElement {
     tag: &'static str,
     owner: u32,
     attrs: Vec<MountedAttr>,
-    styles: &'static [zenui_style::StyleDeclaration],
+    class_styles: &'static [zenui_style::StyleDeclaration],
+    inline_styles: Vec<MountedInlineStyle>,
     events: Vec<usize>,
     local: LocalState,
     children: Vec<MountedNode>,
+}
+
+struct MountedInlineStyle {
+    property: zenui_style::Property,
+    slot: StyleSlot,
+    current: Option<zenui_style::StyleValue>,
 }
 
 impl MountedElement {
@@ -1139,12 +1146,22 @@ impl Runtime {
                     };
                     let id = state.mint_node();
                     let slot = state.elements.len();
+                    let inline_styles = plan
+                        .inline_styles
+                        .into_iter()
+                        .map(|InlineStyle { property, slot }| MountedInlineStyle {
+                            property,
+                            slot,
+                            current: None,
+                        })
+                        .collect();
                     state.elements.push(MountedElement {
                         id,
                         tag,
                         owner,
                         attrs,
-                        styles: plan.styles,
+                        class_styles: plan.class_styles,
+                        inline_styles,
                         events,
                         local,
                         children,
@@ -1294,6 +1311,10 @@ impl Runtime {
                 }
             };
         }
+        let mut styles = with_state(|state| std::mem::take(&mut state.elements[id].inline_styles));
+        for style in &mut styles {
+            style.current = Some(style.slot.evaluate());
+        }
         with_state(|state| {
             let element = &mut state.elements[id];
             if let LocalState::Checkbox { checked } = &mut element.local
@@ -1305,6 +1326,7 @@ impl Runtime {
                 *checked = value;
             }
             element.attrs = attrs;
+            element.inline_styles = styles;
         });
     }
 
@@ -2537,7 +2559,7 @@ fn collect_snapshot(state: &State, nodes: &[MountedNode], out: &mut Vec<Snapshot
                     id: element.id,
                     tag: element.tag,
                     attrs: snapshot_attrs(element),
-                    styles: element.styles,
+                    styles: snapshot_styles(element),
                     edit: snapshot_edit(&element.local),
                     children,
                 }));
@@ -2581,6 +2603,23 @@ fn snapshot_edit(local: &LocalState) -> Option<TextEditState> {
         }),
         _ => None,
     }
+}
+
+/// 只复制已提交的声明；inline 槽的当前值在刷新时已经算好。
+/// 没有 inline 声明时借用 class 切片，避免每个元素都分配。
+fn snapshot_styles(
+    element: &MountedElement,
+) -> std::borrow::Cow<'static, [zenui_style::StyleDeclaration]> {
+    if element.inline_styles.is_empty() {
+        return std::borrow::Cow::Borrowed(element.class_styles);
+    }
+    let mut styles = element.class_styles.to_vec();
+    styles.extend(element.inline_styles.iter().filter_map(|style| {
+        style
+            .current
+            .map(|value| zenui_style::StyleDeclaration::inline(style.property, value))
+    }));
+    std::borrow::Cow::Owned(styles)
 }
 
 fn snapshot_attrs(element: &MountedElement) -> Vec<SnapshotAttr> {
