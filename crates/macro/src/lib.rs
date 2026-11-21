@@ -5,7 +5,7 @@ use rstml::node::{
     KVAttributeValue, KeyedAttributeValue, Node, NodeAttribute, NodeBlock, NodeElement,
 };
 use syn::{Block, Expr, FnArg, ItemFn, Pat, ReturnType, Type, spanned::Spanned};
-use zenui_style::{Property, StyleDeclaration, StyleValue};
+use zenui_style::{Condition, Property, StyleDeclaration, StyleValue};
 
 #[proc_macro]
 pub fn view(input: TokenStream1) -> TokenStream1 {
@@ -167,11 +167,23 @@ fn class_error_message(error: &zenui_style::ClassError) -> String {
 fn declaration_tokens(declaration: &StyleDeclaration) -> TokenStream {
     let property = property_tokens(declaration.property());
     let value = style_value_tokens(declaration.value());
+    let condition = condition_tokens(declaration.condition());
     quote! {
         ::zenui::style::StyleDeclaration::new(
             ::zenui::style::Property::#property,
             #value,
+            ::zenui::style::Condition::#condition,
         )
+    }
+}
+
+fn condition_tokens(condition: Condition) -> TokenStream {
+    match condition {
+        Condition::Base => quote! { Base },
+        Condition::Focus => quote! { Focus },
+        Condition::Disabled => quote! { Disabled },
+        Condition::Checked => quote! { Checked },
+        Condition::AriaPressed => quote! { AriaPressed },
     }
 }
 

@@ -23,7 +23,11 @@ pub fn FilterButton(
     let selected = memo(move || current.get() == value);
 
     view! {
-        <button aria:pressed={selected} on:click={move || current.set(value)}>{label}</button>
+        <button
+            class="px-3 py-1 rounded-sm bg-control aria-pressed:bg-accent aria-pressed:text-inverse"
+            aria:pressed={selected}
+            on:click={move || current.set(value)}
+        >{label}</button>
     }
 }
 

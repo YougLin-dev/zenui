@@ -179,6 +179,11 @@ impl SnapshotElement {
         self.attr("checked").and_then(SnapshotAttr::as_bool)
     }
 
+    /// `aria:pressed` 是否为真；缺省属性视为未按下。
+    pub fn pressed(&self) -> bool {
+        self.attr("aria:pressed").and_then(SnapshotAttr::as_bool) == Some(true)
+    }
+
     /// 文本输入控件的本地编辑状态；其他元素为 `None`。
     pub const fn edit(&self) -> Option<&TextEditState> {
         self.edit.as_ref()

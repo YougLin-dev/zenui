@@ -11,7 +11,7 @@ use taffy::{
     Size as TaffySize, compute_leaf_layout,
 };
 use zenui::{NodeId, PresentationSnapshot, SnapshotElement, SnapshotNode};
-use zenui_style::{Color, Property, StyleDeclaration, StyleValue};
+use zenui_style::{Color, Condition, Property, StyleDeclaration, StyleValue};
 
 use crate::SceneError;
 use crate::geometry::{Point, Rect, Viewport};
@@ -405,6 +405,27 @@ struct TextContext {
     text: String,
 }
 
+/// 一条声明在解析时能看到的控件状态；来自已提交的快照，不含宿主瞬态。
+#[derive(Clone, Copy, Debug, Default)]
+struct ElementState {
+    focus: bool,
+    disabled: bool,
+    checked: bool,
+    aria_pressed: bool,
+}
+
+impl ElementState {
+    const fn active(self, condition: Condition) -> bool {
+        match condition {
+            Condition::Base => true,
+            Condition::Focus => self.focus,
+            Condition::Disabled => self.disabled,
+            Condition::Checked => self.checked,
+            Condition::AriaPressed => self.aria_pressed,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
     Root,
@@ -506,8 +527,18 @@ impl<'a> Builder<'a> {
             Intrinsic::Text => text_container_style(),
             Intrinsic::View | Intrinsic::Form => container_style(intrinsic, element),
         };
-        let (style, resolved) =
-            resolve_style(with_grow(base, top_level), element.id(), element.styles())?;
+        let state = ElementState {
+            focus: self.snapshot.focus() == Some(element.id()),
+            disabled: element.disabled(),
+            checked: element.checked().unwrap_or(false),
+            aria_pressed: element.pressed(),
+        };
+        let (style, resolved) = resolve_style(
+            with_grow(base, top_level),
+            element.id(),
+            element.styles(),
+            state,
+        )?;
         let node = match intrinsic {
             Intrinsic::TextInput => {
                 let (display, _, _) = display_text(element);
@@ -818,10 +849,7 @@ fn visual(intrinsic: Intrinsic, element: &SnapshotElement) -> Visual {
     match intrinsic {
         Intrinsic::Text => Visual::Text,
         Intrinsic::Button => Visual::Button {
-            pressed: element
-                .attr("aria:pressed")
-                .and_then(|attr| attr.as_bool())
-                .unwrap_or(false),
+            pressed: element.pressed(),
         },
         Intrinsic::Checkbox => Visual::Checkbox {
             checked: element.checked().unwrap_or(false),
@@ -853,14 +881,29 @@ fn with_grow(mut style: Style, top_level: bool) -> Style {
     style
 }
 
-/// 按源码顺序把 class 声明合并到 intrinsic 默认样式上；后出现的声明覆盖先出现的。
+/// 按条件优先级与源码顺序把活动声明合并到 intrinsic 默认样式上。
+///
+/// 高 rank 的条件胜出；相同 rank 时后出现的声明覆盖先出现的。
 fn resolve_style(
     mut style: Style,
     node: NodeId,
     declarations: &[StyleDeclaration],
+    state: ElementState,
 ) -> Result<(Style, ResolvedStyle), SceneError> {
     let mut resolved = ResolvedStyle::initial();
+    let mut winners: HashMap<Property, Condition> = HashMap::new();
     for declaration in declarations {
+        let condition = declaration.condition();
+        if !state.active(condition) {
+            continue;
+        }
+        if winners
+            .get(&declaration.property())
+            .is_some_and(|best| condition.rank() < best.rank())
+        {
+            continue;
+        }
+        winners.insert(declaration.property(), condition);
         apply_declaration(&mut style, &mut resolved, node, *declaration)?;
     }
     Ok((style, resolved))

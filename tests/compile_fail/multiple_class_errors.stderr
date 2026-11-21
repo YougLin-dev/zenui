@@ -1,6 +1,6 @@
 error: unknown class token `nope` at character 0
        unknown spacing step `p--2` at character 5
-       class conditions are not supported yet `hover:px-2` at character 10
+       class condition is not supported yet `hover:px-2` at character 10
  --> tests/compile_fail/multiple_class_errors.rs:5:31
   |
 5 |         view! { <button class="nope p--2 hover:px-2">"Add"</button> };

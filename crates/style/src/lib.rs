@@ -22,6 +22,21 @@ pub enum Property {
     Opacity,
 }
 
+impl Property {
+    /// 绘制属性不参与布局；状态变体只允许设置这些属性。
+    const fn is_paint(self) -> bool {
+        matches!(
+            self,
+            Self::Background
+                | Self::TextColor
+                | Self::BorderColor
+                | Self::BorderWidth
+                | Self::Radius
+                | Self::Opacity
+        )
+    }
+}
+
 /// 语义颜色角色；具体字节由当前调色板决定。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ColorRole {
@@ -40,6 +55,34 @@ pub enum ColorRole {
     TextDisabled,
     BorderDefault,
     BorderAccent,
+}
+
+/// 一条声明生效的状态条件。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Condition {
+    /// 无条件，按源码顺序参与。
+    Base,
+    /// 元素持有焦点。
+    Focus,
+    /// 元素处于禁用状态。
+    Disabled,
+    /// checkbox 处于勾选状态。
+    Checked,
+    /// 按钮的语义选中状态来自 `aria:pressed`。
+    AriaPressed,
+}
+
+impl Condition {
+    /// 同一属性被多条活动声明设置时的优先级；数值大者胜出，相同数值用更晚的源码顺序。
+    pub const fn rank(self) -> u8 {
+        match self {
+            Self::Base => 0,
+            Self::Focus => 1,
+            Self::Disabled => 2,
+            Self::Checked => 3,
+            Self::AriaPressed => 4,
+        }
+    }
 }
 
 /// 一个颜色：语义角色或显式 RGBA 字节。
@@ -72,12 +115,17 @@ pub enum StyleValue {
 pub struct StyleDeclaration {
     property: Property,
     value: StyleValue,
+    condition: Condition,
 }
 
 impl StyleDeclaration {
-    /// 组合一个属性与它的类型化取值。
-    pub const fn new(property: Property, value: StyleValue) -> Self {
-        Self { property, value }
+    /// 组合一个属性、它的类型化取值与生效条件。
+    pub const fn new(property: Property, value: StyleValue, condition: Condition) -> Self {
+        Self {
+            property,
+            value,
+            condition,
+        }
     }
 
     /// 这条声明影响的属性。
@@ -88,6 +136,11 @@ impl StyleDeclaration {
     /// 这条声明的类型化取值。
     pub const fn value(self) -> StyleValue {
         self.value
+    }
+
+    /// 这条声明生效所需的控件状态。
+    pub const fn condition(self) -> Condition {
+        self.condition
     }
 }
 
@@ -121,18 +174,28 @@ impl ClassError {
 /// # Errors
 ///
 /// 返回字面量中的全部坏 token；顺序与它们在字面量中出现的顺序一致。
-/// 条件前缀尚未支持，`hover:` 之类的 token 同样是错误。
+/// 未知或复合条件、尚未支持的条件，以及状态变体里的非绘制属性都是错误。
 pub fn parse_class_literal(text: &str) -> Result<Vec<StyleDeclaration>, Vec<ClassError>> {
     let mut declarations = Vec::new();
     let mut errors = Vec::new();
     for (token, offset) in tokens(text) {
-        match parse_token(token) {
-            Ok(mut parsed) => declarations.append(&mut parsed),
-            Err(message) => errors.push(ClassError {
+        let mut error = |message| {
+            errors.push(ClassError {
                 token: token.to_owned(),
                 offset,
                 message,
-            }),
+            });
+        };
+        match parse_token(token) {
+            Ok(parsed)
+                if parsed.iter().any(|declaration| {
+                    declaration.condition() != Condition::Base && !declaration.property().is_paint()
+                }) =>
+            {
+                error("state variants may only set paint properties");
+            }
+            Ok(mut parsed) => declarations.append(&mut parsed),
+            Err(message) => error(message),
         }
     }
     if errors.is_empty() {
@@ -163,11 +226,11 @@ fn tokens(text: &str) -> Vec<(&str, usize)> {
 }
 
 fn parse_token(token: &str) -> Result<Vec<StyleDeclaration>, &'static str> {
-    if token.contains(':') {
-        return Err("class conditions are not supported yet");
-    }
+    let (condition, token) = split_condition(token)?;
     let mut declarations = Vec::new();
-    let mut push = |property, value| declarations.push(StyleDeclaration::new(property, value));
+    let mut push = |property, value| {
+        declarations.push(StyleDeclaration::new(property, value, condition));
+    };
     match token {
         "flex-row" => push(Property::FlexDirection, StyleValue::Row),
         "flex-col" => push(Property::FlexDirection, StyleValue::Column),
@@ -220,6 +283,27 @@ fn role(role: ColorRole) -> StyleValue {
     StyleValue::Color(Color::Role(role))
 }
 
+/// 把 `[condition:]utility` 拆成条件与 utility。
+fn split_condition(token: &str) -> Result<(Condition, &str), &'static str> {
+    let Some((condition, utility)) = token.split_once(':') else {
+        return Ok((Condition::Base, token));
+    };
+    if utility.contains(':') {
+        return Err("compound class conditions are not supported");
+    }
+    let condition = match condition {
+        "focus" => Condition::Focus,
+        "disabled" => Condition::Disabled,
+        "checked" => Condition::Checked,
+        "aria-pressed" => Condition::AriaPressed,
+        "hover" | "focus-visible" | "active" | "dark" => {
+            return Err("class condition is not supported yet");
+        }
+        _ => return Err("unknown class condition"),
+    };
+    Ok((condition, utility))
+}
+
 /// 解析 `<前缀><步长>`；不是该前缀时返回 `Ok(None)`。
 fn spacing(token: &str, prefix: &str) -> Result<Option<i32>, &'static str> {
     let Some(step) = token.strip_prefix(prefix) else {
@@ -241,7 +325,7 @@ mod tests {
     use super::*;
 
     fn declaration(property: Property, value: StyleValue) -> StyleDeclaration {
-        StyleDeclaration::new(property, value)
+        StyleDeclaration::new(property, value, Condition::Base)
     }
 
     #[test]
@@ -325,12 +409,63 @@ mod tests {
     }
 
     #[test]
-    fn conditions_are_rejected_until_they_are_implemented() {
-        let errors = parse_class_literal("hover:px-2").expect_err("condition");
+    fn semantic_conditions_select_their_declarations() {
+        let parsed =
+            parse_class_literal("disabled:bg-control-hover checked:bg-accent focus:opacity-75 aria-pressed:text-inverse")
+                .expect("parse");
+        assert_eq!(
+            parsed,
+            vec![
+                StyleDeclaration::new(
+                    Property::Background,
+                    StyleValue::Color(Color::Role(ColorRole::ControlHover)),
+                    Condition::Disabled
+                ),
+                StyleDeclaration::new(
+                    Property::Background,
+                    StyleValue::Color(Color::Role(ColorRole::Accent)),
+                    Condition::Checked
+                ),
+                StyleDeclaration::new(Property::Opacity, StyleValue::Opacity(75), Condition::Focus),
+                StyleDeclaration::new(
+                    Property::TextColor,
+                    StyleValue::Color(Color::Role(ColorRole::TextInverse)),
+                    Condition::AriaPressed
+                ),
+            ]
+        );
+        assert!(Condition::Focus.rank() < Condition::Disabled.rank());
+        assert!(Condition::Disabled.rank() < Condition::Checked.rank());
+        assert!(Condition::Checked.rank() < Condition::AriaPressed.rank());
+    }
+
+    #[test]
+    fn state_variants_may_only_set_paint_properties() {
+        let errors = parse_class_literal("disabled:px-2 disabled:w-full").expect_err("layout");
+        assert_eq!(errors.len(), 2);
         assert_eq!(
             errors[0].message(),
-            "class conditions are not supported yet"
+            "state variants may only set paint properties"
         );
+        let paint = parse_class_literal("disabled:border disabled:opacity-50 disabled:rounded-md")
+            .expect("border width, opacity and radius are paint");
+        assert_eq!(paint.len(), 3);
+    }
+
+    #[test]
+    fn unsupported_and_compound_conditions_are_errors() {
+        let unsupported = parse_class_literal("hover:px-2").expect_err("unsupported");
+        assert_eq!(
+            unsupported[0].message(),
+            "class condition is not supported yet"
+        );
+        let compound = parse_class_literal("dark:hover:bg-accent").expect_err("compound");
+        assert_eq!(
+            compound[0].message(),
+            "compound class conditions are not supported"
+        );
+        let unknown = parse_class_literal("pressed:bg-accent").expect_err("unknown");
+        assert_eq!(unknown[0].message(), "unknown class condition");
     }
 
     #[test]
