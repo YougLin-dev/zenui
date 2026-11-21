@@ -4,13 +4,14 @@ use std::collections::HashMap;
 
 use taffy::prelude::{
     AlignItems, AvailableSpace, Display, FlexDirection, JustifyContent, Style, TaffyTree, auto,
-    length, zero,
+    length, percent, zero,
 };
 use taffy::{
     Baselines, LayoutInput, LayoutOutput, NodeId as TaffyNodeId, Rect as TaffyRect, ResolveOrZero,
     Size as TaffySize, compute_leaf_layout,
 };
 use zenui::{NodeId, PresentationSnapshot, SnapshotElement, SnapshotNode};
+use zenui_style::{Property, StyleDeclaration, StyleValue};
 
 use crate::SceneError;
 use crate::geometry::{Point, Rect, Viewport};
@@ -432,28 +433,25 @@ impl<'a> Builder<'a> {
             });
         }
 
+        let base = match intrinsic {
+            Intrinsic::TextInput => input_style(),
+            Intrinsic::Checkbox => checkbox_style(),
+            Intrinsic::Button => button_style(),
+            Intrinsic::Text => text_container_style(),
+            Intrinsic::View | Intrinsic::Form => container_style(intrinsic, element),
+        };
+        let style = with_declarations(with_grow(base, top_level), element.id(), element.styles())?;
         let node = match intrinsic {
             Intrinsic::TextInput => {
                 let (display, _, _) = display_text(element);
                 self.tree
-                    .new_leaf_with_context(
-                        with_grow(input_style(), top_level),
-                        TextContext { text: display },
-                    )
+                    .new_leaf_with_context(style, TextContext { text: display })
                     .map_err(layout_error)?
             }
-            Intrinsic::Checkbox => self
-                .tree
-                .new_leaf(with_grow(checkbox_style(), top_level))
-                .map_err(layout_error)?,
-            Intrinsic::Button => self.container(element, with_grow(button_style(), top_level))?,
-            Intrinsic::Text => {
-                self.container(element, with_grow(text_container_style(), top_level))?
+            Intrinsic::Checkbox => self.tree.new_leaf(style).map_err(layout_error)?,
+            Intrinsic::Button | Intrinsic::Text | Intrinsic::View | Intrinsic::Form => {
+                self.container(element, style)?
             }
-            Intrinsic::View | Intrinsic::Form => self.container(
-                element,
-                with_grow(container_style(intrinsic, element), top_level),
-            )?,
         };
         self.kinds.insert(node, Kind::Element(element.id()));
         Ok(node)
@@ -777,6 +775,65 @@ fn with_grow(mut style: Style, top_level: bool) -> Style {
         style.flex_grow = 1.0;
     }
     style
+}
+
+/// 按源码顺序把 class 声明合并到 intrinsic 默认样式上；后出现的声明覆盖先出现的。
+fn with_declarations(
+    mut style: Style,
+    node: NodeId,
+    declarations: &[StyleDeclaration],
+) -> Result<Style, SceneError> {
+    for declaration in declarations {
+        apply_declaration(&mut style, node, *declaration)?;
+    }
+    Ok(style)
+}
+
+fn apply_declaration(
+    style: &mut Style,
+    node: NodeId,
+    declaration: StyleDeclaration,
+) -> Result<(), SceneError> {
+    let (property, value) = (declaration.property(), declaration.value());
+    match (property, value) {
+        (Property::PaddingX, StyleValue::Points(points)) => {
+            let points = points as f32;
+            style.padding.left = length(points);
+            style.padding.right = length(points);
+        }
+        (Property::PaddingY, StyleValue::Points(points)) => {
+            let points = points as f32;
+            style.padding.top = length(points);
+            style.padding.bottom = length(points);
+        }
+        (Property::Gap, StyleValue::Points(points)) => {
+            let points = points as f32;
+            style.gap.width = length(points);
+            style.gap.height = length(points);
+        }
+        (Property::FlexDirection, StyleValue::Row) => style.flex_direction = FlexDirection::Row,
+        (Property::FlexDirection, StyleValue::Column) => {
+            style.flex_direction = FlexDirection::Column;
+        }
+        (Property::AlignItems, StyleValue::CenterItems) => style.align_items = AlignItems::CENTER,
+        (Property::JustifyContent, StyleValue::SpaceBetween) => {
+            style.justify_content = JustifyContent::SPACE_BETWEEN;
+        }
+        (Property::Width, StyleValue::FullWidth) => style.size.width = percent(1.0),
+        (Property::FlexGrow, StyleValue::Grow) => {
+            style.flex_grow = 1.0;
+            style.flex_shrink = 1.0;
+            style.flex_basis = length(0.0);
+        }
+        _ => {
+            return Err(SceneError::UnsupportedStyle {
+                node,
+                property,
+                value,
+            });
+        }
+    }
+    Ok(())
 }
 
 fn root_style(viewport: Viewport) -> Style {

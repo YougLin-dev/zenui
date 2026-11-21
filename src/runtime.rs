@@ -562,6 +562,7 @@ pub struct MountedElement {
     tag: &'static str,
     owner: u32,
     attrs: Vec<MountedAttr>,
+    styles: &'static [zenui_style::StyleDeclaration],
     events: Vec<usize>,
     local: LocalState,
     children: Vec<MountedNode>,
@@ -1143,6 +1144,7 @@ impl Runtime {
                         tag,
                         owner,
                         attrs,
+                        styles: plan.styles,
                         events,
                         local,
                         children,
@@ -2535,6 +2537,7 @@ fn collect_snapshot(state: &State, nodes: &[MountedNode], out: &mut Vec<Snapshot
                     id: element.id,
                     tag: element.tag,
                     attrs: snapshot_attrs(element),
+                    styles: element.styles,
                     edit: snapshot_edit(&element.local),
                     children,
                 }));

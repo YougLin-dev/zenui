@@ -1,0 +1,5 @@
+error: unknown spacing step `p--2` at character 0
+ --> tests/compile_fail/unknown_class.rs:4:59
+  |
+4 |     let _: MountResult<MountPlan> = view! { <button class="p--2">"Add"</button> };
+  |                                                           ^^^^^^

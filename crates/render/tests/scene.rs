@@ -519,6 +519,21 @@ fn unsupported_tags_and_attributes_are_explicit_errors() {
         other => panic!("expected UnsupportedAttribute for placeholder, got {other:?}"),
     }
 
+    let mut app = Runtime::new();
+    app.open_window("main", |_| {
+        Ok(MountPlan::new(vec![zenui::view::element(
+            "view",
+            vec![zenui::view::attr("class", "px-2")],
+            Vec::new(),
+        )]))
+    })
+    .expect("window");
+    let snapshot = app.presentation().expect("snapshot");
+    match Scene::build(&snapshot, viewport(800.0)) {
+        Err(SceneError::UnsupportedAttribute { name, .. }) => assert_eq!(name, "class"),
+        other => panic!("expected UnsupportedAttribute for class, got {other:?}"),
+    }
+
     assert!(matches!(
         Viewport::new(f32::NAN, 600.0, 1.0),
         Err(SceneError::InvalidViewport { .. })
@@ -655,5 +670,170 @@ fn composition_replaces_the_selected_range_in_the_scene() {
     assert_eq!(
         composed, expected,
         "preedit replaces the selected range instead of only inserting"
+    );
+}
+
+#[test]
+fn class_padding_and_gap_change_the_row_geometry() {
+    let mut app = Runtime::new();
+    app.mount(|| {
+        view! {
+            <view class="flex-row items-center gap-3">
+                <button class="px-4 py-2">"Padded"</button>
+                <button>"Plain"</button>
+            </view>
+        }
+    })
+    .expect("mount");
+    let snapshot = app.presentation().expect("snapshot");
+    let scene = build_scene(&snapshot, 400.0);
+    let padded = scene
+        .node(by_text(&snapshot, "button", "Padded"))
+        .expect("padded button")
+        .rect();
+    let plain = scene
+        .node(by_text(&snapshot, "button", "Plain"))
+        .expect("plain button")
+        .rect();
+
+    assert!(
+        (padded.y + padded.height / 2.0 - (plain.y + plain.height / 2.0)).abs() < 0.01,
+        "items-center aligns both buttons on one line: padded={padded:?} plain={plain:?}"
+    );
+    let gap = plain.x - (padded.x + padded.width);
+    assert!((gap - 12.0).abs() < 0.5, "gap-3 leaves 12 points: {gap}");
+    assert!(
+        padded.width > plain.width + 4.0,
+        "px-4 widens the padded button: padded={padded:?} plain={plain:?}"
+    );
+    assert!(
+        padded.height > plain.height + 4.0,
+        "py-2 makes the padded button taller: padded={padded:?} plain={plain:?}"
+    );
+}
+
+#[test]
+fn flex_grow_and_justify_between_use_the_remaining_space() {
+    let mut app = Runtime::new();
+    app.mount(|| {
+        view! {
+            <view class="flex-row items-center justify-between">
+                <button class="flex-1">"Grow"</button>
+                <button>"Fixed"</button>
+            </view>
+        }
+    })
+    .expect("mount");
+    let snapshot = app.presentation().expect("snapshot");
+    let scene = build_scene(&snapshot, 400.0);
+    let grow = scene
+        .node(by_text(&snapshot, "button", "Grow"))
+        .expect("grow button")
+        .rect();
+    let fixed = scene
+        .node(by_text(&snapshot, "button", "Fixed"))
+        .expect("fixed button")
+        .rect();
+
+    assert!(
+        grow.width > fixed.width,
+        "flex-1 takes the free space: grow={grow:?} fixed={fixed:?}"
+    );
+    assert!(
+        (fixed.x + fixed.width - 400.0).abs() < 0.5,
+        "justify-between pins the last button to the row end: fixed={fixed:?}"
+    );
+}
+
+#[test]
+fn a_mismatched_style_declaration_is_an_explicit_error() {
+    const STYLE: &[StyleDeclaration] = &[StyleDeclaration::new(Property::Gap, StyleValue::Row)];
+    let mut app = Runtime::new();
+    app.open_window("main", |_| {
+        Ok(MountPlan::new(vec![zenui::view::styled_element(
+            "view",
+            Vec::new(),
+            STYLE,
+            Vec::new(),
+        )]))
+    })
+    .expect("window");
+    let snapshot = app.presentation().expect("snapshot");
+    let node = snapshot.roots()[0].id().expect("root element");
+    match Scene::build(&snapshot, viewport(800.0)) {
+        Err(SceneError::UnsupportedStyle {
+            node: failed,
+            property,
+            value,
+        }) => {
+            assert_eq!(failed, node);
+            assert_eq!((property, value), (Property::Gap, StyleValue::Row));
+        }
+        other => panic!("expected UnsupportedStyle, got {other:?}"),
+    }
+}
+
+#[test]
+fn class_padding_moves_the_text_origin_but_keeps_the_hit_area() {
+    let mut app = Runtime::new();
+    app.mount(|| view! { <text-input aria:label="padded" class="px-4" value="abc" /> })
+        .expect("mount");
+    app.focus("padded").expect("focus");
+    let snapshot = app.presentation().expect("snapshot");
+    let scene = build_scene(&snapshot, 400.0);
+    let id = snapshot.find_label("padded").expect("input").id();
+    let input = scene.node(id).expect("scene input");
+    let rect = input.rect();
+    let origin = rect.x + 1.0 + 16.0;
+    let caret = scene.caret(id).expect("caret");
+    assert!(
+        (caret.x - origin).abs() < 0.5,
+        "px-4 offsets the caret past border and padding: {caret:?} rect={rect:?}"
+    );
+    let glyph_x = input
+        .text()
+        .iter()
+        .flat_map(|run| run.glyphs())
+        .map(|glyph| glyph.x)
+        .fold(f32::INFINITY, f32::min);
+    assert!(
+        (glyph_x - origin).abs() < 1.0,
+        "the value starts after the padding: {glyph_x} vs {origin}"
+    );
+
+    let in_padding = Point::new(rect.x + 4.0, rect.y + rect.height / 2.0);
+    assert_eq!(
+        scene.hit_test(in_padding),
+        Some(id),
+        "the padded border box stays clickable"
+    );
+    assert_eq!(
+        input.caret_index(in_padding),
+        Some(0),
+        "a click in the left padding clamps to the value start"
+    );
+}
+
+#[test]
+fn full_width_spans_the_row() {
+    let mut app = Runtime::new();
+    app.mount(|| {
+        view! {
+            <view class="flex-row items-center">
+                <button class="w-full">"Wide"</button>
+            </view>
+        }
+    })
+    .expect("mount");
+    let snapshot = app.presentation().expect("snapshot");
+    let scene = build_scene(&snapshot, 400.0);
+    let wide = scene
+        .node(by_text(&snapshot, "button", "Wide"))
+        .expect("wide button")
+        .rect();
+
+    assert!(
+        (wide.width - 400.0).abs() < 0.5,
+        "w-full spans the row: {wide:?}"
     );
 }

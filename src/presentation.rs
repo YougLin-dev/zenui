@@ -1,5 +1,7 @@
 use std::fmt;
 
+use zenui_style::StyleDeclaration;
+
 /// Presentation snapshot 中一个已提交元素的稳定身份。
 ///
 /// Slot 在挂载时分配且不复用；generation 是这次元素挂载的序号。两者连同来源
@@ -127,6 +129,7 @@ pub struct SnapshotElement {
     pub(crate) id: NodeId,
     pub(crate) tag: &'static str,
     pub(crate) attrs: Vec<SnapshotAttr>,
+    pub(crate) styles: &'static [StyleDeclaration],
     pub(crate) edit: Option<TextEditState>,
     pub(crate) children: Vec<SnapshotNode>,
 }
@@ -144,6 +147,12 @@ impl SnapshotElement {
     /// checkbox 例外，其 `checked` 始终反映已提交的本地状态。
     pub fn attrs(&self) -> &[SnapshotAttr] {
         &self.attrs
+    }
+
+    /// 编译期 class 解析出的类型化样式声明，保持源码顺序。
+    /// 原始 `class` 字符串不会出现在属性或这里。
+    pub fn styles(&self) -> &[StyleDeclaration] {
+        self.styles
     }
 
     pub fn attr(&self, name: &str) -> Option<&SnapshotAttr> {

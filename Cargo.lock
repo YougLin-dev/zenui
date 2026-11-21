@@ -2415,6 +2415,7 @@ dependencies = [
  "zenui-core",
  "zenui-demo",
  "zenui-macro",
+ "zenui-style",
 ]
 
 [[package]]
@@ -2443,6 +2444,7 @@ dependencies = [
  "quote",
  "rstml",
  "syn 3.0.10",
+ "zenui-style",
 ]
 
 [[package]]
@@ -2457,7 +2459,12 @@ dependencies = [
  "wgpu",
  "zenui",
  "zenui-demo",
+ "zenui-style",
 ]
+
+[[package]]
+name = "zenui-style"
+version = "0.1.0"
 
 [[package]]
 name = "zenui-windows"

@@ -1,0 +1,5 @@
+error: duplicate class attribute
+ --> tests/compile_fail/duplicate_class.rs:4:65
+  |
+4 |     let _: MountResult<MountPlan> = view! { <button class="p-2" class="p-3">"Add"</button> };
+  |                                                                 ^^^^^
