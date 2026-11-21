@@ -725,7 +725,7 @@ fn delete_removes_a_native_row() {
     host.render().expect("render the initial frame");
     assert_eq!(checkbox_ids(&host).len(), 2);
 
-    let (delete, scale) = button_at(&host, 9);
+    let (_, delete, scale) = center_label(&host, MAIN, "Delete Write tests");
     post_click(&host, delete, scale);
     host.pump().expect("delete the first row");
     assert_eq!(
@@ -736,6 +736,72 @@ fn delete_removes_a_native_row() {
 
     post_close(&host);
     host.run().expect("process the close");
+}
+
+#[test]
+fn the_details_action_opens_the_shared_second_window() {
+    let mut host = open_host();
+    host.render().expect("render the primary window");
+    let (_, point, scale) = center_label(&host, MAIN, "Open details");
+    post_click(&host, point, scale);
+    assert!(!host.pump().expect("open the details window"));
+    assert_ne!(
+        host.hwnd(zenui_demo::DETAILS_WINDOW)
+            .expect("a details HWND"),
+        host.hwnd(MAIN).expect("the primary HWND")
+    );
+
+    let details = host
+        .presentation(zenui_demo::DETAILS_WINDOW)
+        .expect("the details snapshot");
+    assert!(
+        details
+            .elements()
+            .any(|element| element.text() == "1 remaining"),
+        "details follows the shared remaining count"
+    );
+    assert!(
+        details
+            .elements()
+            .any(|element| element.text() == "Read docs"),
+        "details shows the shared rows"
+    );
+
+    // 详情窗口有自己的焦点和 caret；输入不会落到主窗口的草稿。
+    let (_, note_point, note_scale) =
+        center_label(&host, zenui_demo::DETAILS_WINDOW, "Details note");
+    post_click_in(&host, zenui_demo::DETAILS_WINDOW, note_point, note_scale);
+    post_char_in(&host, zenui_demo::DETAILS_WINDOW, 'N');
+    assert!(!host.pump().expect("edit the details note"));
+    assert_eq!(
+        host.presentation(zenui_demo::DETAILS_WINDOW)
+            .expect("the details snapshot")
+            .find_label("Details note")
+            .expect("the note input")
+            .text_value(),
+        Some("N")
+    );
+    assert_eq!(
+        host.presentation(MAIN)
+            .expect("the primary snapshot")
+            .find_label("What needs to be done?")
+            .expect("the main draft")
+            .text_value(),
+        Some(""),
+        "typing in details leaves the main draft alone"
+    );
+
+    // 关闭详情只销毁该窗口；主窗口与消息循环继续。
+    let (_, close_point, close_scale) =
+        center_label(&host, zenui_demo::DETAILS_WINDOW, "Close details");
+    post_click_in(&host, zenui_demo::DETAILS_WINDOW, close_point, close_scale);
+    assert!(!host.pump().expect("close the details window"));
+    assert!(host.hwnd(zenui_demo::DETAILS_WINDOW).is_none());
+    assert!(host.scene(zenui_demo::DETAILS_WINDOW).is_none());
+    assert!(host.hwnd(MAIN).is_some());
+
+    post_close(&host);
+    host.run().expect("the last window closes the loop");
 }
 
 #[test]
@@ -1205,6 +1271,17 @@ fn center_in(
         Point::new(rect.x + rect.width / 2.0, rect.y + rect.height / 2.0),
         scene.viewport().scale(),
     )
+}
+
+/// 按 `aria:label` 定位窗口内元素并取盒中心；标签变化不会移动其他按钮的序号。
+fn center_label(host: &Host, key: &str, label: &str) -> (NodeId, Point, f32) {
+    let id = host
+        .presentation(key)
+        .expect("a window snapshot")
+        .find_label(label)
+        .expect("a labelled element")
+        .id();
+    center_in(host, key, |element| element.id() == id)
 }
 
 fn input_glyphs(host: &Host, key: &str) -> usize {

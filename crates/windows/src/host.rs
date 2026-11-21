@@ -31,9 +31,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GWLP_USERDATA, GetClientRect, GetForegroundWindow, GetMessageW,
     GetWindowLongPtrW, IDC_ARROW, IsIconic, IsZoomed, KillTimer, LoadCursorW, MSG, PM_REMOVE,
     PeekMessageW, PostMessageW, RegisterClassExW, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOZORDER, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage,
-    WINDOW_EX_STYLE, WM_APP, WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_DPICHANGED,
-    WM_GETDPISCALEDSIZE, WM_IME_CHAR, WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION,
+    SWP_NOZORDER, SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+    TranslateMessage, WINDOW_EX_STYLE, WM_APP, WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE, WM_DESTROY,
+    WM_DPICHANGED, WM_GETDPISCALEDSIZE, WM_IME_CHAR, WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION,
     WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
     WM_PAINT, WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
 };
@@ -374,35 +374,47 @@ impl Host {
         self.windows.get(key)?.scene.as_ref()
     }
 
+    /// 指定窗口当前已提交的呈现描述；嵌入方与测试可据此按 Node ID 或标签定位。
+    ///
+    /// 场景几何与 `scene(key)` 使用同一份快照；隐藏窗口和已关闭窗口返回错误。
+    pub fn presentation(&self, key: &str) -> Result<PresentationSnapshot, HostError> {
+        let ctx = self.window_ctx(key)?;
+        self.runtime
+            .presentation_of(ctx)
+            .map_err(HostError::Snapshot)
+    }
+
+    fn window_ctx(&self, key: &str) -> Result<WindowCtx, HostError> {
+        self.windows
+            .get(key)
+            .map(|window| window.ctx)
+            .ok_or_else(|| HostError::UnknownWindow(key.to_owned()))
+    }
+
     /// 显示目录窗口：未打开时挂载并创建 HWND；已打开时聚焦或从隐藏恢复。
     pub fn show(&mut self, key: &'static str) -> Result<WindowCtx, HostError> {
         let window = self.runtime.show(key).map_err(HostError::Open)?;
         self.sync_windows()?;
+        self.focus_native_focused_window()?;
         self.repaint_changed_windows()?;
         Ok(window)
     }
 
     /// 隐藏窗口：保留 activation 与本地状态，只隐藏原生窗口并停止输入/呈现。
     pub fn hide(&mut self, key: &str) -> Result<(), HostError> {
-        let ctx = self
-            .windows
-            .get(key)
-            .map(|window| window.ctx)
-            .ok_or_else(|| HostError::UnknownWindow(key.to_owned()))?;
+        let ctx = self.window_ctx(key)?;
         self.runtime.hide(ctx).map_err(HostError::Close)?;
         self.sync_windows()?;
+        self.focus_native_focused_window()?;
         self.repaint_changed_windows()
     }
 
     /// 关闭窗口并释放它的 activation；其他窗口不受影响。
     pub fn close(&mut self, key: &str) -> Result<(), HostError> {
-        let ctx = self
-            .windows
-            .get(key)
-            .map(|window| window.ctx)
-            .ok_or_else(|| HostError::UnknownWindow(key.to_owned()))?;
+        let ctx = self.window_ctx(key)?;
         self.runtime.close_window(ctx).map_err(HostError::Close)?;
         self.sync_windows()?;
+        self.focus_native_focused_window()?;
         self.repaint_changed_windows()
     }
 
@@ -463,9 +475,64 @@ impl Host {
         if let Err(error) = result {
             self.deferred_error.get_or_insert(error);
         }
+        if let Err(error) = self.settle_window_requests() {
+            self.deferred_error.get_or_insert(error);
+        }
         if let Err(error) = self.repaint_changed_windows() {
             self.deferred_error.get_or_insert(error);
         }
+    }
+
+    /// 结算运行时队列里的窗口请求；有动作生效时把原生前台切到焦点窗口。
+    ///
+    /// 隐藏模式从不显示原生窗口，不抢前台；系统前台策略拒绝时忽略错误，
+    /// 运行时焦点与输入路由不受影响。
+    fn settle_window_requests(&mut self) -> Result<(), HostError> {
+        match self.runtime.apply_window_requests() {
+            Ok(0) => Ok(()),
+            Ok(_) => self.focus_native_focused_window(),
+            Err(error) => Err(HostError::WindowState(error)),
+        }
+    }
+
+    /// 把运行时焦点窗口置前；只在应用已经持有前台时重定向，绝不从其它进程抢焦点。
+    ///
+    /// 隐藏模式或目标窗口已关闭时什么也不做。`SetForegroundWindow` 会同步派发
+    /// 焦点消息；调用期间禁止路由，避免重入正被借出的宿主。被抑制的
+    /// `WM_KILLFOCUS` 由这里显式结算，否则旧窗口的按下瞬态与 IME 组合会残留。
+    fn focus_native_focused_window(&mut self) -> Result<(), HostError> {
+        // 安全：只读取前台窗口句柄用于比较。
+        let previous = unsafe { GetForegroundWindow() };
+        if self.key_for(previous).is_none() {
+            return Ok(());
+        }
+        let Some(key) = self.runtime.focused_window().map(|window| window.key()) else {
+            return Ok(());
+        };
+        let Some(window) = self.windows.get(key) else {
+            return Ok(());
+        };
+        if !window.native.shown || window.close_requested {
+            return Ok(());
+        }
+        let hwnd = window.hwnd();
+        self.without_routing(None, |_| unsafe {
+            let _ = SetForegroundWindow(hwnd);
+        });
+        if previous == hwnd {
+            return Ok(());
+        }
+        let Some(previous_key) = self.key_for(previous) else {
+            return Ok(());
+        };
+        let losing = self
+            .windows
+            .get(previous_key)
+            .map(|window| (window.ctx, window.close_requested));
+        if losing.is_none_or(|(ctx, closing)| closing || !self.runtime.window_visible(ctx)) {
+            return Ok(());
+        }
+        self.with_window(previous_key, |host, window| host.focus_lost(window))
     }
 
     /// 一条指向某个窗口的消息；调用方已按 HWND 路由。
@@ -574,6 +641,8 @@ impl Host {
     fn deliver_tasks(&mut self) -> Result<(), HostError> {
         self.wake.observed();
         let report = self.runtime.drive_tasks().map_err(HostError::Runtime)?;
+        // 交付期的 continuation 也可以打开、隐藏或关闭窗口。
+        self.settle_window_requests()?;
         if report.delivered == 0 {
             return Ok(());
         }
@@ -3799,6 +3868,57 @@ mod tests {
             .id();
         assert_eq!(ancestor_form(&snapshot, inside), Some(form));
         assert_eq!(ancestor_form(&snapshot, outside), None);
+    }
+
+    #[test]
+    fn a_task_continuation_can_open_a_window_through_the_host() {
+        let mut runtime = Runtime::new();
+        runtime
+            .declare_windows(|catalog| {
+                catalog.window(WindowSpec::new("main").primary(), |window| {
+                    view! {
+                        <button
+                            aria:label="later"
+                            on:click={move || {
+                                let task = window
+                                    .task_scope()
+                                    .spawn(|_| String::from("ready"))
+                                    .expect("spawn the task");
+                                task.on_done(move |_| {
+                                    window.request_show("details").expect("queue the show");
+                                    Ok(())
+                                })
+                                .expect("register the continuation");
+                            }}
+                        >"Later"</button>
+                    }
+                })?;
+                catalog.window(
+                    WindowSpec::new("details"),
+                    |_| view! { <text>"details"</text> },
+                )?;
+                Ok(())
+            })
+            .expect("catalog");
+        let mut host = Host::open(runtime, HostConfig::hidden()).expect("open the host");
+        host.render().expect("render the primary window");
+
+        host.runtime.click_label("later").expect("start the task");
+        host.runtime.wait_for_tasks();
+        // 只有宿主级唤醒消息会进入 deliver_tasks；任务交付后的窗口请求在那里结算。
+        send_msg(
+            &mut host,
+            MSG {
+                message: HOST_WAKE_MESSAGE,
+                ..Default::default()
+            },
+        );
+        assert!(host.hwnd(MAIN).is_some());
+        assert!(
+            host.hwnd("details").is_some(),
+            "a delivery-time request creates the native window"
+        );
+        assert!(host.scene("details").is_some(), "the new window paints");
     }
 
     #[test]

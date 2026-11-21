@@ -75,6 +75,8 @@ fn a_mounted_todo_exposes_committed_elements_text_attributes_and_order() {
             ("-", "Preview import"),
             ("button", "Theme"),
             ("-", "Theme"),
+            ("button", "Details"),
+            ("-", "Details"),
             ("text", "Nothing here yet"),
             ("-", "Nothing here yet"),
         ]),

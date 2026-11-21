@@ -24,6 +24,10 @@ _Avoid_: main window (when meaning the catalog flag)
 保持 activation、树、焦点与本地编辑状态，但不接收输入、不呈现的窗口；show 恢复同一 activation。
 _Avoid_: closed window, minimized window (when meaning runtime visibility)
 
+**Window request**:
+UI 处理器通过 `WindowCtx` 排队的 show/hide/close 生命周期动作；在事件或交付结算后由 `Runtime::apply_window_requests` 执行，来源 activation 关闭后失效。
+_Avoid_: window command, deferred window event
+
 **Host**:
 拥有原生窗口、事件循环、DPI 与 surface，并驱动 target runtime 的平台层。
 _Avoid_: platform backend, shell

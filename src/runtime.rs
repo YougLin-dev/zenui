@@ -22,7 +22,8 @@ use crate::view::{
     PlanNode, ResultBoolValue, StyleSlot, SubmitEvent, TextSlot,
 };
 use crate::window::{
-    CatalogEntry, CatalogError, WindowCatalog, WindowCtx, WindowError, WindowInfo, WindowRecord,
+    CatalogEntry, CatalogError, WindowAction, WindowCatalog, WindowCtx, WindowError, WindowInfo,
+    WindowRecord, WindowRequest,
 };
 
 const HIDDEN_TARGET: &str = "target window is hidden";
@@ -84,6 +85,8 @@ pub(crate) struct State {
     catalog_declared: bool,
     focused_window: Option<&'static str>,
     windows: BTreeMap<&'static str, WindowRecord>,
+    /// UI 处理期排队、在事件/交付结算后执行的窗口生命周期请求。
+    window_requests: Vec<WindowRequest>,
     /// 窗口打开/关闭/隐藏/显示时递增；原生宿主据此跳过无变化的扫描。
     window_revision: u64,
     pub(crate) tasks: BTreeMap<u32, TaskRecord>,
@@ -156,6 +159,7 @@ impl State {
             catalog_declared: false,
             focused_window: None,
             windows: BTreeMap::new(),
+            window_requests: Vec::new(),
             window_revision: 0,
             tasks: BTreeMap::new(),
             next_task: 1,
@@ -477,6 +481,28 @@ impl State {
             record.visible = false;
             self.bump_window_revision();
         }
+    }
+
+    /// 记录 UI 处理期的窗口请求；只允许来自仍存活窗口的 Event/Delivery 处理器。
+    pub(crate) fn queue_window_request(
+        &mut self,
+        request: WindowRequest,
+    ) -> Result<(), WindowError> {
+        if !matches!(self.phase, Phase::Event | Phase::Delivery) {
+            return Err(WindowError::State(
+                "window requests are only available during event or delivery handlers",
+            ));
+        }
+        if !self.window_live_in_tree(request.from) {
+            return Err(WindowError::Stale);
+        }
+        if let WindowAction::Show(key) = request.action
+            && !self.catalog.contains_key(key)
+        {
+            return Err(WindowError::UnknownWindow(key));
+        }
+        self.window_requests.push(request);
+        Ok(())
     }
 
     /// 正常关闭只取消窗口所有权交付；app 所有权任务按声明继续存活。
@@ -1354,6 +1380,43 @@ impl Runtime {
             });
             Ok(())
         })
+    }
+
+    /// 结算 UI 处理器排队、尚未执行的窗口生命周期请求，返回已应用的数量。
+    ///
+    /// 原生宿主在每条输入消息与每次任务交付后自动调用；headless 驱动在
+    /// 派发事件后调用。来源窗口在结算前关闭时请求被静默丢弃；其余错误
+    /// 继续应用后续请求，再返回第一个错误。结算只挂载、聚焦或释放窗口，
+    /// 不派发用户事件，因此不会在结算期间产生新的请求。
+    pub fn apply_window_requests(&mut self) -> Result<usize, WindowError> {
+        let requests = std::mem::take(&mut self.state.borrow_mut().window_requests);
+        let mut applied = 0;
+        let mut first_error = None;
+        for request in requests {
+            match self.apply_window_request(request) {
+                Ok(()) => applied += 1,
+                Err(WindowError::Stale) => {}
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(applied),
+        }
+    }
+
+    fn apply_window_request(&mut self, request: WindowRequest) -> Result<(), WindowError> {
+        let source_live = self.state.borrow().window_live_in_tree(request.from);
+        if !source_live {
+            return Err(WindowError::Stale);
+        }
+        match request.action {
+            WindowAction::Show(key) => self.show(key).map(|_| ()),
+            WindowAction::Hide => self.hide(request.from),
+            WindowAction::Close => self.close_window(request.from),
+        }
     }
 
     pub fn window_alive(&self, window: WindowCtx) -> bool {

@@ -8,9 +8,18 @@
 
 use zenui::prelude::*;
 
-fn report(result: Result<(), TaskError>, error: Signal<String>) {
+fn report(result: Result<(), impl std::fmt::Display>, error: Signal<String>) {
     if let Err(failure) = result {
         error.set(failure.to_string());
+    }
+}
+
+/// 过滤条件在界面上的标签；主窗口按钮与 Details 摘要共用同一份词表。
+const fn filter_label(filter: Filter) -> &'static str {
+    match filter {
+        Filter::All => "All",
+        Filter::Active => "Active",
+        Filter::Completed => "Done",
     }
 }
 
@@ -128,22 +137,34 @@ impl TodoState {
     }
 }
 
-/// 创建应用级 Todo 状态、声明单窗口目录并打开主窗口。
+/// 主 Todo 窗口的目录键；工具栏的 Details 动作打开名为 `details` 的附属窗口。
+const MAIN_WINDOW: &str = "main";
+/// 共享 Todo 模型的摘要窗口目录键；由主窗口工具栏按需打开或聚焦。
+pub const DETAILS_WINDOW: &str = "details";
+
+/// 创建应用级 Todo 状态、声明窗口目录并打开主窗口。
 ///
 /// 状态必须先于窗口 factory 运行创建，因此本函数内部先运行 `Runtime::setup`，
-/// 再把共享状态交给目录 factory。桌面宿主与 headless 示例共用这个入口。
+/// 再把共享状态交给两个窗口的 factory。Details 窗口只在被请求时挂载；桌面
+/// 宿主与 headless 示例共用这个入口。
 pub fn open_todo_window(runtime: &mut Runtime) -> Result<WindowCtx, WindowError> {
     let state = runtime.setup(TodoState::new)?;
     runtime.declare_windows(move |catalog| {
         catalog.window(
-            WindowSpec::new("main")
+            WindowSpec::new(MAIN_WINDOW)
                 .primary()
                 .titled("ZenUI Todo")
                 .sized(900, 700),
             move |window| view! { <TodoApp window=window state=state /> },
+        )?;
+        catalog.window(
+            WindowSpec::new(DETAILS_WINDOW)
+                .titled("ZenUI Details")
+                .sized(520, 420),
+            move |window| view! { <TodoDetails window=window state=state /> },
         )
     })?;
-    runtime.show("main")
+    runtime.show(MAIN_WINDOW)
 }
 
 #[component]
@@ -234,9 +255,21 @@ pub fn TodoApp(window: WindowCtx, state: TodoState) -> MountResult<MountPlan> {
                 >"Add"</button>
             </form>
             <view role="group" aria:label="Filter">
-                <FilterButton current={filter} value={Filter::All} label="All" />
-                <FilterButton current={filter} value={Filter::Active} label="Active" />
-                <FilterButton current={filter} value={Filter::Completed} label="Done" />
+                <FilterButton
+                    current={filter}
+                    value={Filter::All}
+                    label={filter_label(Filter::All)}
+                />
+                <FilterButton
+                    current={filter}
+                    value={Filter::Active}
+                    label={filter_label(Filter::Active)}
+                />
+                <FilterButton
+                    current={filter}
+                    value={Filter::Completed}
+                    label={filter_label(Filter::Completed)}
+                />
             </view>
             <view role="toolbar" class="gap-3">
                 <button on:click={move || reverse()}>"Reverse"</button>
@@ -252,6 +285,10 @@ pub fn TodoApp(window: WindowCtx, state: TodoState) -> MountResult<MountPlan> {
                         let _ = window.set_appearance(next);
                     }}
                 >"Theme"</button>
+                <button
+                    aria:label="Open details"
+                    on:click={move || report(window.request_show(DETAILS_WINDOW), task_error)}
+                >"Details"</button>
             </view>
             <Show when={has_error}>
                 <text>{task_error}</text>
@@ -268,6 +305,81 @@ pub fn TodoApp(window: WindowCtx, state: TodoState) -> MountResult<MountPlan> {
             <For each={visible} key={|id: TodoId| id}>
                 {move |todo: TodoId| view! { <TodoItem todo={todo} todos={todos} /> }}
             </For>
+        </view>
+    }
+}
+
+/// Details 的一行：只读呈现共享标题。
+///
+/// 与 `TodoItem` 一样在挂载时读取行字段；失效读取沿 `?` 传播，不以空串
+/// 伪装成功。剩余数量、过滤结果与行集合仍由 Memo 实时刷新。
+#[component]
+fn TodoDetailRow(todo: TodoId, todos: Store) -> MountResult<MountPlan> {
+    let title = todos.title(todo).read_once()?;
+
+    view! {
+        <view role="listitem" class="flex-row items-center gap-3">
+            <text>{once(title)}</text>
+        </view>
+    }
+}
+
+/// 与主窗口共享 TodoState 的摘要窗口。
+///
+/// remaining 与过滤结果随共享模型实时刷新；本地 note 输入保留这个窗口
+/// 自己的焦点、caret 与草稿，与主窗口的编辑状态互不影响。
+#[component]
+pub fn TodoDetails(window: WindowCtx, state: TodoState) -> MountResult<MountPlan> {
+    let TodoState {
+        todos,
+        filter,
+        remaining_txt,
+        no_tasks,
+        no_matches,
+        task_error,
+        has_error,
+        ..
+    } = state;
+    let visible = memo(move || todos.rows(filter.get()));
+    let filter_text = memo(move || filter_label(filter.get()).to_owned());
+    let note = signal(String::new());
+
+    view! {
+        <view role="main" class="p-4 gap-3">
+            <text class="text-sm dark:text-muted">{remaining_txt}</text>
+            <text class="font-semibold" aria:label="Details filter">{filter_text}</text>
+            <text-input
+                class="focus-visible:border-accent"
+                value={note}
+                aria:label="Details note"
+                on:input={move |value: String| note.set(value)}
+            />
+            <view role="list" aria:label="Details rows" class="gap-3">
+                <For each={visible} key={|id: TodoId| id}>
+                    {move |todo: TodoId| view! { <TodoDetailRow todo={todo} todos={todos} /> }}
+                </For>
+            </view>
+            <Show when={no_tasks}>
+                <text>"Nothing here yet"</text>
+            </Show>
+            <Show when={no_matches}>
+                <text>"Nothing matches"</text>
+            </Show>
+            <Show when={has_error}>
+                <text>{task_error}</text>
+            </Show>
+            <view role="toolbar" class="gap-3">
+                <button
+                    class="px-3 py-1 rounded-sm bg-control hover:bg-control-hover"
+                    aria:label="Hide details"
+                    on:click={move || report(window.request_hide(), task_error)}
+                >"Hide"</button>
+                <button
+                    class="px-3 py-1 rounded-sm bg-danger text-inverse"
+                    aria:label="Close details"
+                    on:click={move || report(window.request_close(), task_error)}
+                >"Close"</button>
+            </view>
         </view>
     }
 }
