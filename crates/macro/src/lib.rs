@@ -92,20 +92,34 @@ fn lower_intrinsic(
 ) -> syn::Result<TokenStream> {
     let mut attributes = Vec::new();
     let mut styles = Vec::new();
+    let mut inline_styles = Vec::new();
     let mut class_seen = false;
+    let mut style_names = Vec::new();
     for attribute in element.attributes() {
-        if let NodeAttribute::Attribute(attribute) = attribute
-            && attribute.key.to_string() == "class"
-        {
-            if class_seen {
-                return Err(syn::Error::new_spanned(
-                    &attribute.key,
-                    "duplicate class attribute",
-                ));
+        if let NodeAttribute::Attribute(attribute) = attribute {
+            let key = attribute.key.to_string();
+            if key == "class" {
+                if class_seen {
+                    return Err(syn::Error::new_spanned(
+                        &attribute.key,
+                        "duplicate class attribute",
+                    ));
+                }
+                class_seen = true;
+                styles = lower_class(attribute)?;
+                continue;
             }
-            class_seen = true;
-            styles = lower_class(attribute)?;
-            continue;
+            if key.starts_with("style:") {
+                if style_names.contains(&key) {
+                    return Err(syn::Error::new_spanned(
+                        &attribute.key,
+                        format!("duplicate style attribute `{key}`"),
+                    ));
+                }
+                style_names.push(key.clone());
+                inline_styles.push(lower_style(&key, attribute)?);
+                continue;
+            }
         }
         attributes.push(lower_attribute(attribute)?);
     }
@@ -114,7 +128,7 @@ fn lower_intrinsic(
         .iter()
         .map(lower_node)
         .collect::<syn::Result<Vec<_>>>()?;
-    if styles.is_empty() {
+    if styles.is_empty() && inline_styles.is_empty() {
         return Ok(quote! {
             ::zenui::view::element(
                 #tag,
@@ -129,9 +143,43 @@ fn lower_intrinsic(
             #tag,
             ::std::vec![#(#attributes),*],
             const { &[#(#declarations),*] },
+            ::std::vec![#(#inline_styles),*],
             ::std::vec![#(#children),*],
         )
     })
+}
+
+/// 把 `style:<property>` 降到对应的类型化构造器；属性名在展开期校验。
+fn lower_style(key: &str, attribute: &rstml::node::KeyedAttribute) -> syn::Result<TokenStream> {
+    let constructor = match key {
+        "style:background" => quote! { style_background },
+        "style:color" => quote! { style_color },
+        "style:border-color" => quote! { style_border_color },
+        "style:opacity" => quote! { style_opacity },
+        "style:width" => quote! { style_width },
+        other => {
+            return Err(syn::Error::new_spanned(
+                &attribute.key,
+                format!("unsupported style property `{other}`"),
+            ));
+        }
+    };
+    let expression = unbraced(expression(attribute)?);
+    Ok(quote_spanned! {expression.span()=>
+        ::zenui::view::#constructor(#expression)
+    })
+}
+
+/// `style:width={value}` 的块表达式只包一层；直接传递内层表达式，
+/// 避免生成代码触发 `unused_braces`。
+fn unbraced(expression: &Expr) -> &Expr {
+    if let Expr::Block(block) = expression
+        && let [syn::Stmt::Expr(inner, None)] = block.block.stmts.as_slice()
+    {
+        inner
+    } else {
+        expression
+    }
 }
 
 /// 把 `class="..."` 字面量解析成类型化声明；不是字面量时给出定位到表达式的错误。
@@ -219,9 +267,28 @@ fn style_value_tokens(value: StyleValue) -> TokenStream {
             let color = color_tokens(color);
             quote! { ::zenui::style::StyleValue::Color(#color) }
         }
+        StyleValue::Length(length) => {
+            let fixed = length.fixed();
+            let unit = length_unit_tokens(length.unit());
+            quote! {
+                ::zenui::style::StyleValue::Length(
+                    ::zenui::style::Length::from_fixed(
+                        #fixed,
+                        ::zenui::style::LengthUnit::#unit,
+                    )
+                )
+            }
+        }
         StyleValue::Opacity(percent) => {
             quote! { ::zenui::style::StyleValue::Opacity(#percent) }
         }
+    }
+}
+
+fn length_unit_tokens(unit: zenui_style::LengthUnit) -> TokenStream {
+    match unit {
+        zenui_style::LengthUnit::Points => quote! { Points },
+        zenui_style::LengthUnit::Em => quote! { Em },
     }
 }
 

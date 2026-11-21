@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::fmt;
 
 use zenui_style::StyleDeclaration;
@@ -129,7 +130,7 @@ pub struct SnapshotElement {
     pub(crate) id: NodeId,
     pub(crate) tag: &'static str,
     pub(crate) attrs: Vec<SnapshotAttr>,
-    pub(crate) styles: &'static [StyleDeclaration],
+    pub(crate) styles: Cow<'static, [StyleDeclaration]>,
     pub(crate) edit: Option<TextEditState>,
     pub(crate) children: Vec<SnapshotNode>,
 }
@@ -149,10 +150,10 @@ impl SnapshotElement {
         &self.attrs
     }
 
-    /// 编译期 class 解析出的类型化样式声明，保持源码顺序。
-    /// 原始 `class` 字符串不会出现在属性或这里。
+    /// 类型化样式声明：class 声明保持源码顺序，inline 声明附加在其后，
+    /// 由 `origin` 区分。原始 `class` 字符串不会出现在属性或这里。
     pub fn styles(&self) -> &[StyleDeclaration] {
-        self.styles
+        &self.styles
     }
 
     pub fn attr(&self, name: &str) -> Option<&SnapshotAttr> {

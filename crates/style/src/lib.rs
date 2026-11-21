@@ -24,7 +24,7 @@ pub enum Property {
 
 impl Property {
     /// 绘制属性不参与布局；状态变体只允许设置这些属性。
-    const fn is_paint(self) -> bool {
+    pub const fn is_paint(self) -> bool {
         matches!(
             self,
             Self::Background
@@ -94,6 +94,98 @@ pub enum Color {
     Literal([u8; 4]),
 }
 
+/// 动态长度的单位。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum LengthUnit {
+    Points,
+    Em,
+}
+
+/// 动态长度；以 1/64 逻辑点定点存储，快照不出现 `f32`。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Length {
+    value: i32,
+    unit: LengthUnit,
+}
+
+impl Length {
+    /// 逻辑点。
+    pub fn px(value: f32) -> Self {
+        Self::scaled(value, LengthUnit::Points)
+    }
+
+    /// 相对元素字号的倍数。
+    pub fn em(value: f32) -> Self {
+        Self::scaled(value, LengthUnit::Em)
+    }
+
+    fn scaled(value: f32, unit: LengthUnit) -> Self {
+        let fixed = if value.is_finite() {
+            (value * 64.0).round() as i32
+        } else {
+            0
+        };
+        Self::from_fixed(fixed, unit)
+    }
+
+    /// 用 1/64 逻辑点定点值构造，生成的代码与快照共用这个表示。
+    pub const fn from_fixed(value: i32, unit: LengthUnit) -> Self {
+        Self { value, unit }
+    }
+
+    /// 1/64 逻辑点定点值。
+    pub const fn fixed(self) -> i32 {
+        self.value
+    }
+
+    /// 该长度的单位。
+    pub const fn unit(self) -> LengthUnit {
+        self.unit
+    }
+
+    /// 解析成逻辑点；`em` 按给定字号换算。
+    pub fn resolve(self, font_size: f32) -> f32 {
+        let points = self.value as f32 / 64.0;
+        match self.unit {
+            LengthUnit::Points => points,
+            LengthUnit::Em => points * font_size,
+        }
+    }
+}
+
+/// 动态不透明度，百分比 0–100。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Opacity(u8);
+
+impl Opacity {
+    /// 百分比形式的取值；超过 100 的输入夹到全不透明。
+    pub const fn percent(percent: u8) -> Self {
+        Self(if percent > 100 { 100 } else { percent })
+    }
+
+    /// 百分比数值。
+    pub const fn value(self) -> u8 {
+        self.0
+    }
+}
+
+/// 逻辑点长度。
+pub fn px(value: f32) -> Length {
+    Length::px(value)
+}
+
+/// 相对元素字号的长度。
+pub fn em(value: f32) -> Length {
+    Length::em(value)
+}
+
+/// 一条声明来自 class 还是 inline `style:` 属性。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum StyleOrigin {
+    Class,
+    Inline,
+}
+
 /// 属性的类型化取值。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum StyleValue {
@@ -106,6 +198,8 @@ pub enum StyleValue {
     FullWidth,
     Grow,
     Color(Color),
+    /// 动态长度。
+    Length(Length),
     /// 不透明度百分比（0–100）。
     Opacity(u8),
 }
@@ -116,15 +210,27 @@ pub struct StyleDeclaration {
     property: Property,
     value: StyleValue,
     condition: Condition,
+    origin: StyleOrigin,
 }
 
 impl StyleDeclaration {
-    /// 组合一个属性、它的类型化取值与生效条件。
+    /// 组合一个 class 属性、它的类型化取值与生效条件。
     pub const fn new(property: Property, value: StyleValue, condition: Condition) -> Self {
         Self {
             property,
             value,
             condition,
+            origin: StyleOrigin::Class,
+        }
+    }
+
+    /// 一条 inline `style:` 声明；它总是覆盖同属性的 class 声明。
+    pub const fn inline(property: Property, value: StyleValue) -> Self {
+        Self {
+            property,
+            value,
+            condition: Condition::Base,
+            origin: StyleOrigin::Inline,
         }
     }
 
@@ -141,6 +247,11 @@ impl StyleDeclaration {
     /// 这条声明生效所需的控件状态。
     pub const fn condition(self) -> Condition {
         self.condition
+    }
+
+    /// 这条声明来自 class 还是 inline 属性。
+    pub const fn origin(self) -> StyleOrigin {
+        self.origin
     }
 }
 
@@ -466,6 +577,32 @@ mod tests {
         );
         let unknown = parse_class_literal("pressed:bg-accent").expect_err("unknown");
         assert_eq!(unknown[0].message(), "unknown class condition");
+    }
+
+    #[test]
+    fn dynamic_lengths_are_fixed_point_and_resolve_against_the_font_size() {
+        assert!((px(12.5).resolve(14.0) - 12.5).abs() < 0.01);
+        assert!((em(2.0).resolve(14.0) - 28.0).abs() < 0.01);
+        assert_eq!(px(1.0).unit(), LengthUnit::Points);
+        assert_eq!(em(1.0).unit(), LengthUnit::Em);
+        assert_eq!(Opacity::percent(50).value(), 50);
+        assert_eq!(Opacity::percent(150).value(), 100, "opacity clamps to 100");
+        assert_eq!(
+            px(f32::NAN).resolve(14.0),
+            0.0,
+            "a non-finite length degrades to zero instead of trapping"
+        );
+    }
+
+    #[test]
+    fn inline_declarations_carry_the_inline_origin() {
+        let inline = StyleDeclaration::inline(Property::Background, role(ColorRole::Accent));
+        assert_eq!(inline.origin(), StyleOrigin::Inline);
+        assert_eq!(inline.condition(), Condition::Base);
+        assert_eq!(
+            declaration(Property::Background, role(ColorRole::Accent)).origin(),
+            StyleOrigin::Class
+        );
     }
 
     #[test]

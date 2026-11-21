@@ -35,6 +35,13 @@ pub fn FilterButton(
 pub fn TodoItem(todo: TodoId, todos: Store) -> MountResult<MountPlan> {
     let title = todos.title(todo).read_once()?;
     let completed = memo(move || todos.completed(todo).get());
+    let tint = memo(move || {
+        if completed.get().is_ok_and(|done| done) {
+            Color::Role(ColorRole::TextMuted)
+        } else {
+            Color::Role(ColorRole::TextDefault)
+        }
+    });
     let editing = signal(String::new());
     let complete_label = format!("Complete {title}");
     let edit_label = format!("Edit {title}");
@@ -51,7 +58,7 @@ pub fn TodoItem(todo: TodoId, todos: Store) -> MountResult<MountPlan> {
                         .finish();
                 }}
             />
-            <text>{once(title.clone())}</text>
+            <text style:color={tint}>{once(title.clone())}</text>
             <text-input
                 value={editing}
                 aria:label={once(edit_label)}

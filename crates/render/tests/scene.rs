@@ -880,6 +880,7 @@ fn literal_colors_bypass_the_palette() {
             Vec::new(),
             STYLE,
             Vec::new(),
+            Vec::new(),
         )]))
     })
     .expect("window");
@@ -1021,6 +1022,92 @@ fn the_demo_filters_show_their_selected_style_and_still_filter() {
 }
 
 #[test]
+fn inline_styles_beat_class_base_and_state_variants() {
+    let mut app = Runtime::new();
+    app.mount(|| {
+        view! {
+            <button
+                aria:label="styled"
+                disabled={true}
+                class="bg-control disabled:bg-danger"
+                style:background={Color::Role(ColorRole::Accent)}
+                style:opacity={Opacity::percent(75)}
+            >"Styled"</button>
+        }
+    })
+    .expect("mount");
+    let snapshot = app.presentation().expect("snapshot");
+    let scene = build_scene(&snapshot, 400.0);
+    let style = scene
+        .node(snapshot.find_label("styled").expect("button").id())
+        .expect("button")
+        .resolved_style();
+    assert_eq!(
+        style.background(),
+        Some(Color::Role(ColorRole::Accent)),
+        "an inline declaration beats a higher-rank class variant"
+    );
+    assert_eq!(style.opacity(), 0.75, "inline opacity resolves in place");
+}
+
+#[test]
+fn px_and_em_widths_produce_expected_geometry() {
+    let mut app = Runtime::new();
+    app.mount(|| {
+        view! {
+            <view class="flex-row">
+                <view aria:label="px" style:width={px(100.0)} />
+                <view aria:label="em" style:width={em(2.0)} />
+            </view>
+        }
+    })
+    .expect("mount");
+    let snapshot = app.presentation().expect("snapshot");
+    let scene = build_scene(&snapshot, 400.0);
+    let width = |label: &str| {
+        scene
+            .node(snapshot.find_label(label).expect(label).id())
+            .expect(label)
+            .rect()
+            .width
+    };
+    assert!((width("px") - 100.0).abs() < 0.01, "px is logical points");
+    assert!(
+        (width("em") - 28.0).abs() < 0.01,
+        "em resolves against the 14-point font size"
+    );
+}
+
+#[test]
+fn the_demo_completed_row_text_follows_a_memo_driven_style() {
+    let mut app = runtime();
+    add(&mut app, "A");
+    let snapshot = app.presentation().expect("snapshot");
+    let scene = build_scene(&snapshot, 800.0);
+    let tint = |scene: &Scene, snapshot: &PresentationSnapshot| {
+        scene
+            .node(by_text(snapshot, "text", "A"))
+            .expect("row text")
+            .resolved_style()
+            .text_color()
+    };
+    assert_eq!(
+        tint(&scene, &snapshot),
+        Some(Color::Role(ColorRole::TextDefault)),
+        "an active row uses the default text role"
+    );
+
+    app.change("Complete A", true).expect("complete A");
+    let snapshot = app.presentation().expect("snapshot");
+    let scene = build_scene(&snapshot, 800.0);
+    assert_eq!(
+        tint(&scene, &snapshot),
+        Some(Color::Role(ColorRole::TextMuted)),
+        "the memo-driven style follows the completed state"
+    );
+}
+
+#[test]
 fn a_mismatched_style_declaration_is_an_explicit_error() {
     const STYLE: &[StyleDeclaration] = &[StyleDeclaration::new(
         Property::Gap,
@@ -1033,6 +1120,7 @@ fn a_mismatched_style_declaration_is_an_explicit_error() {
             "view",
             Vec::new(),
             STYLE,
+            Vec::new(),
             Vec::new(),
         )]))
     })
@@ -1047,6 +1135,43 @@ fn a_mismatched_style_declaration_is_an_explicit_error() {
         }) => {
             assert_eq!(failed, node);
             assert_eq!((property, value), (Property::Gap, StyleValue::Row));
+        }
+        other => panic!("expected UnsupportedStyle, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_state_variant_cannot_set_a_layout_property() {
+    const STYLE: &[StyleDeclaration] = &[StyleDeclaration::new(
+        Property::PaddingX,
+        StyleValue::Points(8),
+        Condition::Focus,
+    )];
+    let mut app = Runtime::new();
+    app.open_window("main", |_| {
+        Ok(MountPlan::new(vec![zenui::view::styled_element(
+            "view",
+            Vec::new(),
+            STYLE,
+            Vec::new(),
+            Vec::new(),
+        )]))
+    })
+    .expect("window");
+    let snapshot = app.presentation().expect("snapshot");
+    let node = snapshot.roots()[0].id().expect("root element");
+    // 失效的条件同样被拒绝：错误不能取决于当前瞬态。
+    match Scene::build(&snapshot, viewport(800.0)) {
+        Err(SceneError::UnsupportedStyle {
+            node: failed,
+            property,
+            value,
+        }) => {
+            assert_eq!(failed, node);
+            assert_eq!(
+                (property, value),
+                (Property::PaddingX, StyleValue::Points(8))
+            );
         }
         other => panic!("expected UnsupportedStyle, got {other:?}"),
     }

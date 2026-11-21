@@ -36,6 +36,10 @@ _Avoid_: glyph line, paragraph
 一个顶层窗口的呈现目标；随窗口尺寸、DPI 或设备代际变化重建。
 _Avoid_: swapchain, render target
 
+**Inline declaration**:
+通过 `style:<property>` 给出的类型化样式声明；携带 `StyleOrigin::Inline`，覆盖同属性的 class 声明与状态变体。
+_Avoid_: inline css, dynamic css
+
 **Node ID**:
 presentation snapshot 中用于命中测试与事件派发的稳定元素身份；不是 label，也不是公开的内部数组下标。
 _Avoid_: element index, view ID
