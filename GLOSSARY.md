@@ -20,6 +20,10 @@ _Avoid_: window list, registry
 目录中恰好一个的默认窗口；Host 首次显示以它为入口。
 _Avoid_: main window (when meaning the catalog flag)
 
+**Hidden window**:
+保持 activation、树、焦点与本地编辑状态，但不接收输入、不呈现的窗口；show 恢复同一 activation。
+_Avoid_: closed window, minimized window (when meaning runtime visibility)
+
 **Host**:
 拥有原生窗口、事件循环、DPI 与 surface，并驱动 target runtime 的平台层。
 _Avoid_: platform backend, shell

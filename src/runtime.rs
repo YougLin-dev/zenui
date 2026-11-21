@@ -25,6 +25,8 @@ use crate::window::{
     CatalogError, WindowCatalog, WindowCtx, WindowError, WindowFactory, WindowRecord,
 };
 
+const HIDDEN_TARGET: &str = "target window is hidden";
+
 pub(crate) enum Resource {
     Signal(u32),
     Memo(u32),
@@ -190,18 +192,23 @@ impl State {
         self.trees.insert(key, tree);
     }
 
-    /// 当前接收输入的窗口；没有焦点窗口时退到目录中的第一个窗口或 headless 根。
+    /// 当前接收输入的窗口；没有焦点窗口时退到目录中的第一个可见窗口或 headless 根。
     fn active_tree_key(&self) -> Option<TreeKey> {
         if let Some(key) = self.focused_window
-            && self.trees.contains_key(&TreeKey::Window(key))
+            && self.tree_is_visible(TreeKey::Window(key))
         {
             return Some(TreeKey::Window(key));
         }
-        self.trees
+        self.windows
             .keys()
-            .find(|key| matches!(key, TreeKey::Window(_)))
             .copied()
-            .or_else(|| self.trees.keys().next().copied())
+            .find(|key| self.window_is_visible(key))
+            .map(TreeKey::Window)
+            .or_else(|| {
+                self.trees
+                    .contains_key(&TreeKey::Root)
+                    .then_some(TreeKey::Root)
+            })
     }
 
     fn window_ctx(&self, key: &'static str) -> Option<WindowCtx> {
@@ -211,17 +218,58 @@ impl State {
         live.then(|| WindowCtx::new(self.id, key, record.activation, record.owner))
     }
 
-    fn first_open_window(&self) -> Option<&'static str> {
+    fn window_is_visible(&self, key: &'static str) -> bool {
+        self.windows
+            .get(key)
+            .is_some_and(|record| record.open && record.visible)
+            && self.trees.contains_key(&TreeKey::Window(key))
+    }
+
+    fn tree_is_visible(&self, key: TreeKey) -> bool {
+        match key {
+            TreeKey::Root => self.trees.contains_key(&key),
+            TreeKey::Window(key) => self.window_is_visible(key),
+        }
+    }
+
+    fn first_visible_window(&self) -> Option<&'static str> {
         self.windows
             .keys()
             .copied()
-            .find(|key| self.window_ctx(key).is_some())
+            .find(|key| self.window_is_visible(key))
+    }
+
+    fn hide_window(&mut self, key: &'static str) {
+        if let Some(record) = self.windows.get_mut(key) {
+            record.visible = false;
+        }
+    }
+
+    fn show_window(&mut self, key: &'static str) {
+        if let Some(record) = self.windows.get_mut(key) {
+            record.visible = true;
+        }
     }
 
     fn tree_for_element(&self, element: usize) -> Option<TreeKey> {
         self.trees
             .iter()
             .find_map(|(key, tree)| contains_element(self, &tree.nodes, element).then_some(*key))
+    }
+
+    fn element_is_visible(&self, element: usize) -> bool {
+        self.tree_for_element(element)
+            .is_some_and(|key| self.tree_is_visible(key))
+    }
+
+    /// 窗口仍存活且其树属于同一 Owner。
+    fn window_live_in_tree(&self, window: WindowCtx) -> bool {
+        self.trees
+            .get(&TreeKey::Window(window.key))
+            .is_some_and(|tree| {
+                tree.owner == window.owner
+                    && self.window_is_live(window.key, window.activation, window.owner)
+            })
     }
 
     /// 当前焦点目标；焦点属于树，而不是整个应用。
@@ -398,6 +446,7 @@ impl State {
                 activation,
                 owner,
                 open: true,
+                visible: true,
             },
         );
         (activation, owner)
@@ -406,6 +455,7 @@ impl State {
     pub(crate) fn mark_window_closed(&mut self, key: &'static str) {
         if let Some(record) = self.windows.get_mut(key) {
             record.open = false;
+            record.visible = false;
         }
     }
 
@@ -567,12 +617,21 @@ impl State {
         }
     }
 
-    /// 解析一个存活的 Node ID；未知与已卸载身份分别报错，绝不猜测替代目标。
+    /// 解析一个存活的 Node ID；未知、已卸载与隐藏窗口分别报错，绝不猜测替代目标。
     fn element_for_node(&self, node: NodeId) -> Result<usize, DispatchError> {
-        match self.node_status(node) {
-            NodeStatus::Live => Ok(node.slot() as usize),
-            NodeStatus::Stale => Err(DispatchError::StaleNode(node)),
-            NodeStatus::Unknown => Err(DispatchError::UnknownNode(node)),
+        if node.runtime_id() != self.id {
+            return Err(DispatchError::UnknownNode(node));
+        }
+        let Some(element) = self.elements.get(node.slot() as usize) else {
+            return Err(DispatchError::UnknownNode(node));
+        };
+        if element.id.slot() != node.slot() || element.id.generation() != node.generation() {
+            return Err(DispatchError::StaleNode(node));
+        }
+        match self.tree_for_element(node.slot() as usize) {
+            Some(key) if self.tree_is_visible(key) => Ok(node.slot() as usize),
+            Some(_) => Err(DispatchError::Hidden(node)),
+            None => Err(DispatchError::StaleNode(node)),
         }
     }
 
@@ -580,6 +639,9 @@ impl State {
         let Some(element) = self.find_element(target) else {
             return false;
         };
+        if !self.element_is_visible(element) {
+            return false;
+        }
         if let LocalState::TextInput {
             caret,
             anchor,
@@ -1076,7 +1138,8 @@ impl Runtime {
         self.state.borrow().primary
     }
 
-    /// 显示目录中的窗口：未打开时运行 factory 产生新 activation，已打开时只聚焦。
+    /// 显示目录中的窗口：未打开时运行 factory 产生新 activation；已打开时只聚焦，
+    /// 隐藏的窗口恢复可见且不重跑 factory。
     ///
     /// factory 失败仍消耗这一代 activation；下一次成功打开使用新一代。
     /// 挂载或首帧刷新失败会释放新窗口并让它保持关闭。
@@ -1097,10 +1160,33 @@ impl Runtime {
         }
         let live = self.state.borrow().window_ctx(key);
         if let Some(window) = live {
-            self.state.borrow_mut().focused_window = Some(key);
+            let mut state = self.state.borrow_mut();
+            state.show_window(key);
+            state.focused_window = Some(key);
+            drop(state);
             return Ok(window);
         }
         self.open_window_at(key, move |window| factory(window))
+    }
+
+    /// 隐藏窗口：保留 activation、树、焦点与本地编辑状态，只停止输入与呈现。
+    pub fn hide(&mut self, window: WindowCtx) -> Result<(), WindowError> {
+        let state = self.state.clone();
+        if window.runtime != state.borrow().id {
+            return Err(WindowError::WrongRuntime);
+        }
+        context::install(&state, || {
+            if !with_state(|state| state.window_live_in_tree(window)) {
+                return Err(WindowError::Stale);
+            }
+            let mut state = state.borrow_mut();
+            state.hide_window(window.key);
+            if state.focused_window == Some(window.key) {
+                state.focused_window = state.first_visible_window();
+            }
+            drop(state);
+            Ok(())
+        })
     }
 
     /// 打开一个 headless 窗口 activation；factory 每次打开都会重新执行。
@@ -1204,15 +1290,7 @@ impl Runtime {
             return Err(WindowError::WrongRuntime);
         }
         context::install(&state, || {
-            let live = {
-                let state = state.borrow();
-                state.window_is_live(window.key, window.activation, window.owner)
-                    && state
-                        .trees
-                        .get(&TreeKey::Window(window.key))
-                        .is_some_and(|tree| tree.owner == window.owner)
-            };
-            if !live {
+            if !with_state(|state| state.window_live_in_tree(window)) {
                 return Err(WindowError::Stale);
             }
             let tree = with_state(|state| state.trees.remove(&TreeKey::Window(window.key)));
@@ -1226,7 +1304,7 @@ impl Runtime {
             with_state(|state| {
                 state.dispose_owner(window.owner);
                 if state.focused_window == Some(window.key) {
-                    state.focused_window = state.first_open_window();
+                    state.focused_window = state.first_visible_window();
                 }
             });
             Ok(())
@@ -1237,6 +1315,14 @@ impl Runtime {
         let state = self.state.borrow();
         window.runtime == state.id
             && state.window_is_live(window.key, window.activation, window.owner)
+    }
+
+    /// 窗口仍然存活且处于可见状态。
+    pub fn window_visible(&self, window: WindowCtx) -> bool {
+        let state = self.state.borrow();
+        window.runtime == state.id
+            && state.window_is_live(window.key, window.activation, window.owner)
+            && state.window_is_visible(window.key)
     }
 
     pub fn refresh(&mut self) -> Result<(), MountError> {
@@ -1837,6 +1923,7 @@ impl Runtime {
             DispatchError::UnknownNode(_) | DispatchError::StaleNode(_) => {
                 MountError::Component(not_found)
             }
+            DispatchError::Hidden(_) => MountError::Component(HIDDEN_TARGET),
             DispatchError::WrongKind { .. } => MountError::Component(wrong_kind),
             DispatchError::Rejected { reason, .. } => MountError::Component(reason),
             DispatchError::Command(error) => error,
@@ -1856,6 +1943,9 @@ impl Runtime {
             let Some(element) = with_state(|state| state.find_element(&target)) else {
                 return Err(MountError::Component("input target not found"));
             };
+            if !with_state(|state| state.element_is_visible(element)) {
+                return Err(MountError::Component(HIDDEN_TARGET));
+            }
             if with_state(|state| state.elements[element].local.is_composing()) {
                 return Err(MountError::Component("text input is composing"));
             }
@@ -2656,10 +2746,13 @@ impl Runtime {
             .set_text_input_caret(&FindTarget::Label(label.to_owned()), offset)
     }
 
-    /// 当前接收输入的窗口；没有显示窗口时为 `None`。
+    /// 当前接收输入的窗口；没有可见窗口时为 `None`。
     pub fn focused_window(&self) -> Option<WindowCtx> {
         let state = self.state.borrow();
-        state.focused_window.and_then(|key| state.window_ctx(key))
+        state
+            .focused_window
+            .filter(|key| state.window_is_visible(key))
+            .and_then(|key| state.window_ctx(key))
     }
 
     pub fn focused(&self) -> Option<FocusInfo> {
@@ -2687,7 +2780,7 @@ impl Runtime {
             .active_tree_key()
             .and_then(|key| state.snapshot(key))
             .ok_or(MountError::Component(
-                "presentation snapshot requires a committed interface",
+                "presentation snapshot requires a visible committed interface",
             ))
     }
 
@@ -2699,6 +2792,9 @@ impl Runtime {
         }
         if !state.window_is_live(window.key, window.activation, window.owner) {
             return Err(WindowError::Stale);
+        }
+        if !state.window_is_visible(window.key) {
+            return Err(WindowError::Hidden);
         }
         state
             .snapshot(TreeKey::Window(window.key))

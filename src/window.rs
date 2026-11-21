@@ -186,6 +186,8 @@ pub enum WindowError {
     Unsupported(&'static str),
     /// 当前生命周期状态不允许该操作。
     State(&'static str),
+    /// 窗口仍然存活，但处于隐藏状态。
+    Hidden,
     /// 该 activation 已关闭或被更新的一代取代。
     Stale,
     WrongRuntime,
@@ -204,6 +206,7 @@ impl fmt::Display for WindowError {
                 )
             }
             Self::State(message) => f.write_str(message),
+            Self::Hidden => f.write_str("the window is hidden"),
             Self::Stale => f.write_str("the window activation is no longer live"),
             Self::WrongRuntime => {
                 f.write_str("a WindowCtx from another ZenUI Runtime cannot access this one")
@@ -234,4 +237,6 @@ pub(crate) struct WindowRecord {
     pub(crate) activation: u32,
     pub(crate) owner: u32,
     pub(crate) open: bool,
+    /// `visible` 只在 `open` 时有效；关闭同时清掉两者。
+    pub(crate) visible: bool,
 }

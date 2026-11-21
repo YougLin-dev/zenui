@@ -511,7 +511,7 @@ fn a_snapshot_requires_a_committed_interface() {
     let app = Runtime::new();
     assert_eq!(
         app.presentation().expect_err("nothing is committed yet"),
-        MountError::Component("presentation snapshot requires a committed interface")
+        MountError::Component("presentation snapshot requires a visible committed interface")
     );
 
     let mut app = Runtime::new();
