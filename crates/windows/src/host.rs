@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use windows::Win32::Foundation::{
     ERROR_CLASS_ALREADY_EXISTS, GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
 };
-use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, InvalidateRect, PAINTSTRUCT};
+use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, PAINTSTRUCT, ValidateRect};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
     AdjustWindowRectExForDpi, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForSystem,
@@ -1560,14 +1560,6 @@ unsafe fn with_host(hwnd: HWND, action: impl FnOnce(&mut Host)) {
     action(host);
 }
 
-/// 标脏整个客户区，让下一次 `WM_PAINT` 重排并重绘。
-fn invalidate(hwnd: HWND) {
-    // 安全：hwnd 来自系统回调；不擦除背景，GPU 覆盖整个客户区。
-    unsafe {
-        let _ = InvalidateRect(Some(hwnd), None, false);
-    }
-}
-
 /// 翻译并派发一条消息；窗口过程负责处理。
 fn dispatch_message(message: &MSG) {
     // 安全：消息来自本线程队列，窗口由 Host 持有。
@@ -1653,8 +1645,12 @@ unsafe extern "system" fn wndproc(
             unsafe {
                 let _ = BeginPaint(hwnd, &mut paint);
             }
-            // 安全：派发期间不持有宿主引用，窗口过程可以借出一次。
-            unsafe { with_host(hwnd, Host::paint) };
+            // 尺寸变化已同步呈现并清除区域；空的更新区域不再重复绘制。
+            let region = paint.rcPaint;
+            if region.right > region.left && region.bottom > region.top {
+                // 安全：派发期间不持有宿主引用，窗口过程可以借出一次。
+                unsafe { with_host(hwnd, Host::paint) };
+            }
             // 安全：与 BeginPaint 配对。
             unsafe {
                 let _ = EndPaint(hwnd, &paint);
@@ -1662,11 +1658,18 @@ unsafe extern "system" fn wndproc(
             LRESULT(0)
         }
         WM_SIZE => {
-            // 拖动边框时系统进入自己的模态循环，只派发消息不返回消息循环；
-            // 标脏后由窗口过程里的 WM_PAINT 完成重排。
-            invalidate(hwnd);
-            // 安全：默认窗口过程。
-            unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+            // 拖动边框时系统进入自己的模态循环，只派发消息不返回消息循环。
+            // 先让默认过程完成尺寸变化与类样式失效，再同步按新客户区重排并呈现；
+            // 这样 DWM 在窗口缩放后拿到的是新帧，而不是被拉伸的上一帧。
+            let result = unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
+            // 安全：派发期间不持有宿主引用，窗口过程可以借出一次。
+            unsafe { with_host(hwnd, Host::paint) };
+            // 帧已按当前尺寸呈现；清除同一尺寸的重复重绘区域。
+            // 安全：只清除本窗口的更新区域。
+            unsafe {
+                let _ = ValidateRect(Some(hwnd), None);
+            }
+            result
         }
         WM_CLOSE => {
             // 安全：派发期间不持有宿主引用；结束 activation 并标记关闭。
@@ -1703,7 +1706,13 @@ unsafe extern "system" fn wndproc(
                     );
                 }
             }
-            invalidate(hwnd);
+            // DPI 改变可能不改变窗口尺寸，因而没有 WM_SIZE；这里同步按新 scale 重绘。
+            // 安全：派发期间不持有宿主引用，窗口过程可以借出一次。
+            unsafe { with_host(hwnd, Host::paint) };
+            // 安全：只清除本窗口的更新区域。
+            unsafe {
+                let _ = ValidateRect(Some(hwnd), None);
+            }
             LRESULT(0)
         }
         _ => {
