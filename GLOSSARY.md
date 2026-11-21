@@ -12,6 +12,14 @@ _Avoid_: window instance, window generation
 归属应用而不是某个窗口的 owner 0；`Runtime::setup` 创建的 Signal、Memo 与 Store 在窗口关闭后仍保留。
 _Avoid_: global state, app singleton
 
+**Window catalog**:
+启动时声明的静态窗口集合；每个窗口有稳定键、primary 标记与可重复执行的 factory，声明本身不挂载界面。
+_Avoid_: window list, registry
+
+**Primary window**:
+目录中恰好一个的默认窗口；Host 首次显示以它为入口。
+_Avoid_: main window (when meaning the catalog flag)
+
 **Host**:
 拥有原生窗口、事件循环、DPI 与 surface，并驱动 target runtime 的平台层。
 _Avoid_: platform backend, shell
