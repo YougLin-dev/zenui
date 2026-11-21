@@ -37,8 +37,8 @@ GPU 型号与后端由一次性的 `adapter.get_info()` 探针确认，探针未
   人工操作，也不代替人工清单。
 - 截图是客户区物理像素：初始 1350×1050（900×700 逻辑 × 1.5），resize 后 960×720
   （640×480 逻辑 × 1.5）。截图来自三次独立的可见运行（会话 A/B/C），不是一次
-  连续操作；下表的会话列说明每个状态属于哪一次运行。07–12 来自第二轮的独立运行；
-  12 是松开鼠标之前截取的 900×678 物理客户区。
+  连续操作；下表的会话列说明每个状态属于哪一次运行。07–13 来自第二轮及其修复后的
+  独立运行；12 与 13 是松开鼠标之前截取的客户区（12 为拖动中的 900×678 物理客户区）。
 
 ## 可见窗口结果
 
@@ -108,12 +108,22 @@ GPU 全部绘制。修复让 caret 只属于聚焦输入，并由 `SetTimer`（5
 窗口过程，宿主的消息循环在这段时间收不到 `WM_SIZE`/`WM_PAINT`，于是窗口只显示被
 DWM 拉伸的最后一帧。修复把消息处理移进窗口过程：`run`/`pump` 只负责取消息与派发，
 期间不持有宿主引用；窗口过程通过 `GWLP_USERDATA` 取回宿主，处理输入并在 `WM_SIZE`
-到达时同步按新客户区重排并呈现，避免 DWM 先把上一帧拉伸到新尺寸；`WM_PAINT` 只处理
-有实际更新区域的失效。
+到达时同步按新客户区重排并呈现，`WM_PAINT` 只处理有实际更新区域的失效。
 回归测试 `crates/windows/src/host.rs::a_paint_message_repaints_after_an_external_resize`
 在消息循环之外改窗口尺寸并派发 `WM_PAINT`，断言场景按新的客户区重排；证据
 [12](证据/stage-two/12-live-resize-during-drag.png) 是拖动过程中（松开鼠标之前）
 截取的画面，布局已按新尺寸重排且文字未缩放。
+
+**快速拖动时文字先拉伸再回弹。** 同步重绘缩短了拉伸帧的存续时间，但没有消除它：
+经典 HWND 交换链由 DWM 按 `DXGI_SCALING_STRETCH` 把上一帧缩放到新客户区，任何两次
+呈现之间的尺寸变化都会先显示拉伸帧，快速拖动时尤其明显，慢速拖动几乎看不出来。用
+真实边框拖动、逐帧读取客户区里 "1 remaining" 的暗像素跨度量化（正常跨度 [26,131]）：
+经典交换链快速拖动约 200 帧中约 20 帧偏离（最大到 135）。修复把 DX12 instance 配置
+为 `Dx12SwapchainKind::DxgiFromVisual`，surface 由 DirectComposition 视觉承载，DWM
+合成的是视觉内容而不是上一帧位图；同一探针 190 帧全部保持 [26,131]，没有异常帧。
+代价是 RenderDoc 无法抓取这类交换链。证据
+[13](证据/stage-two/13-directcompose-drag.png) 是 DirectComposition 下拖动过程中
+（松开鼠标之前）的客户区截图。
 
 第四个问题“按钮没有 hover 等状态效果”不在本切片的范围：spec #68 明确本阶段不做
 class 样式，状态样式属于路线图的样式里程碑，已记录为 #96。
@@ -132,7 +142,7 @@ class 样式，状态样式属于路线图的样式里程碑，已记录为 #96�
 | 完整工作流（增删、勾选、筛选、重排） | 部分 | 可见：输入/添加/勾选/筛选/重排/异步；删除由隐藏 smoke `delete_removes_a_native_row` 覆盖，未在本次可见运行中执行 |
 | 中文 IME 组合、提交、取消与候选位置 | 自动通过（真实 IME + 合成按键），人工未执行 | 07–09；宿主单元测试覆盖 `WM_IME_*` 路由 |
 | 焦点与 Tab 顺序 | 自动通过，人工未执行 | `tab_moves_focus_to_the_next_control`、`shift_tab_moves_focus_backward` |
-| resize | 通过（程序化与交互式拖动） | 06、12；`resizing_relayouts_the_scene_and_surface`、`a_paint_message_repaints_after_an_external_resize` |
+| resize | 通过（程序化、交互式拖动与快速拖动探针） | 06、12、13；`resizing_relayouts_the_scene_and_surface`、`a_paint_message_repaints_after_an_external_resize` |
 | 混合 DPI 移动 | 未执行（单显示器） | 步骤见[混合 DPI 检查](windows-混合dpi-检查.md) |
 | 关闭/重开为新 activation，无旧任务或旧呈现 | 自动通过 | `closing_the_window_cancels_window_owned_tasks`、`reopening_uses_a_new_activation_and_discards_the_old_delivery`、`closing_the_activation_prevents_stale_wakes_and_delivery` |
 | 重排与筛选后无残留焦点、caret 或像素 | 部分（像素可见；焦点/caret 自动） | 上表 02、05 验证顺序与像素；10/11 验证 caret 只随焦点出现并闪烁；`reorder_keeps_focus_and_caret_on_the_same_row` 按 Node ID 与 caret x 断言 |
@@ -182,8 +192,9 @@ class 样式，状态样式属于路线图的样式里程碑，已记录为 #96�
 text-input 测量宽度两个缺陷，并各自补了回归测试。
 
 第二轮人工试跑又发现并修复了中文候选提交、Escape 取消、caret 聚焦与闪烁、交互式
-缩放重绘四个问题，新增证据 07–12 与对应回归测试；按钮状态样式不在本切片范围，
-记录为 #96。
+缩放重绘四个问题；随后又用快速拖动探针定位并修复了经典交换链快速拖动时残留的拉伸
+帧，改为 DirectComposition 呈现，新增证据 07–13 与对应回归测试；按钮状态样式不在
+本切片范围，记录为 #96。
 
 中文 IME 候选、混合 DPI、真实硬件键盘/焦点与实机 device loss 仍缺证据，因此本页
 不声明阶段二原生验收完成，#60/#63 保持打开。

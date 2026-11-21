@@ -224,6 +224,16 @@ impl Host {
 
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::DX12,
+            // DirectComposition 视觉承载交换链：DWM 合成视觉内容而不是缩放
+            // 上一帧，窗口缩放（尤其快速拖动）时文字不会先拉伸再回弹。
+            // 代价是 RenderDoc 无法抓取这类交换链。
+            backend_options: wgpu::BackendOptions {
+                dx12: wgpu::Dx12BackendOptions {
+                    presentation_system: wgpu::Dx12SwapchainKind::DxgiFromVisual,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
             ..wgpu::InstanceDescriptor::new_without_display_handle()
         });
         let surface = create_surface(&instance, hwnd, hinstance)?;
