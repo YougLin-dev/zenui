@@ -4,8 +4,9 @@
 
 **状态：部分完成。** 可见窗口、真实 GPU、150% 缩放的自动驱动运行已完成并保留截图；
 第二轮人工试跑发现的问题已修复并复验（见「人工试跑反馈与修复」）。中文 IME 候选、
-混合 DPI 显示器切换与真实硬件键盘操作仍待人工确认：候选、提交与取消已用真实微软
-拼音引擎配合合成按键验证，但这不代替人工操作。
+跨显示器混合 DPI 与真实硬件键盘操作仍待人工确认：候选、提交与取消已用真实微软
+拼音引擎配合合成按键验证，但这不代替人工操作；单显示器缩放切换已于 2026-11-21
+预检通过，只覆盖同屏 DPI 变化。
 本页不把脚本投递的原生消息当作人工操作，也不把 headless 或 CI WARP 结果当作原生呈现验收。
 
 验收日期：2026-11-21。首轮验收对象为 `edd0383`（#80 合并后的 `main`）与本分支的
@@ -143,7 +144,7 @@ class 样式，状态样式属于路线图的样式里程碑，已记录为 #96�
 | 中文 IME 组合、提交、取消与候选位置 | 自动通过（真实 IME + 合成按键），人工未执行 | 07–09；宿主单元测试覆盖 `WM_IME_*` 路由 |
 | 焦点与 Tab 顺序 | 自动通过，人工未执行 | `tab_moves_focus_to_the_next_control`、`shift_tab_moves_focus_backward` |
 | resize | 通过（程序化、交互式拖动与快速拖动探针） | 06、12、13；`resizing_relayouts_the_scene_and_surface`、`a_paint_message_repaints_after_an_external_resize` |
-| 混合 DPI 移动 | 未执行（单显示器） | 步骤见[混合 DPI 检查](windows-混合dpi-检查.md) |
+| 混合 DPI 移动 | 部分（单显示器缩放切换已预检通过；跨屏移动未执行） | [混合 DPI 检查](windows-混合dpi-检查.md)「单显示器预检」；跨屏步骤同页 |
 | 关闭/重开为新 activation，无旧任务或旧呈现 | 自动通过 | `closing_the_window_cancels_window_owned_tasks`、`reopening_uses_a_new_activation_and_discards_the_old_delivery`、`closing_the_activation_prevents_stale_wakes_and_delivery` |
 | 重排与筛选后无残留焦点、caret 或像素 | 部分（像素可见；焦点/caret 自动） | 上表 02、05 验证顺序与像素；10/11 验证 caret 只随焦点出现并闪烁；`reorder_keeps_focus_and_caret_on_the_same_row` 按 Node ID 与 caret x 断言 |
 | device/surface 重建 | 自动通过，实机未触发 | `a_surface_rebuild_preserves_focus_and_caret`；`Lost` 路径未在实机强制触发 |
@@ -165,12 +166,13 @@ class 样式，状态样式属于路线图的样式里程碑，已记录为 #96�
 | #63 验收 | 证据 | 状态 |
 | --- | --- | --- |
 | 同一个 target Todo 在真实 Windows 窗口呈现，并在 add/toggle/filter 后更新 | 上表 01–05；`zenui-render` 的 Scene/GPU 路径 | 通过 |
-| DPI 变化与 device/surface 重建保留挂载身份，无旧呈现 | 150% DPI 实机呈现；resize 与重建测试；跨显示器变化未执行 | 部分 |
+| DPI 变化与 device/surface 重建保留挂载身份，无旧呈现 | 150% DPI 实机呈现；单显示器缩放切换预检；resize 与重建测试；跨显示器变化未执行 | 部分 |
 | 不支持的能力显式报错，不用 validation panic 代替 | 不支持的标签/属性返回 `SceneError`；offscreen 格式返回 `RenderError::UnsupportedFormat`；Windows surface 只接受非 sRGB `Bgra8Unorm`（`HostError::Surface`） | 通过 |
 | headless 测试仍是逻辑测试，不推断像素/native 结论 | 本页分级 | 通过 |
 
-#63 仍保持打开：混合 DPI 显示器移动与实机 device loss 尚无证据；真实 IME 候选与
-提交/取消已由真实引擎配合合成按键覆盖，人工 IME 操作仍未执行。
+#63 仍保持打开：跨显示器混合 DPI 移动与实机 device loss 尚无证据（单显示器缩放切换
+已预检通过，只覆盖同屏 DPI 变化）；真实 IME 候选与提交/取消已由真实引擎配合合成按键
+覆盖，人工 IME 操作仍未执行。
 
 ## 仍需人工执行
 
@@ -181,6 +183,7 @@ class 样式，状态样式属于路线图的样式里程碑，已记录为 #96�
 2. 用真实鼠标/键盘完成 add、toggle、filter、reverse、delete 与 Tab/Shift+Tab，
    确认焦点与 caret 不随重排跳到别的行。
 3. 按[混合 DPI 检查](windows-混合dpi-检查.md)在两块不同缩放率显示器间移动窗口。
+   单显示器上的运行中缩放切换已于 2026-11-21 预检通过，但它不覆盖跨屏移动与拓扑变化。
 4. 若可触发，记录真实 device loss（例如驱动重置）后的重建与重绘；否则保留自动化
    重建测试的覆盖说明。
 
@@ -196,5 +199,6 @@ text-input 测量宽度两个缺陷，并各自补了回归测试。
 帧，改为 DirectComposition 呈现，新增证据 07–13 与对应回归测试；按钮状态样式不在
 本切片范围，记录为 #96。
 
-中文 IME 候选、混合 DPI、真实硬件键盘/焦点与实机 device loss 仍缺证据，因此本页
-不声明阶段二原生验收完成，#60/#63 保持打开。
+中文 IME 候选、跨显示器混合 DPI、真实硬件键盘/焦点与实机 device loss 仍缺证据
+（单显示器缩放切换已预检通过，只覆盖同屏 DPI 变化），因此本页不声明阶段二原生
+验收完成，#60/#63 保持打开。
