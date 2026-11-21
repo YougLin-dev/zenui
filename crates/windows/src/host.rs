@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use windows::Win32::Foundation::{
     ERROR_CLASS_ALREADY_EXISTS, GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
 };
+use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, InvalidateRect, PAINTSTRUCT};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
     AdjustWindowRectExForDpi, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForSystem,
@@ -19,16 +20,17 @@ use windows::Win32::UI::Input::Ime::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, VIRTUAL_KEY, VK_A, VK_BACK, VK_CONTROL, VK_DELETE, VK_END, VK_ESCAPE, VK_HOME,
-    VK_LEFT, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_TAB,
+    VK_LEFT, VK_PROCESSKEY, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_TAB,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow,
-    DispatchMessageW, GetClientRect, GetMessageW, IDC_ARROW, LoadCursorW, MSG, PM_REMOVE,
-    PeekMessageW, PostMessageW, PostQuitMessage, RegisterClassExW, SW_HIDE, SW_SHOW,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SetWindowPos, ShowWindow, TranslateMessage,
+    DispatchMessageW, GWLP_USERDATA, GetClientRect, GetForegroundWindow, GetMessageW,
+    GetWindowLongPtrW, IDC_ARROW, KillTimer, LoadCursorW, MSG, PM_REMOVE, PeekMessageW,
+    PostMessageW, PostQuitMessage, RegisterClassExW, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOZORDER, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage,
     WINDOW_EX_STYLE, WM_APP, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_DPICHANGED, WM_IME_CHAR,
     WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KILLFOCUS,
-    WM_LBUTTONDOWN, WM_PAINT, WM_SIZE, WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
+    WM_LBUTTONDOWN, WM_PAINT, WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
 };
 
 use windows::core::{HSTRING, w};
@@ -41,6 +43,10 @@ use zenui_demo::TodoApp;
 
 /// worker 唤醒只投递这一条消息；`WM_APP` 起是应用私有的消息区间。
 const HOST_WAKE_MESSAGE: u32 = WM_APP + 1;
+
+/// caret 闪烁定时器；OS 原生编辑控件的缺省周期约为 530ms。
+const CARET_BLINK_TIMER: usize = 1;
+const CARET_BLINK_MS: u32 = 530;
 
 /// 打开宿主窗口的选项。
 #[derive(Clone, Copy, Debug)]
@@ -156,6 +162,10 @@ pub struct Host {
     scene: Option<Scene>,
     pending_high_surrogate: Option<u16>,
     wake: Arc<WakeState>,
+    caret_visible: bool,
+    blink_timer: Option<usize>,
+    close_requested: bool,
+    deferred_error: Option<HostError>,
 }
 
 impl Host {
@@ -175,6 +185,9 @@ impl Host {
         register_class(hinstance)?;
         let window = Window::new(config, hinstance)?;
         let hwnd = window.hwnd;
+        // 安全：HWND 在 Host 生命周期内有效；定时器在 close_activation 中销毁。
+        let blink_timer = unsafe { SetTimer(Some(hwnd), CARET_BLINK_TIMER, CARET_BLINK_MS, None) };
+        let blink_timer = (blink_timer != 0).then_some(blink_timer);
 
         // worker 只向宿主窗口投递一条合并后的消息；runtime 访问留在 UI 线程，
         // 关闭标志阻止窗口关闭后的迟到投递。
@@ -229,6 +242,10 @@ impl Host {
             scene: None,
             pending_high_surrogate: None,
             wake,
+            caret_visible: true,
+            blink_timer,
+            close_requested: false,
+            deferred_error: None,
         })
     }
 
@@ -251,75 +268,84 @@ impl Host {
             }
         }
         self.render()?;
-        loop {
-            let mut message = MSG::default();
-            // 安全：标准 Win32 消息循环；窗口由 Host 持有。
-            let result = unsafe { GetMessageW(&mut message, None, 0, 0).0 };
-            if result == -1 {
-                return Err(HostError::MessageLoop);
-            }
-            if result == 0 {
-                break;
-            }
-            if self.process_message(&message)? {
-                break;
-            }
-        }
-        Ok(())
+        let hwnd = self.window.hwnd;
+        // 窗口过程要能在系统自己的拖动/缩放循环里重绘；指针只在循环期间安装。
+        let host = self as *mut Self;
+        let _pointer = HostPointer::install(hwnd, host);
+        // 安全：`host` 指向 `self`，地址在借用的 `run` 期间稳定；循环只通过
+        // 裸指针访问宿主，派发消息时不持有引用。
+        unsafe { run_loop(host) }
     }
 
     /// 处理所有已排队的窗口消息后立即返回；返回是否收到 `WM_CLOSE`。
     ///
     /// 把宿主嵌进别的消息循环，或在测试里驱动一次输入而不阻塞时使用。
     pub fn pump(&mut self) -> Result<bool, HostError> {
-        loop {
-            let mut message = MSG::default();
-            // 安全：只取本线程队列里的消息；窗口由 Host 持有。
-            let result = unsafe { PeekMessageW(&mut message, None, 0, 0, PM_REMOVE) };
-            if result.0 == 0 {
-                return Ok(false);
+        let hwnd = self.window.hwnd;
+        let host = self as *mut Self;
+        let _pointer = HostPointer::install(hwnd, host);
+        // 安全：与 `run` 相同。
+        unsafe { pump_loop(host) }
+    }
+
+    /// 处理一条已经派发到窗口过程的消息。
+    ///
+    /// 输入处理放在窗口过程而不是消息循环里，因为系统的模态拖动/缩放循环会
+    /// 直接调用窗口过程，消息循环在此期间收不到任何消息。
+    fn handle_message(&mut self, message: u32, wparam: WPARAM, lparam: LPARAM) {
+        if self.close_requested {
+            // 关闭后只交付排队结果（由运行时丢弃），不再编辑或绘制。
+            if message == HOST_WAKE_MESSAGE
+                && let Err(error) = self.deliver_tasks()
+            {
+                self.deferred_error.get_or_insert(error);
             }
-            if self.process_message(&message)? {
-                return Ok(true);
-            }
+            return;
+        }
+        // 任何输入都让 caret 立即可见，之后由闪烁定时器继续。
+        if matches!(message, WM_LBUTTONDOWN | WM_CHAR | WM_KEYDOWN) {
+            self.caret_visible = true;
+        }
+        let result = if message == WM_LBUTTONDOWN {
+            self.pointer_pressed(lparam).and_then(|()| self.render())
+        } else if message == WM_CHAR {
+            self.char_typed(wparam)
+        } else if message == WM_KEYDOWN {
+            self.key_down(wparam)
+        } else if message == WM_IME_STARTCOMPOSITION {
+            self.ime_start()
+        } else if message == WM_IME_COMPOSITION {
+            self.ime_composition(lparam)
+        } else if matches!(message, WM_IME_ENDCOMPOSITION | WM_KILLFOCUS) {
+            self.ime_cancel()
+        } else if message == HOST_WAKE_MESSAGE {
+            self.deliver_tasks()
+        } else if message == WM_TIMER && Some(wparam.0) == self.blink_timer {
+            self.blink_caret()
+        } else {
+            Ok(())
+        };
+        if let Err(error) = result {
+            self.deferred_error.get_or_insert(error);
         }
     }
 
-    /// 分派一条消息；返回是否收到 `WM_CLOSE`。
-    fn process_message(&mut self, message: &MSG) -> Result<bool, HostError> {
-        // 提交已经由 WM_IME_COMPOSITION 的 GCS_RESULTSTR 处理；WM_IME_CHAR
-        // 若再交给默认窗口过程会产生重复字符。
-        if message.message == WM_IME_CHAR {
-            return Ok(false);
+    /// `WM_PAINT` 的宿主处理；错误留给消息循环返回。
+    fn paint(&mut self) {
+        if self.close_requested {
+            return;
         }
-        // 安全：消息来自本线程消息队列，目标窗口仍有效。
-        unsafe {
-            let _ = TranslateMessage(message);
-            DispatchMessageW(message);
+        if let Err(error) = self.render() {
+            self.deferred_error.get_or_insert(error);
         }
-        if message.message == WM_LBUTTONDOWN {
-            self.pointer_pressed(message.lParam)?;
-            self.render()?;
-        } else if message.message == WM_CHAR {
-            self.char_typed(message.wParam)?;
-        } else if message.message == WM_KEYDOWN {
-            self.key_down(message.wParam)?;
-        } else if message.message == WM_IME_STARTCOMPOSITION {
-            self.ime_start()?;
-        } else if message.message == WM_IME_COMPOSITION {
-            self.ime_composition(message.lParam)?;
-        } else if matches!(message.message, WM_IME_ENDCOMPOSITION | WM_KILLFOCUS) {
-            self.ime_cancel()?;
-        } else if message.message == HOST_WAKE_MESSAGE {
-            self.deliver_tasks()?;
-        } else if message.message == WM_CLOSE {
-            // 窗口的 HWND 仍然有效；Window::drop 在 surface 释放后才销毁它。
-            self.close_activation()?;
-            return Ok(true);
-        } else if matches!(message.message, WM_SIZE | WM_PAINT | WM_DPICHANGED) {
-            self.render()?;
+    }
+
+    /// `WM_CLOSE` 的宿主处理：结束 activation 并标记关闭。
+    fn close_from_window(&mut self) {
+        self.close_requested = true;
+        if let Err(error) = self.close_activation() {
+            self.deferred_error.get_or_insert(error);
         }
-        Ok(false)
     }
 
     /// 交付已排队的 worker 结果，并只在快照确实变化时重绘。
@@ -344,9 +370,30 @@ impl Host {
         self.render()
     }
 
+    /// 闪烁 caret；只有聚焦输入、非组合且窗口在前台时才翻转。
+    fn blink_caret(&mut self) -> Result<(), HostError> {
+        let snapshot = self.runtime.presentation().map_err(HostError::Runtime)?;
+        let focused = focused_input(&snapshot).is_some();
+        let composing = focused_composition(&snapshot);
+        // 安全：只读取前台窗口句柄用于比较。
+        let foreground = unsafe { GetForegroundWindow() } == self.window.hwnd;
+        let visible = blinked(self.caret_visible, focused, composing, foreground);
+        if visible == self.caret_visible {
+            return Ok(());
+        }
+        self.caret_visible = visible;
+        self.render()
+    }
+
     /// 结束 activation 并拒绝后续唤醒；`WM_CLOSE` 与 `Drop` 共用。
     fn close_activation(&mut self) -> Result<(), HostError> {
         self.wake.close();
+        if let Some(timer) = self.blink_timer.take() {
+            // 安全：HWND 与定时器都属于本宿主；重复销毁安全。
+            unsafe {
+                let _ = KillTimer(Some(self.window.hwnd), timer);
+            }
+        }
         self.runtime
             .close_window(self.window_ctx)
             .map_err(HostError::Close)
@@ -637,19 +684,35 @@ impl Host {
             return Ok(());
         };
         let mut buffer = [0_u8; 4];
-        pointer_dispatch(
-            self.runtime
-                .insert_text_node(focused, character.encode_utf8(&mut buffer)),
-        )?;
+        let text = character.encode_utf8(&mut buffer);
+        // 部分 IME 把候选确认作为 WM_CHAR 送达，而不是 GCS_RESULTSTR；
+        // 组合中的字符必须走 commit，否则普通编辑会被 reducer 拒绝。
+        if is_composing(&snapshot, focused) {
+            pointer_dispatch(self.runtime.compose_commit_node(focused, text))?;
+        } else {
+            pointer_dispatch(self.runtime.insert_text_node(focused, text))?;
+        }
         self.render()
     }
 
     /// 一次 `WM_KEYDOWN`：从线程消息队列读取修饰键后进入映射本体。
     fn key_down(&mut self, wparam: WPARAM) -> Result<(), HostError> {
+        let key = VIRTUAL_KEY(wparam.0 as u16);
+        if key == VK_PROCESSKEY {
+            // IME 已消费该键。部分 IME 在 Escape 结束组合时不发送
+            // WM_IME_ENDCOMPOSITION；本地仍在组合而 OS 已无组合串时补一次取消。
+            if self.local_composition_active()?
+                && !self.os_composition_active()
+                && self.cancel_compositions()?
+            {
+                self.render()?;
+            }
+            return Ok(());
+        }
         // 安全：GetKeyState 只查询本线程最近一条键盘消息的修饰键状态。
         let shift = unsafe { GetKeyState(i32::from(VK_SHIFT.0)) } < 0;
         let control = unsafe { GetKeyState(i32::from(VK_CONTROL.0)) } < 0;
-        self.key_down_with(VIRTUAL_KEY(wparam.0 as u16), shift, control)
+        self.key_down_with(key, shift, control)
     }
 
     /// 键盘映射本体：编辑、caret/selection、焦点遍历与表单提交。
@@ -842,6 +905,26 @@ impl Host {
         }
     }
 
+    /// 运行时里是否有聚焦输入仍在组合。
+    fn local_composition_active(&self) -> Result<bool, HostError> {
+        let snapshot = self.runtime.presentation().map_err(HostError::Runtime)?;
+        Ok(focused_composition(&snapshot))
+    }
+
+    /// OS IME 当前是否仍有组合串；Escape 取消后部分 IME 直接清空它。
+    fn os_composition_active(&self) -> bool {
+        // 安全：himc 与 HWND 配对；只查询组合串长度，不读取缓冲。
+        let himc = unsafe { ImmGetContext(self.window.hwnd) };
+        if himc.0.is_null() {
+            return false;
+        }
+        let bytes = unsafe { ImmGetCompositionStringW(himc, GCS_COMPSTR, None, 0) };
+        unsafe {
+            let _ = ImmReleaseContext(self.window.hwnd, himc);
+        }
+        bytes > 0
+    }
+
     fn composition_string(
         &self,
         kind: IME_COMPOSITION_STRING,
@@ -875,7 +958,7 @@ impl Host {
         result
     }
 
-    /// 用 caret 的物理客户区坐标定位 OS 组合与候选窗口。
+    /// 用 caret 的物理客户区坐标定位 OS 组合与候选窗口；组合中改用 preedit 起点。
     ///
     /// `COMPOSITIONFORM` / `CANDIDATEFORM` 的坐标相对窗口左上角，不是屏幕坐标。
     fn position_ime(&self, snapshot: &PresentationSnapshot) {
@@ -888,7 +971,21 @@ impl Host {
         let Some(scene) = &self.scene else {
             return;
         };
-        let Some(caret) = scene.caret(node) else {
+        // 组合窗口放在 preedit 起点：UI 已绘制 preedit，OS 的组合串与它重叠，
+        // 而不是在 caret（preedit 末尾）之后再画一份。
+        let composition_start = snapshot
+            .node(node)
+            .and_then(SnapshotElement::edit)
+            .and_then(|edit| edit.composition())
+            .map(|(start, _)| start);
+        let caret = composition_start
+            .and_then(|start| {
+                scene
+                    .node(node)
+                    .and_then(|element| element.caret_at_value(start))
+            })
+            .or_else(|| scene.caret(node));
+        let Some(caret) = caret else {
             return;
         };
         let scale = scene.viewport().scale();
@@ -978,7 +1075,10 @@ impl Host {
         let viewport = Viewport::new(width as f32 / scale, height as f32 / scale, scale)
             .map_err(HostError::Scene)?;
         let snapshot = self.runtime.presentation().map_err(HostError::Runtime)?;
-        let scene = Scene::build(&snapshot, viewport).map_err(HostError::Scene)?;
+        let mut scene = Scene::build(&snapshot, viewport).map_err(HostError::Scene)?;
+        // 组合期间由 OS 组合窗口绘制 caret；闪烁只在非组合状态生效。
+        let composing = focused_composition(&snapshot);
+        scene.set_caret_visible(self.caret_visible && !composing);
         Ok((scene, snapshot))
     }
 }
@@ -1235,6 +1335,21 @@ fn is_composing(snapshot: &PresentationSnapshot, node: NodeId) -> bool {
         .is_some_and(|edit| edit.composition().is_some())
 }
 
+/// 聚焦输入是否仍在组合；没有聚焦输入时视为未组合。
+fn focused_composition(snapshot: &PresentationSnapshot) -> bool {
+    focused_input(snapshot).is_some_and(|node| is_composing(snapshot, node))
+}
+
+/// 一次闪烁后的 caret 可见性：只有聚焦输入、非组合且窗口在前台时才翻转；
+/// 其他情况保持可见，避免 caret 停在该隐藏的状态。
+const fn blinked(current: bool, focused: bool, composing: bool, foreground: bool) -> bool {
+    if focused && !composing && foreground {
+        !current
+    } else {
+        true
+    }
+}
+
 fn caret_command_for(
     snapshot: &PresentationSnapshot,
     node: NodeId,
@@ -1404,6 +1519,122 @@ fn target_config(
     RenderTargetConfig::new(format, width, height).map_err(HostError::Render)
 }
 
+/// 窗口过程可见的宿主指针；析构时清除槽位。
+///
+/// 只在 `run` 与 `pump` 期间安装：两者的循环在派发消息前不持有宿主引用，
+/// 窗口过程因此可以在系统模态循环里安全地重入宿主。析构清除也覆盖 panic
+/// 展开与提前返回，不会给窗口过程留下悬空地址。
+struct HostPointer {
+    hwnd: HWND,
+}
+
+impl HostPointer {
+    fn install(hwnd: HWND, host: *mut Host) -> Self {
+        // 安全：槽位只保存地址，不拥有对象；guard 离开作用域时清除。
+        unsafe {
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, host as isize);
+        }
+        Self { hwnd }
+    }
+}
+
+impl Drop for HostPointer {
+    fn drop(&mut self) {
+        // 安全：只清除地址槽。
+        unsafe {
+            SetWindowLongPtrW(self.hwnd, GWLP_USERDATA, 0);
+        }
+    }
+}
+
+/// 在窗口过程里取回宿主并执行一次动作；未安装指针时什么也不做。
+///
+/// # Safety
+///
+/// 动作执行期间不得通过其他引用访问宿主。`run`/`pump` 满足这一点：它们在
+/// 派发消息时只持有裸指针，派发返回后才重新借出宿主。
+unsafe fn with_host(hwnd: HWND, action: impl FnOnce(&mut Host)) {
+    // 安全：读取窗口的 user data 槽；未安装时为零。
+    let pointer = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut Host;
+    if pointer.is_null() {
+        return;
+    }
+    // 安全：指针由 HostPointer 安装，指向在 `run`/`pump` 期间不会移动的 Host；
+    // 调用方不在动作执行期间访问宿主。
+    let host = unsafe { &mut *pointer };
+    action(host);
+}
+
+/// 标脏整个客户区，让下一次 `WM_PAINT` 重排并重绘。
+fn invalidate(hwnd: HWND) {
+    // 安全：hwnd 来自系统回调；不擦除背景，GPU 覆盖整个客户区。
+    unsafe {
+        let _ = InvalidateRect(Some(hwnd), None, false);
+    }
+}
+
+/// 翻译并派发一条消息；窗口过程负责处理。
+fn dispatch_message(message: &MSG) {
+    // 安全：消息来自本线程队列，窗口由 Host 持有。
+    unsafe {
+        let _ = TranslateMessage(message);
+        DispatchMessageW(message);
+    }
+}
+
+/// `run` 的消息循环；返回关闭或处理错误。
+///
+/// # Safety
+///
+/// `host` 指向在循环期间不会移动的 `Host`；循环在派发消息时不持有它的引用。
+unsafe fn run_loop(host: *mut Host) -> Result<(), HostError> {
+    loop {
+        let mut message = MSG::default();
+        // 安全：标准 Win32 消息循环；窗口由 Host 持有。
+        let result = unsafe { GetMessageW(&mut message, None, 0, 0).0 };
+        if result == -1 {
+            return Err(HostError::MessageLoop);
+        }
+        if result == 0 {
+            return Ok(());
+        }
+        dispatch_message(&message);
+        // 安全：派发已返回，重新借出宿主读取处理结果。
+        let host = unsafe { &mut *host };
+        if let Some(error) = host.deferred_error.take() {
+            return Err(error);
+        }
+        if host.close_requested {
+            return Ok(());
+        }
+    }
+}
+
+/// `pump` 的消息循环；返回是否收到 `WM_CLOSE`。
+///
+/// # Safety
+///
+/// 与 [`run_loop`] 相同。
+unsafe fn pump_loop(host: *mut Host) -> Result<bool, HostError> {
+    loop {
+        let mut message = MSG::default();
+        // 安全：只取本线程队列里的消息；窗口由 Host 持有。
+        let result = unsafe { PeekMessageW(&mut message, None, 0, 0, PM_REMOVE) };
+        if result.0 == 0 {
+            return Ok(false);
+        }
+        dispatch_message(&message);
+        // 安全：派发已返回，重新借出宿主读取处理结果。
+        let host = unsafe { &mut *host };
+        if let Some(error) = host.deferred_error.take() {
+            return Err(error);
+        }
+        if host.close_requested {
+            return Ok(true);
+        }
+    }
+}
+
 unsafe extern "system" fn wndproc(
     hwnd: HWND,
     message: u32,
@@ -1411,7 +1642,33 @@ unsafe extern "system" fn wndproc(
     lparam: LPARAM,
 ) -> LRESULT {
     match message {
+        // 提交已经由 WM_IME_COMPOSITION 的 GCS_RESULTSTR 或 WM_CHAR 处理；
+        // WM_IME_CHAR 若再交给默认窗口过程会产生重复字符。
+        WM_IME_CHAR => LRESULT(0),
+        WM_PAINT => {
+            let mut paint = PAINTSTRUCT::default();
+            // 安全：hwnd 来自系统回调；paint 是有效的输出缓冲。
+            unsafe {
+                let _ = BeginPaint(hwnd, &mut paint);
+            }
+            // 安全：派发期间不持有宿主引用，窗口过程可以借出一次。
+            unsafe { with_host(hwnd, Host::paint) };
+            // 安全：与 BeginPaint 配对。
+            unsafe {
+                let _ = EndPaint(hwnd, &paint);
+            }
+            LRESULT(0)
+        }
+        WM_SIZE => {
+            // 拖动边框时系统进入自己的模态循环，只派发消息不返回消息循环；
+            // 标脏后由窗口过程里的 WM_PAINT 完成重排。
+            invalidate(hwnd);
+            // 安全：默认窗口过程。
+            unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+        }
         WM_CLOSE => {
+            // 安全：派发期间不持有宿主引用；结束 activation 并标记关闭。
+            unsafe { with_host(hwnd, Host::close_from_window) };
             // 隐藏窗口并结束消息循环；销毁推迟到 Window::drop，使 HWND 在 surface
             // 存活期间保持有效。
             // 安全：hwnd 来自系统回调。
@@ -1444,11 +1701,15 @@ unsafe extern "system" fn wndproc(
                     );
                 }
             }
+            invalidate(hwnd);
             LRESULT(0)
         }
         _ => {
             // 安全：默认窗口过程。
-            unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+            let result = unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
+            // 安全：默认过程已返回；窗口过程借出宿主处理这条消息。
+            unsafe { with_host(hwnd, |host| host.handle_message(message, wparam, lparam)) };
+            result
         }
     }
 }
@@ -1456,6 +1717,7 @@ unsafe extern "system" fn wndproc(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows::Win32::UI::WindowsAndMessaging::SendMessageW;
 
     #[test]
     fn resizing_relayouts_the_scene_and_surface() {
@@ -1497,6 +1759,78 @@ mod tests {
         host.resize(320, 240).expect("restore size");
         let frame = host.read_frame().expect("frame after restore");
         assert!(frame.width() > 0 && frame.height() > 0);
+    }
+
+    #[test]
+    fn a_paint_message_repaints_after_an_external_resize() {
+        let mut host = open_host();
+        host.render().expect("initial render");
+        let before = host.scene().expect("scene").viewport().width();
+
+        // 系统的拖动/缩放循环会直接调用窗口过程；这里用 SetWindowPos + WM_PAINT
+        // 复现同一路径，确认重排发生在窗口过程里而不是消息循环里。
+        let hwnd = host.hwnd();
+        {
+            let _pointer = HostPointer::install(hwnd, &mut host as *mut Host);
+            // 安全：hwnd 有效；只改大小，不移动也不改变 Z 序。
+            unsafe {
+                SetWindowPos(
+                    hwnd,
+                    None,
+                    0,
+                    0,
+                    640,
+                    480,
+                    SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+                )
+                .expect("resize the window");
+                SendMessageW(hwnd, WM_PAINT, Some(WPARAM(0)), Some(LPARAM(0)));
+            }
+        }
+
+        // 窗口尺寸不是客户区尺寸；重排的目标是新的客户区。
+        let (width, _) = client_size(hwnd).expect("client size after resize");
+        let scene = host.scene().expect("scene after paint");
+        let scale = scene.viewport().scale();
+        assert!(
+            (scene.viewport().width() - width as f32 / scale).abs() < 2.0,
+            "WM_PAINT relayouts at the new physical client size"
+        );
+        assert_ne!(scene.viewport().width(), before);
+    }
+
+    #[test]
+    fn caret_blinking_requires_focus_composition_and_foreground() {
+        assert!(!blinked(true, true, false, true), "a blink hides the caret");
+        assert!(blinked(false, true, false, true), "the next tick shows it");
+        assert!(
+            blinked(false, false, false, true),
+            "no focused input keeps the caret visible"
+        );
+        assert!(
+            blinked(false, true, true, true),
+            "composition keeps the caret visible"
+        );
+        assert!(
+            blinked(false, true, false, false),
+            "a background window keeps the caret visible"
+        );
+    }
+
+    #[test]
+    fn a_closed_host_ignores_later_paint_and_input() {
+        let mut host = open_host();
+        host.render().expect("initial render");
+        host.close_from_window();
+        assert!(host.close_requested);
+
+        // 关闭后 runtime 已释放 activation；再绘制或输入若没被跳过会记录错误。
+        host.handle_message(WM_CHAR, WPARAM('X' as usize), LPARAM(0));
+        host.paint();
+        assert!(
+            host.deferred_error.is_none(),
+            "a closed host does not touch the runtime"
+        );
     }
 
     fn wake_state() -> WakeState {
@@ -1746,6 +2080,26 @@ mod tests {
         Host::open(HostConfig::hidden("ZenUI host keyboard")).expect("open host")
     }
 
+    /// 通过真实窗口过程同步派发一条消息，验证路由而不是直接调用处理函数。
+    fn send_msg(host: &mut Host, message: MSG) {
+        let hwnd = host.hwnd();
+        {
+            let _pointer = HostPointer::install(hwnd, host as *mut Host);
+            // 安全：SendMessageW 在调用线程同步调用窗口过程；调用期间不使用 host。
+            unsafe {
+                SendMessageW(
+                    hwnd,
+                    message.message,
+                    Some(message.wParam),
+                    Some(message.lParam),
+                );
+            }
+        }
+        if let Some(error) = host.deferred_error.take() {
+            panic!("the window procedure failed: {error}");
+        }
+    }
+
     fn editor_node(host: &Host) -> NodeId {
         host.runtime
             .presentation()
@@ -1914,6 +2268,22 @@ mod tests {
     }
 
     #[test]
+    fn a_wm_char_commits_the_active_composition() {
+        let (mut host, node) = composing_host();
+        host.apply_ime_composition(node, request(false, true), None, Some("zhong".into()))
+            .expect("update");
+        host.char_typed(WPARAM(u32::from('中') as usize))
+            .expect("commit the IME character");
+
+        let snapshot = host.runtime.presentation().expect("snapshot");
+        let element = snapshot.node(node).expect("editor");
+        assert_eq!(element.text_value(), Some("Write tests中"));
+        let edit = element.edit().expect("edit");
+        assert_eq!(edit.composition(), None);
+        assert_eq!(edit.preedit(), None);
+    }
+
+    #[test]
     fn ime_commit_inserts_the_result() {
         let (mut host, node) = composing_host();
         host.apply_ime_composition(node, request(true, false), Some("你".into()), None)
@@ -1971,6 +2341,26 @@ mod tests {
     }
 
     #[test]
+    fn an_ime_consumed_key_cancels_a_local_composition() {
+        let (mut host, node) = composing_host();
+        host.runtime
+            .compose_update_node(node, "ni")
+            .expect("preedit");
+
+        // 没有真实 IME 上下文时 OS 组合串为空；本地仍在组合，按 Escape 的
+        // 静默结束路径补一次取消。
+        host.key_down(WPARAM(VK_PROCESSKEY.0 as usize))
+            .expect("process the consumed key");
+        let snapshot = host.runtime.presentation().expect("snapshot");
+        let element = snapshot.node(node).expect("editor");
+        assert_eq!(element.text_value(), Some("Write tests"));
+        assert!(
+            element.edit().expect("edit").composition().is_none(),
+            "a local composition without an OS string is cancelled"
+        );
+    }
+
+    #[test]
     fn wm_killfocus_cancels_composition() {
         let (mut host, node) = composing_host();
         host.runtime
@@ -1980,8 +2370,9 @@ mod tests {
             message: WM_KILLFOCUS,
             ..MSG::default()
         };
+        send_msg(&mut host, message);
         assert!(
-            !host.process_message(&message).expect("handle message"),
+            !host.close_requested,
             "focus loss does not close the window"
         );
         let snapshot = host.runtime.presentation().expect("snapshot");
@@ -2009,7 +2400,7 @@ mod tests {
             message: WM_IME_STARTCOMPOSITION,
             ..MSG::default()
         };
-        host.process_message(&start).expect("start message");
+        send_msg(&mut host, start);
         let snapshot = host.runtime.presentation().expect("snapshot");
         assert!(
             snapshot
@@ -2026,7 +2417,7 @@ mod tests {
             message: WM_IME_ENDCOMPOSITION,
             ..MSG::default()
         };
-        host.process_message(&end).expect("end message");
+        send_msg(&mut host, end);
         let snapshot = host.runtime.presentation().expect("snapshot");
         assert!(
             snapshot
@@ -2050,7 +2441,7 @@ mod tests {
             lParam: LPARAM(GCS_COMPSTR.0 as isize),
             ..MSG::default()
         };
-        host.process_message(&message).expect("composition message");
+        send_msg(&mut host, message);
         let snapshot = host.runtime.presentation().expect("snapshot");
         let element = snapshot.node(node).expect("editor");
         assert_eq!(element.text_value(), Some("Write tests"));
@@ -2070,7 +2461,7 @@ mod tests {
             wParam: WPARAM('X' as usize),
             ..MSG::default()
         };
-        host.process_message(&message).expect("IME char");
+        send_msg(&mut host, message);
         let snapshot = host.runtime.presentation().expect("snapshot");
         assert_eq!(
             snapshot.node(node).expect("editor").text_value(),

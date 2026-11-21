@@ -242,8 +242,15 @@ fn clicking_a_text_input_focuses_it_and_changes_the_frame() {
     let (id, _, scale) = center_of(&host, |element| {
         matches!(element.visual(), Visual::TextInput) && !element.text().is_empty()
     });
-    // 种子输入把 caret 留在文本末尾；点击靠左处应把它移回文本内部。
+    // 先点击靠右处聚焦，让 caret 落在文本末尾。
+    post_click(&host, point_in_text(&host, id, 0.8), scale);
+    assert!(
+        !host.pump().expect("focus the text input"),
+        "no close was posted"
+    );
     let initial_caret = host.scene().expect("scene").caret(id).expect("caret").x;
+
+    // 再点击靠左处应把它移回文本内部。
     post_click(&host, point_in_text(&host, id, 0.2), scale);
     assert!(
         !host.pump().expect("process the click"),

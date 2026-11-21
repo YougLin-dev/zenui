@@ -126,6 +126,16 @@ impl SceneElement {
             })
             .map(|stop| stop.value_index)
     }
+
+    /// 值偏移处的 caret 几何；组合窗口用它对齐 preedit 起点。
+    pub fn caret_at_value(&self, value_index: usize) -> Option<Rect> {
+        self.caret_stops
+            .as_ref()?
+            .iter()
+            .filter(|stop| stop.value_index == value_index)
+            .map(|stop| stop.caret)
+            .min_by(|left, right| left.x.total_cmp(&right.x))
+    }
 }
 
 fn caret_distance(caret: Rect, point: Point) -> f32 {
@@ -269,6 +279,7 @@ pub struct Scene {
     viewport: Viewport,
     elements: Vec<SceneElement>,
     decorations: Vec<Decoration>,
+    caret_visible: bool,
 }
 
 impl Scene {
@@ -280,6 +291,16 @@ impl Scene {
     /// 构建该场景的 viewport；scale 未参与布局。
     pub const fn viewport(&self) -> Viewport {
         self.viewport
+    }
+
+    /// 是否绘制 caret；几何在 `decorations` 中保留，供 IME 定位使用。
+    pub const fn caret_visible(&self) -> bool {
+        self.caret_visible
+    }
+
+    /// caret 闪烁或组合期间隐藏绘制，但不影响 caret 几何查询。
+    pub const fn set_caret_visible(&mut self, visible: bool) {
+        self.caret_visible = visible;
     }
 
     /// 已提交元素，按绘制顺序（先序）。
@@ -380,6 +401,7 @@ impl<'a> Builder<'a> {
             viewport,
             elements: Vec::new(),
             decorations: Vec::new(),
+            caret_visible: true,
         };
         self.emit(&mut shaper, root, Point::ZERO, &mut scene)?;
         Ok(scene)
@@ -530,6 +552,7 @@ impl<'a> Builder<'a> {
                         tag: element.tag(),
                     }
                 })?;
+                let focused = self.snapshot.focus() == Some(id);
                 let mut caret_stops = None;
                 if intrinsic == Intrinsic::TextInput {
                     let (content, width) = content_box(rect, layout);
@@ -544,7 +567,7 @@ impl<'a> Builder<'a> {
                         origin: content,
                     };
                     runs.extend(text::runs(&view.layout, content));
-                    add_edit_decorations(&view, &mut scene.decorations);
+                    add_edit_decorations(&view, focused, &mut scene.decorations);
                     caret_stops = Some(
                         text::caret_stops(&view.layout, view.origin, &view.display)
                             .into_iter()
@@ -560,7 +583,6 @@ impl<'a> Builder<'a> {
                     );
                 }
 
-                let focused = self.snapshot.focus() == Some(id);
                 scene.elements.push(SceneElement {
                     id,
                     tag: element.tag(),
@@ -622,7 +644,7 @@ fn measure_leaf(
     output
 }
 
-fn add_edit_decorations(view: &EditView<'_>, out: &mut Vec<Decoration>) {
+fn add_edit_decorations(view: &EditView<'_>, focused: bool, out: &mut Vec<Decoration>) {
     let Some(edit) = view.element.edit() else {
         return;
     };
@@ -649,11 +671,13 @@ fn add_edit_decorations(view: &EditView<'_>, out: &mut Vec<Decoration>) {
             });
         }
     }
-    out.push(Decoration {
-        node: view.element.id(),
-        kind: DecorationKind::Caret,
-        rect: text::caret(&view.layout, view.origin, &view.display, edit.caret()),
-    });
+    if focused {
+        out.push(Decoration {
+            node: view.element.id(),
+            kind: DecorationKind::Caret,
+            rect: text::caret(&view.layout, view.origin, &view.display, edit.caret()),
+        });
+    }
 }
 
 /// 把显示文本的字符偏移换算回编辑器 value 的字符偏移。
