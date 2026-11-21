@@ -61,6 +61,7 @@ fn a_long_value_stays_inside_its_input() {
     let mut app = runtime();
     let value = "word ".repeat(40);
     app.input("What needs to be done?", &value).expect("input");
+    app.focus("What needs to be done?").expect("focus");
     let snapshot = app.presentation().expect("snapshot");
     let scene = build_scene(&snapshot, 220.0);
     let node = snapshot
@@ -222,8 +223,8 @@ fn caret_and_selection_geometry_follow_local_edit_state() {
     let idle = app.presentation().expect("snapshot");
     let idle_id = idle.find_label("Edit Alpha").expect("editor").id();
     assert!(
-        build_scene(&idle, 800.0).caret(idle_id).is_some(),
-        "caret geometry exists without focus; drawing it is the backend's choice"
+        build_scene(&idle, 800.0).caret(idle_id).is_none(),
+        "an unfocused input draws no caret"
     );
 
     app.focus("Edit Alpha").expect("focus");

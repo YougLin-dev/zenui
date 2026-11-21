@@ -321,13 +321,15 @@ fn paint(
             }
         }
     }
-    for decoration in scene.decorations() {
-        if decoration.kind() == DecorationKind::Caret {
-            fill(
-                target,
-                physical_rect(decoration.rect(), scale),
-                palette.caret,
-            );
+    if scene.caret_visible() {
+        for decoration in scene.decorations() {
+            if decoration.kind() == DecorationKind::Caret {
+                fill(
+                    target,
+                    physical_rect(decoration.rect(), scale),
+                    palette.caret,
+                );
+            }
         }
     }
     Ok(())
