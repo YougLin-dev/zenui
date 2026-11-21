@@ -5,8 +5,12 @@ use zenui_demo::*;
 
 fn runtime() -> Runtime {
     let mut app = Runtime::new();
-    app.open_window("main", |window| view! { <TodoApp window={window} /> })
-        .expect("open window");
+    let state = app.setup(TodoState::new).expect("setup");
+    app.open_window(
+        "main",
+        move |window| view! { <TodoApp window={window} state={state} /> },
+    )
+    .expect("open window");
     app
 }
 

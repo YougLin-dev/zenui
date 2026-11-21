@@ -832,6 +832,32 @@ impl Runtime {
         }
     }
 
+    /// 在任何窗口挂载前运行应用级 setup，返回值由窗口 factory 捕获。
+    ///
+    /// setup 中的 Signal、Memo 与 Store 归属于应用 owner；窗口关闭不会释放它们。
+    /// 窗口已经挂载后不能再运行应用级 setup。
+    pub fn setup<R>(&mut self, setup: impl FnOnce() -> R) -> Result<R, MountError> {
+        if self.state.borrow().tree.is_some() {
+            return Err(MountError::Component(
+                "application setup must run before a window mounts",
+            ));
+        }
+        let state = self.state.clone();
+        context::install(&state, || {
+            with_state(|state| state.fault = None);
+            let value = with_owner(0, || {
+                with_state(|state| state.phase = Phase::Setup);
+                let value = setup();
+                with_state(|state| state.phase = Phase::Idle);
+                value
+            });
+            if let Some(fault) = with_state(|state| state.fault.take()) {
+                return Err(State::context_error(fault));
+            }
+            Ok(value)
+        })
+    }
+
     pub fn mount(
         &mut self,
         root: impl FnOnce() -> MountResult<MountPlan> + 'static,

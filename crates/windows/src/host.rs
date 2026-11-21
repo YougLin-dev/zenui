@@ -194,8 +194,13 @@ impl Host {
         runtime
             .set_appearance(config.appearance)
             .map_err(HostError::Runtime)?;
+        let state = runtime
+            .setup(zenui_demo::TodoState::new)
+            .map_err(HostError::Runtime)?;
         let window_ctx = runtime
-            .open_window("main", |window| view! { <TodoApp window=window /> })
+            .open_window("main", move |window| {
+                view! { <TodoApp window=window state=state /> }
+            })
             .map_err(|error| HostError::Window(error.to_string()))?;
         zenui_demo::seed(&mut runtime).map_err(HostError::Runtime)?;
 
