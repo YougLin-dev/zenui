@@ -32,6 +32,26 @@ fn by_text(snapshot: &PresentationSnapshot, tag: &str, text: &str) -> NodeId {
         .unwrap_or_else(|| panic!("no {tag} with text {text:?}"))
 }
 
+fn background_by_label(
+    snapshot: &PresentationSnapshot,
+    scene: &Scene,
+    label: &str,
+) -> Option<Color> {
+    scene
+        .node(snapshot.find_label(label).expect("labelled element").id())
+        .expect("scene element")
+        .resolved_style()
+        .background()
+}
+
+fn background_by_text(snapshot: &PresentationSnapshot, scene: &Scene, text: &str) -> Option<Color> {
+    scene
+        .node(by_text(snapshot, "button", text))
+        .expect("button")
+        .resolved_style()
+        .background()
+}
+
 #[test]
 fn long_toolbar_labels_stay_inside_their_buttons() {
     let app = runtime();
@@ -851,6 +871,7 @@ fn literal_colors_bypass_the_palette() {
     const STYLE: &[StyleDeclaration] = &[StyleDeclaration::new(
         Property::Background,
         StyleValue::Color(Color::Literal([12, 34, 56, 255])),
+        Condition::Base,
     )];
     let mut app = Runtime::new();
     app.open_window("main", |_| {
@@ -875,8 +896,137 @@ fn literal_colors_bypass_the_palette() {
 }
 
 #[test]
+fn semantic_conditions_select_declarations_from_committed_state() {
+    let mut app = Runtime::new();
+    app.mount(|| {
+        view! {
+            <view>
+                <button aria:label="dead" disabled={true} class="bg-control disabled:bg-danger">"Dead"</button>
+                <button aria:label="toggle" aria:pressed={true} class="bg-control aria-pressed:bg-accent">"On"</button>
+                <checkbox aria:label="checked" checked={true} class="bg-control checked:bg-accent" />
+                <text-input aria:label="editor" class="bg-control focus:bg-accent" />
+            </view>
+        }
+    })
+    .expect("mount");
+    app.focus("editor").expect("focus the editor");
+    let snapshot = app.presentation().expect("snapshot");
+    let scene = build_scene(&snapshot, 400.0);
+
+    assert_eq!(
+        background_by_label(&snapshot, &scene, "dead"),
+        Some(Color::Role(ColorRole::Danger)),
+        "disabled: applies while the button is disabled"
+    );
+    assert_eq!(
+        background_by_label(&snapshot, &scene, "toggle"),
+        Some(Color::Role(ColorRole::Accent)),
+        "aria-pressed: follows the semantic toggle"
+    );
+    assert_eq!(
+        background_by_label(&snapshot, &scene, "checked"),
+        Some(Color::Role(ColorRole::Accent)),
+        "checked: follows the committed checkbox state"
+    );
+    assert_eq!(
+        background_by_label(&snapshot, &scene, "editor"),
+        Some(Color::Role(ColorRole::Accent)),
+        "focus: follows the committed focus"
+    );
+
+    app.blur().expect("clear focus");
+    let unfocused = app.presentation().expect("snapshot");
+    let scene = build_scene(&unfocused, 400.0);
+    assert_eq!(
+        scene
+            .node(unfocused.find_label("editor").expect("editor").id())
+            .expect("editor")
+            .resolved_style()
+            .background(),
+        Some(Color::Role(ColorRole::Control)),
+        "the base declaration returns once focus is gone"
+    );
+}
+
+#[test]
+fn condition_rank_and_source_order_break_ties() {
+    let mut app = Runtime::new();
+    app.mount(|| {
+        view! {
+            <view>
+                <button
+                    aria:label="ranked"
+                    aria:pressed={true}
+                    disabled={true}
+                    class="aria-pressed:bg-accent disabled:bg-danger"
+                >"Ranked"</button>
+                <button
+                    aria:label="tied"
+                    aria:pressed={true}
+                    class="aria-pressed:bg-control aria-pressed:bg-danger"
+                >"Tied"</button>
+            </view>
+        }
+    })
+    .expect("mount");
+    let snapshot = app.presentation().expect("snapshot");
+    let scene = build_scene(&snapshot, 400.0);
+
+    assert_eq!(
+        background_by_label(&snapshot, &scene, "ranked"),
+        Some(Color::Role(ColorRole::Accent)),
+        "aria-pressed outranks disabled even when it appears earlier"
+    );
+    assert_eq!(
+        background_by_label(&snapshot, &scene, "tied"),
+        Some(Color::Role(ColorRole::Danger)),
+        "equal conditions use the later source order"
+    );
+}
+
+#[test]
+fn the_demo_filters_show_their_selected_style_and_still_filter() {
+    let mut app = runtime();
+    add(&mut app, "A");
+    app.change("Complete A", true).expect("complete A");
+    let snapshot = app.presentation().expect("snapshot");
+    let scene = build_scene(&snapshot, 800.0);
+    assert_eq!(
+        background_by_text(&snapshot, &scene, "All"),
+        Some(Color::Role(ColorRole::Accent)),
+        "the selected filter uses the accent role"
+    );
+    assert_eq!(
+        background_by_text(&snapshot, &scene, "Active"),
+        Some(Color::Role(ColorRole::Control)),
+        "an unselected filter uses the control role"
+    );
+
+    app.click_text("Active").expect("filter active");
+    let filtered = app.presentation().expect("snapshot");
+    assert!(
+        filtered.find_label("Complete A").is_none(),
+        "aria-pressed styling leaves the toggle semantics intact"
+    );
+    let scene = build_scene(&filtered, 800.0);
+    assert_eq!(
+        scene
+            .node(by_text(&filtered, "button", "Active"))
+            .expect("Active")
+            .resolved_style()
+            .background(),
+        Some(Color::Role(ColorRole::Accent)),
+        "the newly selected filter gains the accent role"
+    );
+}
+
+#[test]
 fn a_mismatched_style_declaration_is_an_explicit_error() {
-    const STYLE: &[StyleDeclaration] = &[StyleDeclaration::new(Property::Gap, StyleValue::Row)];
+    const STYLE: &[StyleDeclaration] = &[StyleDeclaration::new(
+        Property::Gap,
+        StyleValue::Row,
+        Condition::Base,
+    )];
     let mut app = Runtime::new();
     app.open_window("main", |_| {
         Ok(MountPlan::new(vec![zenui::view::styled_element(

@@ -621,14 +621,15 @@ fn class_literals_become_typed_declarations() {
     assert_eq!(
         button.styles(),
         &[
-            StyleDeclaration::new(Property::PaddingX, StyleValue::Points(12)),
-            StyleDeclaration::new(Property::PaddingY, StyleValue::Points(8)),
-            StyleDeclaration::new(Property::FlexDirection, StyleValue::Row),
+            StyleDeclaration::new(Property::PaddingX, StyleValue::Points(12), Condition::Base),
+            StyleDeclaration::new(Property::PaddingY, StyleValue::Points(8), Condition::Base),
+            StyleDeclaration::new(Property::FlexDirection, StyleValue::Row, Condition::Base),
             StyleDeclaration::new(
                 Property::Background,
-                StyleValue::Color(Color::Role(ColorRole::Accent))
+                StyleValue::Color(Color::Role(ColorRole::Accent)),
+                Condition::Base,
             ),
-            StyleDeclaration::new(Property::Radius, StyleValue::Points(6)),
+            StyleDeclaration::new(Property::Radius, StyleValue::Points(6), Condition::Base),
         ]
     );
     assert!(

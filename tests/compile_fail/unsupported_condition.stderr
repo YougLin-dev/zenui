@@ -1,0 +1,5 @@
+error: class condition is not supported yet `hover:bg-accent` at character 0
+ --> tests/compile_fail/unsupported_condition.rs:4:59
+  |
+4 |     let _: MountResult<MountPlan> = view! { <button class="hover:bg-accent">"Add"</button> };
+  |                                                           ^^^^^^^^^^^^^^^^^

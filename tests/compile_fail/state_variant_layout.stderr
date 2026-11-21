@@ -1,0 +1,5 @@
+error: state variants may only set paint properties `disabled:w-full` at character 0
+ --> tests/compile_fail/state_variant_layout.rs:4:59
+  |
+4 |     let _: MountResult<MountPlan> = view! { <button class="disabled:w-full">"Add"</button> };
+  |                                                           ^^^^^^^^^^^^^^^^^
