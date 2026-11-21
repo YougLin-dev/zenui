@@ -22,6 +22,7 @@ pub enum MountError {
     Write(WriteError),
     Delivery(&'static str),
     Component(&'static str),
+    Setup(&'static str),
 }
 
 impl MountError {
@@ -42,6 +43,7 @@ impl fmt::Display for MountError {
             Self::Write(error) => write!(f, "{error}"),
             Self::Delivery(message) => f.write_str(message),
             Self::Component(label) => write!(f, "component {label} rejected its mount"),
+            Self::Setup(message) => f.write_str(message),
         }
     }
 }

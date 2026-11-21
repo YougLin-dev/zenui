@@ -8,6 +8,10 @@ ZenUI 是一个 Rust 原生桌面界面框架；这个上下文覆盖 target SDK
 一个窗口实例的身份；关闭后旧 activation 的交付被丢弃，重开产生新 activation。
 _Avoid_: window instance, window generation
 
+**Application owner**:
+归属应用而不是某个窗口的 owner 0；`Runtime::setup` 创建的 Signal、Memo 与 Store 在窗口关闭后仍保留。
+_Avoid_: global state, app singleton
+
 **Host**:
 拥有原生窗口、事件循环、DPI 与 surface，并驱动 target runtime 的平台层。
 _Avoid_: platform backend, shell

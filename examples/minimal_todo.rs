@@ -3,16 +3,11 @@
 //! 组件树与 Windows 宿主共用 `zenui-demo`，初始任务由 `seed` 提供。
 
 use zenui::prelude::*;
-use zenui_demo::{TodoApp, TodoState, seed};
+use zenui_demo::{open_todo_window, seed};
 
 fn main() {
     let mut app = Runtime::new();
-    let state = app.setup(TodoState::new).expect("setup");
-    app.open_window(
-        "main",
-        move |window| view! { <TodoApp window=window state=state /> },
-    )
-    .expect("open window");
+    open_todo_window(&mut app).expect("open window");
     seed(&mut app).expect("seed");
 
     app.click_text("Active").expect("filter");

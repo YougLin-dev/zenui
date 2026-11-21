@@ -98,13 +98,17 @@ pub struct TodoState {
 
 impl TodoState {
     /// 在 `Runtime::setup` 中调用，创建归属于应用 owner 的 Store 与派生值。
+    #[expect(
+        clippy::new_without_default,
+        reason = "TodoState is only valid inside Runtime::setup, so it has no Default"
+    )]
     pub fn new() -> Self {
         let todos = Store::new();
         let filter = signal(Filter::All);
         let remaining = memo(move || todos.rows(Filter::Active).len());
         let remaining_txt = memo(move || format!("{} remaining", remaining.get()));
         let no_tasks = memo(move || todos.is_empty(Filter::All));
-        let no_matches = memo(move || !todos.is_empty(Filter::All) && todos.is_empty(filter.get()));
+        let no_matches = memo(move || !no_tasks.get() && todos.is_empty(filter.get()));
         let task_error = signal(String::new());
         let preview = signal(String::new());
         let has_error = memo(move || !task_error.get().is_empty());
@@ -124,10 +128,15 @@ impl TodoState {
     }
 }
 
-impl Default for TodoState {
-    fn default() -> Self {
-        Self::new()
-    }
+/// 创建应用级 Todo 状态并打开主窗口。
+///
+/// 状态必须先于窗口挂载创建，因此本函数内部先运行 `Runtime::setup`，
+/// 再把共享状态交给窗口 factory。
+pub fn open_todo_window(runtime: &mut Runtime) -> Result<WindowCtx, WindowError> {
+    let state = runtime.setup(TodoState::new)?;
+    runtime.open_window("main", move |window| {
+        view! { <TodoApp window=window state=state /> }
+    })
 }
 
 #[component]

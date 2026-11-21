@@ -44,8 +44,6 @@ use zenui_render::{
     Visual, wgpu,
 };
 
-use zenui_demo::TodoApp;
-
 /// worker 唤醒只投递这一条消息；`WM_APP` 起是应用私有的消息区间。
 const HOST_WAKE_MESSAGE: u32 = WM_APP + 1;
 
@@ -194,14 +192,11 @@ impl Host {
         runtime
             .set_appearance(config.appearance)
             .map_err(HostError::Runtime)?;
-        let state = runtime
-            .setup(zenui_demo::TodoState::new)
-            .map_err(HostError::Runtime)?;
-        let window_ctx = runtime
-            .open_window("main", move |window| {
-                view! { <TodoApp window=window state=state /> }
-            })
-            .map_err(|error| HostError::Window(error.to_string()))?;
+        let window_ctx =
+            zenui_demo::open_todo_window(&mut runtime).map_err(|error| match error {
+                WindowError::Mount(error) => HostError::Runtime(error),
+                error => HostError::Window(error.to_string()),
+            })?;
         zenui_demo::seed(&mut runtime).map_err(HostError::Runtime)?;
 
         let hinstance = module_handle()?;
@@ -1316,7 +1311,7 @@ impl Drop for Host {
 /// 宿主的一帧失败；没有 panics。
 #[derive(Debug)]
 pub enum HostError {
-    /// 运行时挂载或快照失败。
+    /// 运行时 setup、挂载或快照失败。
     Runtime(MountError),
     /// 窗口类注册、创建或查询失败。
     Window(String),
