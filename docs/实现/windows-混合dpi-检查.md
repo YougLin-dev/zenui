@@ -45,6 +45,8 @@ surface 重配置的路径。它不覆盖两块显示器同时使用不同缩放
 ## 自动化覆盖的边界
 
 - 隐藏窗口 resize smoke 验证逻辑布局与物理帧尺寸一致。
+- 隐藏窗口测试直接发送 `WM_GETDPISCALEDSIZE`，断言 640×480 逻辑客户区在 192 DPI
+  下得到 1280×960 物理客户区，覆盖 DPI 变化后的目标外框计算；它不触发真实缩放切换。
 - `Host::resize` 使用 `AdjustWindowRectExForDpi`，surface 重建测试验证焦点、
   caret、selection 与 Node ID 在恢复后不变。
 - 这些测试不切换显示器，也不产生真实 IME 组合，因此不能替代本页的人工检查。
