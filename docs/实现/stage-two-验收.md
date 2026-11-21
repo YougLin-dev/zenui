@@ -84,9 +84,11 @@ border-box known dimension 直接交给文本测量，而最终绘制按 content
 **中文只显示草稿，候选确认后仍是草稿。** 微软拼音在候选确认时把提交字符作为
 `WM_CHAR` 送达，而宿主只在非组合状态调用 `insert_text_node`，组合中的字符被
 reducer 拒绝，模型从未写入。修复让组合中的 `WM_CHAR` 走 `compose_commit_node`。
-同一轮还发现应用绘制的 preedit 与系统组合窗口重影：组合窗口原先定位在 preedit
-末尾，现在定位到 preedit 起点，两者重叠。真实微软拼音配合合成按键的证据见
-[07](证据/stage-two/07-ime-preedit-with-candidates.png)（候选窗口、单一 preedit）
+第二轮人工试跑又发现草稿被画了两层：应用绘制 preedit，输入法又在自己的组合窗口里
+画了一份拼音（白色浮层）。窗口过程现在消费 `WM_IME_STARTCOMPOSITION` 而不交给
+默认过程，微软拼音不再绘制自己的组合窗口；preedit 由场景按输入框的普通文本样式
+绘制，候选窗仍由系统绘制并锚在 preedit 起点。真实微软拼音配合合成按键的证据见
+[07](证据/stage-two/07-ime-preedit-with-candidates.png)（单一 preedit，候选窗）
 与 [08](证据/stage-two/08-ime-committed.png)（提交为“中文”）。
 
 **Escape 取消失败。** 微软拼音吞掉 Escape 后只送达 `VK_PROCESSKEY`，不发送
