@@ -1,6 +1,7 @@
 use std::fmt;
 use std::marker::PhantomData;
 
+use crate::presentation::Appearance;
 use crate::task::TaskScope;
 use crate::view::MountError;
 
@@ -42,6 +43,27 @@ impl WindowCtx {
     /// 应用所有权的工作：窗口关闭后仍可提交共享模型。
     pub const fn app_task_scope(self) -> TaskScope {
         TaskScope::app(self.runtime)
+    }
+
+    /// 当前应用外观；在 memo 计算期间读取会建立依赖。
+    pub fn appearance(self) -> Result<Appearance, WindowError> {
+        crate::context::with_state_of(self.runtime, |state| {
+            if !state.window_is_live(self.key, self.activation, self.owner) {
+                return Err(WindowError::Stale);
+            }
+            Ok(state.read_appearance())
+        })
+    }
+
+    /// 设置应用外观；窗口已关闭时拒绝。
+    pub fn set_appearance(self, appearance: Appearance) -> Result<(), WindowError> {
+        crate::context::with_state_of(self.runtime, |state| {
+            if !state.window_is_live(self.key, self.activation, self.owner) {
+                return Err(WindowError::Stale);
+            }
+            state.set_appearance(appearance);
+            Ok(())
+        })
     }
 }
 

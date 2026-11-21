@@ -21,8 +21,8 @@ pub mod window;
 pub use context::Phase;
 pub use dispatch::{DispatchError, NodeOperation};
 pub use presentation::{
-    NodeId, NodeStatus, PresentationSnapshot, SnapshotAttr, SnapshotElement, SnapshotNode,
-    SnapshotValue, TextEditState,
+    Appearance, NodeId, NodeStatus, PresentationSnapshot, SnapshotAttr, SnapshotElement,
+    SnapshotNode, SnapshotValue, TextEditState,
 };
 pub use runtime::{FocusInfo, Runtime};
 pub use signal::{Memo, Once, Signal, memo, once, signal};
@@ -42,12 +42,12 @@ pub use zenui_style::{
 
 pub mod prelude {
     pub use crate::{
-        BlurEvent, Children, ChildrenFactory, Color, ColorRole, CompositionEvent, CompositionPhase,
-        Condition, DeliveryReport, DispatchError, Field, FieldError, FocusCause, FocusEvent,
-        FocusInfo, Key, KeyEvent, Length, LengthUnit, Memo, MountError, MountPlan, MountResult,
-        NodeId, NodeOperation, NodeStatus, Once, Opacity, PresentationSnapshot, Property, Runtime,
-        Signal, SnapshotAttr, SnapshotElement, SnapshotNode, SnapshotValue, Store,
-        StyleDeclaration, StyleOrigin, StyleValue, SubmitEvent, Task, TaskError, TaskScope,
+        Appearance, BlurEvent, Children, ChildrenFactory, Color, ColorRole, CompositionEvent,
+        CompositionPhase, Condition, DeliveryReport, DispatchError, Field, FieldError, FocusCause,
+        FocusEvent, FocusInfo, Key, KeyEvent, Length, LengthUnit, Memo, MountError, MountPlan,
+        MountResult, NodeId, NodeOperation, NodeStatus, Once, Opacity, PresentationSnapshot,
+        Property, Runtime, Signal, SnapshotAttr, SnapshotElement, SnapshotNode, SnapshotValue,
+        Store, StyleDeclaration, StyleOrigin, StyleValue, SubmitEvent, Task, TaskError, TaskScope,
         TaskStatus, TaskToken, TextEditState, TodoId, Transaction, WindowCtx, WindowError,
         WriteError, WriteOp, component, em, memo, once, px, signal, view,
     };

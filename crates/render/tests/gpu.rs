@@ -550,6 +550,27 @@ fn hovering_and_pressing_a_control_change_its_pixels() {
 }
 
 #[test]
+fn the_dark_palette_paints_dark_surfaces() {
+    let Some(context) = context() else {
+        return;
+    };
+    let app = runtime();
+    let snapshot = app.presentation().expect("snapshot");
+    let scene = scene(&snapshot, 128.0, 128.0, 1.0);
+    let format = wgpu::TextureFormat::Bgra8Unorm;
+    let light = render_with(&context, &scene, format, 128, 128, RenderPalette::light());
+    let dark = render_with(&context, &scene, format, 128, 128, RenderPalette::dark());
+    assert!(
+        light.at(4, 4)[..3].iter().all(|channel| *channel > 200),
+        "the light surface is near white"
+    );
+    assert!(
+        dark.at(4, 4)[..3].iter().all(|channel| *channel < 60),
+        "the dark surface is near black"
+    );
+}
+
+#[test]
 fn both_bgra_formats_render_the_same_primary_colors() {
     let Some(context) = context() else {
         return;

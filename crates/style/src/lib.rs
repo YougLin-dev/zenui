@@ -431,7 +431,7 @@ fn split_condition(token: &str) -> Result<(Condition, &str), &'static str> {
         "disabled" => Condition::Disabled,
         "checked" => Condition::Checked,
         "aria-pressed" => Condition::AriaPressed,
-        "dark" => return Err("class condition is not supported yet"),
+        "dark" => Condition::Dark,
         _ => return Err("unknown class condition"),
     };
     Ok((condition, utility))
@@ -633,12 +633,28 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_and_compound_conditions_are_errors() {
-        let unsupported = parse_class_literal("dark:bg-control").expect_err("unsupported");
+    fn the_dark_condition_has_the_lowest_rank() {
+        let parsed = parse_class_literal("dark:bg-surface hover:bg-control-hover").expect("parse");
         assert_eq!(
-            unsupported[0].message(),
-            "class condition is not supported yet"
+            parsed,
+            vec![
+                StyleDeclaration::new(
+                    Property::Background,
+                    StyleValue::Color(Color::Role(ColorRole::Surface)),
+                    Condition::Dark
+                ),
+                StyleDeclaration::new(
+                    Property::Background,
+                    StyleValue::Color(Color::Role(ColorRole::ControlHover)),
+                    Condition::Hover
+                ),
+            ]
         );
+        assert!(Condition::Dark.rank() < Condition::Hover.rank());
+    }
+
+    #[test]
+    fn unsupported_and_compound_conditions_are_errors() {
         let compound = parse_class_literal("dark:hover:bg-accent").expect_err("compound");
         assert_eq!(
             compound[0].message(),

@@ -9,8 +9,8 @@ use zenui_core::{Counters, RowSet};
 use crate::context::{self, ContextFault, DepKey, Phase, with_state};
 use crate::dispatch::{DispatchError, NodeOperation};
 use crate::presentation::{
-    NodeId, NodeStatus, PresentationSnapshot, SnapshotAttr, SnapshotElement, SnapshotNode,
-    SnapshotValue, TextEditState,
+    Appearance, NodeId, NodeStatus, PresentationSnapshot, SnapshotAttr, SnapshotElement,
+    SnapshotNode, SnapshotValue, TextEditState,
 };
 use crate::signal::{Memo, MemoCell, SignalCell};
 use crate::store::{TodoId, WriteError};
@@ -45,6 +45,7 @@ pub(crate) struct State {
     pub(crate) core: zenui_core::Runtime,
     pub(crate) phase: Phase,
     pub(crate) fault: Option<ContextFault>,
+    pub(crate) appearance: Appearance,
     pub(crate) signals: Vec<SignalCell>,
     pub(crate) memos: Vec<MemoCell>,
     pub(crate) reverse: BTreeMap<DepKey, BTreeSet<u32>>,
@@ -112,6 +113,7 @@ impl State {
             core: zenui_core::Runtime::new(),
             phase: Phase::Idle,
             fault: None,
+            appearance: Appearance::Light,
             signals: Vec::new(),
             memos: Vec::new(),
             reverse: BTreeMap::new(),
@@ -241,6 +243,23 @@ impl State {
             .map(|record| std::mem::take(&mut record.resources))
             .unwrap_or_default();
         self.release_resources(resources);
+    }
+
+    /// 读取外观；memo 计算期间记为依赖。
+    pub(crate) fn read_appearance(&mut self) -> Appearance {
+        if self.phase == Phase::Memo {
+            self.note_dep(DepKey::Appearance);
+        }
+        self.appearance
+    }
+
+    /// 更新外观；变化时只失效依赖外观的 memo。
+    pub(crate) fn set_appearance(&mut self, appearance: Appearance) {
+        if self.appearance == appearance {
+            return;
+        }
+        self.appearance = appearance;
+        self.bump(DepKey::Appearance);
     }
 
     pub(crate) fn window_is_live(&self, key: &'static str, activation: u32, owner: u32) -> bool {
@@ -2379,7 +2398,25 @@ impl Runtime {
         let focus = state
             .presented_focus()
             .map(|element| state.elements[element].id);
-        Ok(PresentationSnapshot { roots, focus })
+        Ok(PresentationSnapshot {
+            roots,
+            focus,
+            appearance: state.appearance,
+        })
+    }
+
+    /// 当前应用外观。
+    pub fn appearance(&self) -> Appearance {
+        self.state.borrow().appearance
+    }
+
+    /// 设置应用外观；只失效依赖外观的 memo，并在已挂载时刷新一帧。
+    pub fn set_appearance(&mut self, appearance: Appearance) -> Result<(), MountError> {
+        self.state.borrow_mut().set_appearance(appearance);
+        if self.state.borrow().tree.is_some() {
+            self.refresh()?;
+        }
+        Ok(())
     }
 
     /// 对照当前已提交界面判定一个 Node ID：存活、已卸载或从未分配。

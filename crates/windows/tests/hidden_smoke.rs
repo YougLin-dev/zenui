@@ -11,7 +11,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     PostMessageW, WM_CHAR, WM_CLOSE, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP,
     WM_MOUSEMOVE,
 };
-use zenui::{Color, ColorRole, NodeId};
+use zenui::{Appearance, Color, ColorRole, NodeId};
 use zenui_render::{Point, SceneElement, Visual};
 use zenui_windows::{Host, HostConfig, HostError};
 
@@ -261,6 +261,7 @@ fn an_empty_client_area_renders_nothing_and_refuses_readback() {
         visible: false,
         width: 0,
         height: 0,
+        appearance: Appearance::Light,
     })
     .expect("open a zero-sized host");
 
@@ -683,7 +684,7 @@ fn delete_removes_a_native_row() {
     host.render().expect("render the initial frame");
     assert_eq!(checkbox_ids(&host).len(), 2);
 
-    let (delete, scale) = button_at(&host, 8);
+    let (delete, scale) = button_at(&host, 9);
     post_click(&host, delete, scale);
     host.pump().expect("delete the first row");
     assert_eq!(
@@ -967,6 +968,63 @@ fn focus_visible_follows_keyboard_not_pointer_modality() {
             .border_color(),
         None,
         "pointer input clears focus-visible"
+    );
+
+    post_close(&host);
+    host.run().expect("process the close");
+}
+
+#[test]
+fn a_configured_dark_appearance_paints_and_the_toggle_preserves_edit_state() {
+    let mut host = Host::open(HostConfig {
+        appearance: Appearance::Dark,
+        ..HostConfig::hidden("ZenUI dark appearance")
+    })
+    .expect("open a dark host");
+    host.render().expect("render the dark frame");
+    let dark = host.read_frame().expect("dark frame");
+    assert!(
+        dark.pixel(4, 4).expect("dark pixel")[..3]
+            .iter()
+            .all(|channel| *channel < 60),
+        "the configured dark appearance paints a dark surface: {:?}",
+        dark.pixel(4, 4).expect("dark pixel")
+    );
+
+    let scene = host.scene().expect("scene");
+    let input = scene
+        .elements()
+        .iter()
+        .find(|element| matches!(element.visual(), Visual::TextInput))
+        .expect("a text input");
+    let id = input.id();
+    let point = point_in_text(&host, id, 0.6);
+    let scale = scene.viewport().scale();
+    post_click(&host, point, scale);
+    host.pump().expect("focus the input");
+    let focused = focused_id(&host).expect("focused input");
+    let caret = host.scene().expect("scene").caret(focused).expect("caret");
+
+    let (toggle, scale) = button_at(&host, 8);
+    post_click(&host, toggle, scale);
+    host.pump().expect("toggle the theme");
+    let light = host.read_frame().expect("light frame");
+    assert!(
+        light.pixel(4, 4).expect("light pixel")[..3]
+            .iter()
+            .all(|channel| *channel > 200),
+        "the toggle switches the palette back to light: {:?}",
+        light.pixel(4, 4).expect("light pixel")
+    );
+    assert_eq!(
+        focused_id(&host),
+        Some(focused),
+        "focus survives the switch"
+    );
+    assert_eq!(
+        host.scene().expect("scene").caret(focused).expect("caret"),
+        caret,
+        "caret geometry survives the switch"
     );
 
     post_close(&host);

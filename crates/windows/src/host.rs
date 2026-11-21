@@ -64,6 +64,8 @@ pub struct HostConfig {
     pub width: u32,
     /// 客户区的初始逻辑高度。
     pub height: u32,
+    /// 应用的初始外观。
+    pub appearance: Appearance,
 }
 
 impl HostConfig {
@@ -74,6 +76,7 @@ impl HostConfig {
             visible: true,
             width: 900,
             height: 700,
+            appearance: Appearance::Light,
         }
     }
 
@@ -84,6 +87,7 @@ impl HostConfig {
             visible: false,
             width: 900,
             height: 700,
+            appearance: Appearance::Light,
         }
     }
 }
@@ -187,6 +191,9 @@ impl Host {
             let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         }
         let mut runtime = Runtime::new();
+        runtime
+            .set_appearance(config.appearance)
+            .map_err(HostError::Runtime)?;
         let window_ctx = runtime
             .open_window("main", |window| view! { <TodoApp window=window /> })
             .map_err(|error| HostError::Window(error.to_string()))?;
@@ -516,6 +523,8 @@ impl Host {
                 return Ok(());
             }
             let (scene, snapshot) = self.current_scene(width, height)?;
+            self.renderer
+                .set_palette(palette_for(snapshot.appearance()));
             let status = self.current_surface()?.get_current_texture();
             let frame = match status {
                 wgpu::CurrentSurfaceTexture::Success(frame)
@@ -753,7 +762,9 @@ impl Host {
                 "cannot read a frame from an empty client area",
             )));
         }
-        let (scene, _) = self.current_scene(width, height)?;
+        let (scene, snapshot) = self.current_scene(width, height)?;
+        self.renderer
+            .set_palette(palette_for(snapshot.appearance()));
         let format = self.surface_config.format;
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("zenui host readback"),
@@ -1720,6 +1731,13 @@ fn new_renderer(
         target,
         RenderPalette::default(),
     ))
+}
+
+const fn palette_for(appearance: Appearance) -> RenderPalette {
+    match appearance {
+        Appearance::Light => RenderPalette::light(),
+        Appearance::Dark => RenderPalette::dark(),
+    }
 }
 
 fn target_config(

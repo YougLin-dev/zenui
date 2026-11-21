@@ -53,14 +53,28 @@ pub enum NodeStatus {
     Unknown,
 }
 
+/// 应用外观；影响语义颜色调色板与 `dark:` 条件。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Appearance {
+    #[default]
+    Light,
+    Dark,
+}
+
 /// 从已提交界面生成的一次性只读描述；不包含几何、闭包或平台句柄。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PresentationSnapshot {
     pub(crate) roots: Vec<SnapshotNode>,
     pub(crate) focus: Option<NodeId>,
+    pub(crate) appearance: Appearance,
 }
 
 impl PresentationSnapshot {
+    /// 已提交的应用外观。
+    pub const fn appearance(&self) -> Appearance {
+        self.appearance
+    }
+
     /// 已提交的根节点，保持挂载顺序。
     pub fn roots(&self) -> &[SnapshotNode] {
         &self.roots

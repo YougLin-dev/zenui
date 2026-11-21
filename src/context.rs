@@ -24,6 +24,7 @@ pub(crate) enum FieldKind {
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub(crate) enum DepKey {
+    Appearance,
     Signal(u32),
     Memo(u32),
     Field(TodoId, FieldKind),
