@@ -107,10 +107,11 @@ GPU 全部绘制。修复让 caret 只属于聚焦输入，并由 `SetTimer`（5
 **交互式缩放整页拉伸。** 拖动窗口边框时，系统在自己持有的模态缩放循环里直接调用
 窗口过程，宿主的消息循环在这段时间收不到 `WM_SIZE`/`WM_PAINT`，于是窗口只显示被
 DWM 拉伸的最后一帧。修复把消息处理移进窗口过程：`run`/`pump` 只负责取消息与派发，
-期间不持有宿主引用；窗口过程通过 `GWLP_USERDATA` 取回宿主，处理输入并在 `WM_PAINT`
-中重排。`WM_SIZE` 与 `WM_DPICHANGED` 标脏客户区，由窗口过程的 `WM_PAINT` 完成重排。
+期间不持有宿主引用；窗口过程通过 `GWLP_USERDATA` 取回宿主，处理输入并在 `WM_SIZE`
+到达时同步按新客户区重排并呈现，避免 DWM 先把上一帧拉伸到新尺寸；`WM_PAINT` 只处理
+有实际更新区域的失效。
 回归测试 `crates/windows/src/host.rs::a_paint_message_repaints_after_an_external_resize`
-在消息循环之外发送 `WM_PAINT`，断言场景按新的客户区重排；证据
+在消息循环之外改窗口尺寸并派发 `WM_PAINT`，断言场景按新的客户区重排；证据
 [12](证据/stage-two/12-live-resize-during-drag.png) 是拖动过程中（松开鼠标之前）
 截取的画面，布局已按新尺寸重排且文字未缩放。
 
