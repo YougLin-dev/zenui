@@ -6,7 +6,9 @@
 第二轮人工试跑发现的问题已修复并复验（见「人工试跑反馈与修复」）。维护者报告已用
 真实鼠标、键盘与微软拼音自测 #60 的原生输入与中英文编辑清单，报告未发现异常
 （见「人工验收」；本次未提供截图、录屏或逐项观察记录）；跨显示器混合 DPI 与实机
-device loss 仍待确认（#63）。
+device loss 仍待确认（#63）。样式里程碑的第四轮验收为部分完成：按下、拖出、松开
+激活、`focus-visible:` 与深色主题有可见窗口截图；hover 截图与 100%/150% 缩放的
+可见运行仍待人工执行（见「样式里程碑的可见窗口验收」）。
 本页不把脚本投递的原生消息当作人工操作，也不把 headless 或 CI WARP 结果当作原生呈现验收。
 
 验收日期：2026-11-21。首轮验收对象为 `edd0383`（#80 合并后的 `main`）与本分支的
@@ -127,7 +129,8 @@ DWM 拉伸的最后一帧。修复把消息处理移进窗口过程：`run`/`pum
 （松开鼠标之前）的客户区截图。
 
 第四个问题“按钮没有 hover 等状态效果”不在本切片的范围：spec #68 明确本阶段不做
-class 样式，状态样式属于路线图的样式里程碑，已记录为 #96。
+class 样式，状态样式属于路线图的样式里程碑，已记录为 #96。#96 已由 #113 关闭，
+class 状态变体与深色主题随后由 #110、#114 完成；本轮的可见窗口证据见下一节。
 
 ## 人工验收（第三轮）
 
@@ -147,6 +150,76 @@ class 样式，状态样式属于路线图的样式里程碑，已记录为 #96�
   运行时结算到仍可聚焦的控件，而不是停在已卸载的行；该行为由
   `focus_survives_reorder_and_settles_after_delete` 与
   `filtering_out_the_focused_row_does_not_let_the_remount_steal_focus` 断言。
+
+## 样式里程碑的可见窗口验收（第四轮）
+
+2026-11-21，针对 #115 的样式里程碑（class 词表、宿主瞬态与深色主题）在可见窗口上
+做了一轮自动驱动验收。**状态：部分完成。** 按下、拖出后松开、松开激活、
+`focus-visible:` 与深色主题切换有可见窗口截图；hover 截图与 100%/150% 缩放的可见
+运行未取得（见「仍需人工执行」）。
+
+### 环境与方法
+
+- 与第二、三轮同一台机器：Windows 11 10.0.26300，RTX 4060 Laptop GPU，DX12；
+  单显示器。本轮 `GetDpiForWindow` = 120，即 **125%** 缩放；第二、三轮记录的是
+  150%，因此本节的截图不能当作 100% 或 150% 的证据。
+- 源码为 #114 合并后的分支，验收提交见本节所在 PR；构建命令
+  `cargo build -p zenui-windows --example todo_host --locked`，窗口标题
+  `ZenUI Todo`，客户区 1125×875 物理像素。
+- 录制期间共享桌面正在被使用：窗口可见但不是前台，且被置于 z-order 底部，前台应用
+  保持焦点。状态由 `PostMessage` 投递原生鼠标/键盘消息（与隐藏 smoke 相同的窗口
+  过程路径），不是人工操作；画面用 `PrintWindow(PW_CLIENTONLY|PW_RENDERFULLCONTENT)`
+  读取窗口客户区，不是桌面截屏。因此这些截图证明可见原生窗口、真实 GPU 与真实窗口
+  过程上的状态和像素，不证明用户注视下的完整 DWM 呈现时序，也不等于人工试跑。
+- hover 由真实光标触发并依赖 `TrackMouseEvent`。录制期间光标无法稳定停在窗口上
+  （共享桌面持续有其它输入），未取得 hover 截图；hover 的像素与命中行为由自动测试
+  覆盖（见下）。
+
+### 可见窗口结果
+
+| # | 步骤 | 预期 | 结果 | 截图 |
+| --- | --- | --- | --- | --- |
+| 1 | 启动后的明亮基线 | All 选中，两条种子任务 | 与隐藏 smoke 的种子状态一致 | [01](证据/styling/01-visible-baseline-125.png) |
+| 2 | 在 Reverse 上按下并保持 | 内建按钮变深（`control_pressed`），不立即激活 | 底色变深，顺序未变 | [02](证据/styling/02-pressed-reverse-125.png) |
+| 3 | 按住后拖到空白处松开 | 不激活 | 顺序仍为 Write tests、Read docs | [03](证据/styling/03-drag-off-no-activation-125.png) |
+| 4 | 在 Reverse 上按下并松开 | 松开时恰好激活一次 | 顺序变为 Read docs、Write tests | [04](证据/styling/04-release-activates-125.png) |
+| 5 | 指针点击草稿输入框 | 获得焦点与 caret，不匹配 `focus-visible:` | 边框保持默认色 | [05](证据/styling/05-focus-pointer-125.png) |
+| 6 | 点击空白后按 Tab（键盘模态） | 草稿框获得键盘焦点，显示 accent 边框 | 边框变为 accent 色 | [06](证据/styling/06-focus-visible-125.png) |
+| 7 | 点击 Theme | 切换深色调色板，焦点与 caret 保留 | 深色呈现，草稿框仍是键盘焦点 | [07](证据/styling/07-dark-theme-125.png) |
+
+`focus-visible:` 的前后对照（05 与 06）使用同一控件与同一 `focus-visible:border-accent`
+声明，只改变输入模态；07 显示外观切换不重组界面树。
+
+### 自动覆盖（不能代替实机）
+
+- hover/press 像素：`crates/render/tests/gpu.rs::hovering_and_pressing_a_control_change_its_pixels`；
+  100%/150% 文本与绘制：`text_classes_render_at_both_scales_without_clipping`；
+  深色调色板：`the_dark_palette_paints_dark_surfaces`。
+- 原生消息路径：`crates/windows/tests/hidden_smoke.rs` 的
+  `hover_press_and_release_activate_a_filter_button_once`、`dragging_off_cancels_activation`、
+  `hover_does_not_change_focus_or_caret`、`a_relayout_keeps_hover_consistent_with_the_hit_test`、
+  `focus_visible_follows_keyboard_not_pointer_modality`、
+  `a_configured_dark_appearance_paints_and_the_toggle_preserves_edit_state`。
+- Windows CI 的隐藏 smoke 运行在 WARP 上；即使像素断言通过，也不构成本节的可见
+  窗口验收。
+- 100% 与 150% 的可见缩放运行未执行：离屏 GPU 测试覆盖这两个 scale 的文本与绘制，
+  宿主 DPI 消息路径由 #63 的单显示器缩放切换预检与隐藏测试覆盖，均不替代可见运行。
+
+### #96 关闭理由
+
+#96 要求宿主跟踪 hover/press、按调色板绘制内建控件状态、按下改为松开激活，并保持
+`aria:pressed` 与按下瞬态分离。这些由 #113 完成（宿主瞬态、`SceneEnv`、松开激活与
+拖出取消）；#96 明确排除的 class 状态变体与深色主题分别由 #110（条件声明）与
+#114（应用外观与深色调色板）完成。因此 #96 随 #113 的 PR 关闭。设计与取舍见
+[ADR-0006](../adr/0006-presentation-transients-and-style-resolution.md)。
+
+### 仍需人工执行（样式里程碑）
+
+1. 在 100% 与 150% 缩放下用真实鼠标重复上表，特别是 hover：悬停 FilterButton
+   （`hover:bg-control-hover`）与无 class 的内建按钮（intrinsic hover）各截一张。
+2. 在深色主题下重复 hover、按下与 Tab 焦点检查，确认深色调色板的对比度。
+3. 记录时可以沿用第二、三轮的桌面截屏方法；本节的 `PrintWindow` 读法证明窗口内容，
+   但人工验收仍应包含真实的桌面呈现。
 
 ## 已知限制
 
