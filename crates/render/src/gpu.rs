@@ -181,6 +181,18 @@ impl GpuRenderer {
         }
     }
 
+    /// 调整目标尺寸；复用已有的 vello 渲染器与资源，只重建深度视图。
+    ///
+    /// vello 在每帧准备阶段按目标尺寸更新配置缓冲，因此窗口缩放不需要重建
+    /// pipeline 与渲染资源。
+    pub fn resize(&mut self, config: RenderTargetConfig) {
+        self.depth = self.renderer.create_depth_texture_view(&RenderSize {
+            width: config.width,
+            height: config.height,
+        });
+        self.config = config;
+    }
+
     /// 把场景编码进 `encoder`；调用方负责提交。
     pub fn render(
         &mut self,
