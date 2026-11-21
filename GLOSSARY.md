@@ -40,6 +40,26 @@ _Avoid_: swapchain, render target
 通过 `style:<property>` 给出的类型化样式声明；携带 `StyleOrigin::Inline`，覆盖同属性的 class 声明与状态变体。
 _Avoid_: inline css, dynamic css
 
+**Class token**:
+`class` 字面量中一个空白分隔的项，展开期解析为属性、值与可选条件；词表封闭，未登记的 token 是编译错误。
+_Avoid_: css class, utility string
+
+**Condition**:
+一条声明生效所需的已提交状态、应用外观或宿主瞬态，例如 `dark:`、`hover:`、`aria-pressed:`；同属性冲突先比条件 rank，再比源码顺序。
+_Avoid_: pseudo-class, selector
+
+**Appearance**:
+应用的 `Light`/`Dark` 外观，属于已提交状态，随快照参与相等性并影响调色板与 `dark:`；不跟随操作系统设置。
+_Avoid_: theme (when meaning the OS mode), color scheme
+
+**Resolved style**:
+场景构建时由 intrinsic 默认、class 与 inline 声明合并后的值，供布局、文本整形与绘制共用。
+_Avoid_: computed style, final css
+
+**Presentation transient**:
+宿主拥有、逐帧变化且不进入快照的呈现状态，例如 hovered、pressed 与键盘模态。
+_Avoid_: interaction state, hover state (when meaning committed state)
+
 **Node ID**:
 presentation snapshot 中用于命中测试与事件派发的稳定元素身份；不是 label，也不是公开的内部数组下标。
 _Avoid_: element index, view ID

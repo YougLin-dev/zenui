@@ -60,7 +60,7 @@ let remaining = signal(3);
 let remaining_txt = memo(move || format!("{} remaining", remaining.get()));
 
 view! {
-    <text class="text-sm text-zinc-500">{remaining_txt}</text>
+    <text class="text-sm text-muted">{remaining_txt}</text>
 }
 ```
 
