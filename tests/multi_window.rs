@@ -708,3 +708,189 @@ fn focus_traversal_and_blur_are_scoped_to_the_window() {
         .expect("open a foreign window");
     assert_eq!(app.focus_next_in(foreign), Err(WindowError::WrongRuntime));
 }
+
+#[test]
+fn window_requests_open_focus_hide_and_close_from_handlers() {
+    let mut app = Runtime::new();
+    let runs = Rc::new(Cell::new(0));
+    let details_ctx = Rc::new(Cell::new(None));
+    let counter = runs.clone();
+    let seen = details_ctx.clone();
+    app.declare_windows(move |catalog| {
+        catalog.window(WindowSpec::new("main").primary(), |window| {
+            view! {
+                <view>
+                    <button
+                        aria:label="open-details"
+                        on:click={move || {
+                            window.request_show("details").expect("queue show");
+                        }}
+                    >"Open"</button>
+                    <button
+                        aria:label="close-main"
+                        on:click={move || {
+                            window.request_close().expect("queue close");
+                        }}
+                    >"Close"</button>
+                </view>
+            }
+        })?;
+        catalog.window(WindowSpec::new("details"), move |window| {
+            counter.set(counter.get() + 1);
+            seen.set(Some(window));
+            view! {
+                <view>
+                    <text aria:label="details-body">"details"</text>
+                    <button
+                        aria:label="hide-details"
+                        on:click={move || {
+                            window.request_hide().expect("queue hide");
+                        }}
+                    >"Hide"</button>
+                    <button
+                        aria:label="close-details"
+                        on:click={move || {
+                            window.request_close().expect("queue close");
+                        }}
+                    >"Close"</button>
+                </view>
+            }
+        })?;
+        Ok(())
+    })
+    .expect("catalog");
+
+    let main = app.show("main").expect("show main");
+    app.click_label("open-details").expect("queue details");
+    assert_eq!(
+        app.windows().len(),
+        1,
+        "a request waits for the settle step"
+    );
+    app.apply_window_requests().expect("apply the show request");
+    let details = details_ctx.get().expect("the details factory ran");
+    assert_eq!(app.windows().len(), 2);
+    assert!(app.window_alive(details) && app.window_visible(details));
+    assert_eq!(app.focused_window(), Some(details));
+
+    app.focus("open-details").expect("focus the main window");
+    assert_eq!(app.focused_window(), Some(main));
+    app.click_label("open-details")
+        .expect("focus the open details");
+    app.apply_window_requests()
+        .expect("apply the focus request");
+    assert_eq!(runs.get(), 1, "a visible target is focused, not remounted");
+    assert_eq!(details_ctx.get(), Some(details));
+    assert_eq!(
+        app.focused_window(),
+        Some(details),
+        "the request refocuses the visible target"
+    );
+
+    app.click_label("hide-details").expect("queue hide");
+    app.apply_window_requests().expect("apply the hide request");
+    assert!(app.window_alive(details));
+    assert!(!app.window_visible(details));
+    assert_eq!(app.focused_window(), Some(main));
+
+    app.click_label("open-details")
+        .expect("show the hidden details");
+    app.apply_window_requests().expect("apply the show request");
+    assert!(app.window_visible(details));
+    assert_eq!(app.focused_window(), Some(details));
+    assert_eq!(
+        runs.get(),
+        1,
+        "showing a hidden window keeps its activation"
+    );
+
+    app.click_label("close-details")
+        .expect("queue the details close");
+    app.apply_window_requests()
+        .expect("apply the close request");
+    assert!(!app.window_alive(details));
+    assert_eq!(app.windows().len(), 1);
+    assert_eq!(app.focused_window(), Some(main));
+
+    app.click_label("open-details").expect("reopen details");
+    app.apply_window_requests().expect("apply the reopen");
+    let reopened = details_ctx.get().expect("the factory ran again");
+    assert_ne!(reopened, details);
+    assert!(reopened.activation() > details.activation());
+    assert_eq!(runs.get(), 2);
+
+    app.click_label("close-details")
+        .expect("queue closing the details");
+    app.apply_window_requests().expect("apply the close");
+    assert_eq!(app.windows().len(), 1);
+    app.click_label("close-main")
+        .expect("queue closing the main window");
+    app.apply_window_requests().expect("apply the close");
+    assert!(app.windows().is_empty());
+}
+
+#[test]
+fn window_requests_check_phase_catalog_and_source_liveness() {
+    let mut app = Runtime::new();
+    let setup_probe = Rc::new(RefCell::new(None));
+    let setup_outcome = setup_probe.clone();
+    let handler_probe = Rc::new(RefCell::new(None));
+    let handler_outcome = handler_probe.clone();
+    let handler_click = handler_probe.clone();
+    app.declare_windows(move |catalog| {
+        catalog.window(WindowSpec::new("main").primary(), move |window| {
+            *setup_outcome.borrow_mut() = Some(window.request_hide());
+            let handler_click = handler_click.clone();
+            view! {
+                <view>
+                    <button
+                        aria:label="bad"
+                        on:click={move || {
+                            *handler_click.borrow_mut() = Some(window.request_show("missing"));
+                        }}
+                    >"Bad"</button>
+                    <button
+                        aria:label="queue"
+                        on:click={move || {
+                            window.request_show("details").expect("queue");
+                        }}
+                    >"Queue"</button>
+                </view>
+            }
+        })?;
+        catalog.window(
+            WindowSpec::new("details"),
+            |_| view! { <text>"details"</text> },
+        )?;
+        Ok(())
+    })
+    .expect("catalog");
+
+    let main = app.show("main").expect("show main");
+    assert!(
+        matches!(
+            setup_probe.borrow().as_ref(),
+            Some(Err(WindowError::State(_)))
+        ),
+        "a factory runs in Setup and cannot queue window requests"
+    );
+
+    app.click_label("bad").expect("click the bad action");
+    assert_eq!(
+        handler_outcome.borrow().as_ref(),
+        Some(&Err(WindowError::UnknownWindow("missing"))),
+        "the catalog key is checked before the request is queued"
+    );
+    app.apply_window_requests()
+        .expect("a rejected request queues nothing");
+
+    app.click_label("queue").expect("queue showing details");
+    app.close_window(main)
+        .expect("close the source before settling");
+    app.apply_window_requests()
+        .expect("a request from a closed source is dropped");
+    assert!(
+        app.windows().is_empty(),
+        "a stale source cannot open another window"
+    );
+}

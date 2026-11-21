@@ -67,6 +67,44 @@ impl WindowCtx {
             Ok(())
         })
     }
+
+    /// 请求打开或聚焦目录窗口；宿主在本次事件/交付结算后执行。
+    ///
+    /// 只能在 `Event` 或 `Delivery` 处理器中调用。目标窗口已可见时只聚焦，
+    /// 不重跑 factory；来源 activation 在结算前关闭时请求被丢弃。
+    pub fn request_show(self, key: &'static str) -> Result<(), WindowError> {
+        self.request(WindowAction::Show(key))
+    }
+
+    /// 请求隐藏自身窗口；保留 activation、树与本地编辑状态。
+    pub fn request_hide(self) -> Result<(), WindowError> {
+        self.request(WindowAction::Hide)
+    }
+
+    /// 请求关闭自身窗口；释放 activation 的树、资源与窗口任务。
+    pub fn request_close(self) -> Result<(), WindowError> {
+        self.request(WindowAction::Close)
+    }
+
+    fn request(self, action: WindowAction) -> Result<(), WindowError> {
+        crate::context::with_state_of(self.runtime, |state| {
+            state.queue_window_request(WindowRequest { from: self, action })
+        })
+    }
+}
+
+/// UI 处理期挂起的窗口生命周期请求；由 `Runtime::apply_window_requests` 结算。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct WindowRequest {
+    pub(crate) from: WindowCtx,
+    pub(crate) action: WindowAction,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WindowAction {
+    Show(&'static str),
+    Hide,
+    Close,
 }
 
 impl fmt::Debug for WindowCtx {
