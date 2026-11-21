@@ -958,9 +958,10 @@ impl Host {
         result
     }
 
-    /// 用 caret 的物理客户区坐标定位 OS 组合与候选窗口；组合中改用 preedit 起点。
+    /// 把组合位置告诉 IME，并用 preedit 起点定位候选窗口。
     ///
-    /// `COMPOSITIONFORM` / `CANDIDATEFORM` 的坐标相对窗口左上角，不是屏幕坐标。
+    /// 系统组合窗口本身被 `WM_IME_STARTCOMPOSITION` 的窗口过程分支抑制；这里的
+    /// `COMPOSITIONFORM` 仍参与候选窗定位。两个结构的坐标相对窗口左上角，不是屏幕坐标。
     fn position_ime(&self, snapshot: &PresentationSnapshot) {
         let Some(node) = focused_input(snapshot) else {
             return;
@@ -971,8 +972,7 @@ impl Host {
         let Some(scene) = &self.scene else {
             return;
         };
-        // 组合窗口放在 preedit 起点：UI 已绘制 preedit，OS 的组合串与它重叠，
-        // 而不是在 caret（preedit 末尾）之后再画一份。
+        // 候选窗锚在 preedit 起点，而不是 caret（preedit 末尾）。
         let composition_start = snapshot
             .node(node)
             .and_then(SnapshotElement::edit)
@@ -1076,7 +1076,7 @@ impl Host {
             .map_err(HostError::Scene)?;
         let snapshot = self.runtime.presentation().map_err(HostError::Runtime)?;
         let mut scene = Scene::build(&snapshot, viewport).map_err(HostError::Scene)?;
-        // 组合期间由 OS 组合窗口绘制 caret；闪烁只在非组合状态生效。
+        // 组合期间不绘制 caret，草稿由 preedit 下划线标识；闪烁只在非组合状态生效。
         let composing = focused_composition(&snapshot);
         scene.set_caret_visible(self.caret_visible && !composing);
         Ok((scene, snapshot))
@@ -1645,6 +1645,13 @@ unsafe extern "system" fn wndproc(
         // 提交已经由 WM_IME_COMPOSITION 的 GCS_RESULTSTR 或 WM_CHAR 处理；
         // WM_IME_CHAR 若再交给默认窗口过程会产生重复字符。
         WM_IME_CHAR => LRESULT(0),
+        WM_IME_STARTCOMPOSITION => {
+            // 应用自己在输入框里绘制 preedit；把开始消息交给默认过程会让微软
+            // 拼音再画一份组合窗口，与 preedit 叠成两层。这里只通知运行时。
+            // 安全：派发期间不持有宿主引用，窗口过程借出一次。
+            unsafe { with_host(hwnd, |host| host.handle_message(message, wparam, lparam)) };
+            LRESULT(0)
+        }
         WM_PAINT => {
             let mut paint = PAINTSTRUCT::default();
             // 安全：hwnd 来自系统回调；paint 是有效的输出缓冲。
