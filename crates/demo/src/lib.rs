@@ -24,7 +24,7 @@ pub fn FilterButton(
 
     view! {
         <button
-            class="px-3 py-1 rounded-sm bg-control aria-pressed:bg-accent aria-pressed:text-inverse"
+            class="px-3 py-1 rounded-sm bg-control hover:bg-control-hover active:bg-control-pressed aria-pressed:bg-accent aria-pressed:text-inverse"
             aria:pressed={selected}
             on:click={move || current.set(value)}
         >{label}</button>
@@ -60,6 +60,7 @@ pub fn TodoItem(todo: TodoId, todos: Store) -> MountResult<MountPlan> {
             />
             <text style:color={tint}>{once(title.clone())}</text>
             <text-input
+                class="focus-visible:border-accent"
                 value={editing}
                 aria:label={once(edit_label)}
                 on:input={move |value: String| {
@@ -149,6 +150,7 @@ pub fn TodoApp(window: WindowCtx) -> MountResult<MountPlan> {
                 }}
             >
                 <text-input
+                    class="focus-visible:border-accent"
                     value={draft}
                     aria:label="What needs to be done?"
                     on:input={move |value: String| draft.set(value)}

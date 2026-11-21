@@ -10,6 +10,7 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, PAINTSTRUCT, ValidateRect};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows::Win32::UI::HiDpi::{
     AdjustWindowRectExForDpi, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForSystem,
     GetDpiForWindow, SetProcessDpiAwarenessContext,
@@ -20,8 +21,9 @@ use windows::Win32::UI::Input::Ime::{
     ImmReleaseContext, ImmSetCandidateWindow, ImmSetCompositionWindow, NI_COMPOSITIONSTR,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, VIRTUAL_KEY, VK_A, VK_BACK, VK_CONTROL, VK_DELETE, VK_END, VK_ESCAPE, VK_HOME,
-    VK_LEFT, VK_PROCESSKEY, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_TAB,
+    GetKeyState, ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
+    VIRTUAL_KEY, VK_A, VK_BACK, VK_CONTROL, VK_DELETE, VK_END, VK_ESCAPE, VK_HOME, VK_LEFT,
+    VK_PROCESSKEY, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_TAB,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow,
@@ -29,16 +31,17 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowLongPtrW, IDC_ARROW, IsIconic, IsZoomed, KillTimer, LoadCursorW, MSG, PM_REMOVE,
     PeekMessageW, PostMessageW, PostQuitMessage, RegisterClassExW, SW_HIDE, SW_SHOW,
     SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SetTimer, SetWindowLongPtrW, SetWindowPos,
-    ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WM_APP, WM_CHAR, WM_CLOSE, WM_DESTROY,
-    WM_DPICHANGED, WM_GETDPISCALEDSIZE, WM_IME_CHAR, WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION,
-    WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_PAINT, WM_SIZE, WM_TIMER,
-    WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
+    ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WM_APP, WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE,
+    WM_DESTROY, WM_DPICHANGED, WM_GETDPISCALEDSIZE, WM_IME_CHAR, WM_IME_COMPOSITION,
+    WM_IME_ENDCOMPOSITION, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
 };
 
 use windows::core::{HSTRING, w};
 use zenui::prelude::*;
 use zenui_render::{
-    GpuRenderer, Point, RenderPalette, RenderTargetConfig, Scene, Viewport, Visual, wgpu,
+    GpuRenderer, Point, RenderPalette, RenderTargetConfig, Scene, SceneElement, SceneEnv, Viewport,
+    Visual, wgpu,
 };
 
 use zenui_demo::TodoApp;
@@ -162,6 +165,11 @@ pub struct Host {
     renderer: GpuRenderer,
     window: Window,
     scene: Option<Scene>,
+    pointer: Option<Point>,
+    hovered: Option<NodeId>,
+    pressed: Option<NodeId>,
+    tracking_leave: bool,
+    keyboard_modality: bool,
     pending_high_surrogate: Option<u16>,
     wake: Arc<WakeState>,
     caret_visible: bool,
@@ -252,6 +260,11 @@ impl Host {
             renderer: presentation.renderer,
             window,
             scene: None,
+            pointer: None,
+            hovered: None,
+            pressed: None,
+            tracking_leave: false,
+            keyboard_modality: false,
             pending_high_surrogate: None,
             wake,
             caret_visible: true,
@@ -315,11 +328,28 @@ impl Host {
             return;
         }
         // 任何输入都让 caret 立即可见，之后由闪烁定时器继续。
-        if matches!(message, WM_LBUTTONDOWN | WM_CHAR | WM_KEYDOWN) {
+        if matches!(
+            message,
+            WM_LBUTTONDOWN | WM_LBUTTONUP | WM_MOUSEMOVE | WM_CHAR | WM_KEYDOWN
+        ) {
             self.caret_visible = true;
+        }
+        if matches!(message, WM_CHAR | WM_KEYDOWN) {
+            self.keyboard_modality = true;
+        } else if message == WM_LBUTTONDOWN {
+            self.keyboard_modality = false;
         }
         let result = if message == WM_LBUTTONDOWN {
             self.pointer_pressed(lparam).and_then(|()| self.render())
+        } else if message == WM_LBUTTONUP {
+            self.pointer_released(lparam)
+        } else if message == WM_MOUSEMOVE {
+            self.pointer_moved(lparam)
+        } else if message == WM_MOUSELEAVE {
+            self.pointer_left()
+        } else if message == WM_CAPTURECHANGED {
+            self.capture_lost();
+            Ok(())
         } else if message == WM_CHAR {
             self.char_typed(wparam)
         } else if message == WM_KEYDOWN {
@@ -329,6 +359,7 @@ impl Host {
         } else if message == WM_IME_COMPOSITION {
             self.ime_composition(lparam)
         } else if matches!(message, WM_IME_ENDCOMPOSITION | WM_KILLFOCUS) {
+            self.pressed = None;
             self.ime_cancel()
         } else if message == HOST_WAKE_MESSAGE {
             self.deliver_tasks()
@@ -355,6 +386,9 @@ impl Host {
     /// `WM_CLOSE` 的宿主处理：结束 activation 并标记关闭。
     fn close_from_window(&mut self) {
         self.close_requested = true;
+        self.pressed = None;
+        self.hovered = None;
+        self.pointer = None;
         if let Err(error) = self.close_activation() {
             self.deferred_error.get_or_insert(error);
         }
@@ -531,7 +565,8 @@ impl Host {
         }
     }
 
-    /// 一次左键按下：命中测试后按元素类型聚焦、放置 caret 或派发控件事件。
+    /// 一次左键按下：文本输入在按下时聚焦并放置 caret；按钮与复选框只记录
+    /// 按住目标并捕获指针，激活发生在同一节点上松开时。
     ///
     /// `lparam` 是客户区物理像素坐标；场景几何是逻辑像素，按最近一次呈现的 scale 换算。
     fn pointer_pressed(&mut self, lparam: LPARAM) -> Result<(), HostError> {
@@ -542,6 +577,7 @@ impl Host {
             .as_ref()
             .map_or(1.0, |scene| scene.viewport().scale());
         let point = pointer_point(lparam, scale);
+        self.pointer = Some(point);
 
         let Some((node, visual, caret, disabled)) = self.scene.as_ref().and_then(|scene| {
             let node = scene.hit_test(point)?;
@@ -553,13 +589,18 @@ impl Host {
                 element.disabled(),
             ))
         }) else {
+            self.hovered = None;
+            self.pressed = None;
             return self.runtime.blur().map_err(HostError::Runtime);
         };
 
         // disabled 控件不聚焦、不激活，也不改变焦点。
         if disabled {
+            self.hovered = None;
+            self.pressed = None;
             return Ok(());
         }
+        self.hovered = Some(node);
 
         match visual {
             Visual::TextInput => {
@@ -568,15 +609,123 @@ impl Host {
                     pointer_dispatch(self.runtime.set_caret_node(node, offset))?;
                 }
             }
-            Visual::Checkbox { checked } => {
-                pointer_dispatch(self.runtime.change_node(node, !checked))?;
+            Visual::Checkbox { .. } | Visual::Button { .. } => {
+                self.pressed = Some(node);
+                // 安全：捕获指针，拖动离开后的松开仍回到本窗口，但不再激活。
+                unsafe {
+                    SetCapture(self.window.hwnd);
+                }
             }
-            Visual::Button { .. } => pointer_dispatch(self.runtime.click_node(node))?,
             Visual::Container | Visual::Text => {
+                self.pressed = None;
                 self.runtime.blur().map_err(HostError::Runtime)?;
             }
         }
         Ok(())
+    }
+
+    /// 指针移动：更新悬停目标；按住时离开原目标会清除按住状态。
+    fn pointer_moved(&mut self, lparam: LPARAM) -> Result<(), HostError> {
+        let scale = self
+            .scene
+            .as_ref()
+            .map_or(1.0, |scene| scene.viewport().scale());
+        let point = pointer_point(lparam, scale);
+        self.pointer = Some(point);
+        self.arm_leave_tracking();
+
+        let hovered = self.scene.as_ref().and_then(|scene| {
+            let node = scene.hit_test(point)?;
+            (!scene.node(node)?.disabled()).then_some(node)
+        });
+        let mut changed = hovered != self.hovered;
+        self.hovered = hovered;
+        if self.pressed.is_some() && self.pressed != hovered {
+            self.pressed = None;
+            changed = true;
+        }
+        if !changed {
+            return Ok(());
+        }
+        self.render()
+    }
+
+    /// 指针离开客户区：清除悬停；按住目标由松开或捕获丢失结束。
+    fn pointer_left(&mut self) -> Result<(), HostError> {
+        self.tracking_leave = false;
+        self.pointer = None;
+        if self.hovered.take().is_none() {
+            return Ok(());
+        }
+        self.render()
+    }
+
+    /// 左键松开：只有仍命中同一个启用节点时才激活按钮或复选框。
+    fn pointer_released(&mut self, lparam: LPARAM) -> Result<(), HostError> {
+        let scale = self
+            .scene
+            .as_ref()
+            .map_or(1.0, |scene| scene.viewport().scale());
+        let point = pointer_point(lparam, scale);
+        self.pointer = Some(point);
+        // 先取走目标：ReleaseCapture 会同步送出 WM_CAPTURECHANGED，
+        // 那条消息不能把这次松开要激活的目标一起清掉。
+        let target = self.pressed.take();
+        // 安全：释放本窗口的指针捕获；没有捕获时同样安全。
+        unsafe {
+            let _ = ReleaseCapture();
+        }
+        let activated = target.is_some_and(|node| {
+            self.scene.as_ref().is_some_and(|scene| {
+                scene.hit_test(point) == Some(node)
+                    && scene.node(node).is_some_and(|element| !element.disabled())
+            })
+        });
+        if activated && let Some(node) = target {
+            let visual = self
+                .scene
+                .as_ref()
+                .and_then(|scene| scene.node(node))
+                .map(SceneElement::visual);
+            match visual {
+                Some(Visual::Button { .. }) => pointer_dispatch(self.runtime.click_node(node))?,
+                Some(Visual::Checkbox { checked }) => {
+                    pointer_dispatch(self.runtime.change_node(node, !checked))?;
+                }
+                _ => {}
+            }
+        }
+
+        self.hovered = self.scene.as_ref().and_then(|scene| {
+            let node = scene.hit_test(point)?;
+            (!scene.node(node)?.disabled()).then_some(node)
+        });
+        self.render()
+    }
+
+    /// 捕获丢失（例如系统抢走指针）：按住状态不能残留。
+    fn capture_lost(&mut self) {
+        if self.pressed.take().is_some() {
+            let _ = self.render();
+        }
+    }
+
+    /// 只在第一次进入客户区时请求一次 `WM_MOUSELEAVE`。
+    fn arm_leave_tracking(&mut self) {
+        // 隐藏窗口没有真实光标；注册跟踪会让系统立即投递 leave。
+        if self.tracking_leave || !self.window.visible {
+            return;
+        }
+        let mut event = TRACKMOUSEEVENT {
+            cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+            dwFlags: TME_LEAVE,
+            hwndTrack: self.window.hwnd,
+            dwHoverTime: 0,
+        };
+        // 安全：结构由本地值初始化；失败时下一次移动会重试。
+        if unsafe { TrackMouseEvent(&mut event) }.is_ok() {
+            self.tracking_leave = true;
+        }
     }
 
     /// 用同一场景渲染到离屏纹理并读回 BGRA 像素；隐藏 CI smoke 使用。
@@ -1072,7 +1221,7 @@ impl Host {
     }
 
     fn current_scene(
-        &self,
+        &mut self,
         width: u32,
         height: u32,
     ) -> Result<(Scene, PresentationSnapshot), HostError> {
@@ -1082,11 +1231,43 @@ impl Host {
         let viewport = Viewport::new(width as f32 / scale, height as f32 / scale, scale)
             .map_err(HostError::Scene)?;
         let snapshot = self.runtime.presentation().map_err(HostError::Runtime)?;
-        let mut scene = Scene::build(&snapshot, viewport).map_err(HostError::Scene)?;
+        let mut scene =
+            Scene::build_with(&snapshot, viewport, &self.scene_env()).map_err(HostError::Scene)?;
+        // 新场景可能已经移走或卸载了指针下的节点；失效目标不能继续高亮。
+        if self.revalidate_pointer(&scene) {
+            scene = Scene::build_with(&snapshot, viewport, &self.scene_env())
+                .map_err(HostError::Scene)?;
+        }
         // 组合期间不绘制 caret，草稿由 preedit 下划线标识；闪烁只在非组合状态生效。
         let composing = focused_composition(&snapshot);
         scene.set_caret_visible(self.caret_visible && !composing);
         Ok((scene, snapshot))
+    }
+
+    fn scene_env(&self) -> SceneEnv {
+        SceneEnv::default()
+            .with_hovered(self.hovered)
+            .with_pressed(self.pressed)
+            .with_focus_visible(self.keyboard_modality)
+    }
+
+    /// 用新场景重新命中最后的指针位置；返回是否需要按新瞬态重建。
+    fn revalidate_pointer(&mut self, scene: &Scene) -> bool {
+        let Some(point) = self.pointer else {
+            return false;
+        };
+        let hit = scene.hit_test(point);
+        let hovered = hit.filter(|node| scene.node(*node).is_some_and(|e| !e.disabled()));
+        let hover_changed = hovered != self.hovered;
+        let press_cleared = self.pressed.is_some() && self.pressed != hit;
+        if !hover_changed && !press_cleared {
+            return false;
+        }
+        self.hovered = hovered;
+        if press_cleared {
+            self.pressed = None;
+        }
+        true
     }
 }
 

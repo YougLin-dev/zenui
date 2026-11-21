@@ -64,8 +64,16 @@ pub enum ColorRole {
 pub enum Condition {
     /// 无条件，按源码顺序参与。
     Base,
+    /// 应用处于深色外观。
+    Dark,
+    /// 命中测试的最上层元素就是该节点。
+    Hover,
     /// 元素持有焦点。
     Focus,
+    /// 键盘输入方式下的焦点。
+    FocusVisible,
+    /// 指针正按在该节点上。
+    Active,
     /// 元素处于禁用状态。
     Disabled,
     /// checkbox 处于勾选状态。
@@ -79,10 +87,14 @@ impl Condition {
     pub const fn rank(self) -> u8 {
         match self {
             Self::Base => 0,
-            Self::Focus => 1,
-            Self::Disabled => 2,
-            Self::Checked => 3,
-            Self::AriaPressed => 4,
+            Self::Dark => 1,
+            Self::Hover => 2,
+            Self::Focus => 3,
+            Self::FocusVisible => 4,
+            Self::Active => 5,
+            Self::Disabled => 6,
+            Self::Checked => 7,
+            Self::AriaPressed => 8,
         }
     }
 }
@@ -412,13 +424,14 @@ fn split_condition(token: &str) -> Result<(Condition, &str), &'static str> {
         return Err("compound class conditions are not supported");
     }
     let condition = match condition {
+        "hover" => Condition::Hover,
         "focus" => Condition::Focus,
+        "focus-visible" => Condition::FocusVisible,
+        "active" => Condition::Active,
         "disabled" => Condition::Disabled,
         "checked" => Condition::Checked,
         "aria-pressed" => Condition::AriaPressed,
-        "hover" | "focus-visible" | "active" | "dark" => {
-            return Err("class condition is not supported yet");
-        }
+        "dark" => return Err("class condition is not supported yet"),
         _ => return Err("unknown class condition"),
     };
     Ok((condition, utility))
@@ -589,8 +602,39 @@ mod tests {
     }
 
     #[test]
+    fn transient_conditions_parse_with_the_documented_rank() {
+        let parsed = parse_class_literal(
+            "hover:bg-control-hover active:bg-control-pressed focus-visible:border-accent",
+        )
+        .expect("parse");
+        assert_eq!(
+            parsed,
+            vec![
+                StyleDeclaration::new(
+                    Property::Background,
+                    StyleValue::Color(Color::Role(ColorRole::ControlHover)),
+                    Condition::Hover
+                ),
+                StyleDeclaration::new(
+                    Property::Background,
+                    StyleValue::Color(Color::Role(ColorRole::ControlPressed)),
+                    Condition::Active
+                ),
+                StyleDeclaration::new(
+                    Property::BorderColor,
+                    StyleValue::Color(Color::Role(ColorRole::BorderAccent)),
+                    Condition::FocusVisible
+                ),
+            ]
+        );
+        assert!(Condition::Hover.rank() < Condition::Focus.rank());
+        assert!(Condition::FocusVisible.rank() < Condition::Active.rank());
+        assert!(Condition::Active.rank() < Condition::Disabled.rank());
+    }
+
+    #[test]
     fn unsupported_and_compound_conditions_are_errors() {
-        let unsupported = parse_class_literal("hover:px-2").expect_err("unsupported");
+        let unsupported = parse_class_literal("dark:bg-control").expect_err("unsupported");
         assert_eq!(
             unsupported[0].message(),
             "class condition is not supported yet"

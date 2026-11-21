@@ -314,7 +314,7 @@ fn paint(
     for element in scene.elements() {
         let rect = physical_rect(element.rect(), scale);
         let style = element.resolved_style();
-        paint_background(target, rect, element.visual(), style, palette, scale);
+        paint_background(target, rect, element, style, palette, scale);
         paint_border(target, rect, element.visual(), style, palette, scale);
         for decoration in scene.decorations() {
             if decoration.node() != element.id() {
@@ -334,9 +334,16 @@ fn paint(
             }
         }
         if !element.text().is_empty() {
+            let intrinsic = if element.disabled() {
+                palette.text_disabled
+            } else if matches!(element.visual(), Visual::Button { pressed: true }) {
+                palette.text_inverse
+            } else {
+                palette.text
+            };
             let paint = style
                 .text_color()
-                .map_or(palette.text, |color| resolve_color(color, palette));
+                .map_or(intrinsic, |color| resolve_color(color, palette));
             target.set_paint(color(with_opacity(paint, style.opacity())));
             for run in element.text() {
                 glyphs(target, resources, run, scale)?;
@@ -364,17 +371,31 @@ fn paint(
 fn paint_background(
     target: &mut vello_gpu::Scene,
     rect: KurboRect,
-    visual: Visual,
+    element: &crate::scene::SceneElement,
     style: ResolvedStyle,
     palette: RenderPalette,
     scale: f32,
 ) {
+    let visual = element.visual();
+    let control = if element.pointer_pressed() {
+        palette.control_pressed
+    } else if element.hovered() {
+        palette.control_hover
+    } else {
+        palette.control
+    };
     let intrinsic = match visual {
         Visual::Container => Some(palette.surface),
         Visual::Text => None,
-        Visual::Button { pressed: true } => Some(palette.accent),
+        Visual::Button { pressed: true } => Some(if element.pointer_pressed() {
+            palette.accent_pressed
+        } else if element.hovered() {
+            palette.accent_hover
+        } else {
+            palette.accent
+        }),
         Visual::Button { pressed: false } | Visual::Checkbox { .. } | Visual::TextInput => {
-            Some(palette.control)
+            Some(control)
         }
     };
     let background = style
