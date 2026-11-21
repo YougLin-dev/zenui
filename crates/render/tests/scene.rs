@@ -746,6 +746,135 @@ fn flex_grow_and_justify_between_use_the_remaining_space() {
 }
 
 #[test]
+fn paint_classes_resolve_colors_radius_and_opacity() {
+    let mut app = Runtime::new();
+    app.mount(|| {
+        view! {
+            <view class="bg-surface rounded-lg">
+                <button class="bg-accent text-inverse border border-accent rounded-md opacity-50">"Accent"</button>
+                <text class="text-muted">"Muted"</text>
+            </view>
+        }
+    })
+    .expect("mount");
+    let snapshot = app.presentation().expect("snapshot");
+    let scene = build_scene(&snapshot, 400.0);
+
+    let root = scene
+        .node(snapshot.roots()[0].id().expect("root element"))
+        .expect("scene root");
+    let style = root.resolved_style();
+    assert_eq!(
+        style.background(),
+        Some(Color::Role(ColorRole::Surface)),
+        "bg-surface resolves to its semantic role"
+    );
+    assert_eq!(style.radius(), 10.0, "rounded-lg is a 10-point radius");
+    assert_eq!(style.opacity(), 1.0, "no opacity class means fully opaque");
+
+    let button = scene
+        .node(by_text(&snapshot, "button", "Accent"))
+        .expect("accent button")
+        .resolved_style();
+    assert_eq!(
+        button.background(),
+        Some(Color::Role(ColorRole::Accent)),
+        "bg-accent stays a role until the palette resolves it"
+    );
+    assert_eq!(
+        button.text_color(),
+        Some(Color::Role(ColorRole::TextInverse))
+    );
+    assert_eq!(
+        button.border_color(),
+        Some(Color::Role(ColorRole::BorderAccent))
+    );
+    assert_eq!(button.border_width(), Some(1.0), "border is one point");
+    assert_eq!(button.radius(), 6.0, "rounded-md is a 6-point radius");
+    assert_eq!(button.opacity(), 0.5, "opacity-50 halves the element paint");
+
+    let text = scene
+        .node(by_text(&snapshot, "text", "Muted"))
+        .expect("muted text")
+        .resolved_style();
+    assert_eq!(text.text_color(), Some(Color::Role(ColorRole::TextMuted)));
+}
+
+#[test]
+fn radius_affects_paint_only_not_geometry_or_hit_testing() {
+    fn mounted(rounded: bool) -> (NodeId, Scene) {
+        let mut app = Runtime::new();
+        if rounded {
+            app.mount(|| {
+                view! { <text-input aria:label="padded" class="px-4 rounded-lg" value="abc" /> }
+            })
+        } else {
+            app.mount(|| view! { <text-input aria:label="padded" class="px-4" value="abc" /> })
+        }
+        .expect("mount");
+        app.focus("padded").expect("focus");
+        let snapshot = app.presentation().expect("snapshot");
+        let id = snapshot.find_label("padded").expect("input").id();
+        (id, build_scene(&snapshot, 400.0))
+    }
+
+    let (plain_id, plain) = mounted(false);
+    let (rounded_id, rounded) = mounted(true);
+    let plain_input = plain.node(plain_id).expect("plain input");
+    let rounded_input = rounded.node(rounded_id).expect("rounded input");
+
+    assert_eq!(
+        rounded_input.rect(),
+        plain_input.rect(),
+        "radius changes no layout"
+    );
+    assert_eq!(
+        rounded.caret(rounded_id).expect("rounded caret"),
+        plain.caret(plain_id).expect("plain caret"),
+        "radius changes no caret geometry"
+    );
+    assert_eq!(
+        rounded_input.resolved_style().radius(),
+        10.0,
+        "the rounded twin really carries a radius"
+    );
+    let corner = Point::new(rounded_input.rect().x + 0.5, rounded_input.rect().y + 0.5);
+    assert_eq!(
+        rounded.hit_test(corner),
+        Some(rounded_id),
+        "a click in the rounded-away corner still hits the input"
+    );
+}
+
+#[test]
+fn literal_colors_bypass_the_palette() {
+    const STYLE: &[StyleDeclaration] = &[StyleDeclaration::new(
+        Property::Background,
+        StyleValue::Color(Color::Literal([12, 34, 56, 255])),
+    )];
+    let mut app = Runtime::new();
+    app.open_window("main", |_| {
+        Ok(MountPlan::new(vec![zenui::view::styled_element(
+            "view",
+            Vec::new(),
+            STYLE,
+            Vec::new(),
+        )]))
+    })
+    .expect("window");
+    let snapshot = app.presentation().expect("snapshot");
+    let scene = build_scene(&snapshot, 400.0);
+    let root = scene
+        .node(snapshot.roots()[0].id().expect("root element"))
+        .expect("scene root");
+    assert_eq!(
+        root.resolved_style().background(),
+        Some(Color::Literal([12, 34, 56, 255])),
+        "a literal color reaches the scene unchanged"
+    );
+}
+
+#[test]
 fn a_mismatched_style_declaration_is_an_explicit_error() {
     const STYLE: &[StyleDeclaration] = &[StyleDeclaration::new(Property::Gap, StyleValue::Row)];
     let mut app = Runtime::new();

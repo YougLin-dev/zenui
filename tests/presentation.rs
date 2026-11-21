@@ -608,9 +608,9 @@ fn presentation_attributes_include_disabled() {
 }
 
 #[test]
-fn class_literals_become_typed_layout_declarations() {
+fn class_literals_become_typed_declarations() {
     let mut app = Runtime::new();
-    app.mount(|| view! { <button class="px-3 py-2 flex-row">"Add"</button> })
+    app.mount(|| view! { <button class="px-3 py-2 flex-row bg-accent rounded-md">"Add"</button> })
         .expect("mount");
 
     let snapshot = app.presentation().expect("snapshot");
@@ -624,6 +624,11 @@ fn class_literals_become_typed_layout_declarations() {
             StyleDeclaration::new(Property::PaddingX, StyleValue::Points(12)),
             StyleDeclaration::new(Property::PaddingY, StyleValue::Points(8)),
             StyleDeclaration::new(Property::FlexDirection, StyleValue::Row),
+            StyleDeclaration::new(
+                Property::Background,
+                StyleValue::Color(Color::Role(ColorRole::Accent))
+            ),
+            StyleDeclaration::new(Property::Radius, StyleValue::Points(6)),
         ]
     );
     assert!(

@@ -3,7 +3,7 @@
 //! `view!` 在展开期把 `class="..."` 字面量解析成本模块的声明；运行时与渲染器
 //! 只消费已解析的字段，不解析 CSS 字符串。词表是封闭的：未登记的 token 是编译错误。
 
-/// class 声明影响的布局属性。简写在解析时展开到这些长手属性。
+/// class 声明影响的属性。简写在解析时展开到这些长手属性。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Property {
     PaddingX,
@@ -14,9 +14,44 @@ pub enum Property {
     JustifyContent,
     Width,
     FlexGrow,
+    Background,
+    TextColor,
+    BorderColor,
+    BorderWidth,
+    Radius,
+    Opacity,
 }
 
-/// 布局属性的类型化取值。
+/// 语义颜色角色；具体字节由当前调色板决定。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ColorRole {
+    Surface,
+    Control,
+    ControlHover,
+    ControlPressed,
+    Accent,
+    AccentHover,
+    AccentPressed,
+    Danger,
+    DangerHover,
+    TextDefault,
+    TextMuted,
+    TextInverse,
+    TextDisabled,
+    BorderDefault,
+    BorderAccent,
+}
+
+/// 一个颜色：语义角色或显式 RGBA 字节。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Color {
+    /// 按当前调色板解析的角色。
+    Role(ColorRole),
+    /// 绕过调色板的固定 RGBA 字节。
+    Literal([u8; 4]),
+}
+
+/// 属性的类型化取值。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum StyleValue {
     /// 逻辑点；整数避免快照出现 `f32`。
@@ -27,6 +62,9 @@ pub enum StyleValue {
     SpaceBetween,
     FullWidth,
     Grow,
+    Color(Color),
+    /// 不透明度百分比（0–100）。
+    Opacity(u8),
 }
 
 /// 一条已解析的 class 声明。
@@ -137,6 +175,29 @@ fn parse_token(token: &str) -> Result<Vec<StyleDeclaration>, &'static str> {
         "justify-between" => push(Property::JustifyContent, StyleValue::SpaceBetween),
         "w-full" => push(Property::Width, StyleValue::FullWidth),
         "flex-1" => push(Property::FlexGrow, StyleValue::Grow),
+        "bg-surface" => push(Property::Background, role(ColorRole::Surface)),
+        "bg-control" => push(Property::Background, role(ColorRole::Control)),
+        "bg-control-hover" => push(Property::Background, role(ColorRole::ControlHover)),
+        "bg-control-pressed" => push(Property::Background, role(ColorRole::ControlPressed)),
+        "bg-accent" => push(Property::Background, role(ColorRole::Accent)),
+        "bg-accent-hover" => push(Property::Background, role(ColorRole::AccentHover)),
+        "bg-accent-pressed" => push(Property::Background, role(ColorRole::AccentPressed)),
+        "bg-danger" => push(Property::Background, role(ColorRole::Danger)),
+        "bg-danger-hover" => push(Property::Background, role(ColorRole::DangerHover)),
+        "text-default" => push(Property::TextColor, role(ColorRole::TextDefault)),
+        "text-muted" => push(Property::TextColor, role(ColorRole::TextMuted)),
+        "text-inverse" => push(Property::TextColor, role(ColorRole::TextInverse)),
+        "text-disabled" => push(Property::TextColor, role(ColorRole::TextDisabled)),
+        "border" => push(Property::BorderWidth, StyleValue::Points(1)),
+        "border-default" => push(Property::BorderColor, role(ColorRole::BorderDefault)),
+        "border-accent" => push(Property::BorderColor, role(ColorRole::BorderAccent)),
+        "rounded-sm" => push(Property::Radius, StyleValue::Points(4)),
+        "rounded-md" => push(Property::Radius, StyleValue::Points(6)),
+        "rounded-lg" => push(Property::Radius, StyleValue::Points(10)),
+        "opacity-25" => push(Property::Opacity, StyleValue::Opacity(25)),
+        "opacity-50" => push(Property::Opacity, StyleValue::Opacity(50)),
+        "opacity-75" => push(Property::Opacity, StyleValue::Opacity(75)),
+        "opacity-100" => push(Property::Opacity, StyleValue::Opacity(100)),
         _ => {
             if let Some(points) = spacing(token, "px-")? {
                 push(Property::PaddingX, StyleValue::Points(points));
@@ -153,6 +214,10 @@ fn parse_token(token: &str) -> Result<Vec<StyleDeclaration>, &'static str> {
         }
     }
     Ok(declarations)
+}
+
+fn role(role: ColorRole) -> StyleValue {
+    StyleValue::Color(Color::Role(role))
 }
 
 /// 解析 `<前缀><步长>`；不是该前缀时返回 `Ok(None)`。
@@ -208,6 +273,34 @@ mod tests {
                 declaration(Property::JustifyContent, StyleValue::SpaceBetween),
                 declaration(Property::Width, StyleValue::FullWidth),
                 declaration(Property::FlexGrow, StyleValue::Grow),
+            ]
+        );
+    }
+
+    #[test]
+    fn paint_utilities_map_to_their_properties() {
+        let parsed = parse_class_literal(
+            "bg-accent text-inverse border border-accent rounded-md opacity-50",
+        )
+        .expect("parse");
+        assert_eq!(
+            parsed,
+            vec![
+                declaration(
+                    Property::Background,
+                    StyleValue::Color(Color::Role(ColorRole::Accent))
+                ),
+                declaration(
+                    Property::TextColor,
+                    StyleValue::Color(Color::Role(ColorRole::TextInverse))
+                ),
+                declaration(Property::BorderWidth, StyleValue::Points(1)),
+                declaration(
+                    Property::BorderColor,
+                    StyleValue::Color(Color::Role(ColorRole::BorderAccent))
+                ),
+                declaration(Property::Radius, StyleValue::Points(6)),
+                declaration(Property::Opacity, StyleValue::Opacity(50)),
             ]
         );
     }

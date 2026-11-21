@@ -7,17 +7,19 @@ use std::error::Error;
 use std::fmt;
 
 use vello_gpu::color::{AlphaColor, Srgb};
-use vello_gpu::kurbo::{Rect as KurboRect, Stroke};
+use vello_gpu::kurbo::{Rect as KurboRect, RoundedRect, Shape, Stroke};
 use vello_gpu::{
     ClearSettings, RenderOptions, RenderSize, RenderTarget,
     RenderTargetConfig as VelloTargetConfig, TargetInit, TextureBindings,
 };
 use wgpu::{CommandEncoder, Device, Queue, TextureFormat, TextureView};
+use zenui_style::{Color, ColorRole};
 
 use crate::geometry::Rect;
-use crate::scene::{DecorationKind, Scene, TextRun, Visual};
+use crate::scene::{DecorationKind, ResolvedStyle, Scene, TextRun, Visual};
 
-/// GPU 层绘制内建视觉时使用的颜色；各字段是 RGBA 字节，按目标视图的转移函数解释。
+/// GPU 层绘制内建视觉与 class 颜色角色时使用的调色板；各字段是 RGBA 字节，
+/// 按目标视图的转移函数解释。
 ///
 /// 纯色（0 或 255）在两种 BGRA 格式下写出相同的字节；中间调在 sRGB 视图上
 /// 会再经过一次传输编码。显示用途应请求非 sRGB 视图；只有 sRGB 视图时需要
@@ -30,12 +32,30 @@ pub struct RenderPalette {
     pub surface: [u8; 4],
     /// 按钮、输入框与复选框底色。
     pub control: [u8; 4],
-    /// 文本颜色。
+    /// 指针悬停时的控件底色。
+    pub control_hover: [u8; 4],
+    /// 指针按下时的控件底色。
+    pub control_pressed: [u8; 4],
+    /// 默认文本颜色。
     pub text: [u8; 4],
+    /// 次要文本颜色。
+    pub text_muted: [u8; 4],
+    /// 强调色背景上的文本颜色。
+    pub text_inverse: [u8; 4],
+    /// 禁用文本颜色。
+    pub text_disabled: [u8; 4],
     /// 控件边框。
     pub border: [u8; 4],
     /// 选中、按下与 preedit 下划线。
     pub accent: [u8; 4],
+    /// 悬停时的强调色。
+    pub accent_hover: [u8; 4],
+    /// 按下时的强调色。
+    pub accent_pressed: [u8; 4],
+    /// 危险操作的底色。
+    pub danger: [u8; 4],
+    /// 悬停时的危险色。
+    pub danger_hover: [u8; 4],
     /// selection 高亮。
     pub selection: [u8; 4],
     /// caret。
@@ -48,9 +68,18 @@ impl Default for RenderPalette {
             background: [244, 244, 245, 255],
             surface: [255, 255, 255, 255],
             control: [228, 228, 231, 255],
+            control_hover: [212, 212, 216, 255],
+            control_pressed: [161, 161, 170, 255],
             text: [24, 24, 27, 255],
+            text_muted: [82, 82, 91, 255],
+            text_inverse: [255, 255, 255, 255],
+            text_disabled: [161, 161, 170, 255],
             border: [161, 161, 170, 255],
             accent: [37, 99, 235, 255],
+            accent_hover: [29, 78, 216, 255],
+            accent_pressed: [30, 64, 175, 255],
+            danger: [220, 38, 38, 255],
+            danger_hover: [185, 28, 28, 255],
             selection: [37, 99, 235, 80],
             caret: [24, 24, 27, 255],
         }
@@ -284,35 +313,9 @@ fn paint(
     let scale = scene.viewport().scale();
     for element in scene.elements() {
         let rect = physical_rect(element.rect(), scale);
-        match element.visual() {
-            Visual::Container => fill(target, rect, palette.surface),
-            Visual::Text => {}
-            Visual::Button { pressed } => {
-                if pressed {
-                    fill(target, rect, palette.accent);
-                    outline(target, rect, palette.border, scale);
-                } else {
-                    control_box(target, rect, palette, scale);
-                }
-            }
-            Visual::Checkbox { checked } => {
-                control_box(target, rect, palette, scale);
-                if checked {
-                    let inset = 4.0 * f64::from(scale);
-                    fill(
-                        target,
-                        KurboRect::new(
-                            rect.x0 + inset,
-                            rect.y0 + inset,
-                            rect.x1 - inset,
-                            rect.y1 - inset,
-                        ),
-                        palette.accent,
-                    );
-                }
-            }
-            Visual::TextInput => control_box(target, rect, palette, scale),
-        }
+        let style = element.resolved_style();
+        paint_background(target, rect, element.visual(), style, palette, scale);
+        paint_border(target, rect, element.visual(), style, palette, scale);
         for decoration in scene.decorations() {
             if decoration.node() != element.id() {
                 continue;
@@ -323,11 +326,18 @@ fn paint(
                 DecorationKind::Caret => None,
             };
             if let Some(paint) = paint {
-                fill(target, physical_rect(decoration.rect(), scale), paint);
+                fill(
+                    target,
+                    physical_rect(decoration.rect(), scale),
+                    with_opacity(paint, style.opacity()),
+                );
             }
         }
         if !element.text().is_empty() {
-            target.set_paint(color(palette.text));
+            let paint = style
+                .text_color()
+                .map_or(palette.text, |color| resolve_color(color, palette));
+            target.set_paint(color(with_opacity(paint, style.opacity())));
             for run in element.text() {
                 glyphs(target, resources, run, scale)?;
             }
@@ -336,15 +346,107 @@ fn paint(
     if scene.caret_visible() {
         for decoration in scene.decorations() {
             if decoration.kind() == DecorationKind::Caret {
+                let opacity = scene
+                    .node(decoration.node())
+                    .map_or(1.0, |element| element.resolved_style().opacity());
                 fill(
                     target,
                     physical_rect(decoration.rect(), scale),
-                    palette.caret,
+                    with_opacity(palette.caret, opacity),
                 );
             }
         }
     }
     Ok(())
+}
+
+/// intrinsic 的背景先铺，class 的 `bg-*` 覆盖它；checkbox 的勾选块始终是强调色。
+fn paint_background(
+    target: &mut vello_gpu::Scene,
+    rect: KurboRect,
+    visual: Visual,
+    style: ResolvedStyle,
+    palette: RenderPalette,
+    scale: f32,
+) {
+    let intrinsic = match visual {
+        Visual::Container => Some(palette.surface),
+        Visual::Text => None,
+        Visual::Button { pressed: true } => Some(palette.accent),
+        Visual::Button { pressed: false } | Visual::Checkbox { .. } | Visual::TextInput => {
+            Some(palette.control)
+        }
+    };
+    let background = style
+        .background()
+        .map(|color| resolve_color(color, palette))
+        .or(intrinsic);
+    if let Some(paint) = background {
+        fill_rounded(target, rect, paint, style, scale);
+    }
+    if let Visual::Checkbox { checked: true } = visual {
+        let inset = 4.0 * f64::from(scale);
+        fill(
+            target,
+            KurboRect::new(
+                rect.x0 + inset,
+                rect.y0 + inset,
+                rect.x1 - inset,
+                rect.y1 - inset,
+            ),
+            with_opacity(palette.accent, style.opacity()),
+        );
+    }
+}
+
+/// intrinsic 的控件边框先铺，class 的 `border` / `border-*` 覆盖宽度或颜色。
+fn paint_border(
+    target: &mut vello_gpu::Scene,
+    rect: KurboRect,
+    visual: Visual,
+    style: ResolvedStyle,
+    palette: RenderPalette,
+    scale: f32,
+) {
+    let width = style.border_width().unwrap_or(match visual {
+        Visual::Button { .. } | Visual::Checkbox { .. } | Visual::TextInput => 1.0,
+        Visual::Container | Visual::Text => 0.0,
+    });
+    if width <= 0.0 {
+        return;
+    }
+    let paint = style
+        .border_color()
+        .map_or(palette.border, |color| resolve_color(color, palette));
+    stroke_rounded(target, rect, paint, style, width * scale, scale);
+}
+
+fn resolve_color(color: Color, palette: RenderPalette) -> [u8; 4] {
+    match color {
+        Color::Role(role) => role_color(role, palette),
+        Color::Literal(rgba) => rgba,
+    }
+}
+
+/// 语义角色到当前调色板的分派；暗色调色板只需提供同一组字段。
+fn role_color(role: ColorRole, palette: RenderPalette) -> [u8; 4] {
+    match role {
+        ColorRole::Surface => palette.surface,
+        ColorRole::Control => palette.control,
+        ColorRole::ControlHover => palette.control_hover,
+        ColorRole::ControlPressed => palette.control_pressed,
+        ColorRole::Accent => palette.accent,
+        ColorRole::AccentHover => palette.accent_hover,
+        ColorRole::AccentPressed => palette.accent_pressed,
+        ColorRole::Danger => palette.danger,
+        ColorRole::DangerHover => palette.danger_hover,
+        ColorRole::TextDefault => palette.text,
+        ColorRole::TextMuted => palette.text_muted,
+        ColorRole::TextInverse => palette.text_inverse,
+        ColorRole::TextDisabled => palette.text_disabled,
+        ColorRole::BorderDefault => palette.border,
+        ColorRole::BorderAccent => palette.accent,
+    }
 }
 
 fn glyphs(
@@ -369,20 +471,50 @@ fn glyphs(
         })
 }
 
-fn control_box(target: &mut vello_gpu::Scene, rect: KurboRect, palette: RenderPalette, scale: f32) {
-    fill(target, rect, palette.control);
-    outline(target, rect, palette.border, scale);
-}
-
 fn fill(target: &mut vello_gpu::Scene, rect: KurboRect, paint: [u8; 4]) {
     target.set_paint(color(paint));
     target.fill_rect(&rect);
 }
 
-fn outline(target: &mut vello_gpu::Scene, rect: KurboRect, paint: [u8; 4], scale: f32) {
-    target.set_paint(color(paint));
-    target.set_stroke(Stroke::new(f64::from(scale)));
-    target.stroke_rect(&rect);
+fn fill_rounded(
+    target: &mut vello_gpu::Scene,
+    rect: KurboRect,
+    paint: [u8; 4],
+    style: ResolvedStyle,
+    scale: f32,
+) {
+    target.set_paint(color(with_opacity(paint, style.opacity())));
+    if style.radius() > 0.0 {
+        target.fill_path(&rounded_path(rect, style.radius(), scale));
+    } else {
+        target.fill_rect(&rect);
+    }
+}
+
+fn stroke_rounded(
+    target: &mut vello_gpu::Scene,
+    rect: KurboRect,
+    paint: [u8; 4],
+    style: ResolvedStyle,
+    width: f32,
+    scale: f32,
+) {
+    target.set_paint(color(with_opacity(paint, style.opacity())));
+    target.set_stroke(Stroke::new(f64::from(width)));
+    if style.radius() > 0.0 {
+        target.stroke_path(&rounded_path(rect, style.radius(), scale));
+    } else {
+        target.stroke_rect(&rect);
+    }
+}
+
+fn rounded_path(rect: KurboRect, radius: f32, scale: f32) -> vello_gpu::kurbo::BezPath {
+    RoundedRect::from_rect(rect, f64::from(radius) * f64::from(scale)).to_path(0.1)
+}
+
+fn with_opacity(paint: [u8; 4], opacity: f32) -> [u8; 4] {
+    let alpha = (f32::from(paint[3]) * opacity).clamp(0.0, 255.0).round() as u8;
+    [paint[0], paint[1], paint[2], alpha]
 }
 
 fn physical_rect(rect: Rect, scale: f32) -> KurboRect {

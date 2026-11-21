@@ -12,9 +12,18 @@ const TEST_PALETTE: RenderPalette = RenderPalette {
     background: [0, 0, 255, 255],
     surface: [0, 255, 0, 255],
     control: [255, 0, 0, 255],
+    control_hover: [0, 255, 255, 255],
+    control_pressed: [255, 0, 255, 255],
     text: [0, 0, 0, 255],
+    text_muted: [0, 0, 255, 255],
+    text_inverse: [0, 255, 255, 255],
+    text_disabled: [128, 128, 128, 255],
     border: [0, 0, 0, 255],
     accent: [255, 255, 0, 255],
+    accent_hover: [255, 128, 0, 255],
+    accent_pressed: [128, 0, 255, 255],
+    danger: [255, 0, 0, 255],
+    danger_hover: [128, 0, 0, 255],
     selection: [255, 0, 255, 255],
     caret: [255, 255, 255, 255],
 };
@@ -306,6 +315,116 @@ fn a_known_color_scene_renders_expected_pixels() {
     assert!(
         pixels.any_in(caret.into(), |pixel| pixel[1] > 100),
         "the white caret bar appears at its geometry: {caret:?}"
+    );
+}
+
+#[test]
+fn class_paint_renders_background_text_border_radius_and_opacity() {
+    let Some(context) = context() else {
+        return;
+    };
+    let mut app = Runtime::new();
+    app.mount(|| {
+        view! {
+            <view class="bg-surface rounded-lg">
+                <button class="bg-accent rounded-md">"Accent"</button>
+                <button class="bg-control border border-accent">"Border"</button>
+                <button class="bg-control opacity-50 rounded-lg">"Faded"</button>
+                <text class="text-muted">"Muted"</text>
+            </view>
+        }
+    })
+    .expect("mount");
+    let snapshot = app.presentation().expect("snapshot");
+    let scene = scene(&snapshot, 200.0, 200.0, 1.0);
+    let pixels = render(&context, &scene, wgpu::TextureFormat::Bgra8Unorm, 200, 200);
+
+    assert_eq!(
+        pixels.at(0, 199),
+        BLUE_BGRA,
+        "a rounded root corner leaves the clear color visible"
+    );
+    assert_eq!(
+        pixels.at(100, 190),
+        GREEN_BGRA,
+        "bg-surface paints the root between its children"
+    );
+
+    let accent = scene
+        .node(by_text(&snapshot, "button", "Accent"))
+        .expect("accent button")
+        .rect();
+    assert_eq!(
+        pixels.at(
+            (accent.x + 6.0) as u32,
+            (accent.y + accent.height / 2.0) as u32
+        ),
+        [0, 255, 255, 255],
+        "bg-accent overrides the intrinsic control background"
+    );
+    let border = scene
+        .node(by_text(&snapshot, "button", "Border"))
+        .expect("border button")
+        .rect();
+    assert_eq!(
+        pixels.at(
+            (border.x + 6.0) as u32,
+            (border.y + border.height / 2.0) as u32
+        ),
+        RED_BGRA,
+        "bg-control keeps the control body"
+    );
+    let border_probe = RectLike {
+        x: border.x - 1.0,
+        y: border.y + 4.0,
+        width: 3.0,
+        height: border.height - 8.0,
+    };
+    assert!(
+        pixels.any_in(border_probe, |pixel| {
+            pixel[1] > 100 && pixel[2] > 100 && pixel[0] < 80
+        }),
+        "border-accent strokes the button edge"
+    );
+
+    let faded = scene
+        .node(by_text(&snapshot, "button", "Faded"))
+        .expect("faded button")
+        .rect();
+    let center = pixels.at(
+        (faded.x + 6.0) as u32,
+        (faded.y + faded.height / 2.0) as u32,
+    );
+    assert!(
+        (90..=170).contains(&center[1]) && (90..=170).contains(&center[2]) && center[0] < 40,
+        "opacity-50 blends the control over the surface: {center:?}"
+    );
+    assert_eq!(
+        pixels.at((faded.x + 1.0) as u32, (faded.y + 1.0) as u32),
+        GREEN_BGRA,
+        "rounded-lg keeps the button corner unpainted"
+    );
+
+    let muted = scene
+        .node(by_text(&snapshot, "text", "Muted"))
+        .expect("muted text");
+    let glyph = muted
+        .text()
+        .iter()
+        .flat_map(|run| run.glyphs())
+        .next()
+        .expect("a shaped glyph");
+    let probe = RectLike {
+        x: glyph.x,
+        y: glyph.y - 10.0,
+        width: glyph.advance.max(2.0),
+        height: 12.0,
+    };
+    assert!(
+        pixels.any_in(probe, |pixel| pixel[0] > 150
+            && pixel[1] < 100
+            && pixel[2] < 100),
+        "text-muted paints glyph ink in the muted color"
     );
 }
 

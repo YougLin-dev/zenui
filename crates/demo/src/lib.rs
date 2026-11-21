@@ -57,6 +57,7 @@ pub fn TodoItem(todo: TodoId, todos: Store) -> MountResult<MountPlan> {
                 }}
             />
             <button
+                class="px-2 py-1 bg-danger text-inverse rounded-sm"
                 aria:label={once(delete_label)}
                 on:click={move || {
                     let _ = Transaction::new().write(todos.remove(todo)).finish();
@@ -141,7 +142,10 @@ pub fn TodoApp(window: WindowCtx) -> MountResult<MountPlan> {
                     aria:label="What needs to be done?"
                     on:input={move |value: String| draft.set(value)}
                 />
-                <button class="px-4 py-2" on:click={move || add()}>"Add"</button>
+                <button
+                    class="px-4 py-2 bg-accent text-inverse rounded-md"
+                    on:click={move || add()}
+                >"Add"</button>
             </form>
             <view role="group" aria:label="Filter">
                 <FilterButton current={filter} value={Filter::All} label="All" />
