@@ -2,7 +2,7 @@
 
 use zenui::prelude::*;
 use zenui_demo::*;
-use zenui_render::{DecorationKind, Point, Scene, SceneElement, SceneError, Viewport};
+use zenui_render::{DecorationKind, Point, Scene, SceneElement, SceneEnv, SceneError, Viewport};
 
 fn runtime() -> Runtime {
     let mut app = Runtime::new();
@@ -1202,6 +1202,86 @@ fn the_demo_count_and_add_button_use_text_utilities() {
         add.resolved_style().font_weight(),
         600,
         "the primary button uses font-semibold"
+    );
+}
+
+#[test]
+fn pointer_and_modality_conditions_select_from_the_scene_environment() {
+    let mut app = Runtime::new();
+    app.mount(|| {
+        view! {
+            <view>
+                <button
+                    aria:label="feedback"
+                    class="bg-control hover:bg-control-hover active:bg-control-pressed"
+                >"Hover"</button>
+                <text-input aria:label="editor" class="bg-control focus-visible:bg-accent" />
+            </view>
+        }
+    })
+    .expect("mount");
+    app.focus("editor").expect("focus the editor");
+    let snapshot = app.presentation().expect("snapshot");
+    let viewport = viewport(400.0);
+    let button = snapshot.find_label("feedback").expect("button").id();
+    let editor = snapshot.find_label("editor").expect("editor").id();
+    let background = |scene: &Scene, node| {
+        scene
+            .node(node)
+            .expect("scene element")
+            .resolved_style()
+            .background()
+    };
+
+    let plain = Scene::build_with(&snapshot, viewport, &SceneEnv::default()).expect("scene");
+    assert_eq!(
+        background(&plain, button),
+        Some(Color::Role(ColorRole::Control))
+    );
+    assert_eq!(
+        background(&plain, editor),
+        Some(Color::Role(ColorRole::Control)),
+        "focus alone is not focus-visible"
+    );
+
+    let hovered = Scene::build_with(
+        &snapshot,
+        viewport,
+        &SceneEnv::default().with_hovered(Some(button)),
+    )
+    .expect("scene");
+    assert_eq!(
+        background(&hovered, button),
+        Some(Color::Role(ColorRole::ControlHover))
+    );
+    assert!(hovered.node(button).expect("button").hovered());
+    assert!(!hovered.node(button).expect("button").pointer_pressed());
+
+    let pressed = Scene::build_with(
+        &snapshot,
+        viewport,
+        &SceneEnv::default()
+            .with_hovered(Some(button))
+            .with_pressed(Some(button)),
+    )
+    .expect("scene");
+    assert_eq!(
+        background(&pressed, button),
+        Some(Color::Role(ColorRole::ControlPressed)),
+        "active outranks hover"
+    );
+    assert!(pressed.node(button).expect("button").pointer_pressed());
+
+    let keyboard = Scene::build_with(
+        &snapshot,
+        viewport,
+        &SceneEnv::default().with_focus_visible(true),
+    )
+    .expect("scene");
+    assert_eq!(
+        background(&keyboard, editor),
+        Some(Color::Role(ColorRole::Accent)),
+        "focus-visible follows the host modality"
     );
 }
 

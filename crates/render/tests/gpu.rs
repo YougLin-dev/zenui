@@ -4,7 +4,7 @@ use zenui::prelude::*;
 use zenui_demo::*;
 use zenui_render::{
     GpuContext, GpuRenderer, RenderError, RenderPalette, RenderTargetConfig, Scene, SceneElement,
-    Viewport, wgpu,
+    SceneEnv, Viewport, wgpu,
 };
 
 /// 纯色调色板：0/255 分量在 Unorm 与 sRGB 目标下写出相同字节。
@@ -497,6 +497,56 @@ fn text_classes_render_at_both_scales_without_clipping() {
             );
         }
     }
+}
+
+#[test]
+fn hovering_and_pressing_a_control_change_its_pixels() {
+    let Some(context) = context() else {
+        return;
+    };
+    let app = runtime();
+    let snapshot = app.presentation().expect("snapshot");
+    let id = by_text(&snapshot, "button", "Reverse");
+    let viewport = || Viewport::new(256.0, 256.0, 1.0).expect("viewport");
+    let plain = Scene::build_with(&snapshot, viewport(), &SceneEnv::default()).expect("scene");
+    let hovered = Scene::build_with(
+        &snapshot,
+        viewport(),
+        &SceneEnv::default().with_hovered(Some(id)),
+    )
+    .expect("scene");
+    let pressed = Scene::build_with(
+        &snapshot,
+        viewport(),
+        &SceneEnv::default()
+            .with_hovered(Some(id))
+            .with_pressed(Some(id)),
+    )
+    .expect("scene");
+    assert!(
+        hovered.node(id).expect("button").hovered(),
+        "hover reaches the scene"
+    );
+    assert!(
+        pressed.node(id).expect("button").pointer_pressed(),
+        "press reaches the scene"
+    );
+    let rect = plain.node(id).expect("button").rect();
+    let center = ((rect.x + 6.0) as u32, (rect.y + 6.0) as u32);
+    let format = wgpu::TextureFormat::Bgra8Unorm;
+    let base = render(&context, &plain, format, 256, 256);
+    let hover = render(&context, &hovered, format, 256, 256);
+    let down = render(&context, &pressed, format, 256, 256);
+    assert_ne!(
+        base.at(center.0, center.1),
+        hover.at(center.0, center.1),
+        "hover paints the control with its hover color"
+    );
+    assert_ne!(
+        hover.at(center.0, center.1),
+        down.at(center.0, center.1),
+        "pressed paints the control with its pressed color"
+    );
 }
 
 #[test]

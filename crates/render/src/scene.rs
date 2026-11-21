@@ -130,6 +130,51 @@ impl ResolvedStyle {
     }
 }
 
+/// 宿主拥有的呈现瞬态；不属于 presentation snapshot。
+///
+/// `Default` 表示没有指针、指针输入方式：hover 与 active 都不命中。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SceneEnv {
+    hovered: Option<NodeId>,
+    pressed: Option<NodeId>,
+    focus_visible: bool,
+}
+
+impl SceneEnv {
+    /// 命中测试的最上层元素；容器也可以被命中，只有控件会使用它。
+    pub const fn with_hovered(mut self, node: Option<NodeId>) -> Self {
+        self.hovered = node;
+        self
+    }
+
+    /// 指针当前按住的节点。
+    pub const fn with_pressed(mut self, node: Option<NodeId>) -> Self {
+        self.pressed = node;
+        self
+    }
+
+    /// 焦点是否来自键盘输入。
+    pub const fn with_focus_visible(mut self, focus_visible: bool) -> Self {
+        self.focus_visible = focus_visible;
+        self
+    }
+
+    /// 当前悬停的节点。
+    pub const fn hovered(self) -> Option<NodeId> {
+        self.hovered
+    }
+
+    /// 当前按住的节点。
+    pub const fn pressed(self) -> Option<NodeId> {
+        self.pressed
+    }
+
+    /// 焦点是否来自键盘输入。
+    pub const fn focus_visible(self) -> bool {
+        self.focus_visible
+    }
+}
+
 /// 一个已提交元素的绝对逻辑几何与内建视觉。
 #[derive(Clone, Debug)]
 pub struct SceneElement {
@@ -139,6 +184,8 @@ pub struct SceneElement {
     visual: Visual,
     resolved: ResolvedStyle,
     disabled: bool,
+    hovered: bool,
+    pointer_pressed: bool,
     focused: bool,
     text: Vec<TextRun>,
     caret_stops: Option<Vec<CaretStop>>,
@@ -185,6 +232,16 @@ impl SceneElement {
     /// 该元素是否持有快照焦点。
     pub const fn focused(&self) -> bool {
         self.focused
+    }
+
+    /// 该元素是否是 `SceneEnv` 里当前悬停的节点。
+    pub const fn hovered(&self) -> bool {
+        self.hovered
+    }
+
+    /// 该元素是否是 `SceneEnv` 里当前按住的节点。
+    pub const fn pointer_pressed(&self) -> bool {
+        self.pointer_pressed
     }
 
     /// 绘制在该元素盒内的文本 run，包含按钮标题等裸文本子节点。
@@ -361,9 +418,19 @@ pub struct Scene {
 }
 
 impl Scene {
-    /// 完整重排一次快照。每次调用都重新构建 Taffy 树，Node ID 原样保留。
+    /// 用默认环境完整重排一次快照；没有指针瞬态。
     pub fn build(snapshot: &PresentationSnapshot, viewport: Viewport) -> Result<Self, SceneError> {
-        Builder::new(snapshot).build(viewport)
+        Self::build_with(snapshot, viewport, &SceneEnv::default())
+    }
+
+    /// 用宿主提供的指针瞬态完整重排一次快照。每次调用都重新构建 Taffy 树，
+    /// Node ID 原样保留。
+    pub fn build_with(
+        snapshot: &PresentationSnapshot,
+        viewport: Viewport,
+        env: &SceneEnv,
+    ) -> Result<Self, SceneError> {
+        Builder::new(snapshot, *env).build(viewport)
     }
 
     /// 构建该场景的 viewport；scale 未参与布局。
@@ -428,7 +495,10 @@ impl TextContext {
 /// 一条声明在解析时能看到的控件状态；来自已提交的快照，不含宿主瞬态。
 #[derive(Clone, Copy, Debug, Default)]
 struct ElementState {
+    hovered: bool,
     focus: bool,
+    focus_visible: bool,
+    pressed: bool,
     disabled: bool,
     checked: bool,
     aria_pressed: bool,
@@ -438,7 +508,11 @@ impl ElementState {
     const fn active(self, condition: Condition) -> bool {
         match condition {
             Condition::Base => true,
+            Condition::Dark => false,
+            Condition::Hover => self.hovered,
             Condition::Focus => self.focus,
+            Condition::FocusVisible => self.focus_visible,
+            Condition::Active => self.pressed,
             Condition::Disabled => self.disabled,
             Condition::Checked => self.checked,
             Condition::AriaPressed => self.aria_pressed,
@@ -465,15 +539,17 @@ struct EditView<'a> {
 
 struct Builder<'a> {
     snapshot: &'a PresentationSnapshot,
+    env: SceneEnv,
     tree: TaffyTree<TextContext>,
     kinds: HashMap<TaffyNodeId, Kind>,
     resolved: HashMap<TaffyNodeId, ResolvedStyle>,
 }
 
 impl<'a> Builder<'a> {
-    fn new(snapshot: &'a PresentationSnapshot) -> Self {
+    fn new(snapshot: &'a PresentationSnapshot, env: SceneEnv) -> Self {
         Self {
             snapshot,
+            env,
             tree: TaffyTree::new(),
             kinds: HashMap::new(),
             resolved: HashMap::new(),
@@ -548,7 +624,10 @@ impl<'a> Builder<'a> {
             Intrinsic::View | Intrinsic::Form => container_style(intrinsic, element),
         };
         let state = ElementState {
+            hovered: self.env.hovered == Some(element.id()),
             focus: self.snapshot.focus() == Some(element.id()),
+            focus_visible: self.env.focus_visible && self.snapshot.focus() == Some(element.id()),
+            pressed: self.env.pressed == Some(element.id()),
             disabled: element.disabled(),
             checked: element.checked().unwrap_or(false),
             aria_pressed: element.pressed(),
@@ -717,6 +796,8 @@ impl<'a> Builder<'a> {
                     visual: visual(intrinsic, element),
                     resolved,
                     disabled: element.disabled(),
+                    hovered: self.env.hovered == Some(id),
+                    pointer_pressed: self.env.pressed == Some(id),
                     focused,
                     text: runs,
                     caret_stops,

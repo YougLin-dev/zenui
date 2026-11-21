@@ -228,7 +228,11 @@ fn declaration_tokens(declaration: &StyleDeclaration) -> TokenStream {
 fn condition_tokens(condition: Condition) -> TokenStream {
     match condition {
         Condition::Base => quote! { Base },
+        Condition::Dark => quote! { Dark },
+        Condition::Hover => quote! { Hover },
         Condition::Focus => quote! { Focus },
+        Condition::FocusVisible => quote! { FocusVisible },
+        Condition::Active => quote! { Active },
         Condition::Disabled => quote! { Disabled },
         Condition::Checked => quote! { Checked },
         Condition::AriaPressed => quote! { AriaPressed },

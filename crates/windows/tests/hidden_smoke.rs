@@ -3,25 +3,64 @@
 use std::collections::BTreeSet;
 
 use windows::Win32::Foundation::{LPARAM, WPARAM};
+use windows::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     VIRTUAL_KEY, VK_BACK, VK_DELETE, VK_END, VK_HOME, VK_RETURN, VK_RIGHT, VK_TAB,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    PostMessageW, WM_CHAR, WM_CLOSE, WM_KEYDOWN, WM_LBUTTONDOWN,
+    PostMessageW, WM_CHAR, WM_CLOSE, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MOUSEMOVE,
 };
-use zenui::NodeId;
+use zenui::{Color, ColorRole, NodeId};
 use zenui_render::{Point, SceneElement, Visual};
 use zenui_windows::{Host, HostConfig, HostError};
 
-fn post_click(host: &Host, point: Point, scale: f32) {
+fn pointer_lparam(point: Point, scale: f32) -> LPARAM {
     let x = (point.x * scale).round() as i16;
     let y = (point.y * scale).round() as i16;
-    let lparam = LPARAM((x as isize & 0xffff) | ((y as isize & 0xffff) << 16));
+    LPARAM((x as isize & 0xffff) | ((y as isize & 0xffff) << 16))
+}
+
+fn post_pointer(host: &Host, message: u32, point: Point, scale: f32) {
     let hwnd = host.hwnd();
     // 安全：HWND 由 Host 持有，消息只排队，不跨线程解引用。
     unsafe {
-        PostMessageW(Some(hwnd), WM_LBUTTONDOWN, WPARAM(0), lparam).expect("post the click");
+        PostMessageW(Some(hwnd), message, WPARAM(0), pointer_lparam(point, scale))
+            .expect("post the pointer message");
     }
+}
+
+fn post_down(host: &Host, point: Point, scale: f32) {
+    post_pointer(host, WM_LBUTTONDOWN, point, scale);
+}
+
+fn post_up(host: &Host, point: Point, scale: f32) {
+    post_pointer(host, WM_LBUTTONUP, point, scale);
+}
+
+fn post_move(host: &Host, point: Point, scale: f32) {
+    post_pointer(host, WM_MOUSEMOVE, point, scale);
+}
+
+fn post_focus_lost(host: &Host) {
+    let hwnd = host.hwnd();
+    // 安全：HWND 由 Host 持有，消息只排队，不跨线程解引用。
+    unsafe {
+        PostMessageW(Some(hwnd), WM_KILLFOCUS, WPARAM(0), LPARAM(0)).expect("post focus loss");
+    }
+}
+
+fn post_leave(host: &Host) {
+    let hwnd = host.hwnd();
+    // 安全：HWND 由 Host 持有，消息只排队，不跨线程解引用。
+    unsafe {
+        PostMessageW(Some(hwnd), WM_MOUSELEAVE, WPARAM(0), LPARAM(0)).expect("post the leave");
+    }
+}
+
+fn post_click(host: &Host, point: Point, scale: f32) {
+    post_down(host, point, scale);
+    post_up(host, point, scale);
 }
 
 fn post_char(host: &Host, character: char) {
@@ -651,6 +690,283 @@ fn delete_removes_a_native_row() {
         checkbox_ids(&host).len(),
         1,
         "Delete removes the row from the native list"
+    );
+
+    post_close(&host);
+    host.run().expect("process the close");
+}
+
+#[test]
+fn hover_press_and_release_activate_a_filter_button_once() {
+    let mut host = Host::open(HostConfig::hidden("ZenUI pointer feedback")).expect("open a host");
+    host.render().expect("render the initial frame");
+    let (point, scale) = button_at(&host, 2);
+    let id = host
+        .scene()
+        .expect("scene")
+        .hit_test(point)
+        .expect("the Active button");
+    let baseline = host.read_frame().expect("baseline frame");
+
+    post_move(&host, point, scale);
+    host.pump().expect("process the move");
+    let scene = host.scene().expect("scene after the move");
+    let element = scene.node(id).expect("Active button");
+    assert!(element.hovered(), "moving over the button shows hover");
+    assert!(
+        matches!(element.visual(), Visual::Button { pressed: false }),
+        "hover does not change aria-pressed"
+    );
+    assert_ne!(
+        baseline.pixels(),
+        host.read_frame().expect("hovered frame").pixels(),
+        "hover changes the pixels"
+    );
+
+    post_down(&host, point, scale);
+    host.pump().expect("process the press");
+    let scene = host.scene().expect("scene after the press");
+    let element = scene.node(id).expect("Active button");
+    assert!(
+        element.pointer_pressed(),
+        "holding the pointer shows pressed"
+    );
+    assert!(
+        matches!(element.visual(), Visual::Button { pressed: false }),
+        "a transient press stays distinct from aria-pressed"
+    );
+
+    post_up(&host, point, scale);
+    host.pump().expect("process the release");
+    let scene = host.scene().expect("scene after the release");
+    let element = scene.node(id).expect("Active button");
+    assert!(!element.pointer_pressed(), "release clears pressed");
+    assert!(
+        matches!(element.visual(), Visual::Button { pressed: true }),
+        "release over the same node activates once"
+    );
+    assert!(element.hovered(), "the pointer is still over the button");
+
+    post_leave(&host);
+    host.pump().expect("process the leave");
+    let scene = host.scene().expect("scene after the leave");
+    assert!(
+        !scene.node(id).expect("Active button").hovered(),
+        "leaving the client area clears hover"
+    );
+
+    post_close(&host);
+    host.run().expect("process the close");
+}
+
+#[test]
+fn focus_loss_clears_the_pressed_visual() {
+    let mut host = Host::open(HostConfig::hidden("ZenUI focus loss")).expect("open a host");
+    host.render().expect("render the initial frame");
+    let (point, scale) = button_at(&host, 2);
+    let id = host
+        .scene()
+        .expect("scene")
+        .hit_test(point)
+        .expect("the Active button");
+
+    post_down(&host, point, scale);
+    host.pump().expect("process the press");
+    assert!(
+        host.scene()
+            .expect("scene after the press")
+            .node(id)
+            .expect("Active button")
+            .pointer_pressed(),
+        "the button is the press target"
+    );
+    let pressed = host.read_frame().expect("pressed frame");
+
+    post_focus_lost(&host);
+    host.pump().expect("process focus loss");
+    assert!(
+        !host
+            .scene()
+            .expect("scene after focus loss")
+            .node(id)
+            .expect("Active button")
+            .pointer_pressed(),
+        "focus loss clears the press target"
+    );
+    assert_ne!(
+        pressed.pixels(),
+        host.read_frame().expect("frame after focus loss").pixels(),
+        "focus loss repaints without the pressed state"
+    );
+
+    post_close(&host);
+    host.run().expect("process the close");
+}
+
+#[test]
+fn dragging_off_cancels_activation() {
+    let mut host = Host::open(HostConfig::hidden("ZenUI drag off")).expect("open a host");
+    host.render().expect("render the initial frame");
+    let (id, point, scale) = center_of(&host, |element| {
+        matches!(element.visual(), Visual::Checkbox { .. })
+    });
+    assert!(matches!(
+        host.scene()
+            .expect("scene")
+            .node(id)
+            .expect("checkbox")
+            .visual(),
+        Visual::Checkbox { checked: true }
+    ));
+
+    post_down(&host, point, scale);
+    host.pump().expect("process the press");
+    assert!(
+        host.scene()
+            .expect("scene")
+            .node(id)
+            .expect("checkbox")
+            .pointer_pressed(),
+        "the checkbox is the press target"
+    );
+
+    let off = Point::new(2.0, 2.0);
+    post_move(&host, off, scale);
+    host.pump().expect("process the move off");
+    post_up(&host, off, scale);
+    host.pump().expect("process the release off the target");
+    assert!(
+        matches!(
+            host.scene()
+                .expect("scene")
+                .node(id)
+                .expect("checkbox")
+                .visual(),
+            Visual::Checkbox { checked: true }
+        ),
+        "dragging off and releasing does not activate"
+    );
+
+    post_close(&host);
+    host.run().expect("process the close");
+}
+
+#[test]
+fn hover_does_not_change_focus_or_caret() {
+    let mut host = Host::open(HostConfig::hidden("ZenUI hover focus")).expect("open a host");
+    host.render().expect("render the initial frame");
+    let scene = host.scene().expect("scene");
+    let input = scene
+        .elements()
+        .iter()
+        .find(|element| matches!(element.visual(), Visual::TextInput))
+        .expect("a text input");
+    let id = input.id();
+    let point = point_in_text(&host, id, 0.4);
+    let scale = scene.viewport().scale();
+    post_click(&host, point, scale);
+    host.pump().expect("focus the input");
+    let focused = focused_id(&host).expect("a focused input");
+    let caret = host.scene().expect("scene").caret(focused).expect("caret");
+
+    let (button, scale) = button_at(&host, 1);
+    post_move(&host, button, scale);
+    host.pump().expect("hover a button");
+    let scene = host.scene().expect("scene after hover");
+    assert_eq!(focused_id(&host), Some(focused), "hover keeps focus");
+    assert_eq!(
+        scene.caret(focused).expect("caret after hover"),
+        caret,
+        "hover keeps caret geometry"
+    );
+
+    post_close(&host);
+    host.run().expect("process the close");
+}
+
+#[test]
+fn a_relayout_keeps_hover_consistent_with_the_hit_test() {
+    let mut host = Host::open(HostConfig::hidden("ZenUI stale hover")).expect("open a host");
+    host.render().expect("render the initial frame");
+    let (point, scale) = button_at(&host, 7);
+    post_move(&host, point, scale);
+    host.pump().expect("hover the button");
+    assert!(
+        host.scene()
+            .expect("scene")
+            .elements()
+            .iter()
+            .any(SceneElement::hovered)
+    );
+
+    host.resize(320, 100).expect("resize the window");
+    let scene = host.scene().expect("scene after resize");
+    let under = scene
+        .hit_test(point)
+        .filter(|node| scene.node(*node).is_some_and(|element| !element.disabled()));
+    let hovered = scene
+        .elements()
+        .iter()
+        .find(|element| element.hovered())
+        .map(SceneElement::id);
+    assert_eq!(
+        hovered, under,
+        "after a relayout the hover agrees with the new hit test"
+    );
+    post_close(&host);
+    host.run().expect("process the close");
+}
+
+#[test]
+fn focus_visible_follows_keyboard_not_pointer_modality() {
+    let mut host = Host::open(HostConfig::hidden("ZenUI focus visible")).expect("open a host");
+    host.render().expect("render the initial frame");
+    let scene = host.scene().expect("scene");
+    let input = scene
+        .elements()
+        .iter()
+        .find(|element| matches!(element.visual(), Visual::TextInput))
+        .expect("a text input");
+    let id = input.id();
+    let point = point_in_text(&host, id, 0.5);
+    let scale = scene.viewport().scale();
+    post_click(&host, point, scale);
+    host.pump().expect("focus the input with the pointer");
+    assert_eq!(
+        host.scene()
+            .expect("scene")
+            .node(id)
+            .expect("input")
+            .resolved_style()
+            .border_color(),
+        None,
+        "pointer focus is not focus-visible"
+    );
+
+    post_key(&host, VK_RIGHT);
+    host.pump().expect("use the keyboard");
+    assert_eq!(
+        host.scene()
+            .expect("scene")
+            .node(id)
+            .expect("input")
+            .resolved_style()
+            .border_color(),
+        Some(Color::Role(ColorRole::BorderAccent)),
+        "keyboard focus selects focus-visible"
+    );
+
+    post_down(&host, point, scale);
+    host.pump().expect("press with the pointer");
+    assert_eq!(
+        host.scene()
+            .expect("scene")
+            .node(id)
+            .expect("input")
+            .resolved_style()
+            .border_color(),
+        None,
+        "pointer input clears focus-visible"
     );
 
     post_close(&host);

@@ -19,7 +19,7 @@ pub use geometry::{Point, Rect, Viewport};
 pub use gpu::{GpuContext, GpuRenderer, RenderError, RenderPalette, RenderTargetConfig};
 pub use parley::FontData;
 pub use scene::{
-    Decoration, DecorationKind, PositionedGlyph, ResolvedStyle, Scene, SceneElement, TextRun,
-    Visual,
+    Decoration, DecorationKind, PositionedGlyph, ResolvedStyle, Scene, SceneElement, SceneEnv,
+    TextRun, Visual,
 };
 pub use wgpu;
