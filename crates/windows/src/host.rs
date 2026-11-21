@@ -168,6 +168,7 @@ pub struct Host {
     pointer: Option<Point>,
     hovered: Option<NodeId>,
     pressed: Option<NodeId>,
+    release_capture: bool,
     tracking_leave: bool,
     keyboard_modality: bool,
     pending_high_surrogate: Option<u16>,
@@ -263,6 +264,7 @@ impl Host {
             pointer: None,
             hovered: None,
             pressed: None,
+            release_capture: false,
             tracking_leave: false,
             keyboard_modality: false,
             pending_high_surrogate: None,
@@ -348,8 +350,7 @@ impl Host {
         } else if message == WM_MOUSELEAVE {
             self.pointer_left()
         } else if message == WM_CAPTURECHANGED {
-            self.capture_lost();
-            Ok(())
+            self.capture_lost()
         } else if message == WM_CHAR {
             self.char_typed(wparam)
         } else if message == WM_KEYDOWN {
@@ -358,9 +359,11 @@ impl Host {
             self.ime_start()
         } else if message == WM_IME_COMPOSITION {
             self.ime_composition(lparam)
-        } else if matches!(message, WM_IME_ENDCOMPOSITION | WM_KILLFOCUS) {
+        } else if message == WM_IME_ENDCOMPOSITION {
             self.pressed = None;
             self.ime_cancel()
+        } else if message == WM_KILLFOCUS {
+            self.focus_lost()
         } else if message == HOST_WAKE_MESSAGE {
             self.deliver_tasks()
         } else if message == WM_TIMER && Some(wparam.0) == self.blink_timer {
@@ -668,13 +671,12 @@ impl Host {
             .map_or(1.0, |scene| scene.viewport().scale());
         let point = pointer_point(lparam, scale);
         self.pointer = Some(point);
-        // 先取走目标：ReleaseCapture 会同步送出 WM_CAPTURECHANGED，
+        // 先取走目标：松开后的捕获释放会同步送出 WM_CAPTURECHANGED，
         // 那条消息不能把这次松开要激活的目标一起清掉。
         let target = self.pressed.take();
-        // 安全：释放本窗口的指针捕获；没有捕获时同样安全。
-        unsafe {
-            let _ = ReleaseCapture();
-        }
+        // 捕获释放在窗口过程借出宿主之后进行：`ReleaseCapture` 会同步送达
+        // `WM_CAPTURECHANGED`，嵌套的 `with_host` 不能与外层 `&mut Host` 重叠。
+        self.release_capture = true;
         let activated = target.is_some_and(|node| {
             self.scene.as_ref().is_some_and(|scene| {
                 scene.hit_test(point) == Some(node)
@@ -704,10 +706,24 @@ impl Host {
     }
 
     /// 捕获丢失（例如系统抢走指针）：按住状态不能残留。
-    fn capture_lost(&mut self) {
+    fn capture_lost(&mut self) -> Result<(), HostError> {
         if self.pressed.take().is_some() {
-            let _ = self.render();
+            self.render()?;
         }
+        Ok(())
+    }
+
+    /// 焦点丢失：清除按住瞬态与组合，并让下一帧不再绘制按下状态。
+    fn focus_lost(&mut self) -> Result<(), HostError> {
+        let was_pressed = self.pressed.take().is_some();
+        if was_pressed {
+            self.release_capture = true;
+        }
+        let cancelled = self.cancel_compositions()?;
+        if cancelled || was_pressed {
+            self.render()?;
+        }
+        Ok(())
     }
 
     /// 只在第一次进入客户区时请求一次 `WM_MOUSELEAVE`。
@@ -1257,13 +1273,15 @@ impl Host {
             return false;
         };
         let hit = scene.hit_test(point);
-        let hovered = hit.filter(|node| scene.node(*node).is_some_and(|e| !e.disabled()));
-        let hover_changed = hovered != self.hovered;
-        let press_cleared = self.pressed.is_some() && self.pressed != hit;
+        let enabled = hit.filter(|node| scene.node(*node).is_some_and(|e| !e.disabled()));
+        let hover_changed = enabled != self.hovered;
+        let press_cleared = self.pressed.is_some_and(|pressed| {
+            hit != Some(pressed) || scene.node(pressed).is_none_or(|element| element.disabled())
+        });
         if !hover_changed && !press_cleared {
             return false;
         }
-        self.hovered = hovered;
+        self.hovered = enabled;
         if press_cleared {
             self.pressed = None;
         }
@@ -1762,6 +1780,21 @@ unsafe fn with_host(hwnd: HWND, action: impl FnOnce(&mut Host)) {
     action(host);
 }
 
+/// 取走窗口过程的延迟捕获释放请求；调用时不得持有宿主引用。
+///
+/// # Safety
+///
+/// 调用方必须在窗口过程借出宿主结束后调用，期间不得有其它引用指向宿主。
+unsafe fn take_capture_release(hwnd: HWND) -> bool {
+    // 安全：读取窗口的 user data 槽；未安装时为零。
+    let pointer = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut Host;
+    if pointer.is_null() {
+        return false;
+    }
+    // 安全：指针由 HostPointer 安装；调用方不持有宿主引用。
+    unsafe { std::mem::take(&mut (*pointer).release_capture) }
+}
+
 /// 翻译并派发一条消息；窗口过程负责处理。
 fn dispatch_message(message: &MSG) {
     // 安全：消息来自本线程队列，窗口由 Host 持有。
@@ -1976,6 +2009,14 @@ unsafe extern "system" fn wndproc(
             let result = unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
             // 安全：默认过程已返回；窗口过程借出宿主处理这条消息。
             unsafe { with_host(hwnd, |host| host.handle_message(message, wparam, lparam)) };
+            // 捕获释放在借出结束后进行；`ReleaseCapture` 同步送出
+            // `WM_CAPTURECHANGED`，嵌套的 `with_host` 不能与外层引用重叠。
+            if unsafe { take_capture_release(hwnd) } {
+                // 安全：释放本窗口的指针捕获；没有捕获时同样安全。
+                unsafe {
+                    let _ = ReleaseCapture();
+                }
+            }
             result
         }
     }

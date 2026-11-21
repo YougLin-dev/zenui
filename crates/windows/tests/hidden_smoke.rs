@@ -8,7 +8,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VIRTUAL_KEY, VK_BACK, VK_DELETE, VK_END, VK_HOME, VK_RETURN, VK_RIGHT, VK_TAB,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    PostMessageW, WM_CHAR, WM_CLOSE, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
+    PostMessageW, WM_CHAR, WM_CLOSE, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MOUSEMOVE,
 };
 use zenui::{Color, ColorRole, NodeId};
 use zenui_render::{Point, SceneElement, Visual};
@@ -39,6 +40,14 @@ fn post_up(host: &Host, point: Point, scale: f32) {
 
 fn post_move(host: &Host, point: Point, scale: f32) {
     post_pointer(host, WM_MOUSEMOVE, point, scale);
+}
+
+fn post_focus_lost(host: &Host) {
+    let hwnd = host.hwnd();
+    // 安全：HWND 由 Host 持有，消息只排队，不跨线程解引用。
+    unsafe {
+        PostMessageW(Some(hwnd), WM_KILLFOCUS, WPARAM(0), LPARAM(0)).expect("post focus loss");
+    }
 }
 
 fn post_leave(host: &Host) {
@@ -744,6 +753,50 @@ fn hover_press_and_release_activate_a_filter_button_once() {
     assert!(
         !scene.node(id).expect("Active button").hovered(),
         "leaving the client area clears hover"
+    );
+
+    post_close(&host);
+    host.run().expect("process the close");
+}
+
+#[test]
+fn focus_loss_clears_the_pressed_visual() {
+    let mut host = Host::open(HostConfig::hidden("ZenUI focus loss")).expect("open a host");
+    host.render().expect("render the initial frame");
+    let (point, scale) = button_at(&host, 2);
+    let id = host
+        .scene()
+        .expect("scene")
+        .hit_test(point)
+        .expect("the Active button");
+
+    post_down(&host, point, scale);
+    host.pump().expect("process the press");
+    assert!(
+        host.scene()
+            .expect("scene after the press")
+            .node(id)
+            .expect("Active button")
+            .pointer_pressed(),
+        "the button is the press target"
+    );
+    let pressed = host.read_frame().expect("pressed frame");
+
+    post_focus_lost(&host);
+    host.pump().expect("process focus loss");
+    assert!(
+        !host
+            .scene()
+            .expect("scene after focus loss")
+            .node(id)
+            .expect("Active button")
+            .pointer_pressed(),
+        "focus loss clears the press target"
+    );
+    assert_ne!(
+        pressed.pixels(),
+        host.read_frame().expect("frame after focus loss").pixels(),
+        "focus loss repaints without the pressed state"
     );
 
     post_close(&host);
