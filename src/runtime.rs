@@ -1219,6 +1219,26 @@ impl TextHistory {
         self.redo.push_back(entry);
         trim_history(&mut self.redo, &mut self.redo_bytes);
     }
+
+    /// 取走 undo 栈顶，并同步扣减它占用的字节预算。
+    fn pop_undo(&mut self) -> Option<TextEntry> {
+        let entry = self.undo.pop_back()?;
+        self.undo_bytes = self.undo_bytes.saturating_sub(entry.bytes());
+        if self.undo.is_empty() {
+            self.undo_bytes = 0;
+        }
+        Some(entry)
+    }
+
+    /// 取走 redo 栈顶，并同步扣减它占用的字节预算。
+    fn pop_redo(&mut self) -> Option<TextEntry> {
+        let entry = self.redo.pop_back()?;
+        self.redo_bytes = self.redo_bytes.saturating_sub(entry.bytes());
+        if self.redo.is_empty() {
+            self.redo_bytes = 0;
+        }
+        Some(entry)
+    }
 }
 
 /// 淘汰最旧条目，直到条目数与快照文本字节数都回到上限内。
@@ -3154,12 +3174,14 @@ impl Runtime {
                 };
                 match direction {
                     HistoryDirection::Undo => {
-                        history.undo.pop_back();
-                        history.push_redo(entry);
+                        if history.pop_undo().is_some() {
+                            history.push_redo(entry);
+                        }
                     }
                     HistoryDirection::Redo => {
-                        history.redo.pop_back();
-                        history.push_undo(entry);
+                        if history.pop_redo().is_some() {
+                            history.push_undo(entry);
+                        }
                     }
                 }
             });

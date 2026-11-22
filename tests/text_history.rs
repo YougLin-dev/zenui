@@ -223,16 +223,22 @@ fn movement_and_focus_record_nothing() {
 #[test]
 fn cjk_and_emoji_offsets_are_restored_at_character_boundaries() {
     let (mut app, inputs, editor) = editor();
+    app.input("editor", "你好世界")
+        .expect("replace the value with CJK text");
     app.set_caret_node(editor, 2)
         .expect("caret between 好 and 世");
     app.insert_text_node(editor, "🙂").expect("insert an emoji");
-    assert_eq!(value(&app, "editor"), "ab🙂cd");
+    assert_eq!(value(&app, "editor"), "你好🙂世界");
     assert_eq!(edit_state(&app, "editor"), (3, 3, None, None));
 
     app.undo_node(editor).expect("undo the emoji");
-    assert_eq!(value(&app, "editor"), "abcd");
+    assert_eq!(value(&app, "editor"), "你好世界");
     assert_eq!(edit_state(&app, "editor"), (2, 2, Some((2, 2)), None));
-    assert_eq!(inputs.get(), 2);
+    assert_eq!(
+        inputs.get(),
+        3,
+        "external replacement, insert and undo each dispatch once"
+    );
 }
 
 #[test]
@@ -889,6 +895,43 @@ fn the_byte_cap_evicts_oldest_snapshots() {
     let after_undo = inputs.get();
     app.undo_node(bytes).expect("the byte cap left one entry");
     assert_eq!(inputs.get(), after_undo);
+
+    app.redo_node(bytes).expect("redo the retained entry");
+    assert_eq!(value(&app, "bytes").len(), 120 * 1024);
+    app.undo_node(bytes)
+        .expect("undo after redo must keep the same entry undoable");
+    assert_eq!(
+        value(&app, "bytes").len(),
+        80 * 1024,
+        "moving an entry between stacks must release its byte budget"
+    );
+
+    app.insert_text_node(bytes, "b").expect("append a new edit");
+    assert_eq!(value(&app, "bytes").len(), 80 * 1024 + 1);
+    app.undo_node(bytes)
+        .expect("a new edit after the cycle must still be undoable");
+    assert_eq!(value(&app, "bytes").len(), 80 * 1024);
+}
+
+#[test]
+fn repeated_undo_redo_cycles_do_not_inflate_the_byte_budget() {
+    let (mut app, _inputs, editor) = editor();
+    let block = "x".repeat(2_000);
+    app.insert_text_node(editor, &block)
+        .expect("insert a block");
+
+    for _ in 0..200 {
+        app.undo_node(editor).expect("undo");
+        app.redo_node(editor).expect("redo");
+    }
+
+    app.undo_node(editor)
+        .expect("the live entry must survive repeated cycles");
+    assert_eq!(
+        value(&app, "editor"),
+        "abcd",
+        "byte accounting must not evict a live entry after cycles"
+    );
 }
 
 #[test]
