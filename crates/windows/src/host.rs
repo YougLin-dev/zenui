@@ -145,6 +145,11 @@ fn system_wheel_lines() -> WheelLines {
     if result.is_err() {
         return WheelLines::Lines(DEFAULT_WHEEL_LINES);
     }
+    wheel_lines_from(lines)
+}
+
+/// 把 `SPI_GETWHEELSCROLLLINES` 的原始值映射为滚动单位。
+fn wheel_lines_from(lines: u32) -> WheelLines {
     match lines {
         0 => WheelLines::Disabled,
         WHEEL_PAGESCROLL => WheelLines::Page,
@@ -3355,16 +3360,30 @@ mod tests {
 
     #[test]
     fn wheel_sub_notches_accumulate_without_drift() {
-        let mut wheel = wheel(WheelLines::Lines(3));
-        assert_eq!(wheel.step(60, 100), 36, "half a notch is half the pixels");
-        assert_eq!(wheel.step(60, 100), 36, "the residue is not lost");
-        assert_eq!(wheel.step(-60, 100), -36);
-        assert_eq!(wheel.step(-60, 100), -36);
-        assert_eq!(wheel.step(120, 100), 72, "one notch is three lines");
+        // 高分辨率滚轮：每个事件 24 单位（1/5 notch），3 行 × 24 px = 72 px/notch。
+        // 逐事件截断会得到 5 × 14 = 70 px；累积器必须得到 14,14,15,14,15 = 72。
+        let mut forward = wheel(WheelLines::Lines(3));
+        let steps: Vec<i32> = (0..5).map(|_| forward.step(24, 100)).collect();
+        assert_eq!(steps, [14, 14, 15, 14, 15], "sub-notch residue is carried");
+        assert_eq!(steps.iter().sum::<i32>(), 72, "five fifths make one notch");
+
+        let mut backward = wheel(WheelLines::Lines(3));
+        let steps: Vec<i32> = (0..5).map(|_| backward.step(-24, 100)).collect();
+        assert_eq!(steps, [-14, -14, -15, -14, -15]);
+        assert_eq!(steps.iter().sum::<i32>(), -72);
+
+        let mut whole = wheel(WheelLines::Lines(3));
+        assert_eq!(whole.step(120, 100), 72, "one notch is three lines");
+        assert_eq!(whole.step(-120, 100), -72);
     }
 
     #[test]
     fn wheel_page_and_disabled_settings_map_to_fixed_steps() {
+        assert_eq!(wheel_lines_from(0), WheelLines::Disabled);
+        assert_eq!(wheel_lines_from(WHEEL_PAGESCROLL), WheelLines::Page);
+        assert_eq!(wheel_lines_from(1), WheelLines::Lines(1));
+        assert_eq!(wheel_lines_from(3), WheelLines::Lines(3));
+
         let mut page = wheel(WheelLines::Page);
         assert_eq!(page.step(120, 500), 500);
         assert_eq!(page.step(-120, 500), -500);
@@ -3378,10 +3397,15 @@ mod tests {
     #[test]
     fn wheel_line_changes_discard_unapplied_residue() {
         let mut wheel = wheel(WheelLines::Lines(3));
-        assert_eq!(wheel.step(60, 100), 36);
+        // 1 单位在 3 行设置下只有 0.6 px，留下 residue。
+        assert_eq!(wheel.step(1, 100), 0);
         wheel.set_lines(WheelLines::Lines(2));
-        assert_eq!(wheel.step(60, 100), 24, "the new line count starts fresh");
-        assert_eq!(wheel.step(60, 100), 24);
+        assert_eq!(
+            wheel.step(1, 100),
+            0,
+            "the pre-change residue cannot add a phantom pixel"
+        );
+        assert_eq!(wheel.step(120, 100), 48, "the new line count applies");
     }
 
     #[test]

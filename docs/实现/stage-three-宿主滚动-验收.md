@@ -42,7 +42,7 @@
 | 9 | 指针停在第一个 checkbox 上滚动 | hover 从 NodeId 20 变为 30，旧位置没有残留 hover | 通过 | [07-hover-after-scroll](证据/host-scroll/100-07-hover-after-scroll.png) |
 | 10 | 按住 checkbox → 滚动 → 在新位置松开 | press 保持 NodeId 20，hover 变为 8；松开命中同一节点，Task 0 被勾选（`checked=1`） | 通过 | [08-press-scroll-release](证据/host-scroll/100-08-press-scroll-release.png) |
 | 11 | 按住 checkbox → 滚动 → 在旧位置松开 | hover 变为 NodeId 30；松开命中另一节点，不激活，`checked` 仍为 1，元素数仍为 2519 | 通过 | [09-press-release-mismatch](证据/host-scroll/100-09-press-release-mismatch.png) |
-| 12 | 草稿输入框聚焦后 End/PageDown/Home | End 与 Home 只编辑文本并保持 `offset=0`；PageDown 滚到 676，焦点仍是 NodeId(1) | 通过 | [10-focused-paging](证据/host-scroll/100-10-focused-paging.png) |
+| 12 | 草稿输入框聚焦后 End/PageDown/Home | End 与 Home 不滚动并保持 `offset=0`，焦点仍是 NodeId(1)；PageDown 滚到 676。可见状态只证明偏移与焦点；glyph 数与 caret 移动由隐藏 smoke 断言 | 通过 | [10-focused-paging](证据/host-scroll/100-10-focused-paging.png) |
 | 13 | 在 max 处缩放窗口到 784×601 再恢复 | `offset=17954` 保持，`max` 先变为 18053 再回到 17954 | 通过 | [11-resized](证据/host-scroll/100-11-resized.png) |
 
 ### 150%（DPI 144，客户区 1350×1050）
@@ -59,7 +59,7 @@
 | 8 | 按住 checkbox → 滚动 → 在新位置松开 | press 保持 NodeId 60，hover 变为 74；松开后 `checked=1` | 通过；Task 8 被勾选 | [09-press-scroll-release](证据/host-scroll/150-09-press-scroll-release.png) |
 | 9 | 按住 Delete → 滚动 → 在旧位置松开 | press 保持 NodeId 73，hover 变为 83；松开不激活，元素数仍为 2519 | 通过 | [10-press-release-mismatch](证据/host-scroll/150-10-press-release-mismatch.png) |
 | 10 | 在 `offset=144` 缩放窗口到 1078×844 再恢复 | 偏移保持 144；`max` 先变为 18091 再回到 17954 | 通过 | [11-resized](证据/host-scroll/150-11-resized.png) |
-| 11 | 草稿输入框聚焦后 End/PageDown/Home | End/Home 不滚动；PageDown 到 676 且焦点保持；PageUp 回到 0 | 通过 | [12-focused-paging](证据/host-scroll/150-12-focused-paging.png) |
+| 11 | 草稿输入框聚焦后 End/PageDown/Home | End/Home 不滚动；PageDown 到 676 且焦点保持；PageUp 回到 0。可见状态只证明偏移与焦点；glyph 数与 caret 移动由隐藏 smoke 断言 | 通过 | [12-focused-paging](证据/host-scroll/150-12-focused-paging.png) |
 
 关键状态（完整行见 `states.txt`）：
 
@@ -79,9 +79,9 @@
 ## 证据等级与边界
 
 - **可见自动驱动（本页）：** 真实可见 HWND、真实 OS 滚轮路由与 `SendInput`、宿主默认 DX12 presenter、真实窗口过程与 `PrintWindow` 像素。不是人工操作；不证明用户注视下的 DWM 合成、z-order 或被其它窗口遮挡时的表现。
-- **隐藏 smoke：** `crates/windows/tests/hidden_smoke.rs` 覆盖 `WM_MOUSEWHEEL`/翻页键的偏移与夹取、滚动后的 hover 复核、滚动不刷新快照与 Node ID、hide/show 保留偏移、close/reopen 归零、聚焦编辑器的编辑键优先、滚动后重绘帧像素变化。它们是路由与状态证据，不是原生验收。
-- **单元测试：** `WheelScroll` 的 notch 累积、亚 notch 精度、符号、行数变化与极端 delta；`host::tests::device_loss_preserves_the_applied_scroll_offset` 覆盖重建 surface 后偏移保留。
-- **未覆盖：** hide/show 与模拟设备丢失的可见运行（外部脚本只能 `ShowWindow`，不改变 activation），由隐藏 smoke 与单元测试覆盖；滚轮行数的 `WM_SETTINGCHANGE` 刷新只由代码路径与设置读取单元测试覆盖；IME 候选窗定位与焦点自动显露属于 #180；滚动条属于 #181/#182；列表虚拟化属于 ADR-0011；混合 DPI 多显示器与真实硬件设备丢失仍属 #63。
+- **隐藏 smoke：** `crates/windows/tests/hidden_smoke.rs` 覆盖 `WM_MOUSEWHEEL`/翻页键的偏移与夹取、滚动后按同一指针位置重新命中并把 hover 与 `hit_test` 对齐、滚动不刷新快照与 Node ID、hide/show 保留偏移、close/reopen 归零、聚焦编辑器的 glyph 数与 End/Home caret 移动（并断言同一 NodeId 保持焦点）、滚动后重绘帧像素变化。它们是路由与状态证据，不是原生验收。滚轮移动断言只在系统 `SPI_GETWHEELSCROLLLINES` 非零时执行；禁用分支由单元测试覆盖。
+- **单元测试：** `WheelScroll` 的 notch 累积、亚 notch residue（5 × 24 单位 = 72 px，逐事件截断会得到 70）、符号、行数变化丢弃 residue、`SPI_GETWHEELSCROLLLINES` 原始值 0/`WHEEL_PAGESCROLL`/N 的映射与极端 delta；`host::tests::device_loss_preserves_the_applied_scroll_offset` 覆盖重建 surface 后偏移保留。
+- **未覆盖：** hide/show 与模拟设备丢失的可见运行（外部脚本只能 `ShowWindow`，不改变 activation），由隐藏 smoke 与单元测试覆盖；`WM_SETTINGCHANGE` 消息处理本身没有直接测试（只测 SPI 值映射与 `set_lines` 的丢弃行为）；IME 候选窗定位与焦点自动显露属于 #180；滚动条属于 #181/#182；列表虚拟化属于 ADR-0011；混合 DPI 多显示器与真实硬件设备丢失仍属 #63。
 - `states.txt` 中的 hover/press NodeId 是场景元素身份；press 的 capture 语义与松开命中判定来自窗口过程，截图只能证明最终视觉状态。
 
 ## 判据对照
@@ -93,7 +93,7 @@
 | PageUp/PageDown 按 `floor(viewport−24)` 翻页 | 通过 | 步骤 4–5；1468−792=676 |
 | 内容底部没有空白条 | 通过 | 步骤 6；Task 499 贴底截图 |
 | 滚动后 hover 不残留、press 不被滚动重新评估 | 通过 | 步骤 9–11；press 保持、hover 更新；两种松开位置 |
-| 聚焦编辑器保留编辑键，翻页键仍滚动 | 通过 | 步骤 12 / 11；End/Home 不滚动，PageDown 676 且焦点保持 |
+| 聚焦编辑器保留编辑键，翻页键仍滚动 | 通过 | 可见步骤 12 / 11：End/Home 不滚动，PageDown 676 且焦点保持；隐藏 smoke 断言 glyph 数与 caret 移动 |
 | 缩放保留并重新夹取偏移 | 通过 | 步骤 13 / 10 |
 | hide/show 与 close/reopen 偏移生命周期 | 隐藏 smoke 覆盖，本页不宣称可见证据 | `hide_show_keeps_the_offset_and_reopen_starts_at_zero` |
 | 模拟设备丢失保留偏移 | 单元测试覆盖，本页不宣称可见证据 | `device_loss_preserves_the_applied_scroll_offset` |
@@ -101,4 +101,4 @@
 
 ## 结论
 
-在 Windows 11、单屏 100% 与 150% 缩放的可见窗口上，宿主把真实滚轮 notch 与 PageUp/PageDown/Home/End 转换成整页滚动偏移：一个 notch 为 72 逻辑像素，翻页为 676，`End` 到达 `max=17954` 且最后一行贴住底部无空白条，边界处的反向输入立即生效。滚动只改变呈现环境：两端每次状态都保持 2519 个场景元素与相同的 Node ID，hover 随平移后的场景重新命中；按住节点滚动时 press 目标保持，在新位置松开才激活，在旧位置松开不激活。草稿聚焦时 End/Home 仍编辑文本，PageDown 滚动且焦点保持；窗口缩放保留并重新夹取偏移。证据由 OS 级 `SendInput` 自动驱动而非人工；隐藏 smoke 与单元测试只作为路由、生命周期与重建证据，不替代原生验收。
+在 Windows 11、单屏 100% 与 150% 缩放的可见窗口上，宿主把真实滚轮 notch 与 PageUp/PageDown/Home/End 转换成整页滚动偏移：一个 notch 为 72 逻辑像素，翻页为 676，`End` 到达 `max=17954` 且最后一行贴住底部无空白条，边界处的反向输入立即生效。滚动只改变呈现环境：两端每次状态都保持 2519 个场景元素与相同的 Node ID，hover 随平移后的场景重新命中；按住节点滚动时 press 目标保持，在新位置松开才激活，在旧位置松开不激活。草稿聚焦时 End/Home 不滚动且焦点保持（caret 移动与 glyph 数由隐藏 smoke 断言），PageDown 滚动且焦点保持；窗口缩放保留并重新夹取偏移。证据由 OS 级 `SendInput` 自动驱动而非人工；隐藏 smoke 与单元测试只作为路由、生命周期与重建证据，不替代原生验收。

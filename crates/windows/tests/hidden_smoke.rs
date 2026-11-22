@@ -1895,7 +1895,7 @@ fn focus_visible_modality_stays_with_each_window() {
 #[test]
 fn wheel_and_paging_scroll_the_native_scene() {
     let mut host = open_tall_host(500);
-    host.pump().expect("initial render");
+    host.render().expect("initial render");
     let (max, page) = {
         let scene = host.scene(MAIN).expect("a rendered scene");
         assert_eq!(scene.scroll_offset(), 0);
@@ -1990,7 +1990,7 @@ fn wheel_and_paging_scroll_the_native_scene() {
 #[test]
 fn scroll_only_input_keeps_the_snapshot_and_node_ids() {
     let mut host = open_tall_host(500);
-    host.pump().expect("initial render");
+    host.render().expect("initial render");
     let before = host.presentation(MAIN).expect("a committed snapshot");
     let ids: Vec<NodeId> = before.elements().map(|element| element.id()).collect();
 
@@ -2012,7 +2012,7 @@ fn scroll_only_input_keeps_the_snapshot_and_node_ids() {
 #[test]
 fn scrolling_revalidates_hover_against_the_translated_scene() {
     let mut host = open_tall_host(100);
-    host.pump().expect("initial render");
+    host.render().expect("initial render");
     let (first, point, scale) = center_label(&host, MAIN, "Edit Task 0");
     post_move(&host, point, scale);
     host.pump().expect("hover the first row");
@@ -2028,20 +2028,27 @@ fn scrolling_revalidates_hover_against_the_translated_scene() {
 
     post_key(&host, VK_END);
     host.pump().expect("scroll to the bottom");
-    let hovered = host
-        .scene(MAIN)
-        .expect("scene")
+    let scene = host.scene(MAIN).expect("scene");
+    let expected = scene
+        .hit_test(point)
+        .filter(|node| scene.node(*node).is_some_and(|element| !element.disabled()));
+    let hovered = scene
         .elements()
         .iter()
         .find(|element| element.hovered())
         .map(SceneElement::id);
+    assert_eq!(
+        hovered, expected,
+        "hover follows the hit test at the unchanged pointer"
+    );
+    assert!(hovered.is_some(), "the translated scene still has a hover");
     assert_ne!(hovered, Some(first), "the old hover node moved away");
 }
 
 #[test]
 fn hide_show_keeps_the_offset_and_reopen_starts_at_zero() {
     let mut host = open_tall_host(100);
-    host.pump().expect("initial render");
+    host.render().expect("initial render");
     post_key(&host, VK_END);
     host.pump().expect("scroll to the bottom");
     let bottom = host.scene(MAIN).expect("scene").scroll_offset();
@@ -2078,12 +2085,15 @@ fn hide_show_keeps_the_offset_and_reopen_starts_at_zero() {
 #[test]
 fn paging_keys_leave_a_focused_editor_in_place() {
     let mut host = open_tall_host(50);
-    host.pump().expect("initial render");
+    host.render().expect("initial render");
     let (_, point, scale) = center_label(&host, MAIN, "What needs to be done?");
     post_click(&host, point, scale);
     host.pump().expect("focus the draft input");
+    let input = focused_id(&host).expect("the draft input has focus");
     post_char(&host, 'a');
+    post_char(&host, 'b');
     host.pump().expect("type into the draft");
+    assert_eq!(glyphs(&host, input), 2, "two characters were inserted");
 
     post_key(&host, VK_END);
     host.pump().expect("End while editing");
@@ -2092,12 +2102,45 @@ fn paging_keys_leave_a_focused_editor_in_place() {
         0,
         "End edits the focused input instead of scrolling"
     );
+    let caret_end = host
+        .scene(MAIN)
+        .expect("scene")
+        .caret(input)
+        .expect("caret at the end")
+        .x;
+    assert_eq!(
+        focused_id(&host),
+        Some(input),
+        "End keeps the editor focused"
+    );
+
+    post_key(&host, VK_HOME);
+    host.pump().expect("Home while editing");
+    assert_eq!(
+        host.scene(MAIN).expect("scene").scroll_offset(),
+        0,
+        "Home edits the focused input instead of scrolling"
+    );
+    let caret_home = host
+        .scene(MAIN)
+        .expect("scene")
+        .caret(input)
+        .expect("caret at the start")
+        .x;
+    assert!(
+        caret_home < caret_end,
+        "Home moved the caret to the start of the text"
+    );
 
     post_key(&host, VK_NEXT);
     host.pump().expect("PageDown while editing");
     let page = host.scene(MAIN).expect("scene").scroll_offset();
     assert!(page > 0, "PageDown still scrolls with a focused editor");
-    assert!(focused_id(&host).is_some(), "the editor keeps focus");
+    assert_eq!(
+        focused_id(&host),
+        Some(input),
+        "PageDown keeps the same editor focused"
+    );
 
     post_key(&host, VK_HOME);
     host.pump().expect("Home while editing");
@@ -2106,8 +2149,18 @@ fn paging_keys_leave_a_focused_editor_in_place() {
         page,
         "Home edits the caret instead of scrolling"
     );
+    assert_eq!(
+        focused_id(&host),
+        Some(input),
+        "Home keeps the editor focused"
+    );
 
     post_key(&host, VK_PRIOR);
     host.pump().expect("PageUp while editing");
     assert_eq!(host.scene(MAIN).expect("scene").scroll_offset(), 0);
+    assert_eq!(
+        focused_id(&host),
+        Some(input),
+        "PageUp keeps the same editor focused"
+    );
 }
