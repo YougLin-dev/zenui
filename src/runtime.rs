@@ -8,6 +8,7 @@ use zenui_core::{Counters, RowSet};
 
 use crate::context::{self, ContextFault, DepKey, Phase, with_state};
 use crate::dispatch::{DispatchError, NodeOperation};
+use crate::menu::{CommandError, CommandEvent, CommandHandler, CommandSource};
 use crate::presentation::{
     Appearance, NodeId, NodeStatus, PresentationSnapshot, SnapshotAttr, SnapshotElement,
     SnapshotNode, SnapshotValue, TextEditState,
@@ -91,6 +92,8 @@ pub(crate) struct State {
     window_requests: Vec<WindowRequest>,
     /// 每个 activation 在 factory 中注册的关闭处理器，随窗口关闭释放。
     close_handlers: BTreeMap<&'static str, CloseHandler>,
+    /// 每个 activation 在 factory 中注册的命令处理器，随窗口关闭释放。
+    command_handlers: BTreeMap<&'static str, BTreeMap<&'static str, CommandHandler>>,
     /// 按父窗口键索引的待决关闭 epoch；存在即表示父窗口输入被挂起。
     close_epochs: BTreeMap<&'static str, CloseEpoch>,
     /// UI 处理期排队的 Allow/Deny 回复，在事件/交付结算后执行。
@@ -188,6 +191,7 @@ impl State {
             windows: BTreeMap::new(),
             window_requests: Vec::new(),
             close_handlers: BTreeMap::new(),
+            command_handlers: BTreeMap::new(),
             close_epochs: BTreeMap::new(),
             close_replies: Vec::new(),
             next_close_epoch: 1,
@@ -486,6 +490,8 @@ impl State {
 
     pub(crate) fn begin_window(&mut self, key: &'static str) -> (u32, u32) {
         self.window_factory_ran = true;
+        // 旧 activation 的处理器不能进入新 factory；正常关闭已经清理过。
+        self.command_handlers.remove(key);
         let activation = self
             .windows
             .get(key)
@@ -506,6 +512,7 @@ impl State {
 
     pub(crate) fn mark_window_closed(&mut self, key: &'static str) {
         self.close_handlers.remove(key);
+        self.command_handlers.remove(key);
         let Some(record) = self.windows.get_mut(key) else {
             return;
         };
@@ -559,6 +566,62 @@ impl State {
         }
         self.close_handlers.insert(window.key, handler);
         Ok(())
+    }
+
+    /// 在窗口 factory 中登记命令处理器；只接受该 activation 自己的 Setup。
+    pub(crate) fn register_command_handler(
+        &mut self,
+        window: WindowCtx,
+        id: &'static str,
+        handler: CommandHandler,
+    ) -> Result<(), WindowError> {
+        if self.phase != Phase::Setup || self.current_owner != Some(window.owner) {
+            return Err(WindowError::State(
+                "command handlers must be registered during the window factory",
+            ));
+        }
+        if !self.window_is_live(window.key, window.activation, window.owner) {
+            return Err(WindowError::Stale);
+        }
+        let declared = self
+            .catalog
+            .get(window.key)
+            .and_then(|entry| entry.menu.as_ref())
+            .is_some_and(|menu| menu.contains_command(id));
+        if !declared {
+            return Err(WindowError::Command(CommandError::UnknownCommand(id)));
+        }
+        let handlers = self.command_handlers.entry(window.key).or_default();
+        if handlers.contains_key(id) {
+            return Err(WindowError::Command(CommandError::AlreadyRegistered(id)));
+        }
+        handlers.insert(id, handler);
+        Ok(())
+    }
+
+    /// 菜单声明但没有注册处理器的第一个命令 id；打开窗口前必须为空。
+    pub(crate) fn missing_command_handler(&self, key: &'static str) -> Option<&'static str> {
+        let menu = self.catalog.get(key)?.menu.as_ref()?;
+        let handlers = self.command_handlers.get(key);
+        menu.command_ids()
+            .into_iter()
+            .find(|id| handlers.is_none_or(|handlers| !handlers.contains_key(id)))
+    }
+
+    /// 窗口的静态菜单是否声明了这个命令 id。
+    pub(crate) fn menu_declares(&self, key: &'static str, id: &str) -> bool {
+        self.catalog
+            .get(key)
+            .and_then(|entry| entry.menu.as_ref())
+            .is_some_and(|menu| menu.contains_command(id))
+    }
+
+    /// 当前 activation 注册的命令处理器。
+    pub(crate) fn command_handler(&self, key: &'static str, id: &str) -> Option<CommandHandler> {
+        self.command_handlers
+            .get(key)
+            .and_then(|handlers| handlers.get(id))
+            .cloned()
     }
 
     /// 确认窗口读取父窗口当前 epoch 的请求；普通窗口或没有待决请求时为 `None`。
@@ -1484,14 +1547,19 @@ impl Runtime {
                 state.current_owner = previous.0;
                 state.phase = previous.1;
             });
-            let tree = match plan {
-                Ok(plan) => match self.mount_plan(plan, owner) {
-                    Ok(tree) => tree,
-                    Err(error) => {
-                        self.abort_open(key, activation, owner, None);
-                        return Err(WindowError::Mount(error));
-                    }
-                },
+            let plan = match plan {
+                Ok(plan) => plan,
+                Err(error) => {
+                    self.abort_open(key, activation, owner, None);
+                    return Err(WindowError::Mount(error));
+                }
+            };
+            if let Some(id) = with_state(|state| state.missing_command_handler(key)) {
+                self.abort_open(key, activation, owner, None);
+                return Err(WindowError::Command(CommandError::MissingHandler(id)));
+            }
+            let tree = match self.mount_plan(plan, owner) {
+                Ok(tree) => tree,
                 Err(error) => {
                     self.abort_open(key, activation, owner, None);
                     return Err(WindowError::Mount(error));
@@ -1619,6 +1687,79 @@ impl Runtime {
         window.runtime == state.id
             && state.window_is_live(window.key, window.activation, window.owner)
             && state.window_accepts_input(window.key)
+    }
+
+    /// 通过窗口的静态菜单派发一个命令。
+    ///
+    /// 菜单栏、快捷键、上下文菜单、辅助技术与托盘共用这条路径。处理器在
+    /// `Phase::Event` 中恰好运行一次，可以写 Store/Signals 并排队窗口请求；
+    /// 窗口已关闭、隐藏、等待关闭确认或属于另一个 Runtime 时返回 typed
+    /// error。处理器 panic 被 contain，不向调用方展开。
+    pub fn dispatch_command(
+        &mut self,
+        window: WindowCtx,
+        id: &'static str,
+        source: CommandSource,
+    ) -> Result<(), CommandError> {
+        self.dispatch_command_on(window, id, source, None)
+    }
+
+    /// 与 [`Runtime::dispatch_command`] 相同，并携带可选的上下文目标节点。
+    ///
+    /// `target` 必须是这个窗口里仍然存活的 Node ID；菜单栏与快捷键通常不传
+    /// 目标，上下文菜单与辅助动作用它表达被操作的元素。
+    pub fn dispatch_command_on(
+        &mut self,
+        window: WindowCtx,
+        id: &'static str,
+        source: CommandSource,
+        target: Option<NodeId>,
+    ) -> Result<(), CommandError> {
+        let state = self.state.clone();
+        if window.runtime != state.borrow().id {
+            return Err(CommandError::WrongRuntime);
+        }
+        context::install(&state, || {
+            if !with_state(|state| state.window_live_in_tree(window)) {
+                return Err(CommandError::Stale);
+            }
+            if !with_state(|state| state.menu_declares(window.key, id)) {
+                return Err(CommandError::UnknownCommand(id));
+            }
+            let handler = with_state(|state| state.command_handler(window.key, id))
+                .ok_or(CommandError::MissingHandler(id))?;
+            if !with_state(|state| state.window_is_visible(window.key)) {
+                return Err(CommandError::Hidden);
+            }
+            if with_state(|state| state.close_epochs.contains_key(window.key)) {
+                return Err(CommandError::Suspended);
+            }
+            if let Some(target) = target {
+                let valid = with_state(|state| {
+                    state.node_status(target) == NodeStatus::Live
+                        && state.tree_for_element(target.slot() as usize)
+                            == Some(TreeKey::Window(window.key))
+                });
+                if !valid {
+                    return Err(CommandError::InvalidTarget(target));
+                }
+            }
+
+            let event = CommandEvent::new(source, target);
+            let previous = with_state(|state| {
+                let previous = state.phase;
+                state.phase = Phase::Event;
+                state.fault = None;
+                state.write_error = None;
+                previous
+            });
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(event)));
+            with_state(|state| state.phase = previous);
+            if outcome.is_err() {
+                return Err(CommandError::HandlerPanicked(id));
+            }
+            self.finish_command().map_err(CommandError::Mount)
+        })
     }
 
     /// 结算 UI 处理器排队的窗口请求与关闭回复，返回已应用的数量。

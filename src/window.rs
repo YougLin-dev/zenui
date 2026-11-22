@@ -3,9 +3,13 @@ use std::fmt;
 use std::marker::PhantomData;
 use std::rc::Rc;
 
+use crate::menu::{CommandError, CommandEvent, MenuSpec};
 use crate::presentation::Appearance;
 use crate::task::TaskScope;
 use crate::view::{MountError, MountPlan, MountResult};
+
+/// 菜单树的可表示上限；子菜单、分隔线与命令各计一项。
+const MENU_ITEM_LIMIT: usize = u16::MAX as usize;
 
 /// 一次窗口打开的 identity；它不等于目录键，也不保证窗口仍然存活。
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -105,6 +109,21 @@ impl WindowCtx {
     pub fn on_close(self, handler: impl Fn(CloseRequest) + 'static) -> Result<(), WindowError> {
         crate::context::with_state_of(self.runtime, |state| {
             state.register_close_handler(self, Rc::new(handler))
+        })
+    }
+
+    /// 在窗口 factory 中为菜单命令注册处理器；每个 activation、每个 id 一次。
+    ///
+    /// 菜单树声明的每个命令都必须有处理器，否则这次打开失败。注册只发生在
+    /// 窗口 factory 自己的 Setup 中；嵌套组件的 Setup、事件与交付阶段都拒绝。
+    /// 关闭窗口释放全部处理器，重新打开必须重新注册。
+    pub fn on_command(
+        self,
+        id: &'static str,
+        handler: impl Fn(CommandEvent) + 'static,
+    ) -> Result<(), WindowError> {
+        crate::context::with_state_of(self.runtime, |state| {
+            state.register_command_handler(self, id, Rc::new(handler))
         })
     }
 
@@ -326,10 +345,11 @@ impl WindowSpec {
     }
 }
 
-/// 目录中的一个窗口：静态描述与每次打开都执行的 factory。
+/// 目录中的一个窗口：静态描述、每次打开都执行的 factory 与可选静态菜单。
 pub(crate) struct CatalogEntry {
     pub(crate) spec: WindowSpec,
     pub(crate) factory: WindowFactory,
+    pub(crate) menu: Option<MenuSpec>,
 }
 
 /// 一个仍然存活的窗口及它的目录描述；原生宿主据此同步 HWND。
@@ -348,12 +368,14 @@ pub(crate) type WindowFactory = Rc<dyn Fn(WindowCtx) -> MountResult<MountPlan>>;
 /// 声明窗口目录的临时收集器；`Runtime::declare_windows` 接收它。
 pub struct WindowCatalog {
     entries: Vec<(WindowSpec, WindowFactory)>,
+    menus: Vec<(&'static str, MenuSpec)>,
 }
 
 impl WindowCatalog {
     pub(crate) fn new() -> Self {
         Self {
             entries: Vec::new(),
+            menus: Vec::new(),
         }
     }
 
@@ -370,6 +392,18 @@ impl WindowCatalog {
         Ok(())
     }
 
+    /// 为一个目录窗口附加静态菜单；菜单不创建原生界面。
+    ///
+    /// 可以在 `window` 之前或之后调用；未知窗口键、重复菜单、重复命令 id
+    /// 与超限在 `Runtime::declare_windows` 完成时校验，重复菜单立即报错。
+    pub fn menu(&mut self, window: &'static str, menu: MenuSpec) -> Result<(), CatalogError> {
+        if self.menus.iter().any(|(key, _)| *key == window) {
+            return Err(CatalogError::DuplicateMenu(window));
+        }
+        self.menus.push((window, menu));
+        Ok(())
+    }
+
     pub(crate) fn finish(
         self,
     ) -> Result<(BTreeMap<&'static str, CatalogEntry>, &'static str), CatalogError> {
@@ -379,11 +413,31 @@ impl WindowCatalog {
             if spec.primary && primary.replace(spec.key).is_some() {
                 return Err(CatalogError::MultiplePrimaries);
             }
-            entries.insert(spec.key, CatalogEntry { spec, factory });
+            entries.insert(
+                spec.key,
+                CatalogEntry {
+                    spec,
+                    factory,
+                    menu: None,
+                },
+            );
         }
         let Some(primary) = primary else {
             return Err(CatalogError::MissingPrimary);
         };
+        for (key, menu) in self.menus {
+            let Some(entry) = entries.get_mut(key) else {
+                return Err(CatalogError::UnknownMenuWindow(key));
+            };
+            let items = menu.item_count();
+            if items > MENU_ITEM_LIMIT {
+                return Err(CatalogError::MenuTooLarge { window: key, items });
+            }
+            if let Some(id) = menu.first_duplicate_command() {
+                return Err(CatalogError::DuplicateMenuCommand { window: key, id });
+            }
+            entry.menu = Some(menu);
+        }
         let mut confirmation_parents = BTreeSet::new();
         for (key, entry) in &entries {
             let WindowRole::CloseConfirmation { parent } = entry.spec.role else {
@@ -431,6 +485,17 @@ pub enum CatalogError {
     DuplicateConfirmation(&'static str),
     /// 关闭确认窗口自身必须使用 Immediate 策略，避免嵌套确认。
     ConfirmationMustBeImmediate(&'static str),
+    /// 菜单绑定的窗口键不在目录中。
+    UnknownMenuWindow(&'static str),
+    /// 同一个目录窗口声明了不止一个菜单。
+    DuplicateMenu(&'static str),
+    /// 一个窗口的菜单树里命令 id 重复。
+    DuplicateMenuCommand {
+        window: &'static str,
+        id: &'static str,
+    },
+    /// 菜单树超过可表示的命令项上限。
+    MenuTooLarge { window: &'static str, items: usize },
 }
 
 impl fmt::Display for CatalogError {
@@ -468,6 +533,21 @@ impl fmt::Display for CatalogError {
                     "close confirmation window {key} must use Immediate close policy"
                 )
             }
+            Self::UnknownMenuWindow(key) => {
+                write!(f, "menu window {key} is not in the catalog")
+            }
+            Self::DuplicateMenu(key) => {
+                write!(f, "window {key} declares more than one menu")
+            }
+            Self::DuplicateMenuCommand { window, id } => {
+                write!(f, "window {window} declares command id {id} more than once")
+            }
+            Self::MenuTooLarge { window, items } => {
+                write!(
+                    f,
+                    "window {window} declares {items} menu items; the limit is {MENU_ITEM_LIMIT}"
+                )
+            }
         }
     }
 }
@@ -491,6 +571,8 @@ pub enum WindowError {
     Catalog(CatalogError),
     /// 关闭确认协议失败，父窗口保持打开。
     Close(CloseError),
+    /// 命令注册或派发失败。
+    Command(CommandError),
     Mount(MountError),
 }
 
@@ -512,6 +594,7 @@ impl fmt::Display for WindowError {
             Self::UnknownWindow(key) => write!(f, "window key {key} is not in the catalog"),
             Self::Catalog(error) => write!(f, "{error}"),
             Self::Close(error) => write!(f, "{error}"),
+            Self::Command(error) => write!(f, "{error}"),
             Self::Mount(error) => write!(f, "{error}"),
         }
     }
@@ -522,6 +605,7 @@ impl std::error::Error for WindowError {
         match self {
             Self::Catalog(error) => Some(error),
             Self::Close(error) => Some(error),
+            Self::Command(error) => Some(error),
             Self::Mount(error) => Some(error),
             _ => None,
         }
