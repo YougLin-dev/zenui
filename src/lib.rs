@@ -10,6 +10,7 @@ extern crate self as zenui;
 mod context;
 pub mod dispatch;
 pub mod file_dialog;
+pub mod menu;
 pub mod presentation;
 pub mod runtime;
 pub mod signal;
@@ -24,6 +25,9 @@ pub use dispatch::{DispatchError, NodeOperation};
 pub use file_dialog::{
     FileDialogError, FileDialogKind, FileDialogOptions, FileDialogOutcome, FileDialogRequest,
     FileDialogRequestError, FileFilter,
+};
+pub use menu::{
+    CommandError, CommandEvent, CommandSource, MenuCommand, MenuItem, MenuSpec, Submenu,
 };
 pub use presentation::{
     Appearance, NodeId, NodeStatus, PresentationSnapshot, SnapshotAttr, SnapshotElement,
@@ -51,16 +55,17 @@ pub use zenui_style::{
 pub mod prelude {
     pub use crate::{
         Appearance, BlurEvent, CatalogError, Children, ChildrenFactory, CloseError, ClosePolicy,
-        CloseRequest, Color, ColorRole, CompositionEvent, CompositionPhase, Condition,
-        DeliveryReport, DispatchError, Field, FieldError, FileDialogError, FileDialogKind,
-        FileDialogOptions, FileDialogOutcome, FileDialogRequest, FileDialogRequestError,
-        FileFilter, FocusCause, FocusEvent, FocusInfo, Key, KeyEvent, Length, LengthUnit, Memo,
-        MountError, MountPlan, MountResult, NodeId, NodeOperation, NodeStatus, Once, Opacity,
+        CloseRequest, Color, ColorRole, CommandError, CommandEvent, CommandSource,
+        CompositionEvent, CompositionPhase, Condition, DeliveryReport, DispatchError, Field,
+        FieldError, FileDialogError, FileDialogKind, FileDialogOptions, FileDialogOutcome,
+        FileDialogRequest, FileDialogRequestError, FileFilter, FocusCause, FocusEvent, FocusInfo,
+        Key, KeyEvent, Length, LengthUnit, Memo, MenuCommand, MenuItem, MenuSpec, MountError,
+        MountPlan, MountResult, NodeId, NodeOperation, NodeStatus, Once, Opacity,
         PresentationSnapshot, Property, Runtime, Signal, SnapshotAttr, SnapshotElement,
-        SnapshotNode, SnapshotValue, Store, StyleDeclaration, StyleOrigin, StyleValue, SubmitEvent,
-        Task, TaskError, TaskScope, TaskStatus, TaskToken, TextEditState, TodoId, Transaction,
-        WindowCatalog, WindowCtx, WindowError, WindowInfo, WindowRole, WindowSpec, WriteError,
-        WriteOp, component, em, memo, once, px, signal, view,
+        SnapshotNode, SnapshotValue, Store, StyleDeclaration, StyleOrigin, StyleValue, Submenu,
+        SubmitEvent, Task, TaskError, TaskScope, TaskStatus, TaskToken, TextEditState, TodoId,
+        Transaction, WindowCatalog, WindowCtx, WindowError, WindowInfo, WindowRole, WindowSpec,
+        WriteError, WriteOp, component, em, memo, once, px, signal, view,
     };
     pub use zenui_core::Filter;
 }
