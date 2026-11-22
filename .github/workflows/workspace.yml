@@ -16,14 +16,18 @@ jobs:
   workspace:
     name: workspace (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    # trybuild 为每个 fixture 再构建一次 facade 及其依赖；Windows 冷缓存需要余量。
-    timeout-minutes: 45
+    # trybuild 为每个 fixture 再构建一次 facade 及其依赖；Windows leg 还要
+    # 冷编译模板的 release 依赖，因此在原有 45 分钟上留出余量。
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     env:
       CARGO_TERM_COLOR: always
+      # 模板是独立 workspace，但 Windows leg 与根 workspace 共享 target，
+      # 避免为同一批依赖再编译一次。
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
     steps:
       - name: Check out
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -48,6 +52,24 @@ jobs:
 
       - name: Test
         run: cargo test --workspace --locked
+
+      # 模板有自己的 workspace、Cargo.lock 与工具链；隐藏 WARP smoke 是
+      # partial evidence，可见窗口验收仍需在 Windows 11 实机执行。
+      - name: Template format
+        if: matrix.os == 'windows-latest'
+        run: cargo fmt --manifest-path templates/minimal-app/Cargo.toml --all -- --check
+
+      - name: Template clippy
+        if: matrix.os == 'windows-latest'
+        run: cargo clippy --manifest-path templates/minimal-app/Cargo.toml --workspace --all-targets --locked -- -D warnings
+
+      - name: Template test (drift + headless + hidden WARP)
+        if: matrix.os == 'windows-latest'
+        run: cargo test --manifest-path templates/minimal-app/Cargo.toml --workspace --locked
+
+      - name: Template release build
+        if: matrix.os == 'windows-latest'
+        run: cargo build --manifest-path templates/minimal-app/Cargo.toml --release --locked
 
   prototypes:
     name: prototypes (${{ matrix.os }} / ${{ matrix.example }})
