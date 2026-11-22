@@ -2,16 +2,18 @@
 #![allow(unused_braces)]
 
 use std::collections::BTreeSet;
+use std::ffi::c_void;
 
 use windows::Win32::Foundation::{LPARAM, WPARAM};
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    IsWindowEnabled, VIRTUAL_KEY, VK_BACK, VK_DELETE, VK_END, VK_ESCAPE, VK_HOME, VK_RETURN,
-    VK_RIGHT, VK_TAB,
+    IsWindowEnabled, VIRTUAL_KEY, VK_BACK, VK_DELETE, VK_END, VK_ESCAPE, VK_HOME, VK_NEXT,
+    VK_PRIOR, VK_RETURN, VK_RIGHT, VK_TAB,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    PostMessageW, WM_CHAR, WM_CLOSE, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MOUSEMOVE,
+    PostMessageW, SPI_GETWHEELSCROLLLINES, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+    SystemParametersInfoW, WM_CHAR, WM_CLOSE, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
 };
 use zenui::prelude::*;
 use zenui::{Appearance, Color, ColorRole, NodeId};
@@ -30,6 +32,18 @@ fn open_host_with(config: HostConfig) -> Host {
     zenui_demo::open_todo_window(&mut runtime).expect("open the todo window");
     zenui_demo::seed(&mut runtime).expect("seed the todo rows");
     Host::open(runtime, config).expect("open a host")
+}
+
+fn open_tall_host(rows: usize) -> Host {
+    let mut runtime = zenui::Runtime::new();
+    zenui_demo::open_todo_window(&mut runtime).expect("open the todo window");
+    for index in 0..rows {
+        runtime
+            .input("What needs to be done?", &format!("Task {index}"))
+            .expect("fill the draft");
+        runtime.submit("Add task").expect("add a row");
+    }
+    Host::open(runtime, HostConfig::hidden()).expect("open a tall host")
 }
 
 #[component]
@@ -139,6 +153,29 @@ fn post_key(host: &Host, key: VIRTUAL_KEY) {
         PostMessageW(Some(hwnd), WM_KEYDOWN, WPARAM(key.0 as usize), LPARAM(0))
             .expect("post the key");
     }
+}
+
+fn post_wheel(host: &Host, delta: i16) {
+    let hwnd = host.hwnd(MAIN).expect("a live window");
+    let wparam = WPARAM(((delta as u16 as u32) << 16) as usize);
+    // 安全：HWND 由 Host 持有，消息只排队，不跨线程解引用。
+    unsafe {
+        PostMessageW(Some(hwnd), WM_MOUSEWHEEL, wparam, LPARAM(0)).expect("post the wheel");
+    }
+}
+
+fn system_wheel_lines() -> u32 {
+    let mut lines = 3u32;
+    // 安全：lines 是本地输出缓冲；读取设置不改变系统状态。
+    unsafe {
+        let _ = SystemParametersInfoW(
+            SPI_GETWHEELSCROLLLINES,
+            0,
+            Some((&raw mut lines).cast::<c_void>()),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        );
+    }
+    lines
 }
 
 fn glyphs(host: &Host, id: NodeId) -> usize {
@@ -1853,4 +1890,224 @@ fn focus_visible_modality_stays_with_each_window() {
     host.request_close("second").expect("close the secondary");
     host.request_close("main").expect("close the primary");
     host.run().expect("the loop exits after the last window");
+}
+
+#[test]
+fn wheel_and_paging_scroll_the_native_scene() {
+    let mut host = open_tall_host(500);
+    host.pump().expect("initial render");
+    let (max, page) = {
+        let scene = host.scene(MAIN).expect("a rendered scene");
+        assert_eq!(scene.scroll_offset(), 0);
+        let max = scene.max_scroll_offset();
+        assert!(max > 0, "500 rows overflow the viewport");
+        (
+            max,
+            ((scene.viewport().height() - 24.0).floor() as i32).max(1),
+        )
+    };
+
+    if system_wheel_lines() != 0 {
+        // 负 delta 表示滚轮朝用户方向，内容向下滚动。
+        post_wheel(&host, -120);
+        host.pump().expect("one wheel notch");
+        let after = host.scene(MAIN).expect("scene").scroll_offset();
+        assert!(after > 0, "a notch toward the user scrolls down");
+
+        post_wheel(&host, 120);
+        host.pump().expect("reverse wheel");
+        assert_eq!(
+            host.scene(MAIN).expect("scene").scroll_offset(),
+            0,
+            "the reverse notch returns to the top"
+        );
+    }
+
+    let top_frame = host.read_frame(MAIN).expect("read the top frame");
+    post_key(&host, VK_NEXT);
+    host.pump().expect("PageDown");
+    assert_eq!(
+        host.scene(MAIN).expect("scene").scroll_offset(),
+        page.min(max),
+        "PageDown moves by the overlapping page step"
+    );
+    let scrolled_frame = host.read_frame(MAIN).expect("read the scrolled frame");
+    assert_ne!(
+        top_frame.pixels(),
+        scrolled_frame.pixels(),
+        "the painted frame moves with the offset"
+    );
+
+    post_key(&host, VK_PRIOR);
+    host.pump().expect("PageUp");
+    assert_eq!(host.scene(MAIN).expect("scene").scroll_offset(), 0);
+
+    post_key(&host, VK_END);
+    host.pump().expect("End");
+    assert_eq!(
+        host.scene(MAIN).expect("scene").scroll_offset(),
+        max,
+        "End goes to the maximum"
+    );
+
+    if system_wheel_lines() != 0 {
+        post_wheel(&host, -120);
+        host.pump().expect("further down at the bottom");
+        assert_eq!(
+            host.scene(MAIN).expect("scene").scroll_offset(),
+            max,
+            "the over-scroll is discarded at the bottom"
+        );
+        post_wheel(&host, 120);
+        host.pump().expect("reverse at the bottom");
+        assert!(
+            host.scene(MAIN).expect("scene").scroll_offset() < max,
+            "the first reverse wheel step moves immediately"
+        );
+    }
+
+    post_key(&host, VK_HOME);
+    host.pump().expect("Home");
+    assert_eq!(host.scene(MAIN).expect("scene").scroll_offset(), 0);
+
+    if system_wheel_lines() != 0 {
+        post_wheel(&host, 120);
+        host.pump().expect("further up at the top");
+        assert_eq!(
+            host.scene(MAIN).expect("scene").scroll_offset(),
+            0,
+            "the over-scroll is discarded at the top"
+        );
+        post_wheel(&host, -120);
+        host.pump().expect("reverse at the top");
+        assert!(
+            host.scene(MAIN).expect("scene").scroll_offset() > 0,
+            "the first reverse wheel step moves immediately"
+        );
+    }
+}
+
+#[test]
+fn scroll_only_input_keeps_the_snapshot_and_node_ids() {
+    let mut host = open_tall_host(500);
+    host.pump().expect("initial render");
+    let before = host.presentation(MAIN).expect("a committed snapshot");
+    let ids: Vec<NodeId> = before.elements().map(|element| element.id()).collect();
+
+    post_key(&host, VK_END);
+    host.pump().expect("scroll to the bottom");
+    assert!(host.scene(MAIN).expect("scene").scroll_offset() > 0);
+
+    let after = host.presentation(MAIN).expect("the committed snapshot");
+    assert_eq!(
+        before, after,
+        "scroll-only input does not refresh the runtime"
+    );
+    let scene = host.scene(MAIN).expect("scene");
+    for id in ids.iter().take(32) {
+        assert!(scene.node(*id).is_some(), "Node IDs survive scrolling");
+    }
+}
+
+#[test]
+fn scrolling_revalidates_hover_against_the_translated_scene() {
+    let mut host = open_tall_host(100);
+    host.pump().expect("initial render");
+    let (first, point, scale) = center_label(&host, MAIN, "Edit Task 0");
+    post_move(&host, point, scale);
+    host.pump().expect("hover the first row");
+    assert_eq!(
+        host.scene(MAIN)
+            .expect("scene")
+            .elements()
+            .iter()
+            .find(|element| element.hovered())
+            .map(SceneElement::id),
+        Some(first)
+    );
+
+    post_key(&host, VK_END);
+    host.pump().expect("scroll to the bottom");
+    let hovered = host
+        .scene(MAIN)
+        .expect("scene")
+        .elements()
+        .iter()
+        .find(|element| element.hovered())
+        .map(SceneElement::id);
+    assert_ne!(hovered, Some(first), "the old hover node moved away");
+}
+
+#[test]
+fn hide_show_keeps_the_offset_and_reopen_starts_at_zero() {
+    let mut host = open_tall_host(100);
+    host.pump().expect("initial render");
+    post_key(&host, VK_END);
+    host.pump().expect("scroll to the bottom");
+    let bottom = host.scene(MAIN).expect("scene").scroll_offset();
+    assert!(bottom > 0);
+
+    host.hide(MAIN).expect("hide the window");
+    let before_hidden_wheel = host.scene(MAIN).expect("scene").scroll_offset();
+    post_wheel(&host, 120);
+    host.pump().expect("wheel on a hidden window");
+    assert_eq!(
+        host.scene(MAIN).expect("scene").scroll_offset(),
+        before_hidden_wheel,
+        "hidden windows ignore wheel input"
+    );
+
+    host.show(MAIN).expect("show the window");
+    host.pump().expect("show the window");
+    assert_eq!(
+        host.scene(MAIN).expect("scene").scroll_offset(),
+        bottom,
+        "show keeps the offset"
+    );
+
+    host.close(MAIN).expect("close the window");
+    host.show(MAIN).expect("reopen the window");
+    host.pump().expect("render the reopened window");
+    assert_eq!(
+        host.scene(MAIN).expect("scene").scroll_offset(),
+        0,
+        "a new activation starts at zero"
+    );
+}
+
+#[test]
+fn paging_keys_leave_a_focused_editor_in_place() {
+    let mut host = open_tall_host(50);
+    host.pump().expect("initial render");
+    let (_, point, scale) = center_label(&host, MAIN, "What needs to be done?");
+    post_click(&host, point, scale);
+    host.pump().expect("focus the draft input");
+    post_char(&host, 'a');
+    host.pump().expect("type into the draft");
+
+    post_key(&host, VK_END);
+    host.pump().expect("End while editing");
+    assert_eq!(
+        host.scene(MAIN).expect("scene").scroll_offset(),
+        0,
+        "End edits the focused input instead of scrolling"
+    );
+
+    post_key(&host, VK_NEXT);
+    host.pump().expect("PageDown while editing");
+    let page = host.scene(MAIN).expect("scene").scroll_offset();
+    assert!(page > 0, "PageDown still scrolls with a focused editor");
+    assert!(focused_id(&host).is_some(), "the editor keeps focus");
+
+    post_key(&host, VK_HOME);
+    host.pump().expect("Home while editing");
+    assert_eq!(
+        host.scene(MAIN).expect("scene").scroll_offset(),
+        page,
+        "Home edits the caret instead of scrolling"
+    );
+
+    post_key(&host, VK_PRIOR);
+    host.pump().expect("PageUp while editing");
+    assert_eq!(host.scene(MAIN).expect("scene").scroll_offset(), 0);
 }
