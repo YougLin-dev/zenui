@@ -24,7 +24,7 @@ use windows::Win32::UI::Input::Ime::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     EnableWindow, GetCapture, GetKeyState, ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT,
-    TrackMouseEvent, VIRTUAL_KEY, VK_A, VK_BACK, VK_CONTROL, VK_DELETE, VK_END, VK_ESCAPE, VK_HOME,
+    TrackMouseEvent, VIRTUAL_KEY, VK_BACK, VK_CONTROL, VK_DELETE, VK_END, VK_ESCAPE, VK_HOME,
     VK_LEFT, VK_NEXT, VK_PRIOR, VK_PROCESSKEY, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_TAB,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -34,8 +34,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     PeekMessageW, PostMessageW, RegisterClassExW, SPI_GETWHEELSCROLLLINES, SW_HIDE, SW_SHOW,
     SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
     SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-    SystemParametersInfoW, TranslateMessage, WINDOW_EX_STYLE, WM_APP, WM_CAPTURECHANGED, WM_CHAR,
-    WM_CLOSE, WM_DESTROY, WM_DPICHANGED, WM_GETDPISCALEDSIZE, WM_IME_CHAR, WM_IME_COMPOSITION,
+    SystemParametersInfoW, TranslateMessage, WINDOW_EX_STYLE, WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE,
+    WM_DESTROY, WM_DPICHANGED, WM_GETDPISCALEDSIZE, WM_IME_CHAR, WM_IME_COMPOSITION,
     WM_IME_ENDCOMPOSITION, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN,
     WM_LBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_SETTINGCHANGE, WM_SIZE,
     WM_TIMER, WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
@@ -44,14 +44,30 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::{HSTRING, w};
 use zenui::prelude::*;
 
-use crate::file_dialog::{ComApartment, FileDialogPresenter, NativeFileDialog};
+use crate::file_dialog::{FileDialogPresenter, NativeFileDialog};
+use crate::ole::{OleApartment, OleError};
+use crate::shortcuts::{EditorAction, editor_shortcut};
 use zenui_render::{
     GpuRenderer, Point, RenderPalette, RenderTargetConfig, Scene, SceneCache, SceneElement,
     SceneEnv, Viewport, Visual, wgpu,
 };
 
-/// worker 唤醒只投递这一条消息；`WM_APP` 起是应用私有的消息区间。
-const HOST_WAKE_MESSAGE: u32 = WM_APP + 1;
+/// 宿主私有的窗口消息注册表；其他模块不得自行定义 `WM_APP + N`。
+mod host_message {
+    use windows::Win32::UI::WindowsAndMessaging::WM_APP;
+
+    /// worker 唤醒；任一存活窗口收到后交付全部 worker 结果。
+    pub(super) const WAKE: u32 = WM_APP + 1;
+    /// 设备丢失恢复请求，保留给设备丢失工单。
+    pub(super) const DEVICE_LOSS: u32 = WM_APP + 2;
+    /// 辅助技术动作请求，保留给 UIA 工单。
+    pub(super) const UIA_ACTION: u32 = WM_APP + 3;
+    /// 托盘回调，保留给托盘工单；托盘 HWND 使用自己的路由分支。
+    pub(super) const TRAY_CALLBACK: u32 = WM_APP + 4;
+
+    /// 注册表全集；`handle_message` 显式认领它们，保留值不会落入窗口路由。
+    pub(super) const ALL: [u32; 4] = [WAKE, DEVICE_LOSS, UIA_ACTION, TRAY_CALLBACK];
+}
 
 /// `SPI_GETWHEELSCROLLLINES` 的哨兵值：一个 notch 滚动一页。
 const WHEEL_PAGESCROLL: u32 = u32::MAX;
@@ -378,10 +394,10 @@ pub struct Host {
     file_dialog_presenter: Option<Box<dyn FileDialogPresenter>>,
     /// 原生弹窗期间拒绝替换 presenter；只在 UI 线程读写。
     file_dialog_active: bool,
-    /// STA 初始化失败的稳定原因；避免每次请求重试并保留显式错误。
-    com_error: Option<FileDialogError>,
-    /// 必须最后声明：最后一个字段最后释放，COM 生命周期覆盖 presenter。
-    com: Option<ComApartment>,
+    /// OLE 初始化失败的稳定原因；避免每次请求重试并保留显式错误。
+    ole_error: Option<OleError>,
+    /// 必须最后声明：最后一个字段最后释放，OLE 生命周期覆盖 presenter。
+    ole: Option<OleApartment>,
 }
 
 impl Host {
@@ -459,7 +475,7 @@ impl Host {
                 };
                 // 安全：PostMessageW 是线程安全的；关闭标志尽量阻止窗口销毁后
                 // 的新投递，竞态下已销毁窗口的句柄值只让调用返回错误，不会解引用。
-                if unsafe { PostMessageW(Some(target), HOST_WAKE_MESSAGE, WPARAM(0), LPARAM(0)) }
+                if unsafe { PostMessageW(Some(target), host_message::WAKE, WPARAM(0), LPARAM(0)) }
                     .is_err()
                 {
                     // 投递失败说明窗口已不能接收唤醒；释放合并标志，
@@ -493,8 +509,8 @@ impl Host {
             focus_after_sync: false,
             file_dialog_presenter: None,
             file_dialog_active: false,
-            com_error: None,
-            com: None,
+            ole_error: None,
+            ole: None,
         };
         host.insert_window(WindowHost::new(
             window,
@@ -629,11 +645,14 @@ impl Host {
     /// 处理一条已经派发到窗口过程的消息。
     ///
     /// 输入处理放在窗口过程而不是消息循环里，因为系统的模态拖动/缩放循环会
-    /// 直接调用窗口过程，消息循环在此期间收不到任何消息。唤醒消息是宿主级
-    /// 的：任一 HWND 收到它都交付全部 worker 结果，再逐窗口比较快照重绘。
+    /// 直接调用窗口过程，消息循环在此期间收不到任何消息。注册表消息是宿主级
+    /// 的：任一 HWND 收到唤醒都交付全部 worker 结果，再逐窗口比较快照重绘；
+    /// 尚未实现的保留消息被显式忽略，不会落入窗口输入路由。
     fn handle_message(&mut self, hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) {
-        if message == HOST_WAKE_MESSAGE {
-            if let Err(error) = self.deliver_tasks() {
+        if host_message::ALL.contains(&message) {
+            if message == host_message::WAKE
+                && let Err(error) = self.deliver_tasks()
+            {
                 self.deferred_error.get_or_insert(error);
             }
             return;
@@ -671,21 +690,24 @@ impl Host {
         }
     }
 
-    /// 第一次需要原生对话框时初始化 UI 线程的 STA；失败原因被缓存。
-    fn ensure_com(&mut self) -> Result<(), FileDialogError> {
-        if self.com.is_some() {
+    /// 第一次需要 OLE 时初始化 UI 线程的 STA；失败原因被缓存。
+    ///
+    /// 文件对话框与后续剪贴板/拖放共用这一个套间；注入 presenter 的隐藏
+    /// 宿主不会走到这里。
+    fn ensure_ole(&mut self) -> Result<(), OleError> {
+        if self.ole.is_some() {
             return Ok(());
         }
-        if let Some(error) = &self.com_error {
+        if let Some(error) = &self.ole_error {
             return Err(error.clone());
         }
-        match ComApartment::initialize() {
-            Ok(com) => {
-                self.com = Some(com);
+        match OleApartment::initialize() {
+            Ok(ole) => {
+                self.ole = Some(ole);
                 Ok(())
             }
             Err(error) => {
-                self.com_error = Some(error.clone());
+                self.ole_error = Some(error.clone());
                 Err(error)
             }
         }
@@ -708,7 +730,7 @@ impl Host {
         let (presenter, restore) = match self.file_dialog_presenter.take() {
             Some(presenter) => (presenter, true),
             None if self.show_windows => {
-                self.ensure_com()?;
+                self.ensure_ole().map_err(file_dialog_ole_error)?;
                 (
                     Box::new(NativeFileDialog) as Box<dyn FileDialogPresenter>,
                     false,
@@ -1627,9 +1649,9 @@ impl Host {
             }
             return Ok(());
         };
+        let composing = is_composing(&snapshot, focused);
         if key == VK_ESCAPE {
             // 运行时在组合中优先取消并恢复文本；否则派发给用户 keydown。
-            let composing = is_composing(&snapshot, focused);
             pointer_dispatch(self.runtime.keydown_node(focused, Key::Escape))?;
             if composing {
                 self.notify_ime_cancel(window);
@@ -1637,9 +1659,20 @@ impl Host {
             window.paint_requested = true;
             return Ok(());
         }
-        if control && key == VK_A {
-            pointer_dispatch(self.runtime.select_all_node(focused))?;
-            window.paint_requested = true;
+        if let Some(action) = editor_shortcut(key, control, true, composing) {
+            match action {
+                EditorAction::SelectAll => {
+                    pointer_dispatch(self.runtime.select_all_node(focused))?;
+                    window.paint_requested = true;
+                }
+                // Undo/Redo/Cut/Copy/Paste 已由后续工单保留；在接线前消费按键，
+                // 避免它们落入普通字符编辑。
+                EditorAction::Undo
+                | EditorAction::Redo
+                | EditorAction::Cut
+                | EditorAction::Copy
+                | EditorAction::Paste => {}
+            }
             return Ok(());
         }
         if key == VK_RETURN {
@@ -2383,7 +2416,7 @@ impl Host {
         if changed
             && self.wake.is_pending()
             && let Some(target) = target
-            && unsafe { PostMessageW(Some(target), HOST_WAKE_MESSAGE, WPARAM(0), LPARAM(0)) }
+            && unsafe { PostMessageW(Some(target), host_message::WAKE, WPARAM(0), LPARAM(0)) }
                 .is_err()
         {
             self.wake.observed();
@@ -2468,6 +2501,14 @@ impl WindowHost {
         self.pressed = None;
         self.release_capture = false;
         self.tracking_leave = false;
+    }
+}
+
+/// 文件对话框把宿主 OLE 失败映射为它的公开错误。
+fn file_dialog_ole_error(error: OleError) -> FileDialogError {
+    match error {
+        OleError::ChangedMode => FileDialogError::Unsupported,
+        OleError::Failed(message) => FileDialogError::DialogFailed(message),
     }
 }
 
@@ -3089,6 +3130,49 @@ unsafe fn service_file_dialogs(host: *mut Host) -> Result<bool, HostError> {
     }
 }
 
+/// 派发一条消息后的统一结算；返回是否已经没有存活窗口。
+///
+/// 同步窗口、恢复前台焦点、重绘变化窗口、取出延迟错误、结算文件对话框；
+/// `run_loop` 与 `pump_loop` 共用这一条路径。
+///
+/// # Safety
+///
+/// `host` 指向在循环期间不会移动的 `Host`；派发已返回，不持有它的引用。
+unsafe fn after_dispatch(host: *mut Host) -> Result<bool, HostError> {
+    {
+        // 安全：派发已返回，重新借出宿主同步窗口并读取处理结果。
+        let host = unsafe { &mut *host };
+        host.sync_windows()?;
+        if std::mem::take(&mut host.focus_after_sync) {
+            host.focus_native_focused_window()?;
+        }
+        host.repaint_changed_windows()?;
+        if let Some(error) = host.deferred_error.take() {
+            return Err(error);
+        }
+        if host.runtime.windows().is_empty() {
+            return Ok(true);
+        }
+    }
+    unsafe { service_file_dialogs(host)? };
+    Ok(unsafe { &*host }.runtime.windows().is_empty())
+}
+
+/// 没有消息可派发时的结算；返回是否已经没有存活窗口。
+///
+/// # Safety
+///
+/// 与 [`run_loop`] 相同。
+unsafe fn settle_idle(host: *mut Host) -> Result<bool, HostError> {
+    if unsafe { &*host }.runtime.windows().is_empty() {
+        // 确保关闭时排队的请求不会留下 Running 任务。
+        let _ = unsafe { &mut *host }.runtime.take_file_dialog_requests();
+        return Ok(true);
+    }
+    unsafe { service_file_dialogs(host)? };
+    Ok(unsafe { &*host }.runtime.windows().is_empty())
+}
+
 /// `run` 的消息循环；返回关闭或处理错误。
 ///
 /// # Safety
@@ -3106,23 +3190,7 @@ unsafe fn run_loop(host: *mut Host) -> Result<(), HostError> {
             return Ok(());
         }
         dispatch_message(&message);
-        {
-            // 安全：派发已返回，重新借出宿主同步窗口并读取处理结果。
-            let host = unsafe { &mut *host };
-            host.sync_windows()?;
-            if std::mem::take(&mut host.focus_after_sync) {
-                host.focus_native_focused_window()?;
-            }
-            host.repaint_changed_windows()?;
-            if let Some(error) = host.deferred_error.take() {
-                return Err(error);
-            }
-            if host.runtime.windows().is_empty() {
-                return Ok(());
-            }
-        }
-        unsafe { service_file_dialogs(host)? };
-        if unsafe { &*host }.runtime.windows().is_empty() {
+        if unsafe { after_dispatch(host)? } {
             return Ok(());
         }
     }
@@ -3135,17 +3203,7 @@ unsafe fn run_loop(host: *mut Host) -> Result<(), HostError> {
 /// 与 [`run_loop`] 相同。
 unsafe fn pump_loop(host: *mut Host) -> Result<bool, HostError> {
     loop {
-        {
-            // 安全：每次迭代重新借出宿主；派发期间不持有引用。
-            let host = unsafe { &mut *host };
-            if host.runtime.windows().is_empty() {
-                // 确保关闭时排队的请求不会留下 Running 任务。
-                let _ = host.runtime.take_file_dialog_requests();
-                return Ok(true);
-            }
-        }
-        unsafe { service_file_dialogs(host)? };
-        if unsafe { &*host }.runtime.windows().is_empty() {
+        if unsafe { settle_idle(host)? } {
             return Ok(true);
         }
         let mut message = MSG::default();
@@ -3155,20 +3213,8 @@ unsafe fn pump_loop(host: *mut Host) -> Result<bool, HostError> {
             return Ok(false);
         }
         dispatch_message(&message);
-        {
-            // 安全：派发已返回，重新借出宿主同步窗口并读取处理结果。
-            let host = unsafe { &mut *host };
-            host.sync_windows()?;
-            if std::mem::take(&mut host.focus_after_sync) {
-                host.focus_native_focused_window()?;
-            }
-            host.repaint_changed_windows()?;
-            if let Some(error) = host.deferred_error.take() {
-                return Err(error);
-            }
-            if host.runtime.windows().is_empty() {
-                return Ok(true);
-            }
+        if unsafe { after_dispatch(host)? } {
+            return Ok(true);
         }
     }
 }
@@ -3345,7 +3391,7 @@ mod tests {
     #![allow(unused_braces)]
 
     use super::*;
-    use windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled;
+    use windows::Win32::UI::Input::KeyboardAndMouse::{IsWindowEnabled, VK_A};
     use windows::Win32::UI::WindowsAndMessaging::SendMessageW;
 
     const MAIN: &str = "main";
@@ -3415,6 +3461,37 @@ mod tests {
         assert!(up > 0);
         let down = wheel.step(i32::MIN, 100);
         assert!(down < 0);
+    }
+
+    #[test]
+    fn host_messages_are_distinct_and_reserved_in_the_app_range() {
+        use windows::Win32::UI::WindowsAndMessaging::WM_APP;
+
+        let mut sorted = host_message::ALL;
+        sorted.sort_unstable();
+        assert!(
+            sorted.windows(2).all(|pair| pair[0] < pair[1]),
+            "every registered message has its own value"
+        );
+        assert!(
+            host_message::ALL
+                .iter()
+                .all(|message| (WM_APP..WM_APP + 16).contains(message)),
+            "the host registry stays inside the private message range"
+        );
+        assert_eq!(host_message::WAKE, WM_APP + 1);
+    }
+
+    #[test]
+    fn ole_failures_map_to_the_file_dialog_contract() {
+        assert_eq!(
+            file_dialog_ole_error(OleError::ChangedMode),
+            FileDialogError::Unsupported
+        );
+        assert_eq!(
+            file_dialog_ole_error(OleError::Failed(String::from("boom"))),
+            FileDialogError::DialogFailed(String::from("boom"))
+        );
     }
 
     #[test]
@@ -4758,7 +4835,7 @@ mod tests {
         send_msg(
             &mut host,
             MSG {
-                message: HOST_WAKE_MESSAGE,
+                message: host_message::WAKE,
                 ..Default::default()
             },
         );

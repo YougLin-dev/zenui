@@ -8,10 +8,23 @@
 
 #![deny(missing_docs)]
 
+// 平台能力的模块归属一次固定：后续工单只增加实现，不再改动 crate 结构。
+#[cfg(windows)]
+pub mod accessibility;
+#[cfg(windows)]
+pub mod clipboard;
+#[cfg(windows)]
+pub mod drag_drop;
 #[cfg(windows)]
 mod file_dialog;
 #[cfg(windows)]
 mod host;
+#[cfg(windows)]
+pub mod menus;
+#[cfg(windows)]
+mod ole;
+#[cfg(windows)]
+mod shortcuts;
 
 #[cfg(windows)]
 pub use file_dialog::FileDialogPresenter;

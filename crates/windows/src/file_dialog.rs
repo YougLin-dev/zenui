@@ -1,7 +1,7 @@
 //! Native file dialogs for the Windows host.
 //!
-//! The host owns the loop-level request drain; this module owns the presenter
-//! seam, the STA COM guard and the `IFileOpenDialog` / `IFileSaveDialog`
+//! The host owns the loop-level request drain and the OLE apartment; this
+//! module owns the presenter seam and the `IFileOpenDialog` / `IFileSaveDialog`
 //! mapping. Tests inject a presenter, so hidden/CI runs never open a real
 //! dialog.
 
@@ -9,11 +9,8 @@ use std::ffi::{OsString, c_void};
 use std::os::windows::ffi::OsStringExt;
 use std::path::PathBuf;
 
-use windows::Win32::Foundation::{HWND, RPC_E_CHANGED_MODE};
-use windows::Win32::System::Com::{
-    CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoCreateInstance,
-    CoInitializeEx, CoTaskMemFree, CoUninitialize,
-};
+use windows::Win32::Foundation::HWND;
+use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree};
 use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
 use windows::Win32::UI::Shell::{
     FILEOPENDIALOGOPTIONS, FOS_ALLOWMULTISELECT, FOS_FILEMUSTEXIST, FOS_FORCEFILESYSTEM,
@@ -46,41 +43,7 @@ where
 /// `IFileOpenDialog::Show` reports user cancellation as `ERROR_CANCELLED`.
 const ERROR_CANCELLED_HRESULT: HRESULT = HRESULT(0x8007_04C7_u32 as i32);
 
-/// Lazy STA apartment for the native presenter.
-///
-/// `S_OK` and `S_FALSE` both require exactly one `CoUninitialize`; a thread
-/// already in MTA must not be uninitialized and the dialog reports Unsupported.
-pub(crate) struct ComApartment;
-
-impl ComApartment {
-    /// Initialize the UI thread as an STA. Hidden and injected presenters never
-    /// call this.
-    pub(crate) fn initialize() -> Result<Self, FileDialogError> {
-        // 安全：pvReserved 必须为空；UI 线程在 Host 存活期间不跨线程。
-        let result =
-            unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) };
-        if result.is_ok() {
-            Ok(Self)
-        } else if result == RPC_E_CHANGED_MODE {
-            Err(FileDialogError::Unsupported)
-        } else {
-            Err(FileDialogError::DialogFailed(format!(
-                "CoInitializeEx failed with {result:?}"
-            )))
-        }
-    }
-}
-
-impl Drop for ComApartment {
-    fn drop(&mut self) {
-        // 安全：只与成功的 CoInitializeEx 配对；Host 在 UI 线程上释放。
-        unsafe {
-            CoUninitialize();
-        }
-    }
-}
-
-/// The built-in presenter; the Host ensures COM before calling it.
+/// The built-in presenter; the Host ensures OLE before calling it.
 pub(crate) struct NativeFileDialog;
 
 impl FileDialogPresenter for NativeFileDialog {
@@ -444,7 +407,7 @@ mod tests {
 
     #[test]
     fn native_save_and_folder_configuration_is_field_specific() {
-        let _apartment = ComApartment::initialize().expect("initialize the STA");
+        let _apartment = crate::ole::OleApartment::initialize().expect("initialize OLE");
 
         let save_options = FileDialogOptions::save_file()
             .titled("Save tasks")
