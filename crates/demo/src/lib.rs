@@ -314,7 +314,7 @@ pub fn TodoApp(window: WindowCtx, state: TodoState) -> MountResult<MountPlan> {
             .titled("Import tasks")
             .filter("Text files", ["txt"]);
         let result = window
-            .pick_file(options, window.app_task_scope())
+            .request_file_dialog(options, window.app_task_scope())
             .map_err(|error| error.to_string())
             .and_then(|picker| {
                 picker

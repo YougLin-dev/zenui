@@ -216,7 +216,7 @@ impl WindowCtx {
     /// 窗口已关闭返回 [`WindowError::Stale`]，隐藏返回 [`WindowError::Hidden`]，
     /// 待决关闭或非法执行阶段返回 [`WindowError::State`]，跨运行时或跨窗口的
     /// scope 返回 [`WindowError::WrongRuntime`] / [`WindowError::State`]。
-    pub fn pick_file(
+    pub fn request_file_dialog(
         self,
         options: FileDialogOptions,
         scope: TaskScope,

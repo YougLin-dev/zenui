@@ -1,5 +1,7 @@
 # File pickers are host tasks with explicit job ownership
 
+> Historical note: this ADR records the original entry-point name `pick_file`. It was later renamed to `WindowCtx::request_file_dialog` ahead of save and folder support; the contract below is otherwise unchanged.
+
 ZenUI needs a native open-file dialog and a real import in the Todo demo. A file picker is a host service: the runtime owns the request and the task identity, and the platform host presents the dialog. The anchor window decides where the dialog appears, not how long the selected work lives. `WindowCtx::pick_file(options, scope)` returns a normal `Task<FileDialogOutcome>`; the caller passes `window.task_scope()` to cancel the selection with the activation, or `window.app_task_scope()` to let an app-owned import continue after the anchor closes. The anchor never silently promotes or demotes the owner.
 
 The `FileDialogOptions` builder owns the dialog kind, title and filters. `FileDialogOutcome` distinguishes `Picked(Vec<PathBuf>)`, `Cancelled` and `Failed(FileDialogError)`; a user cancel is a value, not an error. `WindowCtx::pick_file` accepts only `Event`/`Delivery` turns, the exact live and visible anchor, a non-suspended parent, and a scope from the same runtime (a window scope must name this anchor). Requests are queued only after every check, so a rejection leaves no half-created task.

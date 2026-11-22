@@ -28,7 +28,7 @@ fn PickerProbe(window: WindowCtx, picks: Picks, outcomes: Outcomes) -> MountResu
     let pick_outcomes = outcomes.clone();
     let pick = move || {
         register(
-            window.pick_file(options(), window.app_task_scope()),
+            window.request_file_dialog(options(), window.app_task_scope()),
             &pick_picks,
             &pick_outcomes,
         );
@@ -39,7 +39,7 @@ fn PickerProbe(window: WindowCtx, picks: Picks, outcomes: Outcomes) -> MountResu
     let close_and_pick = move || {
         let _ = window.request_close();
         register(
-            window.pick_file(options(), window.task_scope()),
+            window.request_file_dialog(options(), window.task_scope()),
             &close_picks,
             &close_outcomes,
         );
