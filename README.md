@@ -6,28 +6,33 @@ ZenUI 使用 Rust 编写原生桌面界面。它保留控件及其编辑状态�
 
 ## 当前能力
 
-ZenUI 处在开发阶段。阶段一 target API 的 headless Todo 已可运行；原生窗口、完整 `view!` SDK 与平台输入尚未落地。
+ZenUI 处在开发阶段。阶段一的 target API、阶段二的 Windows 原生切片，以及阶段三的多窗口与关闭确认已可运行；菜单/托盘、系统对话框、辅助技术和跨平台支持仍在开发中。跨显示器混合 DPI 与实机 device loss 仍是 #63 的开放证据缺口。
 
 仓库目前提供：
 
 - headless Runtime：模型、行集、代际句柄、Owner、Memo 和事务；
 - 阶段一 target API：Copy Signal/Memo/Store Field、mount-once 组件、`view!` 数据位、`Show`/`For` 与共享 RowSet；
-- headless 窗口 activation 与任务交付边界：app/window 所有权、Send worker、代际检查后的 UI continuation；窗口关闭取消其交付，共享模型仍可由 app 所有权任务提交；
+- headless 与原生窗口的 activation 和任务交付边界：app/window 所有权、Send worker、代际检查后的 UI continuation；窗口关闭取消其交付，共享模型仍可由 app 所有权任务提交；
+- Windows 宿主：每个存活窗口一个 HWND、Scene 与 DX12 surface，共享 device 和模型；原生输入、IME、DPI 与隐藏窗口 smoke（CI 回退 WARP）；
+- 多窗口窗口目录：show/hide/close/reopen、关闭确认 epoch、父窗口输入挂起与声明的确认窗口；
 - 有界运行时存储：最近发布快照按固定窗口保留，释放的 Owner 节点回到存活规模，Todo 的列表 reconciliation 与行句柄查找使用索引而不是逐行扫描；
 - 可复现的 Todo 场景：插入、删除、筛选、重排、焦点与拒绝句柄后的恢复；
 - 独立的宏、文本、布局和 GPU 原型；
 - 目标界面语法的预览。
 
-你可以运行 headless Todo 场景，或 stage-one target API 的最小 Todo：
+你可以运行 headless Todo、target API 的最小 Todo，或 Windows 原生多窗口 Todo：
 
 ```sh
 cargo run -p zenui-app --example todolist_headless --locked
 cargo run -p zenui --example minimal_todo --locked
+cargo run -p zenui-windows --example todo_host --locked
 ```
 
-target API 的公开行为测试位于根包 `tests/`，其中 `tests/tasks.rs` 覆盖窗口关闭、重开代际、过期交付与 app 所有权模型提交，`tests/ime.rs` 覆盖 headless composition 的 preedit、候选确认与取消；它们不声明原生窗口、原生 IME 适配或 Windows 完成。
+原生示例的主窗口工具栏可以打开共享模型的详情窗口；隐藏会保留详情窗口的本地编辑状态，关闭后可以重新打开。主窗口有非空草稿时，关闭按钮会显示 Continue editing / Discard draft 确认窗口。
 
-根工程的二进制只保留最小入口，不会打开桌面窗口。目标语法的预览文件不参与默认 workspace 构建，因为只有部分所需 API 已经存在。
+target API 的公开行为测试位于根包 `tests/`，其中 `tests/tasks.rs` 覆盖窗口关闭、重开代际、过期交付与 app 所有权模型提交，`tests/ime.rs` 覆盖 headless composition 的 preedit、候选确认与取消；这些测试不代替原生窗口或真实 IME 验收，原生路径由 `crates/windows` 的隐藏 smoke 与可见窗口验收覆盖。
+
+根工程的二进制只保留最小入口；原生窗口由 `zenui-windows` 的 `todo_host` 示例打开。目标语法的预览文件不参与默认 workspace 构建，因为只有部分所需 API 已经存在。
 
 ## 阅读路径
 
@@ -49,7 +54,10 @@ target API 的公开行为测试位于根包 `tests/`，其中 `tests/tasks.rs` 
 - [技术架构](docs/实现/技术架构.md)：目标技术模型、研究借鉴与架构边界。
 - [渲染与平台](docs/实现/渲染与平台.md)：布局、文本、绘制、内容接入和宿主能力。
 - [验证重点](docs/实现/验证重点.md)：目标模型落地时需要验证的关键语义。
+- [ADR-0007](docs/adr/0007-window-catalog-and-close-epoch.md)：窗口目录、per-activation 权威与关闭 epoch。
 - [Stage-one 验收](docs/实现/stage-one-验收.md)：headless Todo 的可执行完成判据、边界证据与原生缺口。
+- [Stage-two 验收](docs/实现/stage-two-验收.md)：Windows 原生切片、IME、样式与 150% 实机证据。
+- [Stage-three 多窗口验收](docs/实现/stage-three-多窗口-验收.md)：主窗口与详情窗口、hide/show、close/reopen 与关闭确认在 100%/150% 下的可见证据。
 
 ## 界面语法
 

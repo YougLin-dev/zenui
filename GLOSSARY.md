@@ -13,7 +13,7 @@ _Avoid_: window instance, window generation
 _Avoid_: global state, app singleton
 
 **Window catalog**:
-启动时声明的静态窗口集合；每个窗口有稳定键、原生标题、初始逻辑尺寸、primary 标记与可重复执行的 factory，声明本身不挂载界面。
+启动时声明的静态窗口集合；每个窗口有稳定键、原生标题、初始逻辑尺寸、primary 标记、ClosePolicy、WindowRole 与可重复执行的 factory。声明本身不挂载界面，并拒绝重复键、缺失或多个 primary 以及无效的关闭确认绑定。
 _Avoid_: window list, registry
 
 **Primary window**:
@@ -36,8 +36,12 @@ _Avoid_: close mode, quit policy
 一个父窗口 activation 的一次待决关闭请求；绑定父窗口、声明的确认窗口和挂起前的焦点，只有第一个有效 Allow/Deny 生效。待决期间父窗口输入挂起。
 _Avoid_: close transaction, close session
 
+**Window role**:
+目录窗口在关闭协议中的角色：`Normal`，或绑定一个 `Confirm` 父窗口的 `CloseConfirmation { parent }`。每个父窗口至多声明一个确认窗口，确认窗口自身必须是 `Immediate`。
+_Avoid_: dialog role, modal role
+
 **Close confirmation window**:
-目录中以 `CloseConfirmation { parent }` 声明并绑定到 `Confirm` 父窗口的普通窗口；其 X、Escape 或关闭请求在 epoch 待决时表示 Deny。
+目录中以 `CloseConfirmation { parent }` 声明并绑定到 `Confirm` 父窗口的目录窗口；其 X、Escape 或关闭请求在 epoch 待决时表示 Deny。
 _Avoid_: dialog, modal (when meaning the catalog role)
 
 **Host**:

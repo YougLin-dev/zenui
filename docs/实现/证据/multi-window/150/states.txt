@@ -1,0 +1,30 @@
+capture paths name the committed PNG files; the probe wrote BMPs that were converted after the run.
+dpi=144 scale=1.5 expected=144 adapter=AdapterInfo { name: "NVIDIA GeForce RTX 4060 Laptop GPU", vendor: 4318, device: 10400, device_type: DiscreteGpu, device_pci_bus_id: "0000:01:00.0", driver: "32.0.15.7283", driver_info: "", backend: Dx12, subgroup_min_size: 32, subgroup_max_size: 32, transient_saves_memory: Some(false), limit_bucket: None }
+start: main={hwnd=Some(117113120), visible=true, enabled=Some(true), draft=Some(""), focus=None, caret=None}, details={hwnd=None, visible=false, note=None}, prompt={hwnd=None, visible=false}
+capture 01-main: (1350, 1050) -> docs/实现/证据/multi-window/150\01-main.png
+details open: main={hwnd=Some(117113120), visible=true, enabled=Some(true), draft=Some(""), focus=None, caret=None}, details={hwnd=Some(190908546), visible=true, note=Some("")}, prompt={hwnd=None, visible=false}
+capture 02-main-with-details: (1350, 1050) -> docs/实现/证据/multi-window/150\02-main-with-details.png
+capture 03-details: (780, 630) -> docs/实现/证据/multi-window/150\03-details.png
+details note typed: main={hwnd=Some(117113120), visible=true, enabled=Some(true), draft=Some(""), focus=None, caret=None}, details={hwnd=Some(190908546), visible=true, note=Some("note")}, prompt={hwnd=None, visible=false}
+capture 04-details-note: (780, 630) -> docs/实现/证据/multi-window/150\04-details-note.png
+details hidden: main={hwnd=Some(117113120), visible=true, enabled=Some(true), draft=Some(""), focus=None, caret=None}, details={hwnd=Some(190908546), visible=false, note=None}, prompt={hwnd=None, visible=false}
+capture 05-main-details-hidden: (1350, 1050) -> docs/实现/证据/multi-window/150\05-main-details-hidden.png
+details shown: main={hwnd=Some(117113120), visible=true, enabled=Some(true), draft=Some(""), focus=None, caret=None}, details={hwnd=Some(190908546), visible=true, note=Some("note")}, prompt={hwnd=None, visible=false}
+capture 06-details-restored: (780, 630) -> docs/实现/证据/multi-window/150\06-details-restored.png
+details closed: main={hwnd=Some(117113120), visible=true, enabled=Some(true), draft=Some(""), focus=None, caret=None}, details={hwnd=None, visible=false, note=None}, prompt={hwnd=None, visible=false}
+capture 07-main-details-closed: (1350, 1050) -> docs/实现/证据/multi-window/150\07-main-details-closed.png
+details reopened: main={hwnd=Some(117113120), visible=true, enabled=Some(true), draft=Some(""), focus=None, caret=None}, details={hwnd=Some(190974082), visible=true, note=Some("")}, prompt={hwnd=None, visible=false}
+capture 08-details-reopened: (780, 630) -> docs/实现/证据/multi-window/150\08-details-reopened.png
+details closed again: main={hwnd=Some(117113120), visible=true, enabled=Some(true), draft=Some(""), focus=None, caret=None}, details={hwnd=None, visible=false, note=None}, prompt={hwnd=None, visible=false}
+draft typed: main={hwnd=Some(117113120), visible=true, enabled=Some(true), draft=Some("Milk"), focus=Some(NodeId(1)), caret=Some(Rect { x: 47.882813, y: 49.0, width: 1.0, height: 19.0 })}, details={hwnd=None, visible=false, note=None}, prompt={hwnd=None, visible=false}
+capture 09-main-draft: (1350, 1050) -> docs/实现/证据/multi-window/150\09-main-draft.png
+prompt pending: main={hwnd=Some(117113120), visible=true, enabled=Some(false), draft=Some("Milk"), focus=Some(NodeId(1)), caret=Some(Rect { x: 47.882813, y: 49.0, width: 1.0, height: 19.0 })}, details={hwnd=None, visible=false, note=None}, prompt={hwnd=Some(191039618), visible=true}
+capture 10-prompt: (630, 330) -> docs/实现/证据/multi-window/150\10-prompt.png
+capture 11-main-disabled: (1350, 1050) -> docs/实现/证据/multi-window/150\11-main-disabled.png
+after X: main={hwnd=Some(117113120), visible=true, enabled=Some(true), draft=Some("Milk"), focus=Some(NodeId(1)), caret=Some(Rect { x: 47.882813, y: 49.0, width: 1.0, height: 19.0 })}, details={hwnd=None, visible=false, note=None}, prompt={hwnd=None, visible=false}
+capture 12-main-after-x-deny: (1350, 1050) -> docs/实现/证据/multi-window/150\12-main-after-x-deny.png
+after Escape: main={hwnd=Some(117113120), visible=true, enabled=Some(true), draft=Some("Milk"), focus=Some(NodeId(1)), caret=Some(Rect { x: 47.882813, y: 49.0, width: 1.0, height: 19.0 })}, details={hwnd=None, visible=false, note=None}, prompt={hwnd=None, visible=false}
+capture 13-main-after-escape-deny: (1350, 1050) -> docs/实现/证据/multi-window/150\13-main-after-escape-deny.png
+after Continue editing: main={hwnd=Some(117113120), visible=true, enabled=Some(true), draft=Some("Milk"), focus=Some(NodeId(1)), caret=Some(Rect { x: 47.882813, y: 49.0, width: 1.0, height: 19.0 })}, details={hwnd=None, visible=false, note=None}, prompt={hwnd=None, visible=false}
+capture 14-main-after-continue: (1350, 1050) -> docs/实现/证据/multi-window/150\14-main-after-continue.png
+discarded; loop exited: main={hwnd=None, visible=false, enabled=None, draft=None, focus=None, caret=None}, details={hwnd=None, visible=false, note=None}, prompt={hwnd=None, visible=false}
