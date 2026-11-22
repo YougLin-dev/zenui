@@ -40,6 +40,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use windows::core::{HSTRING, w};
 use zenui::prelude::*;
+
+use crate::file_dialog::{ComApartment, FileDialogPresenter, NativeFileDialog};
 use zenui_render::{
     GpuRenderer, Point, RenderPalette, RenderTargetConfig, Scene, SceneElement, SceneEnv, Viewport,
     Visual, wgpu,
@@ -214,6 +216,15 @@ impl WindowHost {
     }
 }
 
+/// 从 Host 取出的一次弹窗工作；presenter 在调用期间不持有 Host 引用。
+struct FileDialogWork {
+    presenter: Box<dyn FileDialogPresenter>,
+    /// presenter 来自 Host 的注入槽，调用后需要放回。
+    restore: bool,
+    hwnd: HWND,
+    options: FileDialogOptions,
+}
+
 /// Win32 宿主：一个 Runtime、一个消息循环，每个存活窗口一个 HWND/Surface/Scene。
 pub struct Host {
     runtime: Runtime,
@@ -246,6 +257,14 @@ pub struct Host {
     deferred_error: Option<HostError>,
     /// 关闭协议改变了焦点/启用状态，消息循环在下次同步后重定向前台。
     focus_after_sync: bool,
+    /// 测试或嵌入方注入的文件选择器；`None` 时使用原生对话框或 Unsupported。
+    file_dialog_presenter: Option<Box<dyn FileDialogPresenter>>,
+    /// 原生弹窗期间拒绝替换 presenter；只在 UI 线程读写。
+    file_dialog_active: bool,
+    /// STA 初始化失败的稳定原因；避免每次请求重试并保留显式错误。
+    com_error: Option<FileDialogError>,
+    /// 必须最后声明：最后一个字段最后释放，COM 生命周期覆盖 presenter。
+    com: Option<ComApartment>,
 }
 
 impl Host {
@@ -354,6 +373,10 @@ impl Host {
             device_lost: false,
             deferred_error: None,
             focus_after_sync: false,
+            file_dialog_presenter: None,
+            file_dialog_active: false,
+            com_error: None,
+            com: None,
         };
         host.insert_window(WindowHost::new(
             window,
@@ -436,6 +459,27 @@ impl Host {
             .map_err(|error| HostError::Window(error.to_string()))
     }
 
+    /// 安装测试或嵌入方的文件选择器；未安装时可见宿主使用原生对话框。
+    ///
+    /// 原生弹窗期间拒绝替换。隐藏宿主没有注入 presenter 时，请求以
+    /// `FileDialogError::Unsupported` 完成，不会打开真实对话框。
+    ///
+    /// # Errors
+    ///
+    /// 弹窗进行中时返回 [`HostError::Window`]。
+    pub fn set_file_dialog_presenter(
+        &mut self,
+        presenter: impl FileDialogPresenter + 'static,
+    ) -> Result<(), HostError> {
+        if self.file_dialog_active {
+            return Err(HostError::Window(String::from(
+                "cannot replace the file dialog presenter while a dialog is active",
+            )));
+        }
+        self.file_dialog_presenter = Some(Box::new(presenter));
+        Ok(())
+    }
+
     /// 显示所有打开的窗口（若配置为可见）并进入消息循环，直到最后一个窗口关闭。
     pub fn run(&mut self) -> Result<(), HostError> {
         self.sync_windows()?;
@@ -505,6 +549,88 @@ impl Host {
             }
             Err(error) => Err(HostError::WindowState(error)),
         }
+    }
+
+    /// 第一次需要原生对话框时初始化 UI 线程的 STA；失败原因被缓存。
+    fn ensure_com(&mut self) -> Result<(), FileDialogError> {
+        if self.com.is_some() {
+            return Ok(());
+        }
+        if let Some(error) = &self.com_error {
+            return Err(error.clone());
+        }
+        match ComApartment::initialize() {
+            Ok(com) => {
+                self.com = Some(com);
+                Ok(())
+            }
+            Err(error) => {
+                self.com_error = Some(error.clone());
+                Err(error)
+            }
+        }
+    }
+
+    /// 校验锚点并取出 presenter；失败时不改变 Host 的 presenter 槽。
+    fn file_dialog_work(
+        &mut self,
+        request: &FileDialogRequest,
+    ) -> Result<FileDialogWork, FileDialogError> {
+        let anchor = request.anchor();
+        let Some(window) = self.windows.get(anchor.key()) else {
+            return Err(FileDialogError::AnchorClosed);
+        };
+        if window.ctx != anchor || !self.runtime.window_accepts_input(anchor) {
+            return Err(FileDialogError::AnchorClosed);
+        }
+        let hwnd = window.hwnd();
+        let options = request.options().clone();
+        let (presenter, restore) = match self.file_dialog_presenter.take() {
+            Some(presenter) => (presenter, true),
+            None if self.show_windows => {
+                self.ensure_com()?;
+                (
+                    Box::new(NativeFileDialog) as Box<dyn FileDialogPresenter>,
+                    false,
+                )
+            }
+            None => return Err(FileDialogError::Unsupported),
+        };
+        self.file_dialog_active = true;
+        Ok(FileDialogWork {
+            presenter,
+            restore,
+            hwnd,
+            options,
+        })
+    }
+
+    /// 保存宿主结果并结算它引起的交付、窗口与重绘变化。
+    fn finish_file_dialog(
+        &mut self,
+        request: FileDialogRequest,
+        outcome: FileDialogOutcome,
+        presenter: Option<Box<dyn FileDialogPresenter>>,
+    ) -> Result<(), HostError> {
+        if let Some(presenter) = presenter {
+            self.file_dialog_presenter = Some(presenter);
+        }
+        self.file_dialog_active = false;
+        match self.runtime.complete_file_dialog_request(request, outcome) {
+            Ok(()) | Err(FileDialogRequestError::Stale) => {}
+            Err(error) => return Err(HostError::FileDialog(error)),
+        }
+        self.runtime.drive_tasks().map_err(HostError::Runtime)?;
+        self.settle_window_requests()?;
+        self.sync_windows()?;
+        if std::mem::take(&mut self.focus_after_sync) {
+            self.focus_native_focused_window()?;
+        }
+        self.repaint_changed_windows()?;
+        if let Some(error) = self.deferred_error.take() {
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// 把运行时焦点窗口置前；只在应用已经持有前台时重定向，绝不从其它进程抢焦点。
@@ -2126,6 +2252,8 @@ pub enum HostError {
     Snapshot(WindowError),
     /// 窗口状态操作（焦点遍历、清除焦点）失败。
     WindowState(WindowError),
+    /// 宿主完成文件选择请求失败；stale 结果已在内部忽略。
+    FileDialog(FileDialogRequestError),
     /// 场景构建失败。
     Scene(zenui_render::SceneError),
     /// GPU 渲染失败。
@@ -2150,6 +2278,7 @@ impl fmt::Display for HostError {
             Self::Close(error) => write!(f, "closing the window failed: {error}"),
             Self::Snapshot(error) => write!(f, "reading the window snapshot failed: {error}"),
             Self::WindowState(error) => write!(f, "window state change failed: {error}"),
+            Self::FileDialog(error) => write!(f, "file dialog request failed: {error}"),
             Self::Scene(error) => write!(f, "scene failed: {error}"),
             Self::Render(error) => write!(f, "render failed: {error}"),
             Self::Input(error) => write!(f, "pointer dispatch failed: {error}"),
@@ -2605,6 +2734,51 @@ fn dispatch_message(message: &MSG) {
     }
 }
 
+/// 在顶层消息回合之外服务文件选择请求。
+///
+/// 一次只弹一个对话框，调用 presenter 期间不持有任何 `&mut Host`；shell 的
+/// 模态循环可以正常把消息派发回窗口过程。每个结果随后走任务交付、窗口同步
+/// 与重绘，continuation 新排队的请求在同一循环里继续处理。
+///
+/// # Safety
+///
+/// `host` 指向在循环期间不会移动的 `Host`；调用方不持有它的引用。
+unsafe fn service_file_dialogs(host: *mut Host) -> Result<bool, HostError> {
+    let mut serviced = false;
+    loop {
+        let requests = unsafe { (&mut *host).runtime.take_file_dialog_requests() };
+        if requests.is_empty() {
+            return Ok(serviced);
+        }
+        serviced = true;
+        for request in requests {
+            let work = unsafe { (&mut *host).file_dialog_work(&request) };
+            let (outcome, presenter) = match work {
+                Ok(work) => {
+                    let FileDialogWork {
+                        mut presenter,
+                        restore,
+                        hwnd,
+                        options,
+                    } = work;
+                    let outcome =
+                        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            presenter.present(hwnd, &options)
+                        })) {
+                            Ok(outcome) => outcome,
+                            Err(_) => FileDialogOutcome::Failed(FileDialogError::DialogFailed(
+                                String::from("the file dialog presenter panicked"),
+                            )),
+                        };
+                    (outcome, restore.then_some(presenter))
+                }
+                Err(error) => (FileDialogOutcome::Failed(error), None),
+            };
+            unsafe { (&mut *host).finish_file_dialog(request, outcome, presenter)? };
+        }
+    }
+}
+
 /// `run` 的消息循环；返回关闭或处理错误。
 ///
 /// # Safety
@@ -2622,17 +2796,23 @@ unsafe fn run_loop(host: *mut Host) -> Result<(), HostError> {
             return Ok(());
         }
         dispatch_message(&message);
-        // 安全：派发已返回，重新借出宿主同步窗口并读取处理结果。
-        let host = unsafe { &mut *host };
-        host.sync_windows()?;
-        if std::mem::take(&mut host.focus_after_sync) {
-            host.focus_native_focused_window()?;
+        {
+            // 安全：派发已返回，重新借出宿主同步窗口并读取处理结果。
+            let host = unsafe { &mut *host };
+            host.sync_windows()?;
+            if std::mem::take(&mut host.focus_after_sync) {
+                host.focus_native_focused_window()?;
+            }
+            host.repaint_changed_windows()?;
+            if let Some(error) = host.deferred_error.take() {
+                return Err(error);
+            }
+            if host.runtime.windows().is_empty() {
+                return Ok(());
+            }
         }
-        host.repaint_changed_windows()?;
-        if let Some(error) = host.deferred_error.take() {
-            return Err(error);
-        }
-        if host.runtime.windows().is_empty() {
+        unsafe { service_file_dialogs(host)? };
+        if unsafe { &*host }.runtime.windows().is_empty() {
             return Ok(());
         }
     }
@@ -2645,7 +2825,16 @@ unsafe fn run_loop(host: *mut Host) -> Result<(), HostError> {
 /// 与 [`run_loop`] 相同。
 unsafe fn pump_loop(host: *mut Host) -> Result<bool, HostError> {
     loop {
-        // 安全：每次迭代重新借出宿主；派发期间不持有引用。
+        {
+            // 安全：每次迭代重新借出宿主；派发期间不持有引用。
+            let host = unsafe { &mut *host };
+            if host.runtime.windows().is_empty() {
+                // 确保关闭时排队的请求不会留下 Running 任务。
+                let _ = host.runtime.take_file_dialog_requests();
+                return Ok(true);
+            }
+        }
+        unsafe { service_file_dialogs(host)? };
         if unsafe { &*host }.runtime.windows().is_empty() {
             return Ok(true);
         }
@@ -2656,18 +2845,20 @@ unsafe fn pump_loop(host: *mut Host) -> Result<bool, HostError> {
             return Ok(false);
         }
         dispatch_message(&message);
-        // 安全：派发已返回，重新借出宿主同步窗口并读取处理结果。
-        let host = unsafe { &mut *host };
-        host.sync_windows()?;
-        if std::mem::take(&mut host.focus_after_sync) {
-            host.focus_native_focused_window()?;
-        }
-        host.repaint_changed_windows()?;
-        if let Some(error) = host.deferred_error.take() {
-            return Err(error);
-        }
-        if host.runtime.windows().is_empty() {
-            return Ok(true);
+        {
+            // 安全：派发已返回，重新借出宿主同步窗口并读取处理结果。
+            let host = unsafe { &mut *host };
+            host.sync_windows()?;
+            if std::mem::take(&mut host.focus_after_sync) {
+                host.focus_native_focused_window()?;
+            }
+            host.repaint_changed_windows()?;
+            if let Some(error) = host.deferred_error.take() {
+                return Err(error);
+            }
+            if host.runtime.windows().is_empty() {
+                return Ok(true);
+            }
         }
     }
 }
