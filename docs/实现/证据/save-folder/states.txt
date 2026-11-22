@@ -1,0 +1,118 @@
+commit: ffa81fc51ecac31ec57c5ed503ba28e255a3a7cb (main after #164)
+os: Microsoft Windows 11 专业版 10.0.26300 build 26300 64-bit, interactive session
+gpu: NVIDIA GeForce RTX 4060 Laptop GPU, driver 32.0.15.7283 (the visible host used its default DX12 path)
+dpi: 144 (150%); logical main window 900x700, client 1350x1050 physical
+display: single display; no 100% run in this acceptance
+input: main-window clicks and typing via PostMessage (WM_LBUTTONDOWN/WM_LBUTTONUP/WM_CHAR); shell dialogs driven through UI Automation for the filename field and Win32 SendMessage for buttons; not a real mouse/keyboard run
+privacy: the committed file-dialog PNGs (02, 06, 11, 15, 18, 20) paint a solid black rectangle over the left navigation tree, which can show the signed-in OneDrive display name. Title bar, address bar, file list, file-type filter and buttons are unmodified. Message-box and app-window captures (04, 13, 14, 16, 17, 19, 21) have no navigation tree. The dialogs were navigated to a temporary data directory before capture, so the file lists contain only probe files.
+
+main window: title="ZenUI Todo" class=ZenUIHostWindow hwnd=97979554 client=1350x1050 window=(228,228)-(1600,1334)
+
+capture 01-main.png
+start: rows=[Write tests (completed), Read docs (active)] "1 remaining"; notice empty; toolbar row 1 = Reverse, Clear done, Load sample, Import file, Theme, Details; toolbar row 2 = Save tasks, Choose folder; both new buttons fully inside the client area.
+
+step save-open: click Save tasks at client (95, 260)
+dialog: title="Save tasks" class=#32770 hwnd=128124688 client=1258x745 window=(239,273)-(1519,1074); owner=97979554; owner_enabled=false; file name="tasks.txt"; save type="Text files (*.txt)"; type_count=1; directory=E:\zenui-acceptance\save-folder\data
+capture 02-save-dialog.png (redacted)
+
+step save-success: invoke Save
+file: E:\zenui-acceptance\save-folder\data\tasks.txt
+bytes: "Write tests\nRead docs\n" (22 bytes, sha256 6335e6b95f95fd67d71c3460b85562e08c514aa138dfdaf26b9fe078d73505f5)
+notice: "Saved 2 tasks"; error empty; rows unchanged
+capture 03-main-saved.png
+
+step overwrite-cancel: seed tasks.txt with "old contents"; open Save tasks; invoke Save
+prompt: title="确认另存为" class=#32770 client=527x158; text "tasks.txt 已存在。要替换它吗？"; buttons 是(Y)/否(N)
+capture 04-overwrite-prompt.png
+click No: file remains "old contents"; save dialog remains open
+click Cancel: dialog closes; rows unchanged; notice remains "Saved 2 tasks"; error empty
+capture 05-main-after-save-cancel.png (same pixels as 03-main-saved.png)
+
+step overwrite-confirm: open Save tasks; invoke Save; click Yes
+file: E:\zenui-acceptance\save-folder\data\tasks.txt again contains "Write tests\nRead docs\n" with sha256 6335e6b95f95fd67d71c3460b85562e08c514aa138dfdaf26b9fe078d73505f5
+notice: "Saved 2 tasks"; error empty
+
+step folder-open: click Choose folder at client (270, 260)
+dialog: title="Choose a folder" class=#32770 hwnd=170854572 client=1259x745; owner=97979554; owner_enabled=false; no file-type filter; directory=E:\zenui-acceptance\save-folder\data
+capture 06-folder-dialog.png (redacted)
+
+step folder-cancel: invoke Cancel
+rows unchanged; notice remains "Saved 2 tasks"; error empty
+capture 07-main-after-folder-cancel.png
+
+step folder-pick: open Choose a folder; invoke Select Folder
+notice: "Folder: E:\zenui-acceptance\save-folder\data"; error empty
+capture 08-main-folder-selected.png
+open Details: Details window title="ZenUI Details" client=780x630; it renders "Folder: E:\zenui-acceptance\save-folder\data" in the shared notice
+capture 09-details-folder-notice.png
+
+step typing-after-dialog: click the draft input at client (622, 88); send "After dialog"
+draft shows "After dialog" with focus ring and caret; the shared notice is unchanged
+capture 10-main-typing-after-dialog.png
+
+step unicode-path: open Save tasks; set file name to
+  E:\zenui-acceptance\save-folder\data\验收-𠀀-保存与文件夹-很长的目录名称-用于路径回传验证\导出标题-𠀀-很长的文件名称-用于路径回传验证.txt
+the dialog shows the full path; type="Text files (*.txt)"
+capture 11-save-dialog-unicode.png (redacted)
+invoke Save: the exact file is created with the same 22 bytes and sha256 6335e6b95f95fd67d71c3460b85562e08c514aa138dfdaf26b9fe078d73505f5
+main notice becomes "Saved 2 tasks"; draft remains "After dialog"; error empty
+capture 12-main-unicode-save.png
+
+step shell-write-rejection: open Save tasks; set file name to C:\Windows\zenui-write-probe.txt; invoke Save
+nested shell prompt: title="Save tasks" class=#32770 client=527x230; text "C:\Windows\zenui-write-probe.txt 你没有权限在此位置中保存文件。请与管理员联系以获得相应权限。你想改为保存到 文档 文件夹中吗？"
+capture 13-write-failure-shell-rejection.png
+click No: the Save As dialog stays open; click Cancel: app rows, notice and error are unchanged; no file is written
+
+step readonly-write-rejection: create data\readonly.txt with "protected" and set the read-only attribute; open Save tasks; choose it; confirm overwrite
+nested shell prompt: title="Save tasks" class=#32770 client=527x182; text "readonly.txt 该文件已设置为只读。请使用其他文件名重试。"
+capture 14-readonly-warning.png
+click OK: the Save As dialog stays open; cancel; readonly.txt still contains "protected" and remains read-only
+
+step two-filter-precedence (Markdown-first run): temporary visible probe (not committed) exposes one Save button; options are filters [Markdown (*.md), Text files (*.txt)], suggested name "probe", default extension "txt"
+dialog: title="ZenUI Two Filters" class=#32770 client=1259x744; owner is the probe window and is disabled; the dialog opens with file name "probe.md" and save type "Markdown (*.md)"
+capture 15-two-filter-markdown-default.png (redacted)
+invoke Save: the continuation receives E:\zenui-acceptance\save-folder\data\probe.md
+capture 16-probe-markdown-result.png
+
+step two-filter-precedence (Text-first run): the same probe is rebuilt with filters [Text files (*.txt), Markdown (*.md)], suggested name "probe", default extension "md"
+dialog: title="ZenUI Two Filters" class=#32770 client=1259x742; owner disabled; the dialog opens with file name "probe.txt" and save type "Text files (*.txt)"
+capture 20-two-filter-text-default.png (redacted)
+invoke Save: the continuation receives E:\zenui-acceptance\save-folder\data\probe.txt
+capture 21-two-filter-text-result.png
+switching the type combo interactively was not driven (UI Automation exposes the control as a Pane without ExpandCollapse, and posted keyboard/mouse messages did not open the shell dropdown). The two runs above show that the initially selected filter type determines the applied extension and overrides the explicit default extension in both directions; the page does not claim a user-driven switch.
+
+step default-extension: temporary visible probe, no filters, suggested name "probe-ext", default extension "dat"
+dialog: title="ZenUI Default Extension" class=#32770 client=1259x743; owner disabled; no save type is configured; file name shows "probe-ext.dat"
+capture 18-default-extension.png (redacted)
+invoke Save: the continuation receives E:\zenui-acceptance\save-folder\data\probe-ext.dat
+capture 19-default-extension-result.png
+
+step modality: while the save dialog was open, main hwnd=97979554 reported visible=true enabled=false, and the dialog reported visible=true enabled=true. `17-main-during-dialog.png` is the owner's client-area capture taken at that moment; it cannot show the separate top-level dialog. The modality evidence is the Win32 state pair plus the dialog screenshot, not the owner image.
+capture 17-main-during-dialog.png
+
+worker-during-dialog: not observed in this run. The demo has no slow-task control, and no temporary worker probe was added. The earlier open-file acceptance page (commit 5f2cd54, #152/#153) recorded a slow worker completing while the dialog was still visible (changed_pixels=2952); that record is referenced, not re-claimed here.
+
+app-level write error: not reached natively. The shell's creation test rejected both unwritable destinations before returning a path, so the demo never entered its app-owned write. The worker write-failure surface is covered by the headless test crates/demo/tests/save.rs::save_reports_an_unwritable_destination_and_clears_the_notice; the two shell rejections above are the native evidence for the FOS_NOTESTFILECREATE decision.
+
+screenshot sha256:
+2fa75de380d675850ef58866c36df8a82dde2421b711cf26e94575ae1b0b3d2e  01-main.png
+7ddac33d3082483220a279cc5d23062d8186d5865092242cb2c43e9a0f5827c8  02-save-dialog.png
+09b759fbb7f49a46da0b1041a36015db025d0c502c7d8dc1418a0cd68e322563  03-main-saved.png
+46f3352ecdd674834efebd0fc8a92bc9c99a94b9fbf782ace23fe85c780708f2  04-overwrite-prompt.png
+09b759fbb7f49a46da0b1041a36015db025d0c502c7d8dc1418a0cd68e322563  05-main-after-save-cancel.png
+64fc7997122e40812d672f99bc59f49f32a7596e6e0eb5d94d3932275b161d36  06-folder-dialog.png
+4c6bad3b7c69199d09dad2ee6a81af722454a624d18667957eab0bb06e853a63  07-main-after-folder-cancel.png
+78e2c1b256eaf529425f32ff2805ffde9e311b12de117d8b64ca398fd054304e  08-main-folder-selected.png
+7f66a2ddcc2d4fe0ce024d80be948d20e9ada1a32235d315e7856caff0965bb1  09-details-folder-notice.png
+6dcb0e27402ce4ddf1779ea96152d293b78dd37a1790cfe0561947de78786ca9  10-main-typing-after-dialog.png
+78531e50bd7319e5bf96ad348f8f4234d493698e834b23856e35ac156f51409d  11-save-dialog-unicode.png
+2b5f36a54e2202a78b8e1e60d55170f989b4ab52e7f8fa7fe57c41f68beabb70  12-main-unicode-save.png
+8c91e43f2b5e78c6831339bab28d716410de46c32bf361fda45152bcfbd84436  13-write-failure-shell-rejection.png
+f2349e8d93227dd33f7db176542ee14b8f2006885c37144ec0e149b4a1956ee5  14-readonly-warning.png
+663d5f59afa2adba9c4e5921b92f3ba6e598fe980c67a47e8e093202e6149b9b  15-two-filter-markdown-default.png
+e07350dfbe58c4069de3388a588bab3cf00ebef61b8e782f2b3a4a19dca6a699  16-probe-markdown-result.png
+f4530c17ed804b1ec6e02885d40564d6a8e7ab519a0d02b1581fb0be4efc79bb  17-main-during-dialog.png
+fd45365630e2f96fe2c3774cc9dbd383a1c64a0a2d6181e86cc96fa4e578939c  18-default-extension.png
+b1669513e35ba7d70d914317c0a76b438fa79b7e796202528009e2cd8fe4ee87  19-default-extension-result.png
+30c6014f6f6b037f56ea9bebf0df50862c0be4e07cf836e871ea4c18685de90f  20-two-filter-text-default.png
+3b0642360d2173cd0f9672407a4a5c06a6bf15b3b8d2169999106c8f8d6f3500  21-two-filter-text-result.png

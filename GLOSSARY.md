@@ -44,12 +44,12 @@ _Avoid_: dialog role, modal role
 目录中以 `CloseConfirmation { parent }` 声明并绑定到 `Confirm` 父窗口的目录窗口；其 X、Escape 或关闭请求在 epoch 待决时表示 Deny。
 _Avoid_: dialog, modal (when meaning the catalog role)
 
-**File picker**:
-一个由应用从 `WindowCtx` 请求、由宿主后端呈现的原生打开文件对话框；携带标题、类型过滤器与单选/多选选项，返回 `Picked`、`Cancelled` 或 `Failed`。它不是窗口目录条目，也不等于关闭确认窗口。
-_Avoid_: file dialog window, import dialog
+**File dialog**:
+一个由应用从 `WindowCtx::request_file_dialog` 请求、由宿主后端呈现的原生打开、保存或选择文件夹对话框；按 kind 携带标题、类型过滤器、建议文件名、默认扩展名与单选/多选选项，返回 `Picked`、`Cancelled` 或 `Failed`。保存与文件夹都是单路径契约；文件夹忽略过滤器、建议文件名与默认扩展名。它不是窗口目录条目，也不等于关闭确认窗口。
+_Avoid_: file dialog window, file picker window, import dialog
 
 **Host task**:
-由后端服务而不是 worker 线程完成的任务；任务记录没有结果通道，只能经 `Runtime` 的宿主完成入口以恰好一次的方式完成，并在 `Delivery` turn 交付。文件选择器是当前的宿主任务；它与 worker 共享 Task 句柄和 continuation，但不被 `settle_tasks` 等待。
+由后端服务而不是 worker 线程完成的任务；任务记录没有结果通道，只能经 `Runtime` 的宿主完成入口以恰好一次的方式完成，并在 `Delivery` turn 交付。文件对话框是当前的宿主任务；它与 worker 共享 Task 句柄和 continuation，但不被 `settle_tasks` 等待。
 _Avoid_: host worker, UI task, dialog task
 
 **Host**:

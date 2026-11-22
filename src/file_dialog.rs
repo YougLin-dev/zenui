@@ -288,6 +288,9 @@ pub(crate) struct PendingFileDialog {
 impl WindowCtx {
     /// 请求宿主以本窗口为锚点显示文件对话框。
     ///
+    /// 这个入口原名 `pick_file`；现在同一个入口覆盖打开、保存与文件夹三种
+    /// kind，避免为保存和文件夹再分叉出平行的 API。
+    ///
     /// 对话框的用途、标题、过滤器、建议文件名与默认扩展名由 `options` 决定；
     /// 哪些字段生效取决于 [`FileDialogKind`]。平台宿主决定是否实现该 kind：
     /// Windows 宿主呈现打开、保存与选择文件夹请求；不提供该能力的宿主以
