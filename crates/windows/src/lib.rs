@@ -9,7 +9,11 @@
 #![deny(missing_docs)]
 
 #[cfg(windows)]
+mod file_dialog;
+#[cfg(windows)]
 mod host;
 
+#[cfg(windows)]
+pub use file_dialog::FileDialogPresenter;
 #[cfg(windows)]
 pub use host::{Frame, Host, HostConfig, HostError};
