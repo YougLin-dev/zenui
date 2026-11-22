@@ -23,19 +23,33 @@ impl FileFilter {
     }
 }
 
-/// 打开单个文件或多个文件；保存对话框不在本里程碑内。
+/// 文件对话框的用途：打开文件、保存文件或选择文件夹。
+///
+/// 打开与保存使用标题和过滤器；保存还使用建议文件名与默认扩展名；选择
+/// 文件夹只使用标题。保存与选择文件夹都只返回一个路径。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FileDialogKind {
+    /// 打开单个文件。
     OpenFile,
+    /// 打开多个文件。
     OpenFiles,
+    /// 保存文件；只返回一个路径。
+    SaveFile,
+    /// 选择文件夹；只返回一个路径。
+    PickFolder,
 }
 
-/// 应用交给宿主文件选择器的只读选项；框架不预设标题、过滤器或扩展名。
+/// 应用交给宿主文件对话框的只读选项；框架不预设标题、过滤器、建议文件名或默认扩展名。
+///
+/// 字段按 [`FileDialogKind`] 生效：打开与保存使用标题和过滤器；保存还使用
+/// 建议文件名与默认扩展名；选择文件夹只使用标题，其余字段被忽略。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileDialogOptions {
     kind: FileDialogKind,
     title: String,
     filters: Vec<FileFilter>,
+    suggested_name: String,
+    default_extension: String,
 }
 
 impl FileDialogOptions {
@@ -45,6 +59,8 @@ impl FileDialogOptions {
             kind: FileDialogKind::OpenFile,
             title: String::new(),
             filters: Vec::new(),
+            suggested_name: String::new(),
+            default_extension: String::new(),
         }
     }
 
@@ -56,19 +72,40 @@ impl FileDialogOptions {
         }
     }
 
+    /// 保存文件；建议文件名与默认扩展名为空表示不提供。
+    #[must_use]
+    pub fn save_file() -> Self {
+        Self {
+            kind: FileDialogKind::SaveFile,
+            ..Self::open_file()
+        }
+    }
+
+    /// 选择文件夹；过滤器、建议文件名与默认扩展名在此 kind 下被忽略。
+    #[must_use]
+    pub fn pick_folder() -> Self {
+        Self {
+            kind: FileDialogKind::PickFolder,
+            ..Self::open_file()
+        }
+    }
+
     #[must_use]
     pub fn titled(mut self, title: impl Into<String>) -> Self {
         self.title = title.into();
         self
     }
 
-    /// 扩展名可以带前导点；空扩展名被忽略。
+    /// 扩展名可以带前导点；空扩展名被忽略。选择文件夹时忽略过滤器。
     #[must_use]
     pub fn filter(
         mut self,
         name: impl Into<String>,
         extensions: impl IntoIterator<Item = impl Into<String>>,
     ) -> Self {
+        if !Self::uses_filters(self.kind) {
+            return self;
+        }
         let extensions = extensions
             .into_iter()
             .map(Into::into)
@@ -82,6 +119,27 @@ impl FileDialogOptions {
         self
     }
 
+    /// 设置保存对话框的建议文件名；空表示不提供。其他 kind 忽略该值。
+    /// 读取使用 [`Self::suggested_name`]。
+    #[must_use]
+    pub fn with_suggested_name(mut self, name: impl Into<String>) -> Self {
+        if Self::uses_save_fields(self.kind) {
+            self.suggested_name = name.into();
+        }
+        self
+    }
+
+    /// 设置保存对话框的默认扩展名；前导点会被去掉，空值表示不提供。
+    /// 其他 kind 忽略该值。读取使用 [`Self::default_extension`]。
+    #[must_use]
+    pub fn with_default_extension(mut self, extension: impl Into<String>) -> Self {
+        if Self::uses_save_fields(self.kind) {
+            let extension = extension.into();
+            self.default_extension = extension.trim_start_matches('.').to_owned();
+        }
+        self
+    }
+
     pub fn kind(&self) -> FileDialogKind {
         self.kind
     }
@@ -90,12 +148,35 @@ impl FileDialogOptions {
         &self.title
     }
 
+    /// 打开与保存对话框的过滤器；选择文件夹时为空。
     pub fn filters(&self) -> &[FileFilter] {
         &self.filters
     }
 
+    /// 保存对话框的建议文件名；不适用或未设置时为空。
+    pub fn suggested_name(&self) -> &str {
+        &self.suggested_name
+    }
+
+    /// 保存对话框的默认扩展名（不含前导点）；不适用或未设置时为空。
+    pub fn default_extension(&self) -> &str {
+        &self.default_extension
+    }
+
+    /// 只有 [`FileDialogKind::OpenFiles`] 允许返回多个路径。
     pub const fn allows_multiple(&self) -> bool {
         matches!(self.kind, FileDialogKind::OpenFiles)
+    }
+
+    const fn uses_filters(kind: FileDialogKind) -> bool {
+        matches!(
+            kind,
+            FileDialogKind::OpenFile | FileDialogKind::OpenFiles | FileDialogKind::SaveFile
+        )
+    }
+
+    const fn uses_save_fields(kind: FileDialogKind) -> bool {
+        matches!(kind, FileDialogKind::SaveFile)
     }
 }
 
@@ -105,7 +186,7 @@ impl Default for FileDialogOptions {
     }
 }
 
-/// 一次文件选择的结果；用户取消不是错误。
+/// 一次文件对话框的结果；用户取消不是错误。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FileDialogOutcome {
     Picked(Vec<PathBuf>),
@@ -113,10 +194,10 @@ pub enum FileDialogOutcome {
     Failed(FileDialogError),
 }
 
-/// 宿主无法完成文件选择的原因；对话框内的普通错误保留平台文本。
+/// 宿主无法完成文件对话框的原因；对话框内的普通错误保留平台文本。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FileDialogError {
-    /// 当前宿主或线程不提供系统文件对话框。
+    /// 当前宿主或线程不提供系统文件对话框，或该对话框类型尚未实现。
     Unsupported,
     /// 弹窗时锚点窗口已关闭、隐藏或暂停输入。
     AnchorClosed,
@@ -127,7 +208,9 @@ pub enum FileDialogError {
 impl fmt::Display for FileDialogError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Unsupported => f.write_str("the host does not support a native file dialog"),
+            Self::Unsupported => {
+                f.write_str("the host does not support the requested native file dialog")
+            }
             Self::AnchorClosed => f.write_str("the anchor window is no longer available"),
             Self::DialogFailed(message) => write!(f, "the file dialog failed: {message}"),
         }
@@ -203,7 +286,12 @@ pub(crate) struct PendingFileDialog {
 }
 
 impl WindowCtx {
-    /// 请求宿主以本窗口为锚点显示打开文件对话框。
+    /// 请求宿主以本窗口为锚点显示文件对话框。
+    ///
+    /// 对话框的用途、标题、过滤器、建议文件名与默认扩展名由 `options` 决定；
+    /// 哪些字段生效取决于 [`FileDialogKind`]。平台宿主决定是否实现该 kind：
+    /// 当前 Windows 宿主只呈现打开文件请求，保存与选择文件夹请求以
+    /// [`FileDialogError::Unsupported`] 完成，不会打开替代对话框。
     ///
     /// 只能从 `Event` 或 `Delivery` 处理器调用；返回的任务按 `scope` 决定生命
     /// 周期。`window.task_scope()` 在窗口关闭时取消交付，`app_task_scope()` 允许
@@ -315,5 +403,88 @@ impl Runtime {
             return Err(FileDialogRequestError::WrongRuntime);
         }
         state.complete_host_task(request.task, TaskKind::FileDialog, Box::new(outcome))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn configured(options: FileDialogOptions) -> FileDialogOptions {
+        options
+            .titled("Dialog")
+            .filter("Text", [".txt", "md"])
+            .with_suggested_name("notes")
+            .with_default_extension(".md")
+    }
+
+    fn extensions(options: &FileDialogOptions) -> Vec<&str> {
+        options.filters()[0]
+            .extensions()
+            .iter()
+            .map(String::as_str)
+            .collect()
+    }
+
+    #[test]
+    fn each_kind_uses_only_its_documented_fields() {
+        for options in [
+            configured(FileDialogOptions::open_file()),
+            configured(FileDialogOptions::open_files()),
+        ] {
+            assert_eq!(options.title(), "Dialog");
+            assert_eq!(extensions(&options), ["txt", "md"]);
+            assert_eq!(options.suggested_name(), "");
+            assert_eq!(options.default_extension(), "");
+        }
+
+        let save = configured(FileDialogOptions::save_file());
+        assert_eq!(save.title(), "Dialog");
+        assert_eq!(save.filters()[0].name(), "Text");
+        assert_eq!(extensions(&save), ["txt", "md"]);
+        assert_eq!(save.suggested_name(), "notes");
+        assert_eq!(save.default_extension(), "md");
+
+        let folder = configured(FileDialogOptions::pick_folder());
+        assert_eq!(folder.title(), "Dialog");
+        assert!(folder.filters().is_empty());
+        assert_eq!(folder.suggested_name(), "");
+        assert_eq!(folder.default_extension(), "");
+    }
+
+    #[test]
+    fn only_open_files_allows_multiple_paths() {
+        assert!(!FileDialogOptions::open_file().allows_multiple());
+        assert!(FileDialogOptions::open_files().allows_multiple());
+        assert!(!FileDialogOptions::save_file().allows_multiple());
+        assert!(!FileDialogOptions::pick_folder().allows_multiple());
+    }
+
+    #[test]
+    fn default_extension_strips_leading_dots_and_empty_means_absent() {
+        assert_eq!(
+            FileDialogOptions::save_file()
+                .with_default_extension(".txt")
+                .default_extension(),
+            "txt"
+        );
+        assert_eq!(
+            FileDialogOptions::save_file()
+                .with_default_extension("..md")
+                .default_extension(),
+            "md"
+        );
+        assert_eq!(
+            FileDialogOptions::save_file()
+                .with_default_extension(".")
+                .default_extension(),
+            ""
+        );
+        assert_eq!(
+            FileDialogOptions::save_file()
+                .with_suggested_name("")
+                .suggested_name(),
+            ""
+        );
     }
 }

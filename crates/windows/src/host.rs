@@ -462,10 +462,12 @@ impl Host {
             .map_err(|error| HostError::Window(error.to_string()))
     }
 
-    /// 安装测试或嵌入方的文件选择器；未安装时可见宿主使用原生对话框。
+    /// 安装测试或嵌入方的打开文件选择器；未安装时可见宿主使用原生对话框。
     ///
-    /// 原生弹窗期间拒绝替换。隐藏宿主没有注入 presenter 时，请求以
-    /// `FileDialogError::Unsupported` 完成，不会打开真实对话框。
+    /// 保存与文件夹请求在 presenter 之前以 `FileDialogError::Unsupported`
+    /// 完成，不会调用任何 presenter，也不会初始化 COM。原生弹窗期间拒绝
+    /// 替换。隐藏宿主没有注入 presenter 时，打开请求同样以 `Unsupported`
+    /// 完成，不会打开真实对话框。
     ///
     /// # Errors
     ///
@@ -579,6 +581,14 @@ impl Host {
         &mut self,
         request: &FileDialogRequest,
     ) -> Result<FileDialogWork, FileDialogError> {
+        // 保存与文件夹的原生映射尚未实现；在任何 presenter 或 COM 工作之前
+        // 拒绝，绝不复用打开文件对话框。
+        if !matches!(
+            request.options().kind(),
+            FileDialogKind::OpenFile | FileDialogKind::OpenFiles
+        ) {
+            return Err(FileDialogError::Unsupported);
+        }
         let anchor = request.anchor();
         let Some(window) = self.windows.get(anchor.key()) else {
             return Err(FileDialogError::AnchorClosed);
