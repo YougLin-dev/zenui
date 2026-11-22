@@ -38,11 +38,28 @@ fn measure(repetitions: u32, mut step: impl FnMut()) -> Duration {
     start.elapsed() / repetitions
 }
 
+fn visible_elements(scene: &Scene) -> usize {
+    let viewport = scene.viewport();
+    scene
+        .elements()
+        .iter()
+        .filter(|element| {
+            let rect = element.rect();
+            rect.width > 0.0
+                && rect.height > 0.0
+                && rect.x < viewport.width()
+                && rect.right() > 0.0
+                && rect.y < viewport.height()
+                && rect.bottom() > 0.0
+        })
+        .count()
+}
+
 fn main() {
     const REPETITIONS: u32 = 20;
     let viewport = Viewport::new(900.0, 700.0, 1.0).expect("viewport");
 
-    for rows in [100usize, 500, 1000] {
+    for rows in [100usize, 500, 1000, 5000] {
         let (mut app, path) = imported_runtime(rows);
         let snapshot = app.presentation().expect("presentation");
         let fresh = measure(REPETITIONS, || {
@@ -69,8 +86,28 @@ fn main() {
             start.elapsed()
         };
         let elements = input_snapshot.elements().count();
+        let base = Scene::build_cached(&input_snapshot, viewport, &SceneEnv::default(), &mut cache)
+            .expect("base scene");
+        let max_offset = base.max_scroll_offset();
+        let offset = max_offset / 2;
+        let scroll_env = SceneEnv::default().with_scroll_offset(offset);
+        let scroll_build = {
+            let start = Instant::now();
+            let _ = Scene::build_cached(&input_snapshot, viewport, &scroll_env, &mut cache)
+                .expect("scroll scene");
+            start.elapsed()
+        };
+        let scroll_scene = Scene::build_cached(&input_snapshot, viewport, &scroll_env, &mut cache)
+            .expect("scroll scene");
+        let visible = visible_elements(&scroll_scene);
+        let shaped = scroll_scene
+            .elements()
+            .iter()
+            .filter(|element| !element.text().is_empty())
+            .count();
         println!(
-            "rows={rows} fresh={fresh:?} cold_cached={cold:?} warm_cached={warm:?} input_rebuild={input_rebuild:?} elements={elements}"
+            "rows={rows} fresh={fresh:?} cold_cached={cold:?} warm_cached={warm:?} input_rebuild={input_rebuild:?} scroll_build={scroll_build:?} offset={offset} max_offset={max_offset} content_height={:.1} visible={visible} shaped={shaped} elements={elements}",
+            scroll_scene.content_extent().height
         );
         let _ = std::fs::remove_file(&path);
     }

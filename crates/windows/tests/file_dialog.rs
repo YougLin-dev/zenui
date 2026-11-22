@@ -34,6 +34,32 @@ fn PickerProbe(window: WindowCtx, picks: Picks, outcomes: Outcomes) -> MountResu
         );
     };
 
+    let save_picks = picks.clone();
+    let save_outcomes = outcomes.clone();
+    let save = move || {
+        let options = FileDialogOptions::save_file()
+            .titled("Save tasks")
+            .filter("Text files", ["txt"])
+            .with_suggested_name("tasks.txt")
+            .with_default_extension(".txt");
+        register(
+            window.request_file_dialog(options, window.app_task_scope()),
+            &save_picks,
+            &save_outcomes,
+        );
+    };
+
+    let folder_picks = picks.clone();
+    let folder_outcomes = outcomes.clone();
+    let folder = move || {
+        let options = FileDialogOptions::pick_folder().titled("Pick a folder");
+        register(
+            window.request_file_dialog(options, window.app_task_scope()),
+            &folder_picks,
+            &folder_outcomes,
+        );
+    };
+
     let close_picks = picks.clone();
     let close_outcomes = outcomes.clone();
     let close_and_pick = move || {
@@ -63,6 +89,8 @@ fn PickerProbe(window: WindowCtx, picks: Picks, outcomes: Outcomes) -> MountResu
     view! {
         <view role="main">
             <button aria:label="Pick" on:click={move || pick()}>"Pick"</button>
+            <button aria:label="Save" on:click={move || save()}>"Save"</button>
+            <button aria:label="Folder" on:click={move || folder()}>"Folder"</button>
             <button aria:label="Close and pick" on:click={move || close_and_pick()}>
                 "Close and pick"
             </button>
@@ -384,6 +412,53 @@ fn two_requests_are_served_fifo_and_never_nested() {
             FileDialogOutcome::Picked(vec![PathBuf::from("picked-0.txt")]),
             FileDialogOutcome::Picked(vec![PathBuf::from("picked-1.txt")]),
         ]
+    );
+}
+
+#[test]
+fn save_and_folder_requests_complete_unsupported_before_the_presenter() {
+    let mut harness = open();
+    let calls: Calls = Rc::new(RefCell::new(Vec::new()));
+    install_recording(
+        &mut harness,
+        &calls,
+        FileDialogOutcome::Picked(vec![PathBuf::from("picked.txt")]),
+    );
+
+    post_click(&harness.host, "Save");
+    post_click(&harness.host, "Folder");
+    assert!(!harness.host.pump().expect("complete both unsupported"));
+
+    assert!(
+        calls.borrow().is_empty(),
+        "an open-file presenter is never called for save or folder"
+    );
+    assert_eq!(
+        harness.outcomes.borrow().as_slice(),
+        [
+            FileDialogOutcome::Failed(FileDialogError::Unsupported),
+            FileDialogOutcome::Failed(FileDialogError::Unsupported),
+        ]
+    );
+
+    post_click(&harness.host, "Pick");
+    assert!(
+        !harness
+            .host
+            .pump()
+            .expect("present an open request after the rejections")
+    );
+    assert_eq!(
+        calls.borrow().len(),
+        1,
+        "the presenter slot survives the rejected requests"
+    );
+    assert_eq!(
+        harness.outcomes.borrow().last(),
+        Some(&FileDialogOutcome::Picked(vec![PathBuf::from(
+            "picked.txt"
+        )])),
+        "open behavior is unchanged after save and folder are rejected"
     );
 }
 
