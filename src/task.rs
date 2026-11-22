@@ -11,15 +11,25 @@ use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::thread::JoinHandle;
 
 use crate::context::{Phase, with_state, with_state_of};
+use crate::file_dialog::{
+    FileDialogError, FileDialogOutcome, FileDialogRequestError, PendingFileDialog,
+};
 use crate::runtime::{Runtime, State};
 use crate::view::MountError;
 use crate::window::WindowCtx;
 
 pub(crate) type WakeCallback = Arc<dyn Fn() + Send + Sync>;
 
+/// 任务由 worker 线程完成，还是由宿主服务完成。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TaskKind {
+    Worker,
+    FileDialog,
+}
+
 /// `App` 拥有的工作可以跨窗口关闭继续提交模型；
 /// `Window` 拥有的工作在 activation 关闭时取消交付。
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TaskOwner {
     App,
     Window(WindowCtx),
@@ -57,6 +67,10 @@ impl TaskScope {
             owner: TaskOwner::Window(window),
             _not_send: PhantomData,
         }
+    }
+
+    pub(crate) const fn task_owner(self) -> TaskOwner {
+        self.owner
     }
 
     /// worker 只接收可 Send 的 job；UI 句柄不满足 `Send`，在编译期被拒绝。
@@ -145,7 +159,7 @@ impl TaskToken {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TaskStatus {
     Running,
-    /// worker 已返回，结果等待 continuation 或交付检查。
+    /// worker 已返回或宿主服务已给出结果，值等待 continuation 或交付检查。
     Completed,
     /// continuation 已在 delivery command turn 中执行。
     Delivered,
@@ -213,6 +227,18 @@ impl<T> Clone for Task<T> {
     }
 }
 
+impl<T> Task<T> {
+    /// 宿主任务由运行时创建句柄；字段保持私有，调用方只能通过公开入口取得。
+    pub(crate) const fn from_id(runtime: u32, id: u32) -> Self {
+        Self {
+            runtime,
+            id,
+            _marker: PhantomData,
+            _not_send: PhantomData,
+        }
+    }
+}
+
 impl<T> fmt::Debug for Task<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Task")
@@ -259,6 +285,8 @@ pub(crate) struct TaskStart {
 
 pub(crate) struct TaskRecord {
     owner: TaskOwner,
+    /// 宿主服务与 worker 使用同一交付机制，但完成入口不同。
+    kind: TaskKind,
     /// 启动位置的 Owner；失败的挂载会取消在该 setup 子树中创建的任务。
     origin: Option<u32>,
     status: TaskStatus,
@@ -320,6 +348,7 @@ impl State {
             id,
             TaskRecord {
                 owner,
+                kind: TaskKind::Worker,
                 origin: self.current_owner,
                 status: TaskStatus::Running,
                 token: Arc::clone(&token),
@@ -330,6 +359,92 @@ impl State {
             },
         );
         Ok(TaskStart { id, sender, token })
+    }
+
+    /// 创建一个由宿主服务完成的任务；没有 worker channel，因此不会被当成
+    /// 已断开的 worker 标记为 Panicked。
+    pub(crate) fn begin_host_task(
+        &mut self,
+        owner: TaskOwner,
+        kind: TaskKind,
+    ) -> Result<u32, TaskError> {
+        if matches!(self.phase, Phase::Binding | Phase::Memo) {
+            return Err(TaskError::Context {
+                operation: "host task",
+                phase: self.phase,
+            });
+        }
+        if !self.task_target_live(owner) {
+            return Err(TaskError::TargetClosed);
+        }
+        let id = self.next_task;
+        self.next_task += 1;
+        self.tasks.insert(
+            id,
+            TaskRecord {
+                owner,
+                kind,
+                origin: self.current_owner,
+                status: TaskStatus::Running,
+                token: Arc::new(AtomicBool::new(false)),
+                worker: None,
+                receiver: None,
+                completion: None,
+                continuation: None,
+            },
+        );
+        Ok(id)
+    }
+
+    /// 宿主结果只写入完成值；continuation 仍由 `drive_tasks` 在 Delivery turn
+    /// 中执行，且不会覆盖已有状态。
+    pub(crate) fn complete_host_task(
+        &mut self,
+        id: u32,
+        kind: TaskKind,
+        value: Box<dyn Any + Send>,
+    ) -> Result<(), FileDialogRequestError> {
+        let Some(record) = self.tasks.get_mut(&id) else {
+            return Err(FileDialogRequestError::Stale);
+        };
+        if record.kind != kind {
+            return Err(FileDialogRequestError::Stale);
+        }
+        match record.status {
+            TaskStatus::Running if record.completion.is_none() => {
+                record.completion = Some(value);
+                record.status = TaskStatus::Completed;
+                Ok(())
+            }
+            TaskStatus::Cancelled | TaskStatus::Stale => Err(FileDialogRequestError::Stale),
+            _ => Err(FileDialogRequestError::AlreadySettled),
+        }
+    }
+
+    /// 锚点已经不可用时结算一个排队请求：窗口所有权取消，应用所有权把
+    /// `AnchorClosed` 作为正常结果交付，避免 continuation 永远等待。
+    pub(crate) fn settle_orphaned_file_dialog(&mut self, pending: PendingFileDialog) {
+        let Some(record) = self.tasks.get_mut(&pending.task) else {
+            return;
+        };
+        match record.owner {
+            TaskOwner::App => {
+                if record.status == TaskStatus::Running && record.completion.is_none() {
+                    record.completion = Some(Box::new(FileDialogOutcome::Failed(
+                        FileDialogError::AnchorClosed,
+                    )));
+                    record.status = TaskStatus::Completed;
+                }
+            }
+            TaskOwner::Window(_) => {
+                if record.status == TaskStatus::Running {
+                    record.status = TaskStatus::Cancelled;
+                    record.token.store(true, Ordering::SeqCst);
+                    record.continuation = None;
+                    record.completion = None;
+                }
+            }
+        }
     }
 
     pub(crate) fn attach_worker(&mut self, id: u32, worker: JoinHandle<()>) {
@@ -380,6 +495,16 @@ impl State {
                 record.continuation = None;
             }
         }
+        let pending = std::mem::take(&mut self.pending_file_dialogs);
+        let tasks = &self.tasks;
+        self.pending_file_dialogs = pending
+            .into_iter()
+            .filter(|request| {
+                tasks
+                    .get(&request.task)
+                    .is_some_and(|record| record.status == TaskStatus::Running)
+            })
+            .collect();
     }
 
     pub(crate) fn cancel_window_tasks(&mut self, key: &'static str, activation: u32) {
@@ -396,6 +521,16 @@ impl State {
                 record.continuation = None;
             }
         }
+        let pending = std::mem::take(&mut self.pending_file_dialogs);
+        let mut kept = Vec::with_capacity(pending.len());
+        for request in pending {
+            if request.anchor.key == key && request.anchor.activation == activation {
+                self.settle_orphaned_file_dialog(request);
+            } else {
+                kept.push(request);
+            }
+        }
+        self.pending_file_dialogs = kept;
     }
 
     fn task_target_live(&self, owner: TaskOwner) -> bool {
@@ -558,7 +693,8 @@ impl Runtime {
     }
 
     /// 等待所有 worker 返回，包括结果发送之后的唤醒步骤；窗口已取消的任务也会
-    /// 等到其完成，以便确认结果被丢弃。
+    /// 等到其完成，以便确认结果被丢弃。宿主任务（例如文件选择器）没有 worker
+    /// channel，不在这里等待，由对应后端通过完成入口给出结果。
     pub fn wait_for_tasks(&mut self) {
         loop {
             let next = {
@@ -667,7 +803,9 @@ impl Runtime {
         })
     }
 
-    /// headless 驱动入口：等待 worker，然后按 delivery 检查交付。
+    /// headless 驱动入口：等待 worker 并交付结果。宿主任务不会让这里阻塞；
+    /// 后端完成宿主任务后仍需调用 [`Runtime::drive_tasks`]（或本方法）执行
+    /// continuation。
     pub fn settle_tasks(&mut self) -> Result<DeliveryReport, MountError> {
         let mut report = DeliveryReport::default();
         loop {
@@ -687,5 +825,52 @@ impl Runtime {
             .tasks
             .values()
             .any(|record| record.receiver.is_some())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_host_task_accepts_exactly_one_completion() {
+        let app = Runtime::new();
+        let mut state = app.state.borrow_mut();
+        let id = state
+            .begin_host_task(TaskOwner::App, TaskKind::FileDialog)
+            .expect("begin the host task");
+        assert!(
+            state
+                .complete_host_task(
+                    id,
+                    TaskKind::FileDialog,
+                    Box::new(FileDialogOutcome::Cancelled)
+                )
+                .is_ok()
+        );
+        assert_eq!(
+            state.complete_host_task(
+                id,
+                TaskKind::FileDialog,
+                Box::new(FileDialogOutcome::Cancelled)
+            ),
+            Err(FileDialogRequestError::AlreadySettled)
+        );
+        assert_eq!(state.tasks[&id].status, TaskStatus::Completed);
+    }
+
+    #[test]
+    fn a_worker_task_cannot_be_completed_as_a_host_task() {
+        let app = Runtime::new();
+        let mut state = app.state.borrow_mut();
+        let worker = state.begin_task(TaskOwner::App).expect("begin the worker");
+        assert_eq!(
+            state.complete_host_task(
+                worker.id,
+                TaskKind::FileDialog,
+                Box::new(FileDialogOutcome::Cancelled)
+            ),
+            Err(FileDialogRequestError::Stale)
+        );
     }
 }
