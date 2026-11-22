@@ -22,7 +22,7 @@ use windows::Win32::UI::Input::Ime::{
     ImmReleaseContext, ImmSetCandidateWindow, ImmSetCompositionWindow, NI_COMPOSITIONSTR,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetCapture, GetKeyState, ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT,
+    EnableWindow, GetCapture, GetKeyState, ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT,
     TrackMouseEvent, VIRTUAL_KEY, VK_A, VK_BACK, VK_CONTROL, VK_DELETE, VK_END, VK_ESCAPE, VK_HOME,
     VK_LEFT, VK_PROCESSKEY, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_TAB,
 };
@@ -197,6 +197,8 @@ struct WindowHost {
     caret_visible: bool,
     blink_timer: Option<usize>,
     close_requested: bool,
+    /// 原生 HWND 是否启用；待决关闭的父窗口保持禁用，直到 Deny。
+    enabled: bool,
     /// 指针、按压、模态或 caret 等瞬时状态变化需要重绘；它们不进入快照。
     paint_requested: bool,
     /// 最近一次构建的呈现快照；未变化的窗口跳过重绘。
@@ -240,6 +242,8 @@ pub struct Host {
     device_lost: bool,
     /// 窗口过程不能返回错误；消息循环在派发后取走并返回。
     deferred_error: Option<HostError>,
+    /// 关闭协议改变了焦点/启用状态，消息循环在下次同步后重定向前台。
+    focus_after_sync: bool,
 }
 
 impl Host {
@@ -346,6 +350,7 @@ impl Host {
             recovering: false,
             device_lost: false,
             deferred_error: None,
+            focus_after_sync: false,
         };
         host.insert_window(WindowHost::new(
             window,
@@ -490,7 +495,11 @@ impl Host {
     fn settle_window_requests(&mut self) -> Result<(), HostError> {
         match self.runtime.apply_window_requests() {
             Ok(0) => Ok(()),
-            Ok(_) => self.focus_native_focused_window(),
+            Ok(_) => {
+                // 启用/禁用与焦点恢复要等消息循环同步 HWND 之后再执行。
+                self.focus_after_sync = true;
+                Ok(())
+            }
             Err(error) => Err(HostError::WindowState(error)),
         }
     }
@@ -512,7 +521,7 @@ impl Host {
         let Some(window) = self.windows.get(key) else {
             return Ok(());
         };
-        if !window.native.shown || window.close_requested {
+        if !window.native.shown || window.close_requested || !window.enabled {
             return Ok(());
         }
         let hwnd = window.hwnd();
@@ -543,8 +552,9 @@ impl Host {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> Result<(), HostError> {
-        if window.close_requested || !self.runtime.window_visible(window.ctx) {
-            // 关闭或隐藏的窗口不接受输入；迟到的唤醒由宿主级路径丢弃结果。
+        if window.close_requested || !self.runtime.window_accepts_input(window.ctx) {
+            // 关闭、隐藏或等待关闭确认的窗口不接受输入；迟到的唤醒由宿主的
+            // 窗口级路径丢弃结果。
             return Ok(());
         }
         // 任何输入都让 caret 立即可见，之后由闪烁定时器继续。
@@ -611,7 +621,11 @@ impl Host {
         }
     }
 
-    /// `WM_CLOSE` 的宿主处理：结束该窗口的 activation，消息循环随后销毁 HWND。
+    /// `WM_CLOSE` 的宿主处理：走目录关闭策略。
+    ///
+    /// Immediate 结束 activation，消息循环随后销毁 HWND；Confirm 建立 epoch
+    /// 并显示确认窗口，父窗口保持存活但在下一轮同步中禁用。确认窗口自己的
+    /// X 由运行时解释为 Deny。
     fn close_from_window(&mut self, hwnd: HWND) {
         let Some(key) = self.key_for(hwnd) else {
             return;
@@ -619,14 +633,15 @@ impl Host {
         let Some(ctx) = self.windows.get(key).map(|window| window.ctx) else {
             return;
         };
-        match self.runtime.close_window(ctx) {
+        match self.runtime.request_close(ctx) {
             Ok(()) => {
-                if let Some(window) = self.windows.get_mut(key) {
+                if !self.runtime.window_alive(ctx)
+                    && let Some(window) = self.windows.get_mut(key)
+                {
                     window.close_requested = true;
-                    window.pressed = None;
-                    window.hovered = None;
-                    window.pointer = None;
+                    window.clear_pointer_transients();
                 }
+                self.focus_after_sync = true;
             }
             Err(error) => {
                 self.deferred_error.get_or_insert(HostError::Close(error));
@@ -1231,6 +1246,24 @@ impl Host {
             window.paint_requested = true;
             return Ok(());
         }
+        if key == VK_ESCAPE
+            && self
+                .runtime
+                .confirmation_request(window.ctx)
+                .is_ok_and(|request| request.is_some())
+        {
+            // 组合中的 Escape 只取消组合；否则确认窗口的 Escape 等价于 Deny。
+            if self.cancel_compositions(window)? {
+                window.paint_requested = true;
+                return Ok(());
+            }
+            self.runtime
+                .request_close(window.ctx)
+                .map_err(HostError::Close)?;
+            self.focus_after_sync = true;
+            window.paint_requested = true;
+            return Ok(());
+        }
 
         let snapshot = self
             .runtime
@@ -1729,6 +1762,12 @@ impl Host {
         hwnds
     }
 
+    fn mark_all_windows_dirty(&mut self) {
+        for window in self.windows.values_mut() {
+            window.paint_requested = true;
+        }
+    }
+
     fn clear_pressed_except(&mut self, key: &'static str) {
         for (other_key, other) in &mut self.windows {
             if *other_key != key && other.pressed.take().is_some() {
@@ -1808,9 +1847,7 @@ impl Host {
             }
         }
         // 销毁期间的激活/重绘消息被跳过；让存活窗口在下一帧重绘。
-        for window in self.windows.values_mut() {
-            window.paint_requested = true;
-        }
+        self.mark_all_windows_dirty();
     }
 
     /// 按 runtime 的窗口修订号增删窗口条目，并同步原生可见性。
@@ -1837,6 +1874,7 @@ impl Host {
             self.revision = revision;
         }
         self.sync_visibility();
+        self.sync_enabled()?;
         self.update_wake_target();
         Ok(())
     }
@@ -1894,16 +1932,52 @@ impl Host {
         window.native.shown = show;
         window.paint_requested = true;
         if !show {
-            window.pointer = None;
-            window.hovered = None;
-            window.pressed = None;
-            window.release_capture = false;
-            window.tracking_leave = false;
+            window.clear_pointer_transients();
         }
         // 路由关闭期间其它窗口可能收到但跳过了重绘消息；统一标记后重绘。
-        for window in self.windows.values_mut() {
-            window.paint_requested = true;
+        self.mark_all_windows_dirty();
+    }
+
+    /// 把原生启用状态对齐到运行时输入仲裁；待决关闭的父窗口被禁用。
+    fn sync_enabled(&mut self) -> Result<(), HostError> {
+        let states: Vec<(&'static str, bool)> = self
+            .windows
+            .iter()
+            .map(|(key, window)| (*key, self.runtime.window_accepts_input(window.ctx)))
+            .collect();
+        for (key, enabled) in states {
+            self.set_native_enabled(key, enabled)?;
         }
+        Ok(())
+    }
+
+    /// 切换一个窗口的原生启用状态；禁用前取消 IME 组合并清除指针瞬态。
+    fn set_native_enabled(&mut self, key: &'static str, enabled: bool) -> Result<(), HostError> {
+        let Some(window) = self.windows.get(key) else {
+            return Ok(());
+        };
+        if window.enabled == enabled {
+            return Ok(());
+        }
+        if !enabled && self.runtime.window_visible(window.ctx) {
+            self.with_window(key, |host, window| host.cancel_compositions(window))?;
+        }
+        let Some(hwnd) = self.windows.get(key).map(WindowHost::hwnd) else {
+            return Ok(());
+        };
+        // EnableWindow 可能同步派发焦点/启用消息；调用期间禁止路由。
+        self.without_routing(None, |_| unsafe {
+            let _ = EnableWindow(hwnd, enabled);
+        });
+        let Some(window) = self.windows.get_mut(key) else {
+            return Ok(());
+        };
+        window.enabled = enabled;
+        if !enabled {
+            window.clear_pointer_transients();
+        }
+        self.mark_all_windows_dirty();
+        Ok(())
     }
 
     fn update_wake_target(&self) {
@@ -1973,6 +2047,7 @@ impl WindowHost {
             caret_visible: true,
             blink_timer,
             close_requested: false,
+            enabled: true,
             paint_requested: true,
             last_snapshot: None,
         }
@@ -1985,6 +2060,15 @@ impl WindowHost {
                 let _ = KillTimer(Some(self.hwnd()), timer);
             }
         }
+    }
+
+    /// 指针瞬态在隐藏、禁用或销毁后不能残留。
+    fn clear_pointer_transients(&mut self) {
+        self.pointer = None;
+        self.hovered = None;
+        self.pressed = None;
+        self.release_capture = false;
+        self.tracking_leave = false;
     }
 }
 
@@ -2215,6 +2299,7 @@ fn pointer_dispatch(result: Result<(), DispatchError>) -> Result<(), HostError> 
         | Err(
             DispatchError::WrongKind { .. }
             | DispatchError::Rejected { .. }
+            | DispatchError::Suspended(_)
             | DispatchError::StaleNode(_),
         ) => Ok(()),
         Err(error) => Err(HostError::Input(error)),
@@ -2532,6 +2617,9 @@ unsafe fn run_loop(host: *mut Host) -> Result<(), HostError> {
         // 安全：派发已返回，重新借出宿主同步窗口并读取处理结果。
         let host = unsafe { &mut *host };
         host.sync_windows()?;
+        if std::mem::take(&mut host.focus_after_sync) {
+            host.focus_native_focused_window()?;
+        }
         host.repaint_changed_windows()?;
         if let Some(error) = host.deferred_error.take() {
             return Err(error);
@@ -2563,6 +2651,9 @@ unsafe fn pump_loop(host: *mut Host) -> Result<bool, HostError> {
         // 安全：派发已返回，重新借出宿主同步窗口并读取处理结果。
         let host = unsafe { &mut *host };
         host.sync_windows()?;
+        if std::mem::take(&mut host.focus_after_sync) {
+            host.focus_native_focused_window()?;
+        }
         host.repaint_changed_windows()?;
         if let Some(error) = host.deferred_error.take() {
             return Err(error);
@@ -2742,7 +2833,10 @@ unsafe extern "system" fn wndproc(
 
 #[cfg(test)]
 mod tests {
+    #![allow(unused_braces)]
+
     use super::*;
+    use windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled;
     use windows::Win32::UI::WindowsAndMessaging::SendMessageW;
 
     const MAIN: &str = "main";
@@ -3369,6 +3463,89 @@ mod tests {
         Host::open(runtime, HostConfig::hidden()).expect("open host")
     }
 
+    /// 一个 Confirm 主窗口与它声明的确认窗口；确认窗口用按钮回复。
+    fn open_confirm_host() -> Host {
+        const CONFIRM: &str = "confirm";
+        let mut runtime = Runtime::new();
+        runtime
+            .declare_windows(|catalog| {
+                catalog.window(
+                    WindowSpec::new(MAIN)
+                        .primary()
+                        .close_policy(ClosePolicy::Confirm),
+                    |window| {
+                        window
+                            .on_close(move |_| {
+                                window.request_show(CONFIRM).expect("show the confirmation");
+                            })
+                            .expect("register the close handler");
+                        let draft = signal(String::new());
+                        view! {
+                            <view>
+                                <text-input
+                                    aria:label="draft"
+                                    value={draft}
+                                    on:input=move |value: String| draft.set(value)
+                                />
+                            </view>
+                        }
+                    },
+                )?;
+                catalog.window(WindowSpec::new(CONFIRM).confirmation_for(MAIN), |window| {
+                    let request = window
+                        .close_request()
+                        .expect("read the close request")
+                        .expect("a pending epoch");
+                    view! {
+                        <view>
+                            <button
+                                aria:label="Allow"
+                                on:click=move || request.allow().expect("allow")
+                            >"Allow"</button>
+                            <button
+                                aria:label="Deny"
+                                on:click=move || request.deny().expect("deny")
+                            >"Deny"</button>
+                        </view>
+                    }
+                })?;
+                Ok(())
+            })
+            .expect("declare the confirmation catalog");
+        let mut host = Host::open(runtime, HostConfig::hidden()).expect("open the host");
+        host.render().expect("render the primary window");
+        host
+    }
+
+    fn click_label_in(host: &mut Host, key: &'static str, label: &str) {
+        let ctx = host.windows[key].ctx;
+        let node = host
+            .runtime
+            .presentation_of(ctx)
+            .expect("window snapshot")
+            .find_label(label)
+            .expect("labelled element")
+            .id();
+        let scene = host.scene(key).expect("a rendered scene");
+        let rect = scene.node(node).expect("element").rect();
+        let scale = scene.viewport().scale();
+        let x = ((rect.x + rect.width / 2.0) * scale).round() as isize;
+        let y = ((rect.y + rect.height / 2.0) * scale).round() as isize;
+        let lparam = LPARAM((x & 0xffff) | ((y & 0xffff) << 16));
+        for message in [WM_LBUTTONDOWN, WM_LBUTTONUP] {
+            send_msg_in(
+                host,
+                key,
+                MSG {
+                    message,
+                    wParam: WPARAM(0),
+                    lParam: lparam,
+                    ..Default::default()
+                },
+            );
+        }
+    }
+
     /// 在 primary 窗口上执行需要窗口与宿主共享资源的动作。
     fn with_main<R>(
         host: &mut Host,
@@ -3397,6 +3574,10 @@ mod tests {
             }
         }
         host.sync_windows().expect("sync windows");
+        if std::mem::take(&mut host.focus_after_sync) {
+            host.focus_native_focused_window()
+                .expect("focus the active window");
+        }
         host.repaint_changed_windows().expect("repaint");
         if let Some(error) = host.deferred_error.take() {
             panic!("the window procedure failed: {error}");
@@ -3919,6 +4100,152 @@ mod tests {
             "a delivery-time request creates the native window"
         );
         assert!(host.scene("details").is_some(), "the new window paints");
+    }
+
+    #[test]
+    fn wm_close_on_a_confirm_window_opens_a_disabled_prompt() {
+        let mut host = open_confirm_host();
+        send_msg(
+            &mut host,
+            MSG {
+                message: WM_CLOSE,
+                ..Default::default()
+            },
+        );
+        assert!(host.hwnd(MAIN).is_some());
+        let confirmation = host.hwnd("confirm").expect("a confirmation HWND");
+        assert!(!host.windows[MAIN].enabled, "the parent is disabled");
+        assert!(
+            // 安全：只查询由宿主持有的 HWND 的启用状态。
+            !unsafe { IsWindowEnabled(host.hwnd(MAIN).expect("main HWND")) }.as_bool(),
+            "the native parent HWND is disabled"
+        );
+        assert!(host.windows["confirm"].enabled);
+        assert!(host.scene("confirm").is_some());
+
+        send_msg(
+            &mut host,
+            MSG {
+                message: WM_CLOSE,
+                ..Default::default()
+            },
+        );
+        assert_eq!(host.hwnd("confirm"), Some(confirmation));
+        assert_eq!(host.runtime.windows().len(), 2, "no second epoch or prompt");
+
+        click_label_in(&mut host, "confirm", "Deny");
+        assert!(host.hwnd("confirm").is_none());
+        assert!(host.windows[MAIN].enabled);
+        assert!(
+            // 安全：只查询由宿主持有的 HWND 的启用状态。
+            unsafe { IsWindowEnabled(host.hwnd(MAIN).expect("main HWND")) }.as_bool(),
+            "the native parent HWND is re-enabled"
+        );
+        assert!(host.runtime.window_accepts_input(host.windows[MAIN].ctx));
+    }
+
+    #[test]
+    fn suspending_a_parent_cancels_its_ime_composition() {
+        let mut host = open_confirm_host();
+        let node = host
+            .runtime
+            .presentation()
+            .expect("snapshot")
+            .find_label("draft")
+            .expect("draft input")
+            .id();
+        host.runtime.focus_node(node).expect("focus the draft");
+        host.runtime.compose_start_node(node).expect("start");
+        host.runtime
+            .compose_update_node(node, "ni")
+            .expect("update");
+
+        send_msg(
+            &mut host,
+            MSG {
+                message: WM_CLOSE,
+                ..Default::default()
+            },
+        );
+        let main = host.windows[MAIN].ctx;
+        let snapshot = host.runtime.presentation_of(main).expect("snapshot");
+        assert!(
+            snapshot
+                .node(node)
+                .expect("draft")
+                .edit()
+                .expect("edit")
+                .composition()
+                .is_none(),
+            "suspending the parent cancels the pending composition"
+        );
+        assert!(!host.windows[MAIN].enabled);
+    }
+
+    #[test]
+    fn closing_the_confirmation_window_denies_the_parent() {
+        let mut host = open_confirm_host();
+        send_msg(
+            &mut host,
+            MSG {
+                message: WM_CLOSE,
+                ..Default::default()
+            },
+        );
+        assert!(!host.windows[MAIN].enabled);
+        send_msg_in(
+            &mut host,
+            "confirm",
+            MSG {
+                message: WM_CLOSE,
+                ..Default::default()
+            },
+        );
+        assert!(host.hwnd("confirm").is_none());
+        assert!(host.hwnd(MAIN).is_some());
+        assert!(host.windows[MAIN].enabled);
+    }
+
+    #[test]
+    fn escape_on_the_confirmation_denies_and_reenables_the_parent() {
+        let mut host = open_confirm_host();
+        send_msg(
+            &mut host,
+            MSG {
+                message: WM_CLOSE,
+                ..Default::default()
+            },
+        );
+        assert!(!host.windows[MAIN].enabled);
+
+        send_msg_in(
+            &mut host,
+            "confirm",
+            MSG {
+                message: WM_KEYDOWN,
+                wParam: WPARAM(VK_ESCAPE.0 as usize),
+                ..Default::default()
+            },
+        );
+        assert!(host.hwnd("confirm").is_none());
+        assert!(host.windows[MAIN].enabled);
+        assert!(host.runtime.window_accepts_input(host.windows[MAIN].ctx));
+    }
+
+    #[test]
+    fn allow_from_the_confirmation_closes_the_group() {
+        let mut host = open_confirm_host();
+        send_msg(
+            &mut host,
+            MSG {
+                message: WM_CLOSE,
+                ..Default::default()
+            },
+        );
+        click_label_in(&mut host, "confirm", "Allow");
+        assert!(host.runtime.windows().is_empty());
+        assert!(host.hwnd(MAIN).is_none());
+        assert!(host.hwnd("confirm").is_none());
     }
 
     #[test]

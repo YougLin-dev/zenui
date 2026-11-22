@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::marker::PhantomData;
 use std::rc::Rc;
@@ -77,11 +77,17 @@ impl WindowCtx {
     }
 
     /// 请求隐藏自身窗口；保留 activation、树与本地编辑状态。
+    ///
+    /// 若该 activation 有待决关闭，先按 Deny 结算；作为确认窗口时隐藏等价于
+    /// 关闭确认窗口并恢复父窗口。
     pub fn request_hide(self) -> Result<(), WindowError> {
         self.request(WindowAction::Hide)
     }
 
-    /// 请求关闭自身窗口；释放 activation 的树、资源与窗口任务。
+    /// 请求关闭自身窗口；遵循目录的 `ClosePolicy`。
+    ///
+    /// `Immediate` 释放 activation 的树、资源与窗口任务；`Confirm` 创建或
+    /// 复用父窗口的 close epoch，等 Allow 后才释放。
     pub fn request_close(self) -> Result<(), WindowError> {
         self.request(WindowAction::Close)
     }
@@ -91,6 +97,93 @@ impl WindowCtx {
             state.queue_window_request(WindowRequest { from: self, action })
         })
     }
+
+    /// 在窗口 factory 中注册关闭处理器；`Confirm` 策略的关闭请求会调用它。
+    ///
+    /// 每个 activation 只能注册一次。处理器收到当前关闭 epoch 的一次性句柄；
+    /// 它可以立即 allow/deny，或显示目录中声明给这个父窗口的确认窗口。
+    pub fn on_close(self, handler: impl Fn(CloseRequest) + 'static) -> Result<(), WindowError> {
+        crate::context::with_state_of(self.runtime, |state| {
+            state.register_close_handler(self, Rc::new(handler))
+        })
+    }
+
+    /// 作为关闭确认窗口时，读取父窗口当前 epoch 的请求。
+    ///
+    /// 没有待决关闭请求、或本窗口不是该父窗口声明的确认窗口时返回 `None`；
+    /// 组件据此把按钮接到 `allow` / `deny`。
+    pub fn close_request(self) -> Result<Option<CloseRequest>, WindowError> {
+        crate::context::with_state_of(self.runtime, |state| state.close_request_for(self))
+    }
+}
+
+/// 一个待决关闭 epoch 的一次性句柄；`Copy` 不能延长期限。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct CloseRequest {
+    runtime: u32,
+    pub(crate) parent: WindowCtx,
+    pub(crate) epoch: u64,
+    _not_send: PhantomData<*const ()>,
+}
+
+impl CloseRequest {
+    pub(crate) const fn new(runtime: u32, parent: WindowCtx, epoch: u64) -> Self {
+        Self {
+            runtime,
+            parent,
+            epoch,
+            _not_send: PhantomData,
+        }
+    }
+
+    /// 父窗口本次关闭请求的 epoch；重开后不会复用。
+    pub const fn epoch(self) -> u64 {
+        self.epoch
+    }
+
+    /// 允许关闭：父窗口与确认窗口作为一组释放。
+    pub fn allow(self) -> Result<(), WindowError> {
+        self.reply(CloseReply::Allow)
+    }
+
+    /// 拒绝关闭：关闭确认窗口，恢复父窗口输入与焦点。
+    pub fn deny(self) -> Result<(), WindowError> {
+        self.reply(CloseReply::Deny)
+    }
+
+    fn reply(self, reply: CloseReply) -> Result<(), WindowError> {
+        crate::context::with_state_of(self.runtime, |state| state.queue_close_reply(self, reply))
+    }
+}
+
+impl fmt::Debug for CloseRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CloseRequest")
+            .field("parent", &self.parent)
+            .field("epoch", &self.epoch)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CloseReply {
+    Allow,
+    Deny,
+}
+
+pub(crate) type CloseHandler = Rc<dyn Fn(CloseRequest)>;
+
+/// 关闭确认协议本身失败；父窗口保持打开，绝不回退为 Allow。
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum CloseError {
+    /// `Confirm` 窗口没有在 factory 中注册 close handler。
+    MissingHandler,
+    /// 目录没有为这个父窗口声明确认窗口。
+    ConfirmationNotDeclared,
+    /// 处理器没有让声明的确认窗口变为可见。
+    ConfirmationNotShown,
+    /// 处理器 panic；取消本次 epoch。
+    HandlerPanicked,
 }
 
 /// UI 处理期挂起的窗口生命周期请求；由 `Runtime::apply_window_requests` 结算。
@@ -117,7 +210,27 @@ impl fmt::Debug for WindowCtx {
     }
 }
 
-/// 声明期的窗口描述；登记身份、原生标题/尺寸与 primary 标记，不挂载界面。
+/// 窗口收到关闭请求时的策略；确认窗口自身必须使用 `Immediate`，目录拒绝嵌套确认。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ClosePolicy {
+    /// 关闭请求立即释放 activation。
+    #[default]
+    Immediate,
+    /// 关闭请求创建一个 epoch，并调用窗口注册的 close handler。
+    Confirm,
+}
+
+/// 窗口在目录中的角色；确认窗口绑定到一个 `Confirm` 父窗口。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WindowRole {
+    /// 普通应用窗口。
+    #[default]
+    Normal,
+    /// 父窗口关闭时用来放置确认界面的窗口。
+    CloseConfirmation { parent: &'static str },
+}
+
+/// 声明期的窗口描述；登记身份、原生标题/尺寸、primary 标记、关闭策略与角色。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WindowSpec {
     key: &'static str,
@@ -125,6 +238,8 @@ pub struct WindowSpec {
     width: u32,
     height: u32,
     primary: bool,
+    close_policy: ClosePolicy,
+    role: WindowRole,
 }
 
 impl WindowSpec {
@@ -136,6 +251,8 @@ impl WindowSpec {
             width: 900,
             height: 700,
             primary: false,
+            close_policy: ClosePolicy::Immediate,
+            role: WindowRole::Normal,
         }
     }
 
@@ -158,6 +275,18 @@ impl WindowSpec {
         self
     }
 
+    /// 关闭策略；`Confirm` 会先创建一个 close epoch。
+    pub const fn close_policy(mut self, policy: ClosePolicy) -> Self {
+        self.close_policy = policy;
+        self
+    }
+
+    /// 把窗口声明为父窗口的关闭确认窗口。
+    pub const fn confirmation_for(mut self, parent: &'static str) -> Self {
+        self.role = WindowRole::CloseConfirmation { parent };
+        self
+    }
+
     /// 目录中的稳定键。
     pub const fn key(self) -> &'static str {
         self.key
@@ -176,6 +305,24 @@ impl WindowSpec {
     /// 是否为目录中的 primary 窗口。
     pub const fn is_primary(self) -> bool {
         self.primary
+    }
+
+    /// 收到关闭请求时的策略。
+    pub const fn policy(self) -> ClosePolicy {
+        self.close_policy
+    }
+
+    /// 目录角色。
+    pub const fn role(self) -> WindowRole {
+        self.role
+    }
+
+    /// 作为确认窗口时绑定的父窗口键。
+    pub const fn confirmation_parent(self) -> Option<&'static str> {
+        match self.role {
+            WindowRole::Normal => None,
+            WindowRole::CloseConfirmation { parent } => Some(parent),
+        }
     }
 }
 
@@ -237,6 +384,27 @@ impl WindowCatalog {
         let Some(primary) = primary else {
             return Err(CatalogError::MissingPrimary);
         };
+        let mut confirmation_parents = BTreeSet::new();
+        for (key, entry) in &entries {
+            let WindowRole::CloseConfirmation { parent } = entry.spec.role else {
+                continue;
+            };
+            if parent == *key {
+                return Err(CatalogError::ConfirmationParentIsSelf(key));
+            }
+            let Some(parent_entry) = entries.get(parent) else {
+                return Err(CatalogError::UnknownConfirmationParent(key));
+            };
+            if parent_entry.spec.close_policy != ClosePolicy::Confirm {
+                return Err(CatalogError::ConfirmationParentNotConfirm(parent));
+            }
+            if entry.spec.close_policy != ClosePolicy::Immediate {
+                return Err(CatalogError::ConfirmationMustBeImmediate(key));
+            }
+            if !confirmation_parents.insert(parent) {
+                return Err(CatalogError::DuplicateConfirmation(parent));
+            }
+        }
         Ok((entries, primary))
     }
 }
@@ -253,6 +421,16 @@ pub enum CatalogError {
     AlreadyDeclared,
     /// 窗口目录必须先于任何窗口 factory。
     DeclaredAfterWindow,
+    /// 确认窗口绑定的父窗口不在目录中。
+    UnknownConfirmationParent(&'static str),
+    /// 确认窗口只能绑定到 `Confirm` 父窗口。
+    ConfirmationParentNotConfirm(&'static str),
+    /// 窗口不能作为自己的关闭确认窗口。
+    ConfirmationParentIsSelf(&'static str),
+    /// 同一个父窗口只能声明一个关闭确认窗口。
+    DuplicateConfirmation(&'static str),
+    /// 关闭确认窗口自身必须使用 Immediate 策略，避免嵌套确认。
+    ConfirmationMustBeImmediate(&'static str),
 }
 
 impl fmt::Display for CatalogError {
@@ -268,6 +446,27 @@ impl fmt::Display for CatalogError {
             Self::AlreadyDeclared => f.write_str("the window catalog was already declared"),
             Self::DeclaredAfterWindow => {
                 f.write_str("the window catalog must be declared before any window opens")
+            }
+            Self::UnknownConfirmationParent(key) => {
+                write!(f, "close confirmation window {key} has no declared parent")
+            }
+            Self::ConfirmationParentNotConfirm(parent) => {
+                write!(f, "window {parent} is not a Confirm parent")
+            }
+            Self::ConfirmationParentIsSelf(key) => {
+                write!(f, "window {key} cannot confirm its own close")
+            }
+            Self::DuplicateConfirmation(parent) => {
+                write!(
+                    f,
+                    "window {parent} declares more than one close confirmation window"
+                )
+            }
+            Self::ConfirmationMustBeImmediate(key) => {
+                write!(
+                    f,
+                    "close confirmation window {key} must use Immediate close policy"
+                )
             }
         }
     }
@@ -290,6 +489,8 @@ pub enum WindowError {
     UnknownWindow(&'static str),
     /// 目录声明失败。
     Catalog(CatalogError),
+    /// 关闭确认协议失败，父窗口保持打开。
+    Close(CloseError),
     Mount(MountError),
 }
 
@@ -310,6 +511,7 @@ impl fmt::Display for WindowError {
             }
             Self::UnknownWindow(key) => write!(f, "window key {key} is not in the catalog"),
             Self::Catalog(error) => write!(f, "{error}"),
+            Self::Close(error) => write!(f, "{error}"),
             Self::Mount(error) => write!(f, "{error}"),
         }
     }
@@ -319,11 +521,33 @@ impl std::error::Error for WindowError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Catalog(error) => Some(error),
+            Self::Close(error) => Some(error),
             Self::Mount(error) => Some(error),
             _ => None,
         }
     }
 }
+
+impl fmt::Display for CloseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingHandler => {
+                f.write_str("a Confirm window needs a close handler registered during its factory")
+            }
+            Self::ConfirmationNotDeclared => {
+                f.write_str("the catalog declares no confirmation window for this parent")
+            }
+            Self::ConfirmationNotShown => {
+                f.write_str("the close handler did not show the declared confirmation window")
+            }
+            Self::HandlerPanicked => {
+                f.write_str("the close handler panicked; the window stays open")
+            }
+        }
+    }
+}
+
+impl std::error::Error for CloseError {}
 
 impl From<MountError> for WindowError {
     fn from(error: MountError) -> Self {
