@@ -236,6 +236,8 @@ pub struct Host {
     show_windows: bool,
     /// 仅在 `run`/`pump` 派发期间指向 self；窗口过程通过 GWLP_USERDATA 取回宿主。
     dispatching: Option<*mut Host>,
+    /// 宿主正在执行借出动作；此时的同步窗口消息不得再次进入窗口过程。
+    routing_suppressed: bool,
     /// 设备丢失后的一次恢复正在进行，避免递归重建。
     recovering: bool,
     /// 渲染时发现 surface 丢失；消息处理结束后统一重建所有窗口。
@@ -347,6 +349,7 @@ impl Host {
             revision: 0,
             show_windows: config.visible,
             dispatching: None,
+            routing_suppressed: false,
             recovering: false,
             device_lost: false,
             deferred_error: None,
@@ -1703,7 +1706,9 @@ impl Host {
     /// 把一个窗口从映射中取出执行动作，再放回；设备丢失在放回后统一恢复。
     ///
     /// 动作同时需要该窗口与宿主的共享资源（runtime、device、renderer）。取出
-    /// 条目让借用检查器看到两者互不重叠；动作运行在当前消息处理内，不会重入。
+    /// 条目让借用检查器看到两者互不重叠。动作期间的窗口过程一律不路由：
+    /// IMM 等 Win32 调用可能在动作内同步派发消息，再次借出宿主会在动作仍
+    /// 持有 `&mut Host` 时产生第二个可变引用，并把取出的窗口当成已关闭。
     fn with_window<R>(
         &mut self,
         key: &'static str,
@@ -1712,7 +1717,8 @@ impl Host {
         let Some(mut window) = self.windows.remove(key) else {
             return Err(HostError::UnknownWindow(key.to_owned()));
         };
-        let result = action(self, &mut window);
+        let hwnd = window.hwnd();
+        let result = self.without_routing(Some(hwnd), |host| action(host, &mut window));
         self.windows.insert(key, window);
         if result.is_ok() && self.device_lost && !self.recovering {
             self.recover_device()?;
@@ -1723,32 +1729,34 @@ impl Host {
     /// 在会同步派发窗口消息的 Win32 调用期间清除所有窗口过程的宿主地址。
     ///
     /// `extra` 用于 `with_window` 已从映射取出的当前窗口。`remove_window`
-    /// 销毁窗口时使用自己的清除/恢复路径，不经过这里。
+    /// 销毁窗口时使用自己的清除/恢复路径，不经过这里。可以嵌套：内层动作
+    /// 不提前恢复路由，否则外层动作仍持有 `&mut Host` 时会重新开放重入。
     fn without_routing<R>(
         &mut self,
         extra: Option<HWND>,
         action: impl FnOnce(&mut Self) -> R,
     ) -> R {
-        let pointer = self.dispatching;
-        if pointer.is_some() {
-            for hwnd in self.routing_hwnds(extra) {
-                // 安全：只清除窗口过程的宿主地址槽。
-                unsafe {
-                    SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
-                }
+        let pointer = self.dispatching.filter(|_| !self.routing_suppressed);
+        let Some(pointer) = pointer else {
+            return action(self);
+        };
+        self.routing_suppressed = true;
+        for hwnd in self.routing_hwnds(extra) {
+            // 安全：只清除窗口过程的宿主地址槽。
+            unsafe {
+                SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
             }
         }
         let result = action(self);
-        if let Some(pointer) = pointer {
-            // `extra` 是已从映射取出的当前窗口；调用方保证它在动作后仍存活
-            // （销毁窗口走 `remove_window` 的专用路径）。
-            for hwnd in self.routing_hwnds(extra) {
-                // 安全：恢复派发期间的宿主地址。
-                unsafe {
-                    SetWindowLongPtrW(hwnd, GWLP_USERDATA, pointer as isize);
-                }
+        // `extra` 是已从映射取出的当前窗口；调用方保证它在动作后仍存活
+        // （销毁窗口走 `remove_window` 的专用路径）。
+        for hwnd in self.routing_hwnds(extra) {
+            // 安全：恢复派发期间的宿主地址。
+            unsafe {
+                SetWindowLongPtrW(hwnd, GWLP_USERDATA, pointer as isize);
             }
         }
+        self.routing_suppressed = false;
         result
     }
 
@@ -1792,7 +1800,7 @@ impl Host {
     fn insert_window(&mut self, window: WindowHost) {
         let key = window.ctx.key();
         let hwnd = window.hwnd();
-        if let Some(pointer) = self.dispatching {
+        if let Some(pointer) = self.dispatching.filter(|_| !self.routing_suppressed) {
             // 安全：窗口过程只在派发期间读取这个槽。
             unsafe {
                 SetWindowLongPtrW(hwnd, GWLP_USERDATA, pointer as isize);
@@ -1827,8 +1835,8 @@ impl Host {
         };
         self.hwnds.remove(&(window.hwnd().0 as isize));
         // DestroyWindow 会同步派发 WM_DESTROY 并可能激活其它窗口；整个销毁
-        // 期间清除所有窗口过程的宿主地址。
-        let pointer = self.dispatching;
+        // 期间清除所有窗口过程的宿主地址。外层已抑制路由时不要提前恢复。
+        let pointer = self.dispatching.filter(|_| !self.routing_suppressed);
         if pointer.is_some() {
             for hwnd in self.routing_hwnds(Some(window.hwnd())) {
                 unsafe {
@@ -3986,6 +3994,40 @@ mod tests {
             snapshot.node(node).expect("editor").text_value(),
             Some("Write tests"),
             "WM_IME_CHAR does not insert a second copy"
+        );
+    }
+
+    #[test]
+    fn a_window_action_keeps_synchronous_messages_out_of_the_host() {
+        let mut host = open_host();
+        host.render().expect("render");
+        let hwnd = host.hwnd(MAIN).expect("a live window");
+        {
+            let _pointer = HostPointer::install(&mut host as *mut Host);
+            host.with_window(MAIN, |host, window| {
+                // 真实 IME 会在 ImmGetCompositionStringW / ImmSetCompositionWindow
+                // 内同步送出 WM_IME_NOTIFY 等消息；动作正在借用宿主，窗口过程
+                // 不得再次借出，否则会把取出的窗口当成已关闭。
+                // 安全：SendMessageW 在调用线程同步调用窗口过程；外层不读取宿主。
+                unsafe {
+                    SendMessageW(hwnd, WM_IME_COMPOSITION, None, None);
+                }
+                host.without_routing(Some(window.hwnd()), |_| unsafe {
+                    SendMessageW(hwnd, WM_IME_COMPOSITION, None, None);
+                });
+                // 内层动作结束后外层仍然借用宿主；路由必须保持关闭。
+                // 安全：同上。
+                unsafe {
+                    SendMessageW(hwnd, WM_IME_COMPOSITION, None, None);
+                }
+                Ok(())
+            })
+            .expect("the action finishes");
+        }
+        assert!(
+            host.deferred_error.is_none(),
+            "a synchronous IME message borrowed the host twice: {:?}",
+            host.deferred_error
         );
     }
 
