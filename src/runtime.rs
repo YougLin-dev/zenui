@@ -100,6 +100,8 @@ pub(crate) struct State {
     window_revision: u64,
     pub(crate) tasks: BTreeMap<u32, TaskRecord>,
     pub(crate) next_task: u32,
+    /// 已排队、等待宿主弹出的文件选择请求；任务本身在 `tasks` 中。
+    pub(crate) pending_file_dialogs: Vec<crate::file_dialog::PendingFileDialog>,
     pub(crate) wake_callback: Arc<RwLock<Option<WakeCallback>>>,
     setup_counts: BTreeMap<&'static str, u64>,
     next_instance: u64,
@@ -192,6 +194,7 @@ impl State {
             window_revision: 0,
             tasks: BTreeMap::new(),
             next_task: 1,
+            pending_file_dialogs: Vec::new(),
             wake_callback: Arc::new(RwLock::new(None)),
             setup_counts: BTreeMap::new(),
             next_instance: 1,
@@ -254,7 +257,7 @@ impl State {
         live.then(|| WindowCtx::new(self.id, key, record.activation, record.owner))
     }
 
-    fn window_is_visible(&self, key: &'static str) -> bool {
+    pub(crate) fn window_is_visible(&self, key: &'static str) -> bool {
         self.windows
             .get(key)
             .is_some_and(|record| record.open && record.visible)
@@ -637,7 +640,7 @@ impl State {
     }
 
     /// 可见且没有待决关闭的窗口才接收输入。
-    fn window_accepts_input(&self, key: &'static str) -> bool {
+    pub(crate) fn window_accepts_input(&self, key: &'static str) -> bool {
         self.window_is_visible(key) && !self.close_epochs.contains_key(key)
     }
 
