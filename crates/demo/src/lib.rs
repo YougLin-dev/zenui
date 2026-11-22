@@ -141,12 +141,15 @@ impl TodoState {
 const MAIN_WINDOW: &str = "main";
 /// 共享 Todo 模型的摘要窗口目录键；由主窗口工具栏按需打开或聚焦。
 pub const DETAILS_WINDOW: &str = "details";
+/// 主窗口有待保存草稿时的关闭确认窗口目录键。
+pub const CLOSE_CONFIRMATION_WINDOW: &str = "close";
 
 /// 创建应用级 Todo 状态、声明窗口目录并打开主窗口。
 ///
 /// 状态必须先于窗口 factory 运行创建，因此本函数内部先运行 `Runtime::setup`，
-/// 再把共享状态交给两个窗口的 factory。Details 窗口只在被请求时挂载；桌面
-/// 宿主与 headless 示例共用这个入口。
+/// 再把共享状态交给窗口的 factory。Details 窗口只在被请求时挂载；主窗口采用
+/// `Confirm` 关闭策略，草稿非空时显示关闭确认窗口。桌面宿主与 headless 示例
+/// 共用这个入口。
 pub fn open_todo_window(runtime: &mut Runtime) -> Result<WindowCtx, WindowError> {
     let state = runtime.setup(TodoState::new)?;
     runtime.declare_windows(move |catalog| {
@@ -154,14 +157,36 @@ pub fn open_todo_window(runtime: &mut Runtime) -> Result<WindowCtx, WindowError>
             WindowSpec::new(MAIN_WINDOW)
                 .primary()
                 .titled("ZenUI Todo")
-                .sized(900, 700),
-            move |window| view! { <TodoApp window=window state=state /> },
+                .sized(900, 700)
+                .close_policy(ClosePolicy::Confirm),
+            move |window| {
+                window
+                    .on_close(move |request| {
+                        if state.draft.with(String::is_empty) {
+                            report(request.allow(), state.task_error);
+                        } else {
+                            report(
+                                window.request_show(CLOSE_CONFIRMATION_WINDOW),
+                                state.task_error,
+                            );
+                        }
+                    })
+                    .map_err(|_| MountError::Component("register the todo close handler"))?;
+                view! { <TodoApp window=window state=state /> }
+            },
         )?;
         catalog.window(
             WindowSpec::new(DETAILS_WINDOW)
                 .titled("ZenUI Details")
                 .sized(520, 420),
             move |window| view! { <TodoDetails window=window state=state /> },
+        )?;
+        catalog.window(
+            WindowSpec::new(CLOSE_CONFIRMATION_WINDOW)
+                .confirmation_for(MAIN_WINDOW)
+                .titled("Discard draft?")
+                .sized(420, 220),
+            move |window| view! { <CloseConfirmation window=window state=state /> },
         )
     })?;
     runtime.show(MAIN_WINDOW)
@@ -379,6 +404,50 @@ pub fn TodoDetails(window: WindowCtx, state: TodoState) -> MountResult<MountPlan
                     aria:label="Close details"
                     on:click={move || report(window.request_close(), task_error)}
                 >"Close"</button>
+            </view>
+        </view>
+    }
+}
+
+/// 主窗口的关闭确认提示。
+///
+/// 窗口只在父窗口有 pending close epoch 时由关闭处理器显示；factory 读不到
+/// 待决请求时拒绝挂载，而不是渲染一对失效的按钮。Continue editing 使用
+/// Deny，保留父窗口的草稿、焦点与 caret；Discard draft 清空应用级草稿，
+/// 并使用 Allow 把父窗口与提示窗作为一组释放。
+#[component]
+fn CloseConfirmation(window: WindowCtx, state: TodoState) -> MountResult<MountPlan> {
+    let request = window
+        .close_request()
+        .map_err(|_| MountError::Component("read the todo close request"))?
+        .ok_or(MountError::Component(
+            "the todo close confirmation has no pending request",
+        ))?;
+    let TodoState {
+        draft, task_error, ..
+    } = state;
+
+    view! {
+        <view role="main" class="p-4 gap-3">
+            <text class="text-lg font-semibold">"Discard the draft?"</text>
+            <text class="text-sm dark:text-muted">"The unsaved task draft will be lost."</text>
+            <view role="toolbar" class="gap-3">
+                <button
+                    class="px-4 py-2 bg-accent text-inverse rounded-md font-semibold"
+                    aria:label="Continue editing"
+                    on:click={move || report(request.deny(), task_error)}
+                >"Continue editing"</button>
+                <button
+                    class="px-4 py-2 bg-danger text-inverse rounded-md"
+                    aria:label="Discard draft"
+                    on:click={move || {
+                        let result = request.allow();
+                        if result.is_ok() {
+                            draft.set(String::new());
+                        }
+                        report(result, task_error);
+                    }}
+                >"Discard draft"</button>
             </view>
         </view>
     }

@@ -6,7 +6,8 @@ use std::collections::BTreeSet;
 use windows::Win32::Foundation::{LPARAM, WPARAM};
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    VIRTUAL_KEY, VK_BACK, VK_DELETE, VK_END, VK_HOME, VK_RETURN, VK_RIGHT, VK_TAB,
+    IsWindowEnabled, VIRTUAL_KEY, VK_BACK, VK_DELETE, VK_END, VK_ESCAPE, VK_HOME, VK_RETURN,
+    VK_RIGHT, VK_TAB,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     PostMessageW, WM_CHAR, WM_CLOSE, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP,
@@ -131,7 +132,11 @@ fn focused_id(host: &Host) -> Option<NodeId> {
 }
 
 fn post_close(host: &Host) {
-    let hwnd = host.hwnd(MAIN).expect("a live window");
+    post_close_in(host, MAIN);
+}
+
+fn post_close_in(host: &Host, key: &str) {
+    let hwnd = host.hwnd(key).expect("a live window");
     // 安全：HWND 由 Host 持有，消息只排队，不跨线程解引用。
     unsafe {
         PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)).expect("post the close");
@@ -805,6 +810,139 @@ fn the_details_action_opens_the_shared_second_window() {
 }
 
 #[test]
+fn closing_with_a_draft_prompts_and_deny_restores_the_parent() {
+    let mut host = open_host();
+    host.render().expect("render the primary window");
+    let draft = type_main_draft(&mut host, "draft");
+    let caret = host
+        .scene(MAIN)
+        .expect("scene")
+        .caret(draft)
+        .expect("caret");
+    let main_hwnd = host.hwnd(MAIN).expect("the main HWND");
+
+    post_close(&host);
+    assert!(!host.pump().expect("show the close prompt"));
+    let prompt = host
+        .hwnd(zenui_demo::CLOSE_CONFIRMATION_WINDOW)
+        .expect("the confirmation HWND");
+    assert_ne!(prompt, main_hwnd);
+    assert!(
+        !unsafe { IsWindowEnabled(main_hwnd) }.as_bool(),
+        "the pending parent HWND is disabled"
+    );
+
+    // 待决期间的再次关闭只聚焦既有确认窗，不创建第二个 HWND。
+    post_close(&host);
+    assert!(!host.pump().expect("focus the pending prompt"));
+    assert_eq!(
+        host.hwnd(zenui_demo::CLOSE_CONFIRMATION_WINDOW),
+        Some(prompt)
+    );
+    assert!(!unsafe { IsWindowEnabled(main_hwnd) }.as_bool());
+
+    // 禁用期间即使消息直接投递到父 HWND，草稿也不接受输入。
+    post_char_in(&host, MAIN, 'x');
+    assert!(!host.pump().expect("ignore the suspended parent input"));
+    assert_eq!(
+        value_in(&host, MAIN, "What needs to be done?").as_deref(),
+        Some("draft")
+    );
+
+    // Continue editing 通过按钮回复 Deny，并恢复父窗编辑状态。
+    let (_, continue_editing, scale) = center_label(
+        &host,
+        zenui_demo::CLOSE_CONFIRMATION_WINDOW,
+        "Continue editing",
+    );
+    post_click_in(
+        &host,
+        zenui_demo::CLOSE_CONFIRMATION_WINDOW,
+        continue_editing,
+        scale,
+    );
+    assert!(!host.pump().expect("deny via Continue editing"));
+    assert!(host.hwnd(zenui_demo::CLOSE_CONFIRMATION_WINDOW).is_none());
+    assert!(
+        unsafe { IsWindowEnabled(main_hwnd) }.as_bool(),
+        "Deny re-enables the parent HWND"
+    );
+    assert_eq!(
+        focused_in(&host, MAIN),
+        Some(draft),
+        "the draft keeps focus"
+    );
+    assert_eq!(
+        host.scene(MAIN)
+            .expect("scene")
+            .caret(draft)
+            .expect("caret"),
+        caret,
+        "the caret is restored"
+    );
+    assert_eq!(
+        value_in(&host, MAIN, "What needs to be done?").as_deref(),
+        Some("draft")
+    );
+
+    // X 关闭提示窗同样等于 Deny。
+    post_close(&host);
+    assert!(!host.pump().expect("reopen the close prompt"));
+    post_close_in(&host, zenui_demo::CLOSE_CONFIRMATION_WINDOW);
+    assert!(!host.pump().expect("X denies the close"));
+    assert!(host.hwnd(zenui_demo::CLOSE_CONFIRMATION_WINDOW).is_none());
+    assert!(unsafe { IsWindowEnabled(main_hwnd) }.as_bool());
+    assert_eq!(
+        value_in(&host, MAIN, "What needs to be done?").as_deref(),
+        Some("draft")
+    );
+
+    // Escape 在提示窗上同样等于 Deny。
+    post_close(&host);
+    assert!(!host.pump().expect("reopen the close prompt"));
+    post_key_in(&host, zenui_demo::CLOSE_CONFIRMATION_WINDOW, VK_ESCAPE);
+    assert!(!host.pump().expect("escape denies the close"));
+    assert!(host.hwnd(zenui_demo::CLOSE_CONFIRMATION_WINDOW).is_none());
+    assert!(unsafe { IsWindowEnabled(main_hwnd) }.as_bool());
+    assert_eq!(
+        value_in(&host, MAIN, "What needs to be done?").as_deref(),
+        Some("draft")
+    );
+}
+
+#[test]
+fn discarding_the_draft_closes_the_group_and_ends_the_loop() {
+    let mut host = open_host();
+    host.render().expect("render the primary window");
+    let _ = type_main_draft(&mut host, "discard me");
+
+    post_close(&host);
+    assert!(!host.pump().expect("show the close prompt"));
+    let (_, discard, scale) = center_label(
+        &host,
+        zenui_demo::CLOSE_CONFIRMATION_WINDOW,
+        "Discard draft",
+    );
+    post_click_in(&host, zenui_demo::CLOSE_CONFIRMATION_WINDOW, discard, scale);
+    assert!(host.pump().expect("the last window closes the loop"));
+    assert!(host.hwnd(MAIN).is_none());
+    assert!(host.hwnd(zenui_demo::CLOSE_CONFIRMATION_WINDOW).is_none());
+    host.run().expect("the message loop exits");
+}
+
+#[test]
+fn an_empty_draft_closes_without_a_prompt() {
+    let mut host = open_host();
+    host.render().expect("render the primary window");
+
+    post_close(&host);
+    assert!(host.pump().expect("the empty draft closes synchronously"));
+    assert!(host.hwnd(MAIN).is_none());
+    assert!(host.hwnd(zenui_demo::CLOSE_CONFIRMATION_WINDOW).is_none());
+    host.run().expect("the message loop exits");
+}
+
+#[test]
 fn hover_press_and_release_activate_a_filter_button_once() {
     let mut host = open_host();
     host.render().expect("render the initial frame");
@@ -1312,6 +1450,26 @@ fn focused_in(host: &Host, key: &str) -> Option<NodeId> {
         .iter()
         .find(|element| element.focused())
         .map(SceneElement::id)
+}
+
+fn value_in(host: &Host, key: &str, label: &str) -> Option<String> {
+    host.presentation(key)
+        .expect("a window snapshot")
+        .find_label(label)
+        .expect("a labelled element")
+        .text_value()
+        .map(str::to_owned)
+}
+
+fn type_main_draft(host: &mut Host, text: &str) -> NodeId {
+    let (draft, point, scale) = center_label(host, MAIN, "What needs to be done?");
+    post_click_in(host, MAIN, point, scale);
+    assert!(!host.pump().expect("focus the draft"));
+    for character in text.chars() {
+        post_char_in(host, MAIN, character);
+    }
+    assert!(!host.pump().expect("type the draft"));
+    draft
 }
 
 fn window_title(hwnd: windows::Win32::Foundation::HWND) -> String {
