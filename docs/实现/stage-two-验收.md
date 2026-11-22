@@ -63,7 +63,7 @@ GPU 型号与后端由一次性的 `adapter.get_info()` 探针确认，探针未
 
 ## 验收发现与修复
 
-**标签断行。** 在 150% 缩放下，"Load sample" 与 "Preview import" 被拆成两行并
+**标签断行。** 在 150% 缩放下，"Load sample" 与当时的 "Preview import"（#152 后为 "Import file"）被拆成两行并
 溢出按钮边框。原因不在 DPI 换算：Taffy 把叶子尺寸取整到整像素，而 Parley 按精确
 的 max-content 宽度断行，测量宽度比最终布局少不足一个像素时就会拆行。修复让
 `TextShaper::measure` 把 intrinsic 宽度向上取整到像素网格，并恢复 `shape` 只按

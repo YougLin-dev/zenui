@@ -13,6 +13,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     PostMessageW, WM_CHAR, WM_CLOSE, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP,
     WM_MOUSEMOVE,
 };
+use zenui::prelude::*;
 use zenui::{Appearance, Color, ColorRole, NodeId};
 use zenui_render::{Point, SceneElement, Visual};
 use zenui_windows::{Host, HostConfig, HostError};
@@ -29,6 +30,35 @@ fn open_host_with(config: HostConfig) -> Host {
     zenui_demo::open_todo_window(&mut runtime).expect("open the todo window");
     zenui_demo::seed(&mut runtime).expect("seed the todo rows");
     Host::open(runtime, config).expect("open a host")
+}
+
+#[component]
+fn WindowTaskProbe(window: WindowCtx) -> MountResult<MountPlan> {
+    let start = move || {
+        let _ = window.task_scope().spawn(|_| String::from("late"));
+    };
+    view! {
+        <view role="main">
+            <button aria:label="Start task" on:click={move || start()}>
+                "Start task"
+            </button>
+        </view>
+    }
+}
+
+fn open_task_host() -> Host {
+    let mut runtime = zenui::Runtime::new();
+    runtime
+        .declare_windows(|catalog| {
+            catalog.window(
+                zenui::WindowSpec::new(MAIN).primary().sized(320, 240),
+                |window| view! { <WindowTaskProbe window={window} /> },
+            )?;
+            Ok(())
+        })
+        .expect("declare the task probe window");
+    runtime.show(MAIN).expect("show the task probe window");
+    Host::open(runtime, HostConfig::hidden()).expect("open the task probe host")
 }
 
 fn open_empty_host() -> Host {
@@ -695,11 +725,11 @@ fn a_delivered_task_wakes_the_host_and_repaints() {
 
 #[test]
 fn closing_while_a_task_runs_discards_the_late_wake_and_reopens_fresh() {
-    let mut host = open_host();
+    let mut host = open_task_host();
     host.render().expect("render the initial frame");
-    let (preview, scale) = button_at(&host, 7);
-    post_click(&host, preview, scale);
-    host.pump().expect("start the preview task");
+    let (_, start, scale) = center_label(&host, MAIN, "Start task");
+    post_click(&host, start, scale);
+    host.pump().expect("start the window-owned task");
     post_close(&host);
     host.run().expect("process the close");
     // 关闭意味着 activation 结束与 HWND 销毁；迟到结果只能被丢弃。
@@ -715,12 +745,15 @@ fn closing_while_a_task_runs_discards_the_late_wake_and_reopens_fresh() {
     );
     drop(host);
 
-    let mut reopened = open_host();
+    let mut reopened = open_task_host();
     reopened.render().expect("render the reopened window");
-    assert_eq!(
-        checkbox_ids(&reopened).len(),
-        2,
-        "reopening mounts a fresh seeded activation"
+    assert!(
+        reopened
+            .presentation(MAIN)
+            .expect("a window snapshot")
+            .find_label("Start task")
+            .is_some(),
+        "reopening mounts a fresh activation"
     );
 }
 

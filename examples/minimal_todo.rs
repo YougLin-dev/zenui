@@ -18,12 +18,19 @@ fn main() {
     app.click_label("Delete Read docs").expect("delete");
     println!("all: {}", app.texts().join(" | "));
 
-    app.click_text("Preview import").expect("preview task");
+    let file =
+        std::env::temp_dir().join(format!("zenui-minimal-import-{}.txt", std::process::id()));
+    std::fs::write(&file, "From file\n").expect("write the import file");
+    app.click_text("Import file").expect("pick a file");
+    let request = app
+        .take_file_dialog_requests()
+        .pop()
+        .expect("a file dialog request");
+    app.complete_file_dialog_request(request, FileDialogOutcome::Picked(vec![file.clone()]))
+        .expect("complete the headless picker");
+    let mut delivered = app.settle_tasks().expect("settle the import").delivered;
     app.click_text("Load sample").expect("app task");
-    let report = app.settle_tasks().expect("settle tasks");
-    println!(
-        "tasks: delivered={} | {}",
-        report.delivered,
-        app.texts().join(" | ")
-    );
+    delivered += app.settle_tasks().expect("settle tasks").delivered;
+    let _ = std::fs::remove_file(&file);
+    println!("tasks: delivered={delivered} | {}", app.texts().join(" | "));
 }

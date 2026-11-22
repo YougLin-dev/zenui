@@ -6,12 +6,76 @@
     reason = "{} is the intentionally supported event-expression syntax"
 )]
 
+use std::path::PathBuf;
+
 use zenui::prelude::*;
 
 fn report(result: Result<(), impl std::fmt::Display>, error: Signal<String>) {
     if let Err(failure) = result {
         error.set(failure.to_string());
     }
+}
+
+/// 导入文本的标题：一行一个，去掉首尾空白，跳过空行。
+fn import_titles(text: &str) -> impl Iterator<Item = &str> {
+    text.lines().map(str::trim).filter(|line| !line.is_empty())
+}
+
+/// 读取所有选中的文件；任一文件读取失败时不返回部分结果。
+fn read_import(paths: &[PathBuf]) -> Result<Vec<String>, String> {
+    let mut titles = Vec::new();
+    for path in paths {
+        let text = std::fs::read_to_string(path)
+            .map_err(|error| format!("Could not read {}: {error}", path.display()))?;
+        titles.extend(import_titles(&text).map(str::to_owned));
+    }
+    Ok(titles)
+}
+
+/// 文件对话框返回后启动应用所有权 worker；取消与失败都不改变任务列表。
+fn begin_import(
+    window: WindowCtx,
+    todos: Store,
+    import_notice: Signal<String>,
+    task_error: Signal<String>,
+    outcome: FileDialogOutcome,
+) -> Result<(), MountError> {
+    let paths = match outcome {
+        FileDialogOutcome::Picked(paths) => paths,
+        FileDialogOutcome::Cancelled => return Ok(()),
+        FileDialogOutcome::Failed(error) => {
+            task_error.set(error.to_string());
+            import_notice.set(String::new());
+            return Ok(());
+        }
+    };
+    let task = window
+        .app_task_scope()
+        .spawn(move |_| read_import(&paths))
+        .map_err(|_| MountError::Component("start the import worker"))?;
+    task.on_done(move |outcome| {
+        let titles = match outcome {
+            Ok(titles) => titles,
+            Err(message) => {
+                task_error.set(format!("Import failed: {message}"));
+                import_notice.set(String::new());
+                return Ok(());
+            }
+        };
+        let count = titles.len();
+        let mut transaction = Transaction::new();
+        for title in titles {
+            transaction = transaction.write(todos.insert(title));
+        }
+        transaction.finish()?;
+        import_notice.set(match count {
+            1 => String::from("Imported 1 task"),
+            _ => format!("Imported {count} tasks"),
+        });
+        task_error.set(String::new());
+        Ok(())
+    })
+    .map_err(|_| MountError::Component("register the import continuation"))
 }
 
 /// 过滤条件在界面上的标签；主窗口按钮与 Details 摘要共用同一份词表。
@@ -96,13 +160,14 @@ pub struct TodoState {
     pub todos: Store,
     pub draft: Signal<String>,
     pub filter: Signal<Filter>,
-    pub preview: Signal<String>,
+    /// 最近一次成功导入的计数提示；为空时不渲染。
+    pub import_notice: Signal<String>,
     pub task_error: Signal<String>,
     remaining_txt: Memo<String>,
     no_tasks: Memo<bool>,
     no_matches: Memo<bool>,
     has_error: Memo<bool>,
-    has_preview: Memo<bool>,
+    has_import_notice: Memo<bool>,
 }
 
 impl TodoState {
@@ -119,20 +184,20 @@ impl TodoState {
         let no_tasks = memo(move || todos.is_empty(Filter::All));
         let no_matches = memo(move || !no_tasks.get() && todos.is_empty(filter.get()));
         let task_error = signal(String::new());
-        let preview = signal(String::new());
+        let import_notice = signal(String::new());
         let has_error = memo(move || !task_error.get().is_empty());
-        let has_preview = memo(move || !preview.get().is_empty());
+        let has_import_notice = memo(move || !import_notice.get().is_empty());
         Self {
             todos,
             draft: signal(String::new()),
             filter,
-            preview,
+            import_notice,
             task_error,
             remaining_txt,
             no_tasks,
             no_matches,
             has_error,
-            has_preview,
+            has_import_notice,
         }
     }
 }
@@ -198,13 +263,13 @@ pub fn TodoApp(window: WindowCtx, state: TodoState) -> MountResult<MountPlan> {
         todos,
         draft,
         filter,
-        preview,
+        import_notice,
         task_error,
         remaining_txt,
         no_tasks,
         no_matches,
         has_error,
-        has_preview,
+        has_import_notice,
     } = state;
     let visible = memo(move || todos.rows(filter.get()));
     let dark = memo(move || {
@@ -244,17 +309,23 @@ pub fn TodoApp(window: WindowCtx, state: TodoState) -> MountResult<MountPlan> {
         })();
         report(result, task_error);
     };
-    let preview_import = move || {
-        let result = (|| -> Result<(), TaskError> {
-            let task = window
-                .task_scope()
-                .spawn(|_| String::from("preview ready"))?;
-            task.on_done(move |text| {
-                preview.set(text);
-                Ok(())
-            })
-        })();
-        report(result, task_error);
+    let import_file = move || {
+        let options = FileDialogOptions::open_files()
+            .titled("Import tasks")
+            .filter("Text files", ["txt"]);
+        let result = window
+            .pick_file(options, window.app_task_scope())
+            .map_err(|error| error.to_string())
+            .and_then(|picker| {
+                picker
+                    .on_done(move |outcome| {
+                        begin_import(window, todos, import_notice, task_error, outcome)
+                    })
+                    .map_err(|error| error.to_string())
+            });
+        if let Err(message) = result {
+            task_error.set(message);
+        }
     };
 
     view! {
@@ -302,7 +373,7 @@ pub fn TodoApp(window: WindowCtx, state: TodoState) -> MountResult<MountPlan> {
                     let _ = Transaction::new().write(todos.clear_completed()).finish();
                 }}>"Clear done"</button>
                 <button on:click={move || load_sample()}>"Load sample"</button>
-                <button on:click={move || preview_import()}>"Preview import"</button>
+                <button on:click={move || import_file()}>"Import file"</button>
                 <button
                     aria:label="Toggle theme"
                     on:click={move || {
@@ -318,8 +389,8 @@ pub fn TodoApp(window: WindowCtx, state: TodoState) -> MountResult<MountPlan> {
             <Show when={has_error}>
                 <text>{task_error}</text>
             </Show>
-            <Show when={has_preview}>
-                <text>{preview}</text>
+            <Show when={has_import_notice}>
+                <text aria:label="Import notice">{import_notice}</text>
             </Show>
             <Show when={no_tasks}>
                 <text>"Nothing here yet"</text>
@@ -465,4 +536,31 @@ pub fn seed(runtime: &mut Runtime) -> Result<(), MountError> {
     runtime.input("Edit Write tests", "Write tests")?;
     runtime.input("Edit Read docs", "Read docs")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::import_titles;
+
+    #[test]
+    fn import_titles_skip_blank_lines_and_trim_whitespace() {
+        let text = "\r\n  Write tests \r\n\r\nRead docs\n   \n";
+        assert_eq!(
+            import_titles(text).collect::<Vec<_>>(),
+            ["Write tests", "Read docs"]
+        );
+    }
+
+    #[test]
+    fn import_titles_keep_inner_spacing_and_unicode() {
+        assert_eq!(
+            import_titles("  Buy 牛奶 \n\n 复习 IME  ").collect::<Vec<_>>(),
+            ["Buy 牛奶", "复习 IME"]
+        );
+    }
+
+    #[test]
+    fn import_titles_of_an_empty_file_are_empty() {
+        assert_eq!(import_titles("\n \r\n").count(), 0);
+    }
 }
