@@ -6,7 +6,7 @@ ZenUI 使用 Rust 编写原生桌面界面。它保留控件及其编辑状态�
 
 ## 当前能力
 
-ZenUI 处在开发阶段。阶段一的 target API、阶段二的 Windows 原生切片，以及阶段三的多窗口、关闭确认与原生打开文件对话框已可运行；菜单/托盘、保存/文件夹对话框、辅助技术和跨平台支持仍在开发中。跨显示器混合 DPI 与实机 device loss 仍是 #63 的开放证据缺口。
+ZenUI 处在开发阶段。阶段一的 target API、阶段二的 Windows 原生切片，以及阶段三的多窗口、关闭确认与原生打开/保存/文件夹对话框已可运行；菜单/托盘、辅助技术和跨平台支持仍在开发中。跨显示器混合 DPI 与实机 device loss 仍是 #63 的开放证据缺口。
 
 仓库目前提供：
 
@@ -15,8 +15,8 @@ ZenUI 处在开发阶段。阶段一的 target API、阶段二的 Windows 原生
 - headless 与原生窗口的 activation 和任务交付边界：app/window 所有权、Send worker、代际检查后的 UI continuation；窗口关闭取消其交付，共享模型仍可由 app 所有权任务提交；
 - Windows 宿主：每个存活窗口一个 HWND、Scene 与 DX12 surface，共享 device 和模型；原生输入、IME、DPI 与隐藏窗口 smoke（CI 回退 WARP）；
 - 多窗口窗口目录：show/hide/close/reopen、关闭确认 epoch、父窗口输入挂起与声明的确认窗口；
-- 原生打开文件对话框：窗口锚定、单选/多选、标题与类型过滤器、取消/失败结果，以及显式的窗口或应用任务所有权；
-- 宿主任务：文件选择结果与 worker 共用 Task/continuation 交付，但没有 worker 通道，也不会阻塞 `settle_tasks`；
+- 原生打开/保存/文件夹对话框：窗口锚定、单选/多选、标题与类型过滤器、建议文件名与默认扩展名、取消/失败结果，以及显式的窗口或应用任务所有权；
+- 宿主任务：文件对话框结果与 worker 共用 Task/continuation 交付，但没有 worker 通道，也不会阻塞 `settle_tasks`；
 - 长列表场景构建：跨重建复用未变化的文本 layout 与测量结果，viewport 外的元素保留几何但跳过 glyph 与绘制；完整列表虚拟化仍在后续路线；
 - 有界运行时存储：最近发布快照按固定窗口保留，释放的 Owner 节点回到存活规模，Todo 的列表 reconciliation 与行句柄查找使用索引而不是逐行扫描；
 - 可复现的 Todo 场景：插入、删除、筛选、重排、焦点与拒绝句柄后的恢复；
@@ -58,11 +58,13 @@ target API 的公开行为测试位于根包 `tests/`，其中 `tests/tasks.rs` 
 - [渲染与平台](docs/实现/渲染与平台.md)：布局、文本、绘制、内容接入和宿主能力。
 - [验证重点](docs/实现/验证重点.md)：目标模型落地时需要验证的关键语义。
 - [ADR-0007](docs/adr/0007-window-catalog-and-close-epoch.md)：窗口目录、per-activation 权威与关闭 epoch。
-- [ADR-0008](docs/adr/0008-file-picker-host-tasks.md)：文件选择器、宿主任务、显式所有权与 STA 模态对话框。
+- [ADR-0008](docs/adr/0008-file-picker-host-tasks.md)：打开文件选择器、宿主任务、显式所有权与 STA 模态对话框。
+- [ADR-0009](docs/adr/0009-file-dialog-family.md)：打开/保存/文件夹对话框家族、kind 矩阵与单路径校验。
 - [Stage-one 验收](docs/实现/stage-one-验收.md)：headless Todo 的可执行完成判据、边界证据与原生缺口。
 - [Stage-two 验收](docs/实现/stage-two-验收.md)：Windows 原生切片、IME、样式与 150% 实机证据。
 - [Stage-three 多窗口验收](docs/实现/stage-three-多窗口-验收.md)：主窗口与详情窗口、hide/show、close/reopen 与关闭确认在 100%/150% 下的可见证据。
 - [Stage-three 文件对话框验收](docs/实现/stage-three-文件对话框-验收.md)：原生 `IFileOpenDialog`、取消、单选/多选、导入、错误与 Unicode 路径的可见证据。
+- [Stage-three 保存与文件夹验收](docs/实现/stage-three-保存与文件夹-验收.md)：原生 `IFileSaveDialog`、覆盖确认、过滤扩展名优先级、写入拒绝、Unicode 路径与文件夹选择的可见证据。
 
 ## 界面语法
 

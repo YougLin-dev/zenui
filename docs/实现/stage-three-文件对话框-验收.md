@@ -1,6 +1,6 @@
 # Stage-three 文件选择器与导入验收（实机记录）
 
-本页记录阶段三文件选择器里程碑的可见 Windows 验收：原生打开文件对话框、标题与过滤器、owner 模态禁用、取消、单选、多选、文本导入、错误路径、长/Unicode 路径，以及对话框期间的 worker 完成与关闭后的焦点/输入。设计取舍见 [ADR-0008](../adr/0008-file-picker-host-tasks.md)。
+本页记录阶段三文件选择器里程碑的可见 Windows 验收：原生打开文件对话框、标题与过滤器、owner 模态禁用、取消、单选、多选、文本导入、错误路径、长/Unicode 路径，以及对话框期间的 worker 完成与关闭后的焦点/输入。设计取舍见 [ADR-0008](../adr/0008-file-picker-host-tasks.md)；保存与文件夹对话框记录在 [stage-three 保存与文件夹验收](stage-three-保存与文件夹-验收.md)，契约见 [ADR-0009](../adr/0009-file-dialog-family.md)。
 
 **状态：可见自动驱动验收完成（150%）。** 运行使用真实可见 HWND、真实 shell `IFileOpenDialog` 和宿主默认 presenter，没有注入 presenter。输入通过 UI Automation 与投递的原生鼠标/键盘消息完成，不是人工鼠标键盘；截图证明可见窗口中的状态与像素，不证明用户注视下的 DWM 时序。隐藏 smoke 与 CI WARP 是部分证据，不构成本页的原生验收。
 
@@ -60,7 +60,7 @@
 - **可见自动驱动（本页）：** 真实可见 HWND、真实 shell 文件对话框、宿主默认原生 presenter、真实窗口过程、UIAutomation 操作与 `PrintWindow` 像素。不是人工操作；不证明用户注视下的 DWM 合成、z-order 或被其它窗口遮挡时的表现。
 - **隐藏 smoke 与 CI WARP：** `crates/windows/tests/file_dialog.rs` 用注入 presenter 覆盖 anchor/options、嵌套消息、worker 唤醒、FIFO、隐藏宿主 `Unsupported` 与失效锚点；`crates/windows/tests/hidden_smoke.rs` 覆盖宿主关闭；`tests/file_picker.rs` 覆盖运行时请求/所有权/恰好一次完成。它们是路由与协议证据，不是原生验收。
 - **headless 导入：** `crates/demo/tests/import.rs` 用 fake host 完成与临时文件覆盖行解析、计数、取消、读取/UTF-8 错误、以及主窗口关闭后的应用所有权导入；这不是原生窗口证据。
-- **未覆盖：** 真实鼠标键盘与人工视觉确认；100% 缩放；程序化取消已打开的 shell 对话框；保存/文件夹对话框、拖放与菜单/托盘；初始目录/MRU 策略；多个同时打开的对话框；跨显示器 DPI 与实机 device loss（仍属 #63）。
+- **未覆盖：** 真实鼠标键盘与人工视觉确认；100% 缩放；程序化取消已打开的 shell 对话框；拖放与菜单/托盘；初始目录/MRU 策略；多个同时打开的对话框；跨显示器 DPI 与实机 device loss（仍属 #63）。保存与文件夹对话框见 [stage-three 保存与文件夹验收](stage-three-保存与文件夹-验收.md)。
 
 ## 判据对照
 
