@@ -3242,13 +3242,42 @@ mod tests {
         assert_eq!(claimed, 1, "exactly one concurrent wake posts a message");
     }
 
+    #[component]
+    fn WindowTaskProbe(window: WindowCtx) -> MountResult<MountPlan> {
+        let start = move || {
+            let _ = window.task_scope().spawn(|_| String::from("done"));
+        };
+        view! {
+            <view role="main">
+                <button on:click={move || start()}>"Start task"</button>
+            </view>
+        }
+    }
+
+    fn open_task_host() -> Host {
+        let mut runtime = Runtime::new();
+        runtime
+            .declare_windows(|catalog| {
+                catalog.window(
+                    WindowSpec::new(MAIN).primary().sized(320, 240),
+                    |window| view! { <WindowTaskProbe window={window} /> },
+                )?;
+                Ok(())
+            })
+            .expect("declare the task probe window");
+        runtime.show(MAIN).expect("show the task probe window");
+        let mut host = Host::open(runtime, HostConfig::hidden()).expect("open the task probe host");
+        host.render().expect("render the task probe window");
+        host
+    }
+
     #[test]
     fn closing_the_window_cancels_window_owned_tasks() {
-        let mut host = open_host();
+        let mut host = open_task_host();
         // 事件 handler 在已安装的运行时上下文里启动窗口所有权任务；
         // 不 pump 唤醒消息，确保关闭发生在交付之前。
         host.runtime
-            .click_text("Preview import")
+            .click_text("Start task")
             .expect("spawn a window-owned task");
 
         host.close(MAIN).expect("close the window");

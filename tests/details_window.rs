@@ -161,10 +161,10 @@ fn details_hides_closes_and_reopens_without_touching_the_main_window() {
     app.focus("What needs to be done?")
         .expect("focus the draft");
     assert!(app.set_caret("What needs to be done?", 4));
-    app.click_text("Preview import")
-        .expect("start a window-owned task");
-    app.settle_tasks().expect("settle the preview task");
-    assert!(has_text(&app, main, "preview ready"));
+    app.click_text("Load sample")
+        .expect("commit app-owned rows");
+    app.settle_tasks().expect("settle the sample task");
+    assert!(has_text(&app, main, "Imported A"));
     let main_input = app
         .presentation_of(main)
         .expect("main snapshot")
@@ -234,7 +234,7 @@ fn details_hides_closes_and_reopens_without_touching_the_main_window() {
     );
     assert_eq!(app.caret("What needs to be done?"), Some(4));
     assert_eq!(draft_value(&app, main).as_deref(), Some("draft kept"));
-    assert!(has_text(&app, main, "preview ready"));
+    assert!(has_text(&app, main, "Imported A"));
 
     let reopened = open_details(&mut app);
     assert_ne!(reopened, details);
@@ -254,5 +254,5 @@ fn details_hides_closes_and_reopens_without_touching_the_main_window() {
     );
     assert_eq!(app.caret("What needs to be done?"), Some(4));
     assert_eq!(draft_value(&app, main).as_deref(), Some("draft kept"));
-    assert!(has_text(&app, main, "preview ready"));
+    assert!(has_text(&app, main, "Imported A"));
 }

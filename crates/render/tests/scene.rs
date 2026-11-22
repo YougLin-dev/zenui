@@ -57,7 +57,7 @@ fn long_toolbar_labels_stay_inside_their_buttons() {
     let snapshot = app.presentation().expect("snapshot");
     let scene = build_scene(&snapshot, 800.0);
 
-    for label in ["Load sample", "Preview import"] {
+    for label in ["Load sample", "Import file"] {
         let element = scene
             .node(by_text(&snapshot, "button", label))
             .expect("toolbar button");
