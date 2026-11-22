@@ -2,7 +2,9 @@
 
 use zenui::prelude::*;
 use zenui_demo::*;
-use zenui_render::{DecorationKind, Point, Scene, SceneElement, SceneEnv, SceneError, Viewport};
+use zenui_render::{
+    DecorationKind, Point, Scene, SceneCache, SceneElement, SceneEnv, SceneError, Viewport,
+};
 
 fn runtime() -> Runtime {
     let mut app = Runtime::new();
@@ -1449,5 +1451,117 @@ fn full_width_spans_the_row() {
     assert!(
         (wide.width - 400.0).abs() < 0.5,
         "w-full spans the row: {wide:?}"
+    );
+}
+
+fn scene_fingerprint(scene: &Scene) -> String {
+    let mut out = format!(
+        "viewport={:?} caret={}\n",
+        scene.viewport(),
+        scene.caret_visible()
+    );
+    for element in scene.elements() {
+        out.push_str(&format!(
+            "element {:?} {:?} rect={:?} visual={:?} style={:?} disabled={}\n",
+            element.id(),
+            element.tag(),
+            element.rect(),
+            element.visual(),
+            element.resolved_style(),
+            element.disabled()
+        ));
+        for run in element.text() {
+            out.push_str(&format!(
+                "run size={} coords={:?}\n",
+                run.font_size(),
+                run.normalized_coords()
+            ));
+            for glyph in run.glyphs() {
+                out.push_str(&format!(
+                    "glyph {} {} {} {}\n",
+                    glyph.id, glyph.x, glyph.y, glyph.advance
+                ));
+            }
+        }
+    }
+    for decoration in scene.decorations() {
+        out.push_str(&format!("decoration {decoration:?}\n"));
+    }
+    out
+}
+
+#[test]
+fn a_scene_cache_reuses_layouts_without_changing_the_scene() {
+    let mut app = runtime();
+    add(&mut app, "Write tests");
+    add(&mut app, "Read docs");
+    app.input("What needs to be done?", "draft").expect("draft");
+    let snapshot = app.presentation().expect("snapshot");
+    let base_viewport = viewport(800.0);
+
+    let fresh = Scene::build(&snapshot, base_viewport).expect("fresh scene");
+    let mut cache = SceneCache::new();
+    let first = Scene::build_cached(&snapshot, base_viewport, &SceneEnv::default(), &mut cache)
+        .expect("cached scene");
+    let second = Scene::build_cached(&snapshot, base_viewport, &SceneEnv::default(), &mut cache)
+        .expect("cached scene again");
+    let fingerprint = scene_fingerprint(&fresh);
+    assert_eq!(fingerprint, scene_fingerprint(&first));
+    assert_eq!(fingerprint, scene_fingerprint(&second));
+
+    app.input("What needs to be done?", "changed")
+        .expect("changed draft");
+    let changed = app.presentation().expect("snapshot");
+    let cached = Scene::build_cached(&changed, base_viewport, &SceneEnv::default(), &mut cache)
+        .expect("cached changed scene");
+    let fresh = Scene::build(&changed, base_viewport).expect("fresh changed scene");
+    let changed_fingerprint = scene_fingerprint(&fresh);
+    assert_eq!(changed_fingerprint, scene_fingerprint(&cached));
+    assert_ne!(
+        fingerprint, changed_fingerprint,
+        "the changed draft produces different glyphs"
+    );
+
+    let narrow = viewport(500.0);
+    let cached = Scene::build_cached(&changed, narrow, &SceneEnv::default(), &mut cache)
+        .expect("cached narrow scene");
+    let fresh = Scene::build(&changed, narrow).expect("fresh narrow scene");
+    assert_eq!(
+        scene_fingerprint(&fresh),
+        scene_fingerprint(&cached),
+        "a different width hits a different shaped layout"
+    );
+}
+
+#[test]
+fn offscreen_rows_keep_geometry_but_skip_glyphs() {
+    let mut app = runtime();
+    for index in 0..60 {
+        add(&mut app, &format!("row-{index:02}"));
+    }
+    let snapshot = app.presentation().expect("snapshot");
+    let short = Scene::build(
+        &snapshot,
+        Viewport::new(800.0, 300.0, 1.0).expect("short viewport"),
+    )
+    .expect("short scene");
+    let tall = Scene::build(
+        &snapshot,
+        Viewport::new(800.0, 4000.0, 1.0).expect("tall viewport"),
+    )
+    .expect("tall scene");
+    let id = by_text(&snapshot, "text", "row-59");
+
+    let offscreen = short.node(id).expect("offscreen geometry is kept");
+    assert!(offscreen.text().is_empty(), "offscreen glyphs are skipped");
+    let visible = tall.node(id).expect("visible element");
+    assert!(
+        !visible.text().is_empty(),
+        "a taller viewport shapes the row"
+    );
+    assert_eq!(
+        offscreen.rect(),
+        visible.rect(),
+        "culling does not move the element"
     );
 }

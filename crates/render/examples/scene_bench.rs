@@ -1,0 +1,77 @@
+//! Fixed-workload probe for scene rebuilds after a large text import.
+//!
+//! Run with `cargo run --release -p zenui-render --example scene_bench --locked`.
+//! It prints timings and element counts; it makes no wall-clock assertion.
+
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
+
+use zenui::prelude::*;
+use zenui_demo::{open_todo_window, seed};
+use zenui_render::{Scene, SceneCache, SceneEnv, Viewport};
+
+fn imported_runtime(rows: usize) -> (Runtime, PathBuf) {
+    let mut app = Runtime::new();
+    open_todo_window(&mut app).expect("open the demo windows");
+    seed(&mut app).expect("seed");
+    let path = std::env::temp_dir().join(format!("zenui-scene-bench-{rows}.txt"));
+    let text = (0..rows)
+        .map(|index| format!("Imported task {index:05}\n"))
+        .collect::<String>();
+    std::fs::write(&path, text).expect("write the import file");
+    app.click_text("Import file").expect("request the picker");
+    let request = app
+        .take_file_dialog_requests()
+        .pop()
+        .expect("a picker request");
+    app.complete_file_dialog_request(request, FileDialogOutcome::Picked(vec![path.clone()]))
+        .expect("complete the picker");
+    app.settle_tasks().expect("settle the import");
+    (app, path)
+}
+
+fn measure(repetitions: u32, mut step: impl FnMut()) -> Duration {
+    let start = Instant::now();
+    for _ in 0..repetitions {
+        step();
+    }
+    start.elapsed() / repetitions
+}
+
+fn main() {
+    const REPETITIONS: u32 = 20;
+    let viewport = Viewport::new(900.0, 700.0, 1.0).expect("viewport");
+
+    for rows in [100usize, 500, 1000] {
+        let (mut app, path) = imported_runtime(rows);
+        let snapshot = app.presentation().expect("presentation");
+        let fresh = measure(REPETITIONS, || {
+            let _ = Scene::build(&snapshot, viewport).expect("scene");
+        });
+        let mut cache = SceneCache::new();
+        let cold = {
+            let start = Instant::now();
+            let _ = Scene::build_cached(&snapshot, viewport, &SceneEnv::default(), &mut cache)
+                .expect("scene");
+            start.elapsed()
+        };
+        let warm = measure(REPETITIONS, || {
+            let _ = Scene::build_cached(&snapshot, viewport, &SceneEnv::default(), &mut cache)
+                .expect("scene");
+        });
+        app.input("What needs to be done?", "x").expect("type");
+        let input_snapshot = app.presentation().expect("presentation");
+        let input_rebuild = {
+            let start = Instant::now();
+            let _ =
+                Scene::build_cached(&input_snapshot, viewport, &SceneEnv::default(), &mut cache)
+                    .expect("scene");
+            start.elapsed()
+        };
+        let elements = input_snapshot.elements().count();
+        println!(
+            "rows={rows} fresh={fresh:?} cold_cached={cold:?} warm_cached={warm:?} input_rebuild={input_rebuild:?} elements={elements}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+}

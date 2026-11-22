@@ -2,8 +2,9 @@
 //! 文本 run、命中测试和 caret/selection 几何。
 //!
 //! 输入是 [`PresentationSnapshot`] 与 [`Viewport`]；输出是 [`Scene`]。每次
-//! 构建都做一次完整 Taffy 重排，Node ID 原样保留。场景不持有闭包、平台
-//! 句柄或第二棵保留树，也不读取运行时内部。
+//! 构建都做一次完整 Taffy 重排，Node ID 原样保留。重复构建可复用
+//! [`SceneCache`] 的文本 layout；场景不持有闭包、平台句柄或第二棵保留树，
+//! 也不读取运行时内部。
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -19,7 +20,7 @@ pub use geometry::{Point, Rect, Viewport};
 pub use gpu::{GpuContext, GpuRenderer, RenderError, RenderPalette, RenderTargetConfig};
 pub use parley::FontData;
 pub use scene::{
-    Decoration, DecorationKind, PositionedGlyph, ResolvedStyle, Scene, SceneElement, SceneEnv,
-    TextRun, Visual,
+    Decoration, DecorationKind, PositionedGlyph, ResolvedStyle, Scene, SceneCache, SceneElement,
+    SceneEnv, TextRun, Visual,
 };
 pub use wgpu;

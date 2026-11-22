@@ -15,6 +15,11 @@ resolver = "3"
 [profile.dev.package."*"]
 opt-level = 3
 
+# 场景 builder、文本缓存与绘制入口也在热路径上。完整 opt-level 3 会拖慢
+# 增量编译，2 足以让 500 行列表在 debug 构建中保持可交互。
+[profile.dev.package.zenui-render]
+opt-level = 2
+
 [package]
 name = "zenui"
 version = "0.1.0"

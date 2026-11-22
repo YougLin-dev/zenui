@@ -1,5 +1,8 @@
 //! Parley 文本整形、测量与 caret/selection 几何。
 
+use std::collections::HashMap;
+
+use parley::layout::ContentWidths;
 use parley::layout::PositionedLayoutItem;
 use parley::{Affinity, Cursor, FontContext, Layout, LayoutContext, Selection, StyleProperty};
 use taffy::prelude::{AvailableSpace, Size as TaffySize};
@@ -62,18 +65,90 @@ impl CharRange {
 pub(crate) struct TextShaper {
     fonts: FontContext,
     layouts: LayoutContext<()>,
+    /// 未断行 layout 与内容宽度；键包含文本、字号与字重。
+    metrics: HashMap<TextKey, TextMetrics>,
+    /// 已按宽度断行的 layout；重复场景构建直接克隆，不重新整形。
+    shaped: HashMap<ShapedKey, Layout<()>>,
+    /// Taffy 会对同一 text leaf 以相同输入重复测量；直接复用尺寸结果。
+    measured: HashMap<MeasureKey, MeasureResult>,
 }
+
+struct TextMetrics {
+    layout: Layout<()>,
+    content: ContentWidths,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct TextKey {
+    text: String,
+    size_bits: u32,
+    weight: u16,
+}
+
+impl TextKey {
+    fn new(text: &str, style: TextStyle) -> Self {
+        Self {
+            text: text.to_owned(),
+            size_bits: style.size.to_bits(),
+            weight: style.weight,
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct ShapedKey {
+    text: TextKey,
+    width_bits: u32,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum AvailableKey {
+    MinContent,
+    MaxContent,
+    Definite(u32),
+}
+
+impl AvailableKey {
+    const fn new(available: AvailableSpace) -> Self {
+        match available {
+            AvailableSpace::MinContent => Self::MinContent,
+            AvailableSpace::MaxContent => Self::MaxContent,
+            AvailableSpace::Definite(width) => Self::Definite(width.to_bits()),
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct MeasureKey {
+    text: TextKey,
+    width_bits: Option<u32>,
+    available: AvailableKey,
+}
+
+#[derive(Clone, Copy)]
+struct MeasureResult {
+    size: TaffySize<f32>,
+    baseline: f32,
+}
+
+/// 每个缓存的条目都包含完整 glyph 数据；达到上限时整体清空，避免无界增长。
+const METRICS_LIMIT: usize = 8192;
+const SHAPED_LIMIT: usize = 16384;
+const MEASURE_LIMIT: usize = 65536;
 
 impl TextShaper {
     pub(crate) fn new() -> Self {
         Self {
             fonts: FontContext::new(),
             layouts: LayoutContext::new(),
+            metrics: HashMap::new(),
+            shaped: HashMap::new(),
+            measured: HashMap::new(),
         }
     }
 
     fn build(&mut self, text: &str, style: TextStyle) -> Layout<()> {
-        let Self { fonts, layouts } = self;
+        let Self { fonts, layouts, .. } = self;
         let mut builder = layouts.ranged_builder(fonts, text, 1.0, true);
         builder.push_default(StyleProperty::FontSize(style.size));
         builder.push_default(StyleProperty::FontWeight(parley::FontWeight::new(
@@ -83,9 +158,40 @@ impl TextShaper {
         builder.build(text)
     }
 
+    fn metrics(&mut self, text: &str, style: TextStyle) -> (Layout<()>, ContentWidths) {
+        let key = TextKey::new(text, style);
+        if !self.metrics.contains_key(&key) {
+            let layout = self.build(text, style);
+            let content = layout.calculate_content_widths();
+            if self.metrics.len() >= METRICS_LIMIT {
+                self.metrics.clear();
+            }
+            self.metrics
+                .insert(key.clone(), TextMetrics { layout, content });
+        }
+        let metrics = self.metrics.get(&key).expect("metrics were just inserted");
+        (metrics.layout.clone(), metrics.content)
+    }
+
+    fn remember_shaped(&mut self, key: ShapedKey, layout: &Layout<()>) {
+        if self.shaped.len() >= SHAPED_LIMIT {
+            self.shaped.clear();
+        }
+        self.shaped.insert(key, layout.clone());
+    }
+
     pub(crate) fn shape(&mut self, text: &str, max_width: f32, style: TextStyle) -> Layout<()> {
-        let mut layout = self.build(text, style);
-        layout.break_all_lines(Some(max_width.max(0.0)));
+        let width = max_width.max(0.0);
+        let key = ShapedKey {
+            text: TextKey::new(text, style),
+            width_bits: width.to_bits(),
+        };
+        if let Some(layout) = self.shaped.get(&key) {
+            return layout.clone();
+        }
+        let (mut layout, _) = self.metrics(text, style);
+        layout.break_all_lines(Some(width));
+        self.remember_shaped(key, &layout);
         layout
     }
 
@@ -97,8 +203,15 @@ impl TextShaper {
         available: TaffySize<AvailableSpace>,
         style: TextStyle,
     ) -> (TaffySize<f32>, f32) {
-        let mut layout = self.build(text, style);
-        let content = layout.calculate_content_widths();
+        let key = MeasureKey {
+            text: TextKey::new(text, style),
+            width_bits: dimensions.width.map(f32::to_bits),
+            available: AvailableKey::new(available.width),
+        };
+        if let Some(result) = self.measured.get(&key) {
+            return (result.size, result.baseline);
+        }
+        let (mut layout, content) = self.metrics(text, style);
         let width = match available.width {
             AvailableSpace::MinContent => content.min,
             AvailableSpace::MaxContent => content.max,
@@ -107,6 +220,12 @@ impl TextShaper {
             }
         };
         layout.break_all_lines(Some(width));
+        // emit 通常以最终布局宽度再次 shape；把这次断行结果留下。
+        let shaped_key = ShapedKey {
+            text: TextKey::new(text, style),
+            width_bits: width.to_bits(),
+        };
+        self.remember_shaped(shaped_key, &layout);
         let intrinsic_width = match available.width {
             AvailableSpace::MinContent => content.min,
             AvailableSpace::MaxContent => content.max,
@@ -120,13 +239,18 @@ impl TextShaper {
         let intrinsic_width = intrinsic_width.ceil();
         let height = layout.height();
         let baseline = layout.first_baseline().unwrap_or(height);
-        (
-            TaffySize {
+        let result = MeasureResult {
+            size: TaffySize {
                 width: intrinsic_width,
                 height,
             },
             baseline,
-        )
+        };
+        if self.measured.len() >= MEASURE_LIMIT {
+            self.measured.clear();
+        }
+        self.measured.insert(key, result);
+        (result.size, result.baseline)
     }
 }
 
@@ -269,6 +393,60 @@ mod tests {
             size.width >= max_content,
             "the measured width never rounds below the line"
         );
+    }
+
+    #[test]
+    fn shaped_layouts_are_reused_for_the_same_text_width_and_style() {
+        let mut shaper = TextShaper::new();
+        let first = shaper.shape("hello", 100.0, TextStyle::DEFAULT);
+        assert_eq!(shaper.shaped.len(), 1);
+        let cached = shaper.shape("hello", 100.0, TextStyle::DEFAULT);
+        assert_eq!(shaper.shaped.len(), 1, "an identical shape is a cache hit");
+        assert_eq!(
+            (first.width(), first.height()),
+            (cached.width(), cached.height())
+        );
+
+        shaper.shape("hello", 90.0, TextStyle::DEFAULT);
+        assert_eq!(shaper.shaped.len(), 2, "a different width is a new entry");
+        shaper.shape(
+            "hello",
+            100.0,
+            TextStyle {
+                size: 16.0,
+                weight: 400,
+            },
+        );
+        assert_eq!(shaper.shaped.len(), 3, "a different style is a new entry");
+    }
+
+    #[test]
+    fn repeated_measurements_reuse_the_cached_result() {
+        let mut shaper = TextShaper::new();
+        let dimensions = TaffySize {
+            width: Some(180.0),
+            height: None,
+        };
+        let available = TaffySize {
+            width: AvailableSpace::Definite(180.0),
+            height: AvailableSpace::MaxContent,
+        };
+        let first = shaper.measure("hello world", dimensions, available, TextStyle::DEFAULT);
+        assert_eq!(shaper.measured.len(), 1);
+        let second = shaper.measure("hello world", dimensions, available, TextStyle::DEFAULT);
+        assert_eq!(
+            shaper.measured.len(),
+            1,
+            "an identical measure is a cache hit"
+        );
+        assert_eq!(first, second);
+
+        let wider = TaffySize {
+            width: AvailableSpace::Definite(240.0),
+            height: AvailableSpace::MaxContent,
+        };
+        shaper.measure("hello world", dimensions, wider, TextStyle::DEFAULT);
+        assert_eq!(shaper.measured.len(), 2, "a different width is a new entry");
     }
 
     #[test]

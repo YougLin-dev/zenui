@@ -43,8 +43,8 @@ use zenui::prelude::*;
 
 use crate::file_dialog::{ComApartment, FileDialogPresenter, NativeFileDialog};
 use zenui_render::{
-    GpuRenderer, Point, RenderPalette, RenderTargetConfig, Scene, SceneElement, SceneEnv, Viewport,
-    Visual, wgpu,
+    GpuRenderer, Point, RenderPalette, RenderTargetConfig, Scene, SceneCache, SceneElement,
+    SceneEnv, Viewport, Visual, wgpu,
 };
 
 /// worker 唤醒只投递这一条消息；`WM_APP` 起是应用私有的消息区间。
@@ -234,6 +234,8 @@ pub struct Host {
     queue: wgpu::Queue,
     renderer: GpuRenderer,
     renderer_target: RenderTargetConfig,
+    /// 消息循环重复构建场景时复用未变化的文本 layout。
+    scene_cache: SceneCache,
     format: wgpu::TextureFormat,
     hinstance: HINSTANCE,
     /// runtime 只安装一个唤醒回调；合并标志与当前投递目标都属于整条交付通道。
@@ -360,6 +362,7 @@ impl Host {
             queue,
             renderer,
             renderer_target: target,
+            scene_cache: SceneCache::new(),
             format,
             hinstance,
             wake,
@@ -1794,12 +1797,22 @@ impl Host {
         let scale = if dpi == 0 { 1.0 } else { dpi as f32 / 96.0 };
         let viewport = Viewport::new(width as f32 / scale, height as f32 / scale, scale)
             .map_err(HostError::Scene)?;
-        let mut scene =
-            Scene::build_with(snapshot, viewport, &scene_env(window)).map_err(HostError::Scene)?;
+        let mut scene = Scene::build_cached(
+            snapshot,
+            viewport,
+            &scene_env(window),
+            &mut self.scene_cache,
+        )
+        .map_err(HostError::Scene)?;
         // 新场景可能已经移走或卸载了指针下的节点；失效目标不能继续高亮。
         if self.revalidate_pointer(window, &scene) {
-            scene = Scene::build_with(snapshot, viewport, &scene_env(window))
-                .map_err(HostError::Scene)?;
+            scene = Scene::build_cached(
+                snapshot,
+                viewport,
+                &scene_env(window),
+                &mut self.scene_cache,
+            )
+            .map_err(HostError::Scene)?;
         }
         // 组合期间不绘制 caret，草稿由 preedit 下划线标识；闪烁只在非组合状态生效。
         let composing = focused_composition(snapshot);

@@ -245,6 +245,8 @@ impl SceneElement {
     }
 
     /// 绘制在该元素盒内的文本 run，包含按钮标题等裸文本子节点。
+    ///
+    /// 元素完全在 viewport 外时为空；几何和样式仍可查询。
     pub fn text(&self) -> &[TextRun] {
         &self.text
     }
@@ -408,6 +410,30 @@ impl Decoration {
     }
 }
 
+/// 跨多次场景构建复用的文本布局缓存。
+///
+/// 一个 UI 线程持有一个实例即可。缓存按文本、字号、字重与断行宽度存储
+/// Parley layout；快照或指针瞬态变化时只重新整形真正变化的文本。
+pub struct SceneCache {
+    shaper: TextShaper,
+}
+
+impl SceneCache {
+    /// 创建一个空的文本布局缓存。
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            shaper: TextShaper::new(),
+        }
+    }
+}
+
+impl Default for SceneCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// 一次完整重排的结果；几何都是逻辑像素与绝对坐标。
 #[derive(Clone, Debug)]
 pub struct Scene {
@@ -430,7 +456,21 @@ impl Scene {
         viewport: Viewport,
         env: &SceneEnv,
     ) -> Result<Self, SceneError> {
-        Builder::new(snapshot, *env).build(viewport)
+        let mut cache = SceneCache::new();
+        Self::build_cached(snapshot, viewport, env, &mut cache)
+    }
+
+    /// 与 [`Scene::build_with`] 相同，但复用调用方持有的文本布局缓存。
+    ///
+    /// 适合消息循环中的重复构建：未变化的文本不需要重新整形。缓存只影响
+    /// 构建耗时，不改变场景几何、字形或快照语义。
+    pub fn build_cached(
+        snapshot: &PresentationSnapshot,
+        viewport: Viewport,
+        env: &SceneEnv,
+        cache: &mut SceneCache,
+    ) -> Result<Self, SceneError> {
+        Builder::new(snapshot, *env).build(viewport, cache)
     }
 
     /// 构建该场景的 viewport；scale 未参与布局。
@@ -449,6 +489,9 @@ impl Scene {
     }
 
     /// 已提交元素，按绘制顺序（先序）。
+    ///
+    /// viewport 外的元素仍在列表中并保留几何，但不生成 glyph run 与 caret
+    /// stops；窗口变大或内容移动后按新 viewport 重新生成。
     pub fn elements(&self) -> &[SceneElement] {
         &self.elements
     }
@@ -544,6 +587,8 @@ struct Builder<'a> {
     tree: TaffyTree<TextContext>,
     kinds: HashMap<TaffyNodeId, Kind>,
     resolved: HashMap<TaffyNodeId, ResolvedStyle>,
+    /// emit 按 Node ID 取快照元素；snapshot 的公开查找是线性的。
+    elements: HashMap<NodeId, &'a SnapshotElement>,
 }
 
 impl<'a> Builder<'a> {
@@ -554,11 +599,15 @@ impl<'a> Builder<'a> {
             tree: TaffyTree::new(),
             kinds: HashMap::new(),
             resolved: HashMap::new(),
+            elements: snapshot
+                .elements()
+                .map(|element| (element.id(), element))
+                .collect(),
         }
     }
 
-    fn build(mut self, viewport: Viewport) -> Result<Scene, SceneError> {
-        let mut shaper = TextShaper::new();
+    fn build(mut self, viewport: Viewport, cache: &mut SceneCache) -> Result<Scene, SceneError> {
+        let shaper = &mut cache.shaper;
         let mut roots = Vec::new();
         for root in self.snapshot.roots() {
             match root {
@@ -578,7 +627,7 @@ impl<'a> Builder<'a> {
         };
         self.tree
             .compute_layout_with_measure(root, available, |inputs, _node, context, style| {
-                measure_leaf(&mut shaper, inputs, context, style)
+                measure_leaf(shaper, inputs, context, style)
             })
             .map_err(layout_error)?;
 
@@ -588,7 +637,8 @@ impl<'a> Builder<'a> {
             decorations: Vec::new(),
             caret_visible: true,
         };
-        self.emit(&mut shaper, root, Point::ZERO, &mut scene)?;
+        let clip = Rect::new(0.0, 0.0, viewport.width(), viewport.height());
+        self.emit(shaper, root, Point::ZERO, &mut scene, clip)?;
         Ok(scene)
     }
 
@@ -699,6 +749,7 @@ impl<'a> Builder<'a> {
         node: TaffyNodeId,
         origin: Point,
         scene: &mut Scene,
+        clip: Rect,
     ) -> Result<(), SceneError> {
         let layout = self.tree.layout(node).map_err(layout_error)?;
         let rect = Rect::new(
@@ -717,13 +768,17 @@ impl<'a> Builder<'a> {
         match kind {
             Kind::Root => {
                 for child in self.tree.children(node).map_err(layout_error)? {
-                    self.emit(shaper, child, Point::new(rect.x, rect.y), scene)?;
+                    self.emit(shaper, child, Point::new(rect.x, rect.y), scene, clip)?;
                 }
             }
             Kind::Element(id) => {
-                let element = self.snapshot.node(id).ok_or_else(|| SceneError::Layout {
-                    message: String::from("the snapshot lost a laid-out element"),
-                })?;
+                let element =
+                    self.elements
+                        .get(&id)
+                        .copied()
+                        .ok_or_else(|| SceneError::Layout {
+                            message: String::from("the snapshot lost a laid-out element"),
+                        })?;
                 let children = self.tree.children(node).map_err(layout_error)?;
                 let resolved =
                     self.resolved
@@ -744,6 +799,9 @@ impl<'a> Builder<'a> {
                         child_layout.size.width,
                         child_layout.size.height,
                     );
+                    if !intersects(child_rect, clip) {
+                        continue;
+                    }
                     let context =
                         self.tree
                             .get_node_context(*child)
@@ -762,7 +820,7 @@ impl<'a> Builder<'a> {
                 })?;
                 let focused = self.snapshot.focus() == Some(id);
                 let mut caret_stops = None;
-                if intrinsic == Intrinsic::TextInput {
+                if intrinsic == Intrinsic::TextInput && intersects(rect, clip) {
                     let (content, width) = content_box(rect, layout);
                     let (display, preedit, composition) = display_text(element);
                     let layout = shaper.shape(&display, width, resolved.text);
@@ -807,7 +865,7 @@ impl<'a> Builder<'a> {
 
                 for child in children {
                     if self.kinds.get(&child) != Some(&Kind::Text) {
-                        self.emit(shaper, child, Point::new(rect.x, rect.y), scene)?;
+                        self.emit(shaper, child, Point::new(rect.x, rect.y), scene, clip)?;
                     }
                 }
             }
@@ -964,6 +1022,16 @@ fn visual(intrinsic: Intrinsic, element: &SnapshotElement) -> Visual {
         Intrinsic::TextInput => Visual::TextInput,
         Intrinsic::View | Intrinsic::Form => Visual::Container,
     }
+}
+
+/// 半开区间相交；完全在 viewport 之外的文本无需整形或生成 glyph run。
+fn intersects(rect: Rect, clip: Rect) -> bool {
+    rect.width > 0.0
+        && rect.height > 0.0
+        && rect.x < clip.right()
+        && rect.right() > clip.x
+        && rect.y < clip.bottom()
+        && rect.bottom() > clip.y
 }
 
 /// 边框盒内的内容原点与可用宽度。
