@@ -176,6 +176,35 @@ fn the_todo_snapshot_lays_out_non_zero_ordered_boxes() {
 }
 
 #[test]
+fn the_save_and_folder_actions_stay_inside_every_supported_viewport() {
+    let app = runtime();
+    let snapshot = app.presentation().expect("snapshot");
+    let viewports = [
+        Viewport::new(900.0, 700.0, 1.0).expect("the default viewport"),
+        Viewport::new(900.0, 700.0, 1.5).expect("the acceptance-scale viewport"),
+        Viewport::new(800.0, 600.0, 1.0).expect("the scene test viewport"),
+    ];
+
+    for viewport in viewports {
+        let scene = Scene::build(&snapshot, viewport).expect("scene");
+        for label in ["Save tasks", "Choose folder"] {
+            let element = scene
+                .node(by_text(&snapshot, "button", label))
+                .expect("toolbar action");
+            let rect = element.rect();
+            assert!(
+                rect.x >= 0.0 && rect.x + rect.width <= viewport.width(),
+                "{label:?} stays horizontally inside {viewport:?}: {rect:?}"
+            );
+            assert!(
+                rect.y >= 0.0 && rect.y + rect.height <= viewport.height(),
+                "{label:?} stays vertically inside {viewport:?}: {rect:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn text_shaping_produces_latin_and_cjk_glyph_runs() {
     let mut app = runtime();
     add(&mut app, "Write tests");

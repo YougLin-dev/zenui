@@ -6,7 +6,7 @@
     reason = "{} is the intentionally supported event-expression syntax"
 )]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use zenui::prelude::*;
 
@@ -32,11 +32,23 @@ fn read_import(paths: &[PathBuf]) -> Result<Vec<String>, String> {
     Ok(titles)
 }
 
+/// 失败时的统一提示迁移：清掉旧提示，显示带上下文前缀的错误。
+fn fail(notice: Signal<String>, task_error: Signal<String>, message: String) {
+    notice.set(String::new());
+    task_error.set(message);
+}
+
+/// 成功时的统一提示迁移：显示结果并清掉旧错误。
+fn succeed(notice: Signal<String>, task_error: Signal<String>, message: String) {
+    notice.set(message);
+    task_error.set(String::new());
+}
+
 /// 文件对话框返回后启动应用所有权 worker；取消与失败都不改变任务列表。
 fn begin_import(
     window: WindowCtx,
     todos: Store,
-    import_notice: Signal<String>,
+    notice: Signal<String>,
     task_error: Signal<String>,
     outcome: FileDialogOutcome,
 ) -> Result<(), MountError> {
@@ -44,8 +56,7 @@ fn begin_import(
         FileDialogOutcome::Picked(paths) => paths,
         FileDialogOutcome::Cancelled => return Ok(()),
         FileDialogOutcome::Failed(error) => {
-            task_error.set(error.to_string());
-            import_notice.set(String::new());
+            fail(notice, task_error, error.to_string());
             return Ok(());
         }
     };
@@ -57,8 +68,7 @@ fn begin_import(
         let titles = match outcome {
             Ok(titles) => titles,
             Err(message) => {
-                task_error.set(format!("Import failed: {message}"));
-                import_notice.set(String::new());
+                fail(notice, task_error, format!("Import failed: {message}"));
                 return Ok(());
             }
         };
@@ -68,14 +78,153 @@ fn begin_import(
             transaction = transaction.write(todos.insert(title));
         }
         transaction.finish()?;
-        import_notice.set(match count {
-            1 => String::from("Imported 1 task"),
-            _ => format!("Imported {count} tasks"),
-        });
-        task_error.set(String::new());
+        succeed(
+            notice,
+            task_error,
+            match count {
+                1 => String::from("Imported 1 task"),
+                _ => format!("Imported {count} tasks"),
+            },
+        );
         Ok(())
     })
     .map_err(|_| MountError::Component("register the import continuation"))
+}
+
+fn read_titles(fields: impl IntoIterator<Item = Field<String>>) -> Result<Vec<String>, String> {
+    fields
+        .into_iter()
+        .map(|field| field.read_once().map_err(|error| error.to_string()))
+        .collect()
+}
+
+/// 按已提交顺序读取全部行；当前过滤只影响呈现，不影响保存内容。
+fn committed_titles(todos: Store) -> Result<Vec<String>, String> {
+    read_titles(
+        todos
+            .rows(Filter::All)
+            .iter()
+            .map(|key| todos.title(TodoId::from_key(key))),
+    )
+}
+
+/// 写入一个 UTF-8 文本文件：每个标题一行，每行以 `\n` 结束。
+///
+/// 换行会破坏行格式，因此在写入任何字节前拒绝；空列表产生空文件，
+/// 空标题产生一个空行。
+fn save_titles(path: &Path, titles: &[String]) -> Result<usize, String> {
+    if titles
+        .iter()
+        .any(|title| title.contains('\n') || title.contains('\r'))
+    {
+        return Err(String::from("a task title contains a line break"));
+    }
+    let mut text = String::new();
+    for title in titles {
+        text.push_str(title);
+        text.push('\n');
+    }
+    std::fs::write(path, text)
+        .map_err(|error| format!("Could not write {}: {error}", path.display()))?;
+    Ok(titles.len())
+}
+
+fn saved_message(count: usize) -> String {
+    match count {
+        1 => String::from("Saved 1 task"),
+        _ => format!("Saved {count} tasks"),
+    }
+}
+
+fn begin_save(
+    window: WindowCtx,
+    todos: Store,
+    notice: Signal<String>,
+    task_error: Signal<String>,
+    outcome: FileDialogOutcome,
+) -> Result<(), MountError> {
+    let path = match outcome {
+        FileDialogOutcome::Picked(mut paths) => {
+            let Some(path) = paths.pop() else {
+                fail(
+                    notice,
+                    task_error,
+                    String::from("Save failed: the dialog returned no path"),
+                );
+                return Ok(());
+            };
+            path
+        }
+        FileDialogOutcome::Cancelled => return Ok(()),
+        FileDialogOutcome::Failed(error) => {
+            fail(notice, task_error, format!("Save failed: {error}"));
+            return Ok(());
+        }
+    };
+    let titles = match committed_titles(todos) {
+        Ok(titles) => titles,
+        Err(message) => {
+            fail(notice, task_error, format!("Save failed: {message}"));
+            return Ok(());
+        }
+    };
+    let task = window
+        .app_task_scope()
+        .spawn(move |_| save_titles(&path, &titles))
+        .map_err(|_| MountError::Component("start the save worker"))?;
+    task.on_done(move |result| {
+        match result {
+            Ok(count) => succeed(notice, task_error, saved_message(count)),
+            Err(message) => fail(notice, task_error, format!("Save failed: {message}")),
+        }
+        Ok(())
+    })
+    .map_err(|_| MountError::Component("register the save continuation"))
+}
+
+fn begin_folder(notice: Signal<String>, task_error: Signal<String>, outcome: FileDialogOutcome) {
+    match outcome {
+        FileDialogOutcome::Picked(mut paths) => {
+            let Some(path) = paths.pop() else {
+                fail(
+                    notice,
+                    task_error,
+                    String::from("Choose folder failed: the dialog returned no path"),
+                );
+                return;
+            };
+            succeed(notice, task_error, format!("Folder: {}", path.display()));
+        }
+        FileDialogOutcome::Cancelled => {}
+        FileDialogOutcome::Failed(error) => {
+            fail(notice, task_error, format!("Choose folder failed: {error}"));
+        }
+    }
+}
+
+/// 发起一次文件对话框请求，并注册返回后的续期。
+///
+/// 请求或续期注册在本地失败时走与其他失败相同的提示迁移，避免旧的
+/// `Saved N tasks` / `Folder: …` 留在新错误旁边。
+fn request_dialog(
+    window: WindowCtx,
+    options: FileDialogOptions,
+    notice: Signal<String>,
+    task_error: Signal<String>,
+    failure_prefix: &str,
+    on_outcome: impl FnOnce(FileDialogOutcome) -> Result<(), MountError> + 'static,
+) {
+    let result = window
+        .request_file_dialog(options, window.app_task_scope())
+        .map_err(|error| error.to_string())
+        .and_then(|picker| {
+            picker
+                .on_done(on_outcome)
+                .map_err(|error| error.to_string())
+        });
+    if let Err(message) = result {
+        fail(notice, task_error, format!("{failure_prefix}: {message}"));
+    }
 }
 
 /// 过滤条件在界面上的标签；主窗口按钮与 Details 摘要共用同一份词表。
@@ -160,14 +309,14 @@ pub struct TodoState {
     pub todos: Store,
     pub draft: Signal<String>,
     pub filter: Signal<Filter>,
-    /// 最近一次成功导入的计数提示；为空时不渲染。
-    pub import_notice: Signal<String>,
+    /// 最近一次导入、保存或选择文件夹的共享提示；为空时不渲染。
+    pub notice: Signal<String>,
     pub task_error: Signal<String>,
     remaining_txt: Memo<String>,
     no_tasks: Memo<bool>,
     no_matches: Memo<bool>,
     has_error: Memo<bool>,
-    has_import_notice: Memo<bool>,
+    has_notice: Memo<bool>,
 }
 
 impl TodoState {
@@ -184,20 +333,20 @@ impl TodoState {
         let no_tasks = memo(move || todos.is_empty(Filter::All));
         let no_matches = memo(move || !no_tasks.get() && todos.is_empty(filter.get()));
         let task_error = signal(String::new());
-        let import_notice = signal(String::new());
+        let notice = signal(String::new());
         let has_error = memo(move || !task_error.get().is_empty());
-        let has_import_notice = memo(move || !import_notice.get().is_empty());
+        let has_notice = memo(move || !notice.get().is_empty());
         Self {
             todos,
             draft: signal(String::new()),
             filter,
-            import_notice,
+            notice,
             task_error,
             remaining_txt,
             no_tasks,
             no_matches,
             has_error,
-            has_import_notice,
+            has_notice,
         }
     }
 }
@@ -263,13 +412,13 @@ pub fn TodoApp(window: WindowCtx, state: TodoState) -> MountResult<MountPlan> {
         todos,
         draft,
         filter,
-        import_notice,
+        notice,
         task_error,
         remaining_txt,
         no_tasks,
         no_matches,
         has_error,
-        has_import_notice,
+        has_notice,
     } = state;
     let visible = memo(move || todos.rows(filter.get()));
     let dark = memo(move || {
@@ -313,19 +462,43 @@ pub fn TodoApp(window: WindowCtx, state: TodoState) -> MountResult<MountPlan> {
         let options = FileDialogOptions::open_files()
             .titled("Import tasks")
             .filter("Text files", ["txt"]);
-        let result = window
-            .request_file_dialog(options, window.app_task_scope())
-            .map_err(|error| error.to_string())
-            .and_then(|picker| {
-                picker
-                    .on_done(move |outcome| {
-                        begin_import(window, todos, import_notice, task_error, outcome)
-                    })
-                    .map_err(|error| error.to_string())
-            });
-        if let Err(message) = result {
-            task_error.set(message);
-        }
+        request_dialog(
+            window,
+            options,
+            notice,
+            task_error,
+            "Import failed",
+            move |outcome| begin_import(window, todos, notice, task_error, outcome),
+        );
+    };
+    let save_tasks = move || {
+        let options = FileDialogOptions::save_file()
+            .titled("Save tasks")
+            .filter("Text files", ["txt"])
+            .with_suggested_name("tasks.txt")
+            .with_default_extension("txt");
+        request_dialog(
+            window,
+            options,
+            notice,
+            task_error,
+            "Save failed",
+            move |outcome| begin_save(window, todos, notice, task_error, outcome),
+        );
+    };
+    let choose_folder = move || {
+        let options = FileDialogOptions::pick_folder().titled("Choose a folder");
+        request_dialog(
+            window,
+            options,
+            notice,
+            task_error,
+            "Choose folder failed",
+            move |outcome| {
+                begin_folder(notice, task_error, outcome);
+                Ok(())
+            },
+        );
     };
 
     view! {
@@ -386,11 +559,15 @@ pub fn TodoApp(window: WindowCtx, state: TodoState) -> MountResult<MountPlan> {
                     on:click={move || report(window.request_show(DETAILS_WINDOW), task_error)}
                 >"Details"</button>
             </view>
+            <view role="toolbar" class="gap-3">
+                <button on:click={move || save_tasks()}>"Save tasks"</button>
+                <button on:click={move || choose_folder()}>"Choose folder"</button>
+            </view>
             <Show when={has_error}>
-                <text>{task_error}</text>
+                <text aria:label="Error">{task_error}</text>
             </Show>
-            <Show when={has_import_notice}>
-                <text aria:label="Import notice">{import_notice}</text>
+            <Show when={has_notice}>
+                <text aria:label="Notice">{notice}</text>
             </Show>
             <Show when={no_tasks}>
                 <text>"Nothing here yet"</text>
@@ -432,8 +609,10 @@ pub fn TodoDetails(window: WindowCtx, state: TodoState) -> MountResult<MountPlan
         remaining_txt,
         no_tasks,
         no_matches,
+        notice,
         task_error,
         has_error,
+        has_notice,
         ..
     } = state;
     let visible = memo(move || todos.rows(filter.get()));
@@ -462,7 +641,10 @@ pub fn TodoDetails(window: WindowCtx, state: TodoState) -> MountResult<MountPlan
                 <text>"Nothing matches"</text>
             </Show>
             <Show when={has_error}>
-                <text>{task_error}</text>
+                <text aria:label="Error">{task_error}</text>
+            </Show>
+            <Show when={has_notice}>
+                <text aria:label="Notice">{notice}</text>
             </Show>
             <view role="toolbar" class="gap-3">
                 <button
@@ -540,7 +722,36 @@ pub fn seed(runtime: &mut Runtime) -> Result<(), MountError> {
 
 #[cfg(test)]
 mod tests {
-    use super::import_titles;
+    use std::cell::RefCell;
+    use std::path::Path;
+    use std::rc::Rc;
+
+    use super::{TodoState, import_titles, read_titles, save_titles};
+    use zenui::prelude::*;
+
+    type StaleRead = Rc<RefCell<Option<Result<Vec<String>, String>>>>;
+
+    #[component]
+    fn StaleProbe(state: TodoState, result: StaleRead) -> MountResult<MountPlan> {
+        let make_stale = move || {
+            let _ = Transaction::new()
+                .write(state.todos.insert("gone"))
+                .finish();
+            let Some(id) = state
+                .todos
+                .rows(Filter::All)
+                .iter()
+                .map(TodoId::from_key)
+                .next()
+            else {
+                return;
+            };
+            let _ = Transaction::new().write(state.todos.remove(id)).finish();
+            *result.borrow_mut() = Some(read_titles([state.todos.title(id)]));
+        };
+
+        view! { <button on:click={move || make_stale()}>"Make stale"</button> }
+    }
 
     #[test]
     fn import_titles_skip_blank_lines_and_trim_whitespace() {
@@ -562,5 +773,39 @@ mod tests {
     #[test]
     fn import_titles_of_an_empty_file_are_empty() {
         assert_eq!(import_titles("\n \r\n").count(), 0);
+    }
+
+    #[test]
+    fn save_titles_rejects_both_line_endings_before_writing() {
+        for separator in [10u8, 13u8] {
+            let title = format!("bad{}line", char::from(separator));
+            let error =
+                save_titles(Path::new("unused"), &[title]).expect_err("a line break is rejected");
+            assert!(error.contains("line break"), "unexpected error: {error}");
+        }
+    }
+
+    #[test]
+    fn a_stale_title_aborts_the_committed_title_read() {
+        let mut app = Runtime::new();
+        let state = app.setup(TodoState::new).expect("application setup");
+        let result: StaleRead = Rc::new(RefCell::new(None));
+        let slot = result.clone();
+        app.open_window("main", move |_| {
+            let slot = slot.clone();
+            view! { <StaleProbe state={state} result={slot} /> }
+        })
+        .expect("open the main window");
+        app.click_text("Make stale").expect("make the row stale");
+
+        let outcome = result
+            .borrow_mut()
+            .take()
+            .expect("the probe records one read");
+        let error = outcome.expect_err("the stale row cannot be read");
+        assert!(
+            error.contains("no longer live"),
+            "unexpected error: {error}"
+        );
     }
 }
