@@ -130,14 +130,17 @@ impl ResolvedStyle {
     }
 }
 
-/// 宿主拥有的呈现瞬态；不属于 presentation snapshot。
+/// 宿主拥有的呈现环境；不属于 presentation snapshot。
 ///
-/// `Default` 表示没有指针、指针输入方式：hover 与 active 都不命中。
+/// `Default` 表示没有指针、指针输入方式，滚动偏移为 0：hover 与 active
+/// 都不命中。滚动偏移是每个窗口 activation 持续的呈现状态，不随指针瞬态
+/// 清除。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SceneEnv {
     hovered: Option<NodeId>,
     pressed: Option<NodeId>,
     focus_visible: bool,
+    scroll_offset: i32,
 }
 
 impl SceneEnv {
@@ -159,6 +162,15 @@ impl SceneEnv {
         self
     }
 
+    /// 宿主请求的逻辑像素滚动偏移；正值让内容向上移动。
+    ///
+    /// 场景构建时把它夹到 `[0, max_scroll_offset]`，并通过
+    /// [`Scene::scroll_offset`] 报告实际采用的值。
+    pub const fn with_scroll_offset(mut self, offset: i32) -> Self {
+        self.scroll_offset = offset;
+        self
+    }
+
     /// 当前悬停的节点。
     pub const fn hovered(self) -> Option<NodeId> {
         self.hovered
@@ -172,6 +184,11 @@ impl SceneEnv {
     /// 焦点是否来自键盘输入。
     pub const fn focus_visible(self) -> bool {
         self.focus_visible
+    }
+
+    /// 宿主请求的滚动偏移；场景构建前可能超出内容范围。
+    pub const fn scroll_offset(self) -> i32 {
+        self.scroll_offset
     }
 }
 
@@ -438,6 +455,9 @@ impl Default for SceneCache {
 #[derive(Clone, Debug)]
 pub struct Scene {
     viewport: Viewport,
+    content_extent: Rect,
+    scroll_offset: i32,
+    max_scroll_offset: i32,
     elements: Vec<SceneElement>,
     decorations: Vec<Decoration>,
     caret_visible: bool,
@@ -449,8 +469,9 @@ impl Scene {
         Self::build_with(snapshot, viewport, &SceneEnv::default())
     }
 
-    /// 用宿主提供的指针瞬态完整重排一次快照。每次调用都重新构建 Taffy 树，
-    /// Node ID 原样保留。
+    /// 用宿主提供的呈现环境完整重排一次快照：指针瞬态、键盘模态与滚动偏移。
+    /// 每次调用都重新构建 Taffy 树，Node ID 原样保留；请求的偏移会夹到内容
+    /// 范围，实际值见 [`Scene::scroll_offset`]。
     pub fn build_with(
         snapshot: &PresentationSnapshot,
         viewport: Viewport,
@@ -478,6 +499,22 @@ impl Scene {
         self.viewport
     }
 
+    /// 滚动前的内容范围：原点是 `(0, 0)`，宽度等于 viewport 宽度，高度是
+    /// 合成根按像素对齐后的高度且不小于 viewport 高度。
+    pub const fn content_extent(&self) -> Rect {
+        self.content_extent
+    }
+
+    /// 场景实际采用的滚动偏移；请求值已夹到内容范围。
+    pub const fn scroll_offset(&self) -> i32 {
+        self.scroll_offset
+    }
+
+    /// 最大可用滚动偏移：内容高度减 viewport 高度，向下取整且不小于 0。
+    pub const fn max_scroll_offset(&self) -> i32 {
+        self.max_scroll_offset
+    }
+
     /// 是否绘制 caret；几何在 `decorations` 中保留，供 IME 定位使用。
     pub const fn caret_visible(&self) -> bool {
         self.caret_visible
@@ -488,21 +525,28 @@ impl Scene {
         self.caret_visible = visible;
     }
 
-    /// 已提交元素，按绘制顺序（先序）。
+    /// 已提交元素，按绘制顺序（先序），几何已按滚动偏移平移。
     ///
     /// viewport 外的元素仍在列表中并保留几何，但不生成 glyph run 与 caret
-    /// stops；窗口变大或内容移动后按新 viewport 重新生成。
+    /// stops；窗口变大、滚动或内容移动后按新 viewport 重新生成。
     pub fn elements(&self) -> &[SceneElement] {
         &self.elements
     }
 
-    /// 按 Node ID 查找场景元素。
+    /// 按 Node ID 查找场景元素；离屏元素同样可查询。
     pub fn node(&self, id: NodeId) -> Option<&SceneElement> {
         self.elements.iter().find(|element| element.id == id)
     }
 
     /// 最上层命中：后绘制的元素优先，半开区间。
+    ///
+    /// `point` 是场景坐标；视口外的点始终返回 `None`，即使平移后的内容
+    /// 几何覆盖该点。
     pub fn hit_test(&self, point: Point) -> Option<NodeId> {
+        let viewport = Rect::new(0.0, 0.0, self.viewport.width(), self.viewport.height());
+        if !viewport.contains(point) {
+            return None;
+        }
         self.elements
             .iter()
             .rev()
@@ -631,14 +675,30 @@ impl<'a> Builder<'a> {
             })
             .map_err(layout_error)?;
 
+        let root_size = self.tree.layout(root).map_err(layout_error)?.size;
+        // Taffy 把尺寸对齐到整像素；内容范围仍报告 viewport 的精确逻辑宽度，
+        // 并把高度夹到不低于 viewport，保持公开不变式。
+        let content_extent = Rect::new(
+            0.0,
+            0.0,
+            viewport.width(),
+            root_size.height.max(viewport.height()),
+        );
+        let max_scroll_offset = (content_extent.height - viewport.height()).max(0.0) as i32;
+        let scroll_offset = self.env.scroll_offset.clamp(0, max_scroll_offset);
         let mut scene = Scene {
             viewport,
+            content_extent,
+            scroll_offset,
+            max_scroll_offset,
             elements: Vec::new(),
             decorations: Vec::new(),
             caret_visible: true,
         };
         let clip = Rect::new(0.0, 0.0, viewport.width(), viewport.height());
-        self.emit(shaper, root, Point::ZERO, &mut scene, clip)?;
+        // 平移发生在布局之后：内容坐标不变，所有 emitted 几何共享同一偏移。
+        let origin = Point::new(0.0, 0.0 - scroll_offset as f32);
+        self.emit(shaper, root, origin, &mut scene, clip)?;
         Ok(scene)
     }
 
@@ -1028,6 +1088,8 @@ fn visual(intrinsic: Intrinsic, element: &SnapshotElement) -> Visual {
 fn intersects(rect: Rect, clip: Rect) -> bool {
     rect.width > 0.0
         && rect.height > 0.0
+        && clip.width > 0.0
+        && clip.height > 0.0
         && rect.x < clip.right()
         && rect.right() > clip.x
         && rect.y < clip.bottom()

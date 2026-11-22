@@ -3,7 +3,7 @@
 use zenui::prelude::*;
 use zenui_demo::*;
 use zenui_render::{
-    DecorationKind, Point, Scene, SceneCache, SceneElement, SceneEnv, SceneError, Viewport,
+    DecorationKind, Point, Rect, Scene, SceneCache, SceneElement, SceneEnv, SceneError, Viewport,
 };
 
 fn runtime() -> Runtime {
@@ -1531,6 +1531,494 @@ fn a_scene_cache_reuses_layouts_without_changing_the_scene() {
         scene_fingerprint(&cached),
         "a different width hits a different shaped layout"
     );
+}
+
+fn row(index: usize) -> zenui::view::PlanNode {
+    zenui::view::element(
+        "view",
+        vec![zenui::view::attr("role", "listitem")],
+        vec![zenui::view::element(
+            "text",
+            vec![zenui::view::attr("aria:label", format!("row-{index:03}"))],
+            vec![zenui::view::PlanNode::Text(zenui::view::TextSlot::Once(
+                format!("row {index:03}"),
+            ))],
+        )],
+    )
+}
+
+fn tall_app(rows: usize) -> Runtime {
+    let mut app = Runtime::new();
+    app.mount(move || {
+        let rows: Vec<zenui::view::PlanNode> = (0..rows).map(row).collect();
+        Ok(MountPlan::new(vec![zenui::view::element(
+            "view",
+            Vec::new(),
+            rows,
+        )]))
+    })
+    .expect("mount the tall list");
+    app
+}
+
+#[test]
+fn scroll_translates_every_rect_and_reports_extent() {
+    let app = tall_app(500);
+    let snapshot = app.presentation().expect("snapshot");
+    let viewport = Viewport::new(900.0, 700.0, 1.0).expect("viewport");
+    let base = Scene::build_cached(
+        &snapshot,
+        viewport,
+        &SceneEnv::default(),
+        &mut SceneCache::new(),
+    )
+    .expect("base scene");
+    let max = base.max_scroll_offset();
+    assert!(max > 0, "500 rows overflow 700 points: {max}");
+    assert_eq!(base.scroll_offset(), 0);
+    assert_eq!(base.content_extent().width, 900.0);
+    assert!(base.content_extent().height >= 700.0);
+
+    let offset = max / 2;
+    let scrolled = Scene::build_cached(
+        &snapshot,
+        viewport,
+        &SceneEnv::default().with_scroll_offset(offset),
+        &mut SceneCache::new(),
+    )
+    .expect("scrolled scene");
+    assert_eq!(scrolled.scroll_offset(), offset);
+    assert_eq!(scrolled.max_scroll_offset(), max);
+    assert_eq!(scrolled.content_extent(), base.content_extent());
+    assert_eq!(scrolled.elements().len(), base.elements().len());
+
+    for (unscrolled, translated) in base.elements().iter().zip(scrolled.elements()) {
+        assert_eq!(unscrolled.id(), translated.id());
+        assert_eq!(unscrolled.rect().x, translated.rect().x);
+        assert_eq!(unscrolled.rect().width, translated.rect().width);
+        assert_eq!(unscrolled.rect().height, translated.rect().height);
+        assert!(
+            (unscrolled.rect().y - translated.rect().y - offset as f32).abs() < 0.001,
+            "{} did not move by exactly {offset}: {:?} -> {:?}",
+            unscrolled.tag(),
+            unscrolled.rect(),
+            translated.rect()
+        );
+    }
+}
+
+#[test]
+fn scroll_clamps_requests_to_the_content_extent() {
+    let app = tall_app(60);
+    let snapshot = app.presentation().expect("snapshot");
+    let viewport = Viewport::new(900.0, 700.0, 1.0).expect("viewport");
+    let base = Scene::build(&snapshot, viewport).expect("base scene");
+    let max = base.max_scroll_offset();
+    assert_eq!(max, (base.content_extent().height - 700.0) as i32);
+    assert!(max > 0);
+
+    let overscrolled = Scene::build_with(
+        &snapshot,
+        viewport,
+        &SceneEnv::default().with_scroll_offset(max + 10_000),
+    )
+    .expect("overscrolled scene");
+    assert_eq!(overscrolled.scroll_offset(), max);
+    let at_max = Scene::build_with(
+        &snapshot,
+        viewport,
+        &SceneEnv::default().with_scroll_offset(max),
+    )
+    .expect("max scene");
+    assert_eq!(
+        scene_fingerprint(&overscrolled),
+        scene_fingerprint(&at_max),
+        "the clamped geometry uses max, not the requested offset"
+    );
+
+    let clamped_low = Scene::build_with(
+        &snapshot,
+        viewport,
+        &SceneEnv::default().with_scroll_offset(-10_000),
+    )
+    .expect("negative scroll scene");
+    assert_eq!(clamped_low.scroll_offset(), 0);
+    assert_eq!(scene_fingerprint(&clamped_low), scene_fingerprint(&base));
+
+    let mut short = Runtime::new();
+    short
+        .mount(|| {
+            Ok(MountPlan::new(vec![zenui::view::element(
+                "view",
+                Vec::new(),
+                Vec::new(),
+            )]))
+        })
+        .expect("mount short content");
+    let short_snapshot = short.presentation().expect("snapshot");
+    let fits = Scene::build_with(
+        &short_snapshot,
+        viewport,
+        &SceneEnv::default().with_scroll_offset(500),
+    )
+    .expect("fitting scene");
+    assert_eq!(fits.max_scroll_offset(), 0);
+    assert_eq!(fits.scroll_offset(), 0);
+    assert_eq!(fits.content_extent().height, 700.0);
+    assert_eq!(
+        scene_fingerprint(&fits),
+        scene_fingerprint(&Scene::build(&short_snapshot, viewport).expect("default scene")),
+        "a clamped zero offset matches the default environment"
+    );
+
+    for (width, height, scale) in [(910.6667, 467.3333, 1.5), (900.5, 700.5, 1.0)] {
+        let fractional = Viewport::new(width, height, scale).expect("fractional viewport");
+        let scene = Scene::build(&short_snapshot, fractional).expect("fractional scene");
+        assert_eq!(
+            scene.content_extent().width,
+            fractional.width(),
+            "the extent keeps the exact logical viewport width"
+        );
+        assert!(
+            scene.content_extent().height >= fractional.height(),
+            "the extent is never shorter than the viewport: {:?} vs {}",
+            scene.content_extent(),
+            fractional.height()
+        );
+        assert_eq!(scene.max_scroll_offset(), 0);
+    }
+}
+
+#[test]
+fn a_zero_area_viewport_culls_everything_and_hit_tests_nothing() {
+    let mut app = Runtime::new();
+    app.mount(|| {
+        let input = zenui::view::styled_element(
+            "text-input",
+            vec![
+                zenui::view::attr("aria:label", "editor"),
+                zenui::view::attr("value", "Alpha"),
+            ],
+            &[],
+            vec![zenui::view::style_width(px(100.0))],
+            Vec::new(),
+        );
+        let parent = zenui::view::element(
+            "view",
+            vec![zenui::view::attr("role", "group")],
+            vec![input],
+        );
+        Ok(MountPlan::new(vec![parent]))
+    })
+    .expect("mount an overhanging input");
+    app.focus("editor").expect("focus the editor");
+    let snapshot = app.presentation().expect("snapshot");
+    let id = snapshot.find_label("editor").expect("editor").id();
+    let viewport = Viewport::new(0.0, 0.0, 1.0).expect("zero viewport");
+    let scene = Scene::build(&snapshot, viewport).expect("zero scene");
+
+    assert_eq!(
+        scene.max_scroll_offset(),
+        scene.content_extent().height as i32
+    );
+    assert!(
+        scene
+            .node(id)
+            .expect("the input keeps its rect")
+            .text()
+            .is_empty(),
+        "no text is shaped into a zero-area viewport"
+    );
+    assert!(scene.caret(id).is_none());
+    assert_eq!(scene.hit_test(Point::new(0.0, 0.0)), None);
+
+    let scrolled = Scene::build_with(
+        &snapshot,
+        viewport,
+        &SceneEnv::default().with_scroll_offset(scene.max_scroll_offset()),
+    )
+    .expect("scrolled zero scene");
+    assert!(scrolled.node(id).expect("input").text().is_empty());
+    assert!(scrolled.caret(id).is_none());
+    assert_eq!(scrolled.hit_test(Point::new(0.0, 0.0)), None);
+
+    for (width, height) in [(400.0, 0.0), (0.0, 400.0)] {
+        let viewport = Viewport::new(width, height, 1.0).expect("one empty axis");
+        let base = Scene::build(&snapshot, viewport).expect("base scene");
+        let offset = base.max_scroll_offset() / 2;
+        let straddling = Scene::build_with(
+            &snapshot,
+            viewport,
+            &SceneEnv::default().with_scroll_offset(offset),
+        )
+        .expect("straddling scene");
+        assert!(
+            straddling.node(id).expect("input").text().is_empty(),
+            "a zero {width}x{height} viewport shapes nothing"
+        );
+        assert!(straddling.caret(id).is_none());
+        assert_eq!(straddling.hit_test(Point::new(0.0, 0.0)), None);
+    }
+}
+
+#[test]
+fn scroll_culls_runs_and_moves_caret_and_decorations() {
+    let mut app = Runtime::new();
+    app.mount(|| {
+        let mut rows = vec![zenui::view::element(
+            "text-input",
+            vec![
+                zenui::view::attr("aria:label", "editor"),
+                zenui::view::attr("value", "Alpha"),
+            ],
+            Vec::new(),
+        )];
+        rows.extend((0..80).map(row));
+        Ok(MountPlan::new(vec![zenui::view::element(
+            "view",
+            Vec::new(),
+            rows,
+        )]))
+    })
+    .expect("mount the list with an editor");
+    app.focus("editor").expect("focus the editor");
+    let id = app
+        .presentation()
+        .expect("snapshot")
+        .find_label("editor")
+        .expect("editor")
+        .id();
+    app.set_selection_node(id, 1, 3).expect("select a range");
+
+    let snapshot = app.presentation().expect("snapshot");
+    let viewport = Viewport::new(400.0, 300.0, 1.0).expect("viewport");
+    let base = Scene::build(&snapshot, viewport).expect("base scene");
+    let base_input = base.node(id).expect("editor");
+    let base_rect = base_input.rect();
+    assert!(!base_input.text().is_empty(), "the visible input shapes");
+    let base_caret = base.caret(id).expect("caret");
+    let base_selection: Vec<_> = base
+        .decorations()
+        .iter()
+        .filter(|decoration| {
+            decoration.node() == id && decoration.kind() == DecorationKind::Selection
+        })
+        .map(|decoration| decoration.rect())
+        .collect();
+    assert!(!base_selection.is_empty(), "the selection is decorated");
+
+    let partly = Scene::build_with(
+        &snapshot,
+        viewport,
+        &SceneEnv::default().with_scroll_offset(8),
+    )
+    .expect("partly scrolled scene");
+    let partly_input = partly.node(id).expect("editor");
+    assert!(
+        !partly_input.text().is_empty(),
+        "a partially visible input still shapes"
+    );
+    let base_glyphs: usize = base_input.text().iter().map(|run| run.glyphs().len()).sum();
+    let partly_glyphs: usize = partly_input
+        .text()
+        .iter()
+        .map(|run| run.glyphs().len())
+        .sum();
+    assert_eq!(
+        partly_glyphs, base_glyphs,
+        "partial visibility shapes the whole display text"
+    );
+    let base_run = base_input.text().first().expect("base run");
+    let partly_run = partly_input.text().first().expect("partial run");
+    assert!((partly_run.baseline() - (base_run.baseline() - 8.0)).abs() < 0.001);
+    let base_glyph = base_run.glyphs().first().expect("base glyph");
+    let partly_glyph = partly_run.glyphs().first().expect("partial glyph");
+    assert_eq!(partly_glyph.x, base_glyph.x);
+    assert!((partly_glyph.y - (base_glyph.y - 8.0)).abs() < 0.001);
+    assert!((partly.caret(id).expect("caret").y - (base_caret.y - 8.0)).abs() < 0.001);
+    assert!(
+        (partly
+            .node(id)
+            .expect("editor")
+            .caret_at_value(1)
+            .expect("caret stop")
+            .y
+            - (base_input.caret_at_value(1).expect("caret stop").y - 8.0))
+            .abs()
+            < 0.001,
+        "IME caret stops translate with the input"
+    );
+    let partly_selection: Vec<_> = partly
+        .decorations()
+        .iter()
+        .filter(|decoration| {
+            decoration.node() == id && decoration.kind() == DecorationKind::Selection
+        })
+        .map(|decoration| decoration.rect())
+        .collect();
+    assert_eq!(partly_selection.len(), base_selection.len());
+    for (before, after) in base_selection.iter().zip(partly_selection) {
+        assert!((after.y - (before.y - 8.0)).abs() < 0.001);
+    }
+
+    let offscreen = Scene::build_with(
+        &snapshot,
+        viewport,
+        &SceneEnv::default().with_scroll_offset(100),
+    )
+    .expect("scrolled scene");
+    let input = offscreen.node(id).expect("offscreen rect is kept");
+    assert!(input.text().is_empty(), "offscreen runs are culled");
+    assert!(input.caret_at_value(1).is_none());
+    assert!(offscreen.caret(id).is_none(), "offscreen caret is culled");
+    assert!(
+        offscreen
+            .decorations()
+            .iter()
+            .all(|decoration| decoration.node() != id),
+        "offscreen decorations are culled"
+    );
+    assert_eq!(input.rect().y, base_rect.y - 100.0);
+
+    let visible_row = snapshot.find_label("row-007").expect("lower row").id();
+    let scrolled_row = offscreen.node(visible_row).expect("visible row");
+    assert!(
+        !scrolled_row.text().is_empty(),
+        "a row translated into the viewport shapes"
+    );
+    let base_row = base.node(visible_row).expect("visible row");
+    let base_run = base_row.text().first().expect("base row run");
+    let scrolled_run = scrolled_row.text().first().expect("scrolled row run");
+    assert!((scrolled_run.baseline() - (base_run.baseline() - 100.0)).abs() < 0.001);
+    let base_glyph = base_run.glyphs().first().expect("base row glyph");
+    let scrolled_glyph = scrolled_run.glyphs().first().expect("scrolled glyph");
+    assert_eq!(scrolled_glyph.x, base_glyph.x);
+    assert!((scrolled_glyph.y - (base_glyph.y - 100.0)).abs() < 0.001);
+
+    app.compose_start("editor").expect("start composing");
+    app.compose_update("editor", "ni").expect("update preedit");
+    let composing = app.presentation().expect("snapshot");
+    let underlines = |scene: &Scene| -> Vec<Rect> {
+        scene
+            .decorations()
+            .iter()
+            .filter(|decoration| {
+                decoration.node() == id && decoration.kind() == DecorationKind::PreeditUnderline
+            })
+            .map(|decoration| decoration.rect())
+            .collect()
+    };
+    let comp_base = Scene::build(&composing, viewport).expect("base composition");
+    let base_underlines = underlines(&comp_base);
+    assert!(!base_underlines.is_empty(), "the preedit is underlined");
+    let comp_partly = Scene::build_with(
+        &composing,
+        viewport,
+        &SceneEnv::default().with_scroll_offset(8),
+    )
+    .expect("partly scrolled composition");
+    let partly_underlines = underlines(&comp_partly);
+    assert_eq!(partly_underlines.len(), base_underlines.len());
+    for (before, after) in base_underlines.iter().zip(partly_underlines) {
+        assert!((after.y - (before.y - 8.0)).abs() < 0.001);
+    }
+    let comp_caret = comp_partly.caret(id).expect("composition caret");
+    assert!(
+        comp_partly
+            .node(id)
+            .expect("editor")
+            .caret_index(Point::new(
+                comp_caret.x,
+                comp_caret.y + comp_caret.height / 2.0
+            ))
+            .is_some(),
+        "caret mapping works for a scrolled composition"
+    );
+    let comp_offscreen = Scene::build_with(
+        &composing,
+        viewport,
+        &SceneEnv::default().with_scroll_offset(100),
+    )
+    .expect("offscreen composition");
+    assert!(underlines(&comp_offscreen).is_empty());
+    assert!(comp_offscreen.caret(id).is_none());
+}
+
+#[test]
+fn scroll_hit_testing_uses_translated_geometry_and_stays_inside_the_viewport() {
+    let app = tall_app(80);
+    let snapshot = app.presentation().expect("snapshot");
+    let viewport = Viewport::new(400.0, 300.0, 1.0).expect("viewport");
+    let scene = Scene::build_with(
+        &snapshot,
+        viewport,
+        &SceneEnv::default().with_scroll_offset(100),
+    )
+    .expect("scrolled scene");
+
+    let row = snapshot.find_label("row-007").expect("visible row").id();
+    let rect = scene.node(row).expect("visible row").rect();
+    let center = Point::new(rect.x + rect.width / 2.0, rect.y + rect.height / 2.0);
+    assert_eq!(scene.hit_test(center), Some(row));
+
+    let partial = Point::new(10.0, 1.0);
+    let hit = scene
+        .hit_test(partial)
+        .expect("a partially visible element is hit");
+    let hit_rect = scene.node(hit).expect("hit element").rect();
+    assert!(
+        hit_rect.y < 0.0 && hit_rect.contains(partial),
+        "the hit is the visible part of a translated element: {hit_rect:?}"
+    );
+    assert_eq!(
+        scene.hit_test(Point::new(10.0, -1.0)),
+        None,
+        "a translated root must not be hit above the viewport"
+    );
+    assert_eq!(
+        scene.hit_test(Point::new(10.0, 300.0)),
+        None,
+        "the half-open viewport bottom is not hit"
+    );
+}
+
+#[test]
+fn the_synthetic_root_gap_is_not_hit_testable() {
+    let mut app = Runtime::new();
+    app.mount(|| {
+        let first = zenui::view::element("view", Vec::new(), (0..40).map(row).collect::<Vec<_>>());
+        let second = zenui::view::element("view", Vec::new(), vec![row(1000)]);
+        Ok(MountPlan::new(vec![first, second]))
+    })
+    .expect("mount two roots");
+    let snapshot = app.presentation().expect("snapshot");
+    let viewport = Viewport::new(400.0, 300.0, 1.0).expect("viewport");
+    let base = Scene::build(&snapshot, viewport).expect("base scene");
+    let offset = base.max_scroll_offset();
+    assert!(offset > 0);
+    let scene = Scene::build_with(
+        &snapshot,
+        viewport,
+        &SceneEnv::default().with_scroll_offset(offset),
+    )
+    .expect("scrolled scene");
+
+    let first = scene
+        .node(snapshot.roots()[0].id().expect("first root"))
+        .expect("first root scene")
+        .rect();
+    let second = scene
+        .node(snapshot.roots()[1].id().expect("second root"))
+        .expect("second root scene")
+        .rect();
+    let gap = second.y - first.bottom();
+    assert!((gap - 8.0).abs() < 0.01, "the synthetic root keeps its gap");
+    let gap_point = Point::new(10.0, first.bottom() + gap / 2.0);
+    assert!(
+        gap_point.y > 0.0 && gap_point.y < 300.0,
+        "the gap is visible at the maximum offset: {gap_point:?}"
+    );
+    assert_eq!(scene.hit_test(gap_point), None);
 }
 
 #[test]
