@@ -140,21 +140,37 @@ fn catalog_limits_the_menu_tree_to_65535_items() {
 
 #[test]
 fn menu_and_window_declaration_order_does_not_matter() {
-    let mut app = Runtime::new();
-    app.declare_windows(|catalog| {
-        catalog.menu("main", MenuSpec::new().command("file.new", "New"))?;
-        catalog.window(WindowSpec::new("main").primary(), |_| view! { <view /> })?;
-        Ok(())
-    })
-    .expect("menu before window");
+    for menu_first in [true, false] {
+        let runs = Rc::new(Cell::new(0));
+        let handler_runs = runs.clone();
+        let mut app = Runtime::new();
+        app.declare_windows(move |catalog| {
+            let menu = MenuSpec::new().command("file.new", "New");
+            if menu_first {
+                catalog.menu("main", menu.clone())?;
+            }
+            let handler_runs = handler_runs.clone();
+            catalog.window(WindowSpec::new("main").primary(), move |window| {
+                let handler_runs = handler_runs.clone();
+                window
+                    .on_command("file.new", move |_| {
+                        handler_runs.set(handler_runs.get() + 1);
+                    })
+                    .expect("register the menu command");
+                view! { <view /> }
+            })?;
+            if !menu_first {
+                catalog.menu("main", menu)?;
+            }
+            Ok(())
+        })
+        .expect("catalog");
 
-    let mut app = Runtime::new();
-    app.declare_windows(|catalog| {
-        catalog.window(WindowSpec::new("main").primary(), |_| view! { <view /> })?;
-        catalog.menu("main", MenuSpec::new().command("file.new", "New"))?;
-        Ok(())
-    })
-    .expect("window before menu");
+        let main = app.show("main").expect("show the window");
+        app.dispatch_command(main, "file.new", CommandSource::MenuBar)
+            .expect("dispatch the declared command");
+        assert_eq!(runs.get(), 1, "menu_first={menu_first}");
+    }
 }
 
 #[test]

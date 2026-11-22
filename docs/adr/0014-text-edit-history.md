@@ -31,7 +31,7 @@ Hidden windows keep their activation, tree and history, but dispatch is rejected
 
 Each input keeps at most 100 entries and at most 256 KiB of snapshot text per stack (undo and redo measured separately). Pushing evicts the oldest entries until both limits hold; a single entry larger than the byte budget is dropped rather than retained. This bounds history memory per input without a global budget or a new public configuration surface.
 
-Unmounting an element clears its undo and redo stacks, the observed value and the local-settlement flag, so a dead element slot retains no text. The paths that unmount a branch (`release_nodes`, a replaced `Show` branch and removed `For` items) all clear history before disposing the Owner. Remounting creates a new Node ID and a fresh empty history; an old Node ID is `StaleNode`.
+Unmounting an element clears its undo and redo stacks, the observed value and the local-settlement flag, so a dead element slot retains no history snapshot text or observed value. The element slot itself and its committed `value` attribute (and any composition preedit) remain until the Runtime is dropped; this ADR bounds history memory, not the existing element-table lifetime. The paths that unmount a branch (`release_nodes`, a replaced `Show` branch and removed `For` items) all clear history before disposing the Owner. Remounting creates a new Node ID and a fresh empty history; an old Node ID is `StaleNode`.
 
 ## Superseding the SDK revision/origin target
 
