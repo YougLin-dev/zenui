@@ -60,11 +60,13 @@ target API 的公开行为测试位于根包 `tests/`，其中 `tests/tasks.rs` 
 - [ADR-0007](docs/adr/0007-window-catalog-and-close-epoch.md)：窗口目录、per-activation 权威与关闭 epoch。
 - [ADR-0008](docs/adr/0008-file-picker-host-tasks.md)：打开文件选择器、宿主任务、显式所有权与 STA 模态对话框。
 - [ADR-0009](docs/adr/0009-file-dialog-family.md)：打开/保存/文件夹对话框家族、kind 矩阵与单路径校验。
+- [ADR-0010](docs/adr/0010-scroll-is-presentation-state.md)：滚动是宿主拥有的整页呈现偏移，几何、命中与 IME 共享同一份已平移场景。
 - [Stage-one 验收](docs/实现/stage-one-验收.md)：headless Todo 的可执行完成判据、边界证据与原生缺口。
 - [Stage-two 验收](docs/实现/stage-two-验收.md)：Windows 原生切片、IME、样式与 150% 实机证据。
 - [Stage-three 多窗口验收](docs/实现/stage-three-多窗口-验收.md)：主窗口与详情窗口、hide/show、close/reopen 与关闭确认在 100%/150% 下的可见证据。
 - [Stage-three 文件对话框验收](docs/实现/stage-three-文件对话框-验收.md)：原生 `IFileOpenDialog`、取消、单选/多选、导入、错误与 Unicode 路径的可见证据。
 - [Stage-three 保存与文件夹验收](docs/实现/stage-three-保存与文件夹-验收.md)：原生 `IFileSaveDialog`、覆盖确认、过滤扩展名优先级、写入拒绝、Unicode 路径与文件夹选择的可见证据。
+- [Stage-three 宿主滚动验收](docs/实现/stage-three-宿主滚动-验收.md)：真实滚轮与翻页键、边界夹取、hover/press 复核、聚焦编辑器与缩放在 100%/150% 下的可见证据。
 
 ## 界面语法
 

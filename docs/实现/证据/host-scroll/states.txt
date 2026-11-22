@@ -1,0 +1,171 @@
+# #179 宿主滚动可见验收 — 状态记录
+
+provenance
+  commit       : 921a1e882843c401fd917b0d2c91e0300b3d1679 (feat/179-host-scroll)
+                 可见运行使用临时示例 crates/windows/examples/scroll_probe.rs（提交前删除）。
+                 运行后、提交前唯一的源码变化是 host.rs 中一个 #[cfg(test)] 设备丢失用例；
+                 非测试源码与 921a1e8 相同。
+  window       : ZenUI Todo / class=ZenUIHostWindow / zenui-demo TodoApp
+  rows         : 500 行，在 Host::open 之前通过公开的 Runtime::input / submit 种入；
+                 没有使用 Import file 对话框，也没有修改磁盘文件。
+  probe        : 只打印场景状态（offset / max / viewport / content / elements / hover / press /
+                 focus / checked），不注入滚动条或额外 UI；输入全部由外部脚本注入。
+  input        : OS 级 SendInput（真实光标移动、左键按下/松开、MOUSEWHEEL notch、键盘
+                 PageUp/PageDown/Home/End）；窗口通过点击标题栏激活。不是人工鼠标键盘。
+                 WM_SETTINGCHANGE 未人工触发；滚轮行数来自 HKCU\Control Panel\Desktop
+                 WheelScrollLines=3（SPI_GETWHEELSCROLLLINES 同值）。
+  screenshots  : PrintWindow(PW_CLIENTONLY|PW_RENDERFULLCONTENT) 客户区；100% 为 900x700 物理，
+                 150% 为 1350x1050 物理。图片只含种子任务，无个人信息。
+
+environment
+  os           : Microsoft Windows 11 专业版 10.0.26300，64 位，交互式控制台会话
+  gpu          : NVIDIA GeForce RTX 4060 Laptop GPU，驱动 32.0.15.7283；可见宿主使用默认 DX12 路径
+  display      : 单屏 2560x1600 @ 240 Hz
+  scaling      : 100% GetDpiForWindow=96 客户区 900x700；150% GetDpiForWindow=144 客户区 1350x1050
+                 切换通过 Settings > 显示 > 缩放 UIA + rundll32 UpdatePerUserSystemParameters；
+                 结束后已恢复 150%（GetDpiForSystem=144）
+  mouse wheel  : WheelScrollLines=3，MouseWheelRouting=2（指针下窗口路由）
+  scene        : 两端均为 2519 个场景元素；内容 900x18654 逻辑像素；max=17954；
+                 一个 notch = 72 逻辑像素（3 行 × 24）；PageDown/PageUp = 676 逻辑像素
+                 （floor(700 - 24)）
+
+key transitions
+  100% / 150%  : 0 → 72（一个真实 notch，向用户方向）→ 792（再 10 个 notch）
+                 → 1468（PageDown，+676）→ 792（PageUp）
+                 → 17954 = max（End）→ 17882（bottom 处第一个反向 notch 立即生效）
+                 → 0（Home）→ 0（top 处继续向上滚，事件被消费、无位移）
+  hover        : 指针静止在第一个 checkbox 上，滚动 72 后 hovered NodeId 20 → 52/30；
+                 press 期间滚动，pressed 保持 NodeId 60/20，hovered 单独更新
+  press        : 按下 checkbox/Delete → 滚动 → 在节点新位置松开：checkbox 切换（checked=1）；
+                 在旧位置松开（命中另一节点）：不激活，元素数保持 2519
+  focus        : 草稿输入框获得焦点后 End/Home 只编辑文本不滚动；PageDown 滚动到 676 且焦点保持
+                 NodeId(1)；PageUp 回到 0
+  resize       : 150% 144 → 144（客户区 1078x844，max 18091）→ 恢复；100% 17954 在
+                 784x601（max 18053）后保持 17954
+  hide/show    : 未在可见运行中驱动（外部只能 ShowWindow，不改变 activation）；offset 生命周期
+                 由隐藏 smoke hide_show_keeps_the_offset_and_reopen_starts_at_zero 覆盖
+  device loss  : 未在可见运行中模拟；由 host::tests::device_loss_preserves_the_applied_scroll_offset 覆盖
+
+raw state logs（scroll_probe stdout，按发生顺序）
+
+=== 150% run 1 (wheel / paging / hover) ===
+state offset=0 max=17954 viewport=900x700 scale=1.5 content=900x18654 elements=2519 hovered=None pressed=None focused=None checkbox=Some((NodeId(20), false, 24.0, 210.0))
+state offset=0 max=17954 viewport=900x700 scale=1.5 content=900x18654 elements=2519 hovered=Some(NodeId(42)) pressed=None focused=None checkbox=Some((NodeId(20), false, 24.0, 210.0))
+state offset=72 max=17954 viewport=900x700 scale=1.5 content=900x18654 elements=2519 hovered=Some(NodeId(52)) pressed=None focused=None checkbox=Some((NodeId(20), false, 24.0, 138.0))
+state offset=144 max=17954 viewport=900x700 scale=1.5 content=900x18654 elements=2519 hovered=Some(NodeId(62)) pressed=None focused=None checkbox=Some((NodeId(20), false, 24.0, 66.0))
+state offset=216 max=17954 viewport=900x700 scale=1.5 content=900x18654 elements=2519 hovered=Some(NodeId(72)) pressed=None focused=None checkbox=Some((NodeId(20), false, 24.0, -6.0))
+state offset=288 max=17954 viewport=900x700 scale=1.5 content=900x18654 elements=2519 hovered=Some(NodeId(19)) pressed=None focused=None checkbox=Some((NodeId(20), false, 24.0, -78.0))
+state offset=360 max=17954 viewport=900x700 scale=1.5 content=900x18654 elements=2519 hovered=Some(NodeId(19)) pressed=None focused=None checkbox=Some((NodeId(20), false, 24.0, -150.0))
+state offset=432 max=17954 viewport=900x700 scale=1.5 content=900x18654 elements=2519 hovered=Some(NodeId(19)) pressed=None focused=None checkbox=Some((NodeId(20), false, 24.0, -222.0))
+state offset=504 max=17954 viewport=900x700 scale=1.5 content=900x18654 elements=2519 hovered=Some(NodeId(19)) pressed=None focused=None checkbox=Some((NodeId(20), false, 24.0, -294.0))
+state offset=576 max=17954 viewport=900x700 scale=1.5 content=900x18654 elements=2519 hovered=Some(NodeId(19)) pressed=None focused=None checkbox=Some((NodeId(20), false, 24.0, -366.0))
+state offset=648 max=17954 viewport=900x700 scale=1.5 content=900x18654 elements=2519 hovered=Some(NodeId(127)) pressed=None focused=None checkbox=Some((NodeId(20), false, 24.0, -438.0))
+state offset=720 max=17954 viewport=900x700 scale=1.5 content=900x18654 elements=2519 hovered=Some(NodeId(137)) pressed=None focused=None checkbox=Some((NodeId(20), false, 24.0, -510.0))
+state offset=792 max=17954 viewport=900x700 scale=1.5 content=900x18654 elements=2519 hovered=Some(NodeId(147)) pressed=None focused=None checkbox=Some((NodeId(20), false, 24.0, -582.0))
+state offset=1468 max=17954 viewport=900x700 scale=1.5 content=900x18654 elements=2519 hovered=Some(NodeId(19)) pressed=None focused=None checkbox=Some((NodeId(20), false, 24.0, -1258.0))
+state offset=792 max=17954 viewport=900x700 scale=1.5 content=900x18654 elements=2519 hovered=Some(NodeId(147)) pressed=None focused=None checkbox=Some((NodeId(20), false, 24.0, -582.0))
+state offset=17954 max=17954 viewport=900x700 scale=1.5 content=900x18654 elements=2519 hovered=Some(NodeId(2472)) pressed=None focused=None checkbox=Some((NodeId(20), false, 24.0, -17744.0))
+state offset=17882 max=17954 viewport=900x700 scale=1.5 content=900x18654 elements=2519 hovered=Some(NodeId(19)) pressed=None focused=None checkbox=Some((NodeId(20), false, 24.0, -17672.0))
+state offset=0 max=17954 viewport=900x700 scale=1.5 content=900x18654 elements=2519 hovered=Some(NodeId(42)) pressed=None focused=None checkbox=Some((NodeId(20), false, 24.0, 210.0))
+state offset=72 max=17954 viewport=900x700 scale=1.5 content=900x18654 elements=2519 hovered=Some(NodeId(52)) pressed=None focused=None checkbox=Some((NodeId(20), false, 24.0, 138.0))
+state offset=72 max=17954 viewport=900x700 scale=1.5 content=900x18654 elements=2519 hovered=Some(NodeId(20)) pressed=None focused=None checkbox=Some((NodeId(20), false, 24.0, 138.0))
+state offset=144 max=17954 viewport=900x700 scale=1.5 content=900x18654 elements=2519 hovered=Some(NodeId(30)) pressed=None focused=None checkbox=Some((NodeId(20), false, 24.0, 66.0))
+state offset=144 max=17954 viewport=900x700 scale=1.5 content=900x18654 elements=2519 hovered=Some(NodeId(60)) pressed=None focused=None checkbox=Some((NodeId(20), false, 24.0, 66.0))
+
+=== 150% run 2 (press / resize / focus, with checked counter) ===
+state offset=0 max=17954 viewport=900x700 scale=1.5 content=900x18654 elements=2519 checked=0 hovered=None pressed=None pressed_checkbox=None focused=None checkbox=Some((NodeId(20), false, 24.0, 210.0))
+state offset=0 max=17954 viewport=900x700 scale=1.5 content=900x18654 elements=2519 checked=0 hovered=Some(NodeId(60)) pressed=None pressed_checkbox=None focused=None checkbox=Some((NodeId(20), false, 24.0, 210.0))
+state offset=0 max=17954 viewport=900x700 scale=1.5 content=900x18654 elements=2519 checked=0 hovered=Some(NodeId(60)) pressed=Some(NodeId(60)) pressed_checkbox=Some((NodeId(60), false)) focused=None checkbox=Some((NodeId(20), false, 24.0, 210.0))
+state offset=72 max=17954 viewport=900x700 scale=1.5 content=900x18654 elements=2519 checked=0 hovered=Some(NodeId(74)) pressed=Some(NodeId(60)) pressed_checkbox=Some((NodeId(60), false)) focused=None checkbox=Some((NodeId(20), false, 24.0, 138.0))
+state offset=72 max=17954 viewport=900x700 scale=1.5 content=900x18654 elements=2519 checked=0 hovered=Some(NodeId(60)) pressed=Some(NodeId(60)) pressed_checkbox=Some((NodeId(60), false)) focused=None checkbox=Some((NodeId(20), false, 24.0, 138.0))
+state offset=72 max=17954 viewport=900x700 scale=1.5 content=900x18654 elements=2519 checked=1 hovered=Some(NodeId(60)) pressed=None pressed_checkbox=None focused=None checkbox=Some((NodeId(20), false, 24.0, 138.0))
+state offset=72 max=17954 viewport=900x700 scale=1.5 content=900x18654 elements=2519 checked=1 hovered=Some(NodeId(74)) pressed=None pressed_checkbox=None focused=None checkbox=Some((NodeId(20), false, 24.0, 138.0))
+state offset=72 max=17954 viewport=900x700 scale=1.5 content=900x18654 elements=2519 checked=1 hovered=Some(NodeId(73)) pressed=None pressed_checkbox=None focused=None checkbox=Some((NodeId(20), false, 24.0, 138.0))
+state offset=72 max=17954 viewport=900x700 scale=1.5 content=900x18654 elements=2519 checked=1 hovered=Some(NodeId(73)) pressed=Some(NodeId(73)) pressed_checkbox=None focused=None checkbox=Some((NodeId(20), false, 24.0, 138.0))
+state offset=144 max=17954 viewport=900x700 scale=1.5 content=900x18654 elements=2519 checked=1 hovered=Some(NodeId(83)) pressed=Some(NodeId(73)) pressed_checkbox=None focused=None checkbox=Some((NodeId(20), false, 24.0, 66.0))
+state offset=144 max=17954 viewport=900x700 scale=1.5 content=900x18654 elements=2519 checked=1 hovered=Some(NodeId(83)) pressed=None pressed_checkbox=None focused=None checkbox=Some((NodeId(20), false, 24.0, 66.0))
+state offset=144 max=18091 viewport=718.6667x562.6667 scale=1.5 content=718.6667x18654 elements=2519 checked=1 hovered=None pressed=None pressed_checkbox=None focused=None checkbox=Some((NodeId(20), false, 24.0, 66.0))
+state offset=144 max=17954 viewport=900x700 scale=1.5 content=900x18654 elements=2519 checked=1 hovered=Some(NodeId(83)) pressed=None pressed_checkbox=None focused=None checkbox=Some((NodeId(20), false, 24.0, 66.0))
+state offset=0 max=17954 viewport=900x700 scale=1.5 content=900x18654 elements=2519 checked=1 hovered=Some(NodeId(63)) pressed=None pressed_checkbox=None focused=None checkbox=Some((NodeId(20), false, 24.0, 210.0))
+state offset=0 max=17954 viewport=900x700 scale=1.5 content=900x18654 elements=2519 checked=1 hovered=Some(NodeId(1)) pressed=None pressed_checkbox=None focused=None checkbox=Some((NodeId(20), false, 24.0, 210.0))
+state offset=0 max=17954 viewport=900x700 scale=1.5 content=900x18654 elements=2519 checked=1 hovered=Some(NodeId(1)) pressed=None pressed_checkbox=None focused=Some(NodeId(1)) checkbox=Some((NodeId(20), false, 24.0, 210.0))
+state offset=676 max=17954 viewport=900x700 scale=1.5 content=900x18654 elements=2519 checked=1 hovered=Some(NodeId(92)) pressed=None pressed_checkbox=None focused=Some(NodeId(1)) checkbox=Some((NodeId(20), false, 24.0, -466.0))
+state offset=0 max=17954 viewport=900x700 scale=1.5 content=900x18654 elements=2519 checked=1 hovered=Some(NodeId(1)) pressed=None pressed_checkbox=None focused=Some(NodeId(1)) checkbox=Some((NodeId(20), false, 24.0, 210.0))
+state offset=0 max=17954 viewport=900x700 scale=1.5 content=900x18654 elements=2519 checked=1 hovered=None pressed=None pressed_checkbox=None focused=Some(NodeId(1)) checkbox=Some((NodeId(20), false, 24.0, 210.0))
+
+=== 100% run ===
+state offset=0 max=17954 viewport=900x700 scale=1 content=900x18654 elements=2519 checked=0 hovered=None pressed=None pressed_checkbox=None focused=None checkbox=Some((NodeId(20), false, 24.0, 210.0))
+state offset=0 max=17954 viewport=900x700 scale=1 content=900x18654 elements=2519 checked=0 hovered=Some(NodeId(42)) pressed=None pressed_checkbox=None focused=None checkbox=Some((NodeId(20), false, 24.0, 210.0))
+state offset=72 max=17954 viewport=900x700 scale=1 content=900x18654 elements=2519 checked=0 hovered=Some(NodeId(52)) pressed=None pressed_checkbox=None focused=None checkbox=Some((NodeId(20), false, 24.0, 138.0))
+state offset=144 max=17954 viewport=900x700 scale=1 content=900x18654 elements=2519 checked=0 hovered=Some(NodeId(62)) pressed=None pressed_checkbox=None focused=None checkbox=Some((NodeId(20), false, 24.0, 66.0))
+state offset=216 max=17954 viewport=900x700 scale=1 content=900x18654 elements=2519 checked=0 hovered=Some(NodeId(72)) pressed=None pressed_checkbox=None focused=None checkbox=Some((NodeId(20), false, 24.0, -6.0))
+state offset=288 max=17954 viewport=900x700 scale=1 content=900x18654 elements=2519 checked=0 hovered=Some(NodeId(19)) pressed=None pressed_checkbox=None focused=None checkbox=Some((NodeId(20), false, 24.0, -78.0))
+state offset=360 max=17954 viewport=900x700 scale=1 content=900x18654 elements=2519 checked=0 hovered=Some(NodeId(19)) pressed=None pressed_checkbox=None focused=None checkbox=Some((NodeId(20), false, 24.0, -150.0))
+state offset=432 max=17954 viewport=900x700 scale=1 content=900x18654 elements=2519 checked=0 hovered=Some(NodeId(19)) pressed=None pressed_checkbox=None focused=None checkbox=Some((NodeId(20), false, 24.0, -222.0))
+state offset=504 max=17954 viewport=900x700 scale=1 content=900x18654 elements=2519 checked=0 hovered=Some(NodeId(19)) pressed=None pressed_checkbox=None focused=None checkbox=Some((NodeId(20), false, 24.0, -294.0))
+state offset=576 max=17954 viewport=900x700 scale=1 content=900x18654 elements=2519 checked=0 hovered=Some(NodeId(19)) pressed=None pressed_checkbox=None focused=None checkbox=Some((NodeId(20), false, 24.0, -366.0))
+state offset=648 max=17954 viewport=900x700 scale=1 content=900x18654 elements=2519 checked=0 hovered=Some(NodeId(127)) pressed=None pressed_checkbox=None focused=None checkbox=Some((NodeId(20), false, 24.0, -438.0))
+state offset=720 max=17954 viewport=900x700 scale=1 content=900x18654 elements=2519 checked=0 hovered=Some(NodeId(137)) pressed=None pressed_checkbox=None focused=None checkbox=Some((NodeId(20), false, 24.0, -510.0))
+state offset=792 max=17954 viewport=900x700 scale=1 content=900x18654 elements=2519 checked=0 hovered=Some(NodeId(147)) pressed=None pressed_checkbox=None focused=None checkbox=Some((NodeId(20), false, 24.0, -582.0))
+state offset=1468 max=17954 viewport=900x700 scale=1 content=900x18654 elements=2519 checked=0 hovered=Some(NodeId(19)) pressed=None pressed_checkbox=None focused=None checkbox=Some((NodeId(20), false, 24.0, -1258.0))
+state offset=792 max=17954 viewport=900x700 scale=1 content=900x18654 elements=2519 checked=0 hovered=Some(NodeId(147)) pressed=None pressed_checkbox=None focused=None checkbox=Some((NodeId(20), false, 24.0, -582.0))
+state offset=17954 max=17954 viewport=900x700 scale=1 content=900x18654 elements=2519 checked=0 hovered=Some(NodeId(2472)) pressed=None pressed_checkbox=None focused=None checkbox=Some((NodeId(20), false, 24.0, -17744.0))
+state offset=17882 max=17954 viewport=900x700 scale=1 content=900x18654 elements=2519 checked=0 hovered=Some(NodeId(19)) pressed=None pressed_checkbox=None focused=None checkbox=Some((NodeId(20), false, 24.0, -17672.0))
+state offset=0 max=17954 viewport=900x700 scale=1 content=900x18654 elements=2519 checked=0 hovered=Some(NodeId(42)) pressed=None pressed_checkbox=None focused=None checkbox=Some((NodeId(20), false, 24.0, 210.0))
+state offset=72 max=17954 viewport=900x700 scale=1 content=900x18654 elements=2519 checked=0 hovered=Some(NodeId(52)) pressed=None pressed_checkbox=None focused=None checkbox=Some((NodeId(20), false, 24.0, 138.0))
+state offset=72 max=17954 viewport=900x700 scale=1 content=900x18654 elements=2519 checked=0 hovered=Some(NodeId(20)) pressed=None pressed_checkbox=None focused=None checkbox=Some((NodeId(20), false, 24.0, 138.0))
+state offset=144 max=17954 viewport=900x700 scale=1 content=900x18654 elements=2519 checked=0 hovered=Some(NodeId(30)) pressed=None pressed_checkbox=None focused=None checkbox=Some((NodeId(20), false, 24.0, 66.0))
+state offset=144 max=17954 viewport=900x700 scale=1 content=900x18654 elements=2519 checked=0 hovered=Some(NodeId(84)) pressed=None pressed_checkbox=None focused=None checkbox=Some((NodeId(20), false, 24.0, 66.0))
+state offset=216 max=17954 viewport=900x700 scale=1 content=900x18654 elements=2519 checked=0 hovered=Some(NodeId(94)) pressed=None pressed_checkbox=None focused=None checkbox=Some((NodeId(20), false, 24.0, -6.0))
+state offset=0 max=17954 viewport=900x700 scale=1 content=900x18654 elements=2519 checked=0 hovered=Some(NodeId(60)) pressed=None pressed_checkbox=None focused=None checkbox=Some((NodeId(20), false, 24.0, 210.0))
+state offset=0 max=17954 viewport=900x700 scale=1 content=900x18654 elements=2519 checked=0 hovered=Some(NodeId(42)) pressed=None pressed_checkbox=None focused=None checkbox=Some((NodeId(20), false, 24.0, 210.0))
+state offset=72 max=17954 viewport=900x700 scale=1 content=900x18654 elements=2519 checked=0 hovered=Some(NodeId(52)) pressed=None pressed_checkbox=None focused=None checkbox=Some((NodeId(20), false, 24.0, 138.0))
+state offset=144 max=17954 viewport=900x700 scale=1 content=900x18654 elements=2519 checked=0 hovered=Some(NodeId(62)) pressed=None pressed_checkbox=None focused=None checkbox=Some((NodeId(20), false, 24.0, 66.0))
+state offset=144 max=17954 viewport=900x700 scale=1 content=900x18654 elements=2519 checked=0 hovered=Some(NodeId(20)) pressed=None pressed_checkbox=None focused=None checkbox=Some((NodeId(20), false, 24.0, 66.0))
+state offset=144 max=17954 viewport=900x700 scale=1 content=900x18654 elements=2519 checked=0 hovered=Some(NodeId(20)) pressed=Some(NodeId(20)) pressed_checkbox=Some((NodeId(20), false)) focused=None checkbox=Some((NodeId(20), false, 24.0, 66.0))
+state offset=72 max=17954 viewport=900x700 scale=1 content=900x18654 elements=2519 checked=0 hovered=Some(NodeId(8)) pressed=Some(NodeId(20)) pressed_checkbox=Some((NodeId(20), false)) focused=None checkbox=Some((NodeId(20), false, 24.0, 138.0))
+state offset=72 max=17954 viewport=900x700 scale=1 content=900x18654 elements=2519 checked=0 hovered=Some(NodeId(20)) pressed=Some(NodeId(20)) pressed_checkbox=Some((NodeId(20), false)) focused=None checkbox=Some((NodeId(20), false, 24.0, 138.0))
+state offset=72 max=17954 viewport=900x700 scale=1 content=900x18654 elements=2519 checked=1 hovered=Some(NodeId(20)) pressed=None pressed_checkbox=None focused=None checkbox=Some((NodeId(20), true, 24.0, 138.0))
+state offset=72 max=17954 viewport=900x700 scale=1 content=900x18654 elements=2519 checked=1 hovered=Some(NodeId(20)) pressed=Some(NodeId(20)) pressed_checkbox=Some((NodeId(20), true)) focused=None checkbox=Some((NodeId(20), true, 24.0, 138.0))
+state offset=144 max=17954 viewport=900x700 scale=1 content=900x18654 elements=2519 checked=1 hovered=Some(NodeId(30)) pressed=Some(NodeId(20)) pressed_checkbox=Some((NodeId(20), true)) focused=None checkbox=Some((NodeId(20), true, 24.0, 66.0))
+state offset=144 max=17954 viewport=900x700 scale=1 content=900x18654 elements=2519 checked=1 hovered=Some(NodeId(30)) pressed=None pressed_checkbox=None focused=None checkbox=Some((NodeId(20), true, 24.0, 66.0))
+state offset=0 max=17954 viewport=900x700 scale=1 content=900x18654 elements=2519 checked=1 hovered=Some(NodeId(8)) pressed=None pressed_checkbox=None focused=None checkbox=Some((NodeId(20), true, 24.0, 210.0))
+state offset=0 max=17954 viewport=900x700 scale=1 content=900x18654 elements=2519 checked=1 hovered=Some(NodeId(7)) pressed=None pressed_checkbox=None focused=None checkbox=Some((NodeId(20), true, 24.0, 210.0))
+state offset=17954 max=17954 viewport=900x700 scale=1 content=900x18654 elements=2519 checked=1 hovered=Some(NodeId(2437)) pressed=None pressed_checkbox=None focused=None checkbox=Some((NodeId(20), true, 24.0, -17744.0))
+state offset=0 max=17954 viewport=900x700 scale=1 content=900x18654 elements=2519 checked=1 hovered=Some(NodeId(7)) pressed=None pressed_checkbox=None focused=None checkbox=Some((NodeId(20), true, 24.0, 210.0))
+state offset=0 max=17954 viewport=900x700 scale=1 content=900x18654 elements=2519 checked=1 hovered=Some(NodeId(1)) pressed=None pressed_checkbox=None focused=None checkbox=Some((NodeId(20), true, 24.0, 210.0))
+state offset=0 max=17954 viewport=900x700 scale=1 content=900x18654 elements=2519 checked=1 hovered=Some(NodeId(1)) pressed=None pressed_checkbox=None focused=Some(NodeId(1)) checkbox=Some((NodeId(20), true, 24.0, 210.0))
+state offset=676 max=17954 viewport=900x700 scale=1 content=900x18654 elements=2519 checked=1 hovered=Some(NodeId(92)) pressed=None pressed_checkbox=None focused=Some(NodeId(1)) checkbox=Some((NodeId(20), true, 24.0, -466.0))
+state offset=0 max=17954 viewport=900x700 scale=1 content=900x18654 elements=2519 checked=1 hovered=Some(NodeId(1)) pressed=None pressed_checkbox=None focused=Some(NodeId(1)) checkbox=Some((NodeId(20), true, 24.0, 210.0))
+state offset=0 max=18053 viewport=784x601 scale=1 content=784x18654 elements=2519 checked=1 hovered=Some(NodeId(1)) pressed=None pressed_checkbox=None focused=Some(NodeId(1)) checkbox=Some((NodeId(20), true, 24.0, 210.0))
+state offset=0 max=17954 viewport=900x700 scale=1 content=900x18654 elements=2519 checked=1 hovered=Some(NodeId(1)) pressed=None pressed_checkbox=None focused=Some(NodeId(1)) checkbox=Some((NodeId(20), true, 24.0, 210.0))
+state offset=0 max=17954 viewport=900x700 scale=1 content=900x18654 elements=2519 checked=1 hovered=Some(NodeId(1)) pressed=None pressed_checkbox=None focused=Some(NodeId(2)) checkbox=Some((NodeId(20), true, 24.0, 210.0))
+state offset=17954 max=17954 viewport=900x700 scale=1 content=900x18654 elements=2519 checked=1 hovered=Some(NodeId(19)) pressed=None pressed_checkbox=None focused=Some(NodeId(2)) checkbox=Some((NodeId(20), true, 24.0, -17744.0))
+state offset=17954 max=18053 viewport=784x601 scale=1 content=784x18654 elements=2519 checked=1 hovered=Some(NodeId(19)) pressed=None pressed_checkbox=None focused=Some(NodeId(2)) checkbox=Some((NodeId(20), true, 24.0, -17744.0))
+state offset=17954 max=17954 viewport=900x700 scale=1 content=900x18654 elements=2519 checked=1 hovered=Some(NodeId(19)) pressed=None pressed_checkbox=None focused=Some(NodeId(2)) checkbox=Some((NodeId(20), true, 24.0, -17744.0))
+state offset=17954 max=17954 viewport=900x700 scale=1 content=900x18654 elements=2519 checked=1 hovered=None pressed=None pressed_checkbox=None focused=Some(NodeId(2)) checkbox=Some((NodeId(20), true, 24.0, -17744.0))
+
+=== screenshot sha256 ===
+915e1f62791da1e40ef9af77edf5adb9232af4a834a76d804f770ba85a8cfbc8 *100-01-startup.png
+311cafa87068f9e102820f088e0b26b715d557b5556e9709d9d98f7c50fb72d8 *100-02-middle.png
+f7fba566fb6f9a9f66c7bc56a3b60a9dc9b4c10eecd58b522b7092d340d0dec1 *100-03-pagedown.png
+e6a179370ca5fb93bc80108bb06a58aae898e7a3f3a24bc0025427734a0e0e07 *100-04-end-bottom.png
+864a6c1d3a4855992a2edc70df12ecf0e9aa03378b95d5d86a478ac6b87e0eb7 *100-05-reverse-at-bottom.png
+b661658621e1515c97f8b910bd28df38d1db674bdab65d906d315481b5a69ec2 *100-06-home-top.png
+eddebb0c339a8f39a77c539bb3e3b5ab83ba36bee456e8ff62f5fa0e289b328e *100-07-hover-after-scroll.png
+5efb84f8a1283e606213ecefd0eb8a7e27e8c08238798a7d936fb59669939096 *100-08-press-scroll-release.png
+1c4e6a9efec65126528791046073ab7ef7ec1c827a4c5be4cab1bac3f0f3230e *100-09-press-release-mismatch.png
+ce97faa5e4eda615a2bbcfee847acfa7915177f4c0cf4ca7dff83dc17c0c0f9c *100-10-focused-paging.png
+0c276deedc2b104cfff5714f220377f30818574c736fcc35f3a3692da84431d0 *100-11-resized.png
+5f463cf834b0bdaf5d6c8153d35552c268e96337f5e0868a4f30a513d9d47037 *150-01-startup.png
+ee8dfa5a6a24529b10a60613c32743b552274b45c9e8507f79f2a62bed5bdc10 *150-02-one-notch.png
+1444eb5620516968e629492c7e66b8de6e22b108b011306ec4f47279d24bd1a9 *150-03-middle.png
+d05b5c9eb2185a016925517b53af70d06753d15db08d7ce7dea168e05f2b234f *150-04-pagedown.png
+187c94d1f051b9e4d6a9091b20ecf37102334caefa19ef1a09984d254693430c *150-05-end-bottom.png
+e9a9713e90a6bbb550116ee33defd7e12a88e5b035e52086b7a1e5d6fcc8d516 *150-06-reverse-at-bottom.png
+ae7f605267a98ec8a9052c2a8838e86b8074ca6574215a03aac9d84d13ce1a3f *150-07-home-top.png
+cb2da4e22377a0880dd3a832d4bb565341b6d8b8017554abe364164326c1c5ad *150-08-hover-after-scroll.png
+db04e1bdbd430fc7f9f4580f5b5ad0747c4ff0033f189e5401bb2d375c83336f *150-09-press-scroll-release.png
+c3f019688d74d8b5102f9b389b12bc937e2588940110c157893c7884446f744d *150-10-press-release-mismatch.png
+e4aa1b4c32850d26a6c222524a75fccf40d3e718fbaadb23513fa50a6bef4249 *150-11-resized.png
+09df14f04506a5ba2c86acab27bce14c9faa287aaae9955a555c418cad69ed5c *150-12-focused-paging.png

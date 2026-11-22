@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::error::Error;
+use std::ffi::c_void;
 use std::fmt;
 use std::num::NonZeroIsize;
 use std::sync::Arc;
@@ -24,18 +25,20 @@ use windows::Win32::UI::Input::Ime::{
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     EnableWindow, GetCapture, GetKeyState, ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT,
     TrackMouseEvent, VIRTUAL_KEY, VK_A, VK_BACK, VK_CONTROL, VK_DELETE, VK_END, VK_ESCAPE, VK_HOME,
-    VK_LEFT, VK_PROCESSKEY, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_TAB,
+    VK_LEFT, VK_NEXT, VK_PRIOR, VK_PROCESSKEY, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_TAB,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow,
     DispatchMessageW, GWLP_USERDATA, GetClientRect, GetForegroundWindow, GetMessageW,
     GetWindowLongPtrW, IDC_ARROW, IsIconic, IsZoomed, KillTimer, LoadCursorW, MSG, PM_REMOVE,
-    PeekMessageW, PostMessageW, RegisterClassExW, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOZORDER, SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-    TranslateMessage, WINDOW_EX_STYLE, WM_APP, WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE, WM_DESTROY,
-    WM_DPICHANGED, WM_GETDPISCALEDSIZE, WM_IME_CHAR, WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION,
-    WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
-    WM_PAINT, WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
+    PeekMessageW, PostMessageW, RegisterClassExW, SPI_GETWHEELSCROLLLINES, SW_HIDE, SW_SHOW,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+    SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+    SystemParametersInfoW, TranslateMessage, WINDOW_EX_STYLE, WM_APP, WM_CAPTURECHANGED, WM_CHAR,
+    WM_CLOSE, WM_DESTROY, WM_DPICHANGED, WM_GETDPISCALEDSIZE, WM_IME_CHAR, WM_IME_COMPOSITION,
+    WM_IME_ENDCOMPOSITION, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_SETTINGCHANGE, WM_SIZE,
+    WM_TIMER, WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
 };
 
 use windows::core::{HSTRING, w};
@@ -49,6 +52,110 @@ use zenui_render::{
 
 /// worker 唤醒只投递这一条消息；`WM_APP` 起是应用私有的消息区间。
 const HOST_WAKE_MESSAGE: u32 = WM_APP + 1;
+
+/// `SPI_GETWHEELSCROLLLINES` 的哨兵值：一个 notch 滚动一页。
+const WHEEL_PAGESCROLL: u32 = u32::MAX;
+/// 查询失败时的缺省行数；与 Windows 的常用缺省一致。
+const DEFAULT_WHEEL_LINES: u32 = 3;
+/// 一个 notch 的滚轮单位。
+const WHEEL_NOTCH_UNITS: i64 = 120;
+/// ADR-0010 的一行逻辑像素高度。
+const WHEEL_LINE_HEIGHT: i64 = 24;
+
+/// 当前系统设置的滚轮行数。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WheelLines {
+    /// 系统设置关闭了滚轮滚动。
+    Disabled,
+    /// 一个 notch 滚动固定行数。
+    Lines(u32),
+    /// 一个 notch 滚动一页；页高在应用偏移时传入。
+    Page,
+}
+
+/// 一个 activation 的滚轮累积器与锚点。
+///
+/// 单位是 1/120 notch 的逻辑像素；正值表示向前滚动（内容向上）。
+#[derive(Clone, Copy, Debug)]
+struct WheelScroll {
+    lines: WheelLines,
+    accumulator: i64,
+    anchor: i64,
+}
+
+impl WheelScroll {
+    fn from_system() -> Self {
+        Self {
+            lines: system_wheel_lines(),
+            accumulator: 0,
+            anchor: 0,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.accumulator = 0;
+        self.anchor = 0;
+    }
+
+    /// 行数设置变化时丢弃未应用的 residue。
+    fn set_lines(&mut self, lines: WheelLines) {
+        if lines != self.lines {
+            self.lines = lines;
+            self.reset();
+        }
+    }
+
+    /// 返回本事件应移动的逻辑像素；正向 notch 使 offset 减小。
+    ///
+    /// `page` 是 `WheelLines::Page` 使用的逻辑页高。
+    fn step(&mut self, delta: i32, page: i32) -> i32 {
+        let notch = match self.lines {
+            WheelLines::Disabled => {
+                self.reset();
+                return 0;
+            }
+            WheelLines::Lines(0) => {
+                self.reset();
+                return 0;
+            }
+            WheelLines::Lines(lines) => i64::from(lines) * WHEEL_LINE_HEIGHT,
+            WheelLines::Page => i64::from(page.max(1)),
+        };
+        self.accumulator = self
+            .accumulator
+            .saturating_add(i64::from(delta).saturating_mul(notch));
+        let pixels = self.accumulator / WHEEL_NOTCH_UNITS;
+        let step = pixels.saturating_sub(self.anchor);
+        self.anchor = pixels;
+        step.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+    }
+}
+
+fn system_wheel_lines() -> WheelLines {
+    let mut lines = DEFAULT_WHEEL_LINES;
+    // 安全：pvParam 指向本地 u32；SPI_GETWHEELSCROLLLINES 只写入该值。
+    let result = unsafe {
+        SystemParametersInfoW(
+            SPI_GETWHEELSCROLLLINES,
+            0,
+            Some((&raw mut lines).cast::<c_void>()),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+    };
+    if result.is_err() {
+        return WheelLines::Lines(DEFAULT_WHEEL_LINES);
+    }
+    wheel_lines_from(lines)
+}
+
+/// 把 `SPI_GETWHEELSCROLLLINES` 的原始值映射为滚动单位。
+fn wheel_lines_from(lines: u32) -> WheelLines {
+    match lines {
+        0 => WheelLines::Disabled,
+        WHEEL_PAGESCROLL => WheelLines::Page,
+        lines => WheelLines::Lines(lines),
+    }
+}
 
 /// caret 闪烁定时器；OS 原生编辑控件的缺省周期约为 530ms。
 const CARET_BLINK_TIMER: usize = 1;
@@ -201,6 +308,14 @@ struct WindowHost {
     close_requested: bool,
     /// 原生 HWND 是否启用；待决关闭的父窗口保持禁用，直到 Deny。
     enabled: bool,
+    /// 当前 activation 采用的逻辑像素滚动偏移；关闭后随 activation 释放。
+    scroll_offset: i32,
+    /// 滚轮累积器与锚点；行数设置在 activation 内缓存。
+    wheel: WheelScroll,
+    /// 最近一次构建的逻辑 viewport；resize/DPI 变化时丢弃滚轮 residue。
+    last_viewport: Option<Viewport>,
+    /// 滚动触发的重建只更新 hover，不清除 capture-based 的按压目标。
+    preserve_press_on_next_rebuild: bool,
     /// 指针、按压、模态或 caret 等瞬时状态变化需要重绘；它们不进入快照。
     paint_requested: bool,
     /// 最近一次构建的呈现快照；未变化的窗口跳过重绘。
@@ -687,6 +802,12 @@ impl Host {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> Result<(), HostError> {
+        if message == WM_SETTINGCHANGE {
+            // 滚轮行数按 activation 缓存；系统广播设置变化时重新读取，
+            // 值变化会丢弃未应用的 residue。
+            window.wheel.set_lines(system_wheel_lines());
+            return Ok(());
+        }
         if window.close_requested || !self.runtime.window_accepts_input(window.ctx) {
             // 关闭、隐藏或等待关闭确认的窗口不接受输入；迟到的唤醒由宿主的
             // 窗口级路径丢弃结果。
@@ -710,12 +831,24 @@ impl Host {
             window.keyboard_modality = false;
             window.paint_requested = true;
         }
+        if matches!(
+            message,
+            WM_LBUTTONDOWN | WM_LBUTTONUP | WM_MOUSEMOVE | WM_MOUSEWHEEL | WM_KEYDOWN
+        ) {
+            // 输入必须命中当前滚动偏移的场景；surface 被遮挡时渲染可能没有
+            // 更新 `window.scene`，这里先补一次只重建、不呈现的同步。
+            self.ensure_scene(window)?;
+        }
         if message == WM_LBUTTONDOWN {
             self.pointer_pressed(window, lparam)
         } else if message == WM_LBUTTONUP {
             self.pointer_released(window, lparam)
         } else if message == WM_MOUSEMOVE {
             self.pointer_moved(window, lparam)
+        } else if message == WM_MOUSEWHEEL {
+            self.wheel_scrolled(window, wparam)
+        } else if message == WM_MOUSEHWHEEL {
+            Ok(())
         } else if message == WM_MOUSELEAVE {
             self.pointer_left(window)
         } else if message == WM_CAPTURECHANGED {
@@ -905,6 +1038,30 @@ impl Host {
             Err(error) => return Err(HostError::Snapshot(error)),
         };
         self.render_window(window, snapshot)
+    }
+
+    /// 输入前确保内存场景使用当前滚动偏移。
+    ///
+    /// `render_window` 在 surface `Timeout`/`Occluded` 时不会更新 `window.scene`；
+    /// 指针与键盘输入必须命中最新偏移的场景，因此这里只重建并保存，不呈现。
+    fn ensure_scene(&mut self, window: &mut WindowHost) -> Result<(), HostError> {
+        let fresh = window
+            .scene
+            .as_ref()
+            .is_some_and(|scene| scene.scroll_offset() == window.scroll_offset);
+        if fresh {
+            return Ok(());
+        }
+        let Some(snapshot) = window.last_snapshot.clone() else {
+            return Ok(());
+        };
+        let (width, height) = client_size(window.hwnd())?;
+        if width == 0 || height == 0 {
+            return Ok(());
+        }
+        let scene = self.build_scene(window, &snapshot, width, height)?;
+        window.scene = Some(scene);
+        Ok(())
     }
 
     /// 把一个窗口的快照渲染到它自己的 surface；共享 renderer 按目标尺寸切换。
@@ -1097,6 +1254,59 @@ impl Host {
         if window.hovered.take().is_some() {
             window.paint_requested = true;
         }
+        Ok(())
+    }
+
+    /// 一次滚轮事件：按 ADR-0010 累积、取整、夹取；正向 notch 减小 offset。
+    fn wheel_scrolled(&mut self, window: &mut WindowHost, wparam: WPARAM) -> Result<(), HostError> {
+        if window.close_requested
+            || !window.enabled
+            || !self.runtime.window_accepts_input(window.ctx)
+        {
+            return Ok(());
+        }
+        let delta = ((wparam.0 >> 16) as u16) as i16;
+        if delta == 0 {
+            return Ok(());
+        }
+        let page = page_step(window.scene.as_ref());
+        let step = window.wheel.step(i32::from(delta), page);
+        if step == 0 {
+            return Ok(());
+        }
+        window.scroll_offset = window.scroll_offset.saturating_sub(step);
+        window.preserve_press_on_next_rebuild = true;
+        window.paint_requested = true;
+        Ok(())
+    }
+
+    /// PageUp/PageDown/Home/End 的滚动步；键盘滚动重置滚轮 residue。
+    fn scroll_by_key(
+        &mut self,
+        window: &mut WindowHost,
+        key: VIRTUAL_KEY,
+    ) -> Result<(), HostError> {
+        self.ensure_scene(window)?;
+        let Some(scene) = window.scene.as_ref() else {
+            return Ok(());
+        };
+        let max = scene.max_scroll_offset();
+        if max == 0 {
+            // ADR：最大偏移为零时不消费滚动键；这里不改变任何状态。
+            return Ok(());
+        }
+        let step = page_step(Some(scene));
+        let target = match key {
+            VK_PRIOR => window.scroll_offset.saturating_sub(step),
+            VK_NEXT => window.scroll_offset.saturating_add(step),
+            VK_HOME => 0,
+            VK_END => max,
+            _ => return Ok(()),
+        };
+        window.wheel.reset();
+        window.scroll_offset = target;
+        window.preserve_press_on_next_rebuild = true;
+        window.paint_requested = true;
         Ok(())
     }
 
@@ -1404,7 +1614,17 @@ impl Host {
             .runtime
             .presentation_of(window.ctx)
             .map_err(HostError::Snapshot)?;
+        if matches!(key, VK_PRIOR | VK_NEXT) {
+            if focused_input(&snapshot).is_some_and(|node| is_composing(&snapshot, node)) {
+                // 组合期间翻页键归 IME；不滚动。
+                return Ok(());
+            }
+            return self.scroll_by_key(window, key);
+        }
         let Some(focused) = focused_input(&snapshot) else {
+            if matches!(key, VK_HOME | VK_END) {
+                return self.scroll_by_key(window, key);
+            }
             return Ok(());
         };
         if key == VK_ESCAPE {
@@ -1800,6 +2020,16 @@ impl Host {
         let scale = if dpi == 0 { 1.0 } else { dpi as f32 / 96.0 };
         let viewport = Viewport::new(width as f32 / scale, height as f32 / scale, scale)
             .map_err(HostError::Scene)?;
+        if window.last_viewport != Some(viewport) {
+            window.last_viewport = Some(viewport);
+            window.wheel.reset();
+        }
+        // 快照变化（增删、过滤、重排）也丢弃未应用的滚轮 residue。
+        if window.last_snapshot.as_ref() != Some(snapshot) {
+            window.wheel.reset();
+        }
+        let requested = window.scroll_offset;
+        let preserve_press = window.preserve_press_on_next_rebuild;
         let mut scene = Scene::build_cached(
             snapshot,
             viewport,
@@ -1807,8 +2037,10 @@ impl Host {
             &mut self.scene_cache,
         )
         .map_err(HostError::Scene)?;
+        adopt_scroll_offset(window, &scene, requested);
         // 新场景可能已经移走或卸载了指针下的节点；失效目标不能继续高亮。
-        if self.revalidate_pointer(window, &scene) {
+        // 滚动触发的重建保留 capture-based 的按压目标。
+        if self.revalidate_pointer(window, &scene, !preserve_press) {
             scene = Scene::build_cached(
                 snapshot,
                 viewport,
@@ -1816,7 +2048,10 @@ impl Host {
                 &mut self.scene_cache,
             )
             .map_err(HostError::Scene)?;
+            let requested = window.scroll_offset;
+            adopt_scroll_offset(window, &scene, requested);
         }
+        window.preserve_press_on_next_rebuild = false;
         // 组合期间不绘制 caret，草稿由 preedit 下划线标识；闪烁只在非组合状态生效。
         let composing = focused_composition(snapshot);
         scene.set_caret_visible(window.caret_visible && !composing);
@@ -1825,16 +2060,25 @@ impl Host {
     }
 
     /// 用新场景重新命中最后的指针位置；返回是否需要按新瞬态重建。
-    fn revalidate_pointer(&mut self, window: &mut WindowHost, scene: &Scene) -> bool {
+    ///
+    /// `clear_press` 为 false 时只更新 hover，保留 capture-based 的按压目标，
+    /// 用于滚动触发的重建：滚动不重新评估按压，松开时仍按命中结果决定激活。
+    fn revalidate_pointer(
+        &mut self,
+        window: &mut WindowHost,
+        scene: &Scene,
+        clear_press: bool,
+    ) -> bool {
         let Some(point) = window.pointer else {
             return false;
         };
         let hit = scene.hit_test(point);
         let enabled = hit.filter(|node| scene.node(*node).is_some_and(|e| !e.disabled()));
         let hover_changed = enabled != window.hovered;
-        let press_cleared = window.pressed.is_some_and(|pressed| {
-            hit != Some(pressed) || scene.node(pressed).is_none_or(|element| element.disabled())
-        });
+        let press_cleared = clear_press
+            && window.pressed.is_some_and(|pressed| {
+                hit != Some(pressed) || scene.node(pressed).is_none_or(|element| element.disabled())
+            });
         if !hover_changed && !press_cleared {
             return false;
         }
@@ -2080,6 +2324,7 @@ impl Host {
             return;
         };
         window.native.shown = show;
+        window.wheel.reset();
         window.paint_requested = true;
         if !show {
             window.clear_pointer_transients();
@@ -2198,6 +2443,10 @@ impl WindowHost {
             blink_timer,
             close_requested: false,
             enabled: true,
+            scroll_offset: 0,
+            wheel: WheelScroll::from_system(),
+            last_viewport: None,
+            preserve_press_on_next_rebuild: false,
             paint_requested: true,
             last_snapshot: None,
         }
@@ -2222,11 +2471,28 @@ impl WindowHost {
     }
 }
 
+/// ADR-0010 的翻页步长：保留 24 逻辑像素重叠，至少 1 像素。
+fn page_step(scene: Option<&Scene>) -> i32 {
+    scene.map_or(1, |scene| {
+        ((scene.viewport().height() - 24.0).floor() as i32).max(1)
+    })
+}
+
+/// 采用场景夹取后的偏移；被夹取时丢弃滚轮 residue。
+fn adopt_scroll_offset(window: &mut WindowHost, scene: &Scene, requested: i32) {
+    let applied = scene.scroll_offset();
+    if applied != requested {
+        window.scroll_offset = applied;
+        window.wheel.reset();
+    }
+}
+
 fn scene_env(window: &WindowHost) -> SceneEnv {
     SceneEnv::default()
         .with_hovered(window.hovered)
         .with_pressed(window.pressed)
         .with_focus_visible(window.keyboard_modality)
+        .with_scroll_offset(window.scroll_offset)
 }
 
 impl Drop for Host {
@@ -3084,6 +3350,73 @@ mod tests {
 
     const MAIN: &str = "main";
 
+    fn wheel(lines: WheelLines) -> WheelScroll {
+        WheelScroll {
+            lines,
+            accumulator: 0,
+            anchor: 0,
+        }
+    }
+
+    #[test]
+    fn wheel_sub_notches_accumulate_without_drift() {
+        // 高分辨率滚轮：每个事件 24 单位（1/5 notch），3 行 × 24 px = 72 px/notch。
+        // 逐事件截断会得到 5 × 14 = 70 px；累积器必须得到 14,14,15,14,15 = 72。
+        let mut forward = wheel(WheelLines::Lines(3));
+        let steps: Vec<i32> = (0..5).map(|_| forward.step(24, 100)).collect();
+        assert_eq!(steps, [14, 14, 15, 14, 15], "sub-notch residue is carried");
+        assert_eq!(steps.iter().sum::<i32>(), 72, "five fifths make one notch");
+
+        let mut backward = wheel(WheelLines::Lines(3));
+        let steps: Vec<i32> = (0..5).map(|_| backward.step(-24, 100)).collect();
+        assert_eq!(steps, [-14, -14, -15, -14, -15]);
+        assert_eq!(steps.iter().sum::<i32>(), -72);
+
+        let mut whole = wheel(WheelLines::Lines(3));
+        assert_eq!(whole.step(120, 100), 72, "one notch is three lines");
+        assert_eq!(whole.step(-120, 100), -72);
+    }
+
+    #[test]
+    fn wheel_page_and_disabled_settings_map_to_fixed_steps() {
+        assert_eq!(wheel_lines_from(0), WheelLines::Disabled);
+        assert_eq!(wheel_lines_from(WHEEL_PAGESCROLL), WheelLines::Page);
+        assert_eq!(wheel_lines_from(1), WheelLines::Lines(1));
+        assert_eq!(wheel_lines_from(3), WheelLines::Lines(3));
+
+        let mut page = wheel(WheelLines::Page);
+        assert_eq!(page.step(120, 500), 500);
+        assert_eq!(page.step(-120, 500), -500);
+
+        let mut disabled = wheel(WheelLines::Disabled);
+        assert_eq!(disabled.step(120, 500), 0);
+        let mut zero_lines = wheel(WheelLines::Lines(0));
+        assert_eq!(zero_lines.step(120, 500), 0);
+    }
+
+    #[test]
+    fn wheel_line_changes_discard_unapplied_residue() {
+        let mut wheel = wheel(WheelLines::Lines(3));
+        // 1 单位在 3 行设置下只有 0.6 px，留下 residue。
+        assert_eq!(wheel.step(1, 100), 0);
+        wheel.set_lines(WheelLines::Lines(2));
+        assert_eq!(
+            wheel.step(1, 100),
+            0,
+            "the pre-change residue cannot add a phantom pixel"
+        );
+        assert_eq!(wheel.step(120, 100), 48, "the new line count applies");
+    }
+
+    #[test]
+    fn wheel_extreme_deltas_stay_representable() {
+        let mut wheel = wheel(WheelLines::Lines(1));
+        let up = wheel.step(i32::MAX, 100);
+        assert!(up > 0);
+        let down = wheel.step(i32::MIN, 100);
+        assert!(down < 0);
+    }
+
     #[test]
     fn resizing_relayouts_the_scene_and_surface() {
         let mut host = open_host();
@@ -3586,6 +3919,35 @@ mod tests {
         host.request_close("second").expect("close second");
         host.request_close("main").expect("close main");
         host.run().expect("the loop exits after the last window");
+    }
+
+    #[test]
+    fn device_loss_preserves_the_applied_scroll_offset() {
+        let mut host = open_host();
+        for index in 0..100 {
+            host.runtime
+                .input("What needs to be done?", &format!("Task {index}"))
+                .expect("fill the draft");
+            host.runtime.submit("Add task").expect("add a row");
+        }
+        host.render().expect("render the tall window");
+        let max = host.scene(MAIN).expect("scene").max_scroll_offset();
+        assert!(max > 0, "the seeded rows overflow the viewport");
+
+        host.windows.get_mut(MAIN).expect("main").scroll_offset = 72;
+        host.render().expect("render at the scrolled offset");
+        assert_eq!(host.scene(MAIN).expect("scene").scroll_offset(), 72);
+
+        host.device_lost = true;
+        host.recover_device().expect("rebuild every surface");
+
+        assert_eq!(
+            host.scene(MAIN)
+                .expect("scene after recovery")
+                .scroll_offset(),
+            72,
+            "a recreated surface keeps the applied offset"
+        );
     }
 
     #[test]
