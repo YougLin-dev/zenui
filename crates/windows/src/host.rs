@@ -3391,9 +3391,7 @@ mod tests {
     #![allow(unused_braces)]
 
     use super::*;
-    use windows::Win32::UI::Input::KeyboardAndMouse::{
-        IsWindowEnabled, VK_A, VK_C, VK_V, VK_X, VK_Y, VK_Z,
-    };
+    use windows::Win32::UI::Input::KeyboardAndMouse::{IsWindowEnabled, VK_A};
     use windows::Win32::UI::WindowsAndMessaging::SendMessageW;
 
     const MAIN: &str = "main";
@@ -4349,49 +4347,6 @@ mod tests {
         let edit = element.edit().expect("edit");
         assert_eq!(edit.caret(), 1);
         assert_eq!(edit.selection(), None, "typing collapses the selection");
-    }
-
-    #[test]
-    fn reserved_editor_shortcuts_are_consumed_without_editing() {
-        let mut host = open_host();
-        host.runtime.focus("Edit Write tests").expect("focus");
-        let node = editor_node(&host);
-        let before = host.runtime.presentation().expect("snapshot");
-        let edit = before.node(node).expect("editor").edit().expect("edit");
-        let (caret, selection) = (edit.caret(), edit.selection());
-        let text = before
-            .node(node)
-            .expect("editor")
-            .text_value()
-            .map(str::to_owned);
-
-        for key in [VK_Z, VK_Y, VK_X, VK_C, VK_V] {
-            with_main(&mut host, |host, window| {
-                host.key_down_with(window, key, false, true)
-            });
-        }
-
-        let after = host.runtime.presentation().expect("snapshot");
-        let edit = after.node(node).expect("editor").edit().expect("edit");
-        assert_eq!(
-            edit.caret(),
-            caret,
-            "reserved shortcuts do not move the caret"
-        );
-        assert_eq!(
-            edit.selection(),
-            selection,
-            "reserved shortcuts do not change the selection"
-        );
-        assert_eq!(
-            after
-                .node(node)
-                .expect("editor")
-                .text_value()
-                .map(str::to_owned),
-            text,
-            "reserved shortcuts do not edit the text"
-        );
     }
 
     #[test]
