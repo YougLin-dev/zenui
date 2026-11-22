@@ -376,10 +376,11 @@ fn a_worker_wake_is_delivered_while_the_dialog_is_open() {
 }
 
 #[test]
-fn two_requests_are_served_fifo_and_never_nested() {
+fn mixed_requests_are_served_fifo_and_never_nested() {
     let mut harness = open();
     post_click(&harness.host, "Pick");
-    post_click(&harness.host, "Pick");
+    post_click(&harness.host, "Save");
+    post_click(&harness.host, "Folder");
 
     let calls: Calls = Rc::new(RefCell::new(Vec::new()));
     let slot = calls.clone();
@@ -403,20 +404,21 @@ fn two_requests_are_served_fifo_and_never_nested() {
         })
         .expect("install the counting presenter");
 
-    assert!(!harness.host.pump().expect("serve both requests"));
+    assert!(!harness.host.pump().expect("serve all requests"));
     assert!(!nested.get(), "dialogs are never stacked");
-    assert_eq!(calls.borrow().len(), 2);
+    assert_eq!(calls.borrow().len(), 3);
     assert_eq!(
         harness.outcomes.borrow().as_slice(),
         [
             FileDialogOutcome::Picked(vec![PathBuf::from("picked-0.txt")]),
             FileDialogOutcome::Picked(vec![PathBuf::from("picked-1.txt")]),
+            FileDialogOutcome::Picked(vec![PathBuf::from("picked-2.txt")]),
         ]
     );
 }
 
 #[test]
-fn save_and_folder_requests_complete_unsupported_before_the_presenter() {
+fn save_and_folder_reach_the_presenter_with_kind_specific_options() {
     let mut harness = open();
     let calls: Calls = Rc::new(RefCell::new(Vec::new()));
     install_recording(
@@ -427,49 +429,121 @@ fn save_and_folder_requests_complete_unsupported_before_the_presenter() {
 
     post_click(&harness.host, "Save");
     post_click(&harness.host, "Folder");
-    assert!(!harness.host.pump().expect("complete both unsupported"));
+    assert!(!harness.host.pump().expect("present save and folder"));
 
-    assert!(
-        calls.borrow().is_empty(),
-        "an open-file presenter is never called for save or folder"
-    );
+    {
+        let calls = calls.borrow();
+        assert_eq!(calls.len(), 2);
+        let save = &calls[0].1;
+        assert_eq!(save.kind(), FileDialogKind::SaveFile);
+        assert_eq!(save.title(), "Save tasks");
+        assert_eq!(save.filters()[0].name(), "Text files");
+        assert_eq!(save.suggested_name(), "tasks.txt");
+        assert_eq!(save.default_extension(), "txt");
+
+        let folder = &calls[1].1;
+        assert_eq!(folder.kind(), FileDialogKind::PickFolder);
+        assert_eq!(folder.title(), "Pick a folder");
+        assert!(folder.filters().is_empty());
+        assert_eq!(folder.suggested_name(), "");
+        assert_eq!(folder.default_extension(), "");
+    }
+
     assert_eq!(
         harness.outcomes.borrow().as_slice(),
         [
-            FileDialogOutcome::Failed(FileDialogError::Unsupported),
-            FileDialogOutcome::Failed(FileDialogError::Unsupported),
+            FileDialogOutcome::Picked(vec![PathBuf::from("picked.txt")]),
+            FileDialogOutcome::Picked(vec![PathBuf::from("picked.txt")]),
         ]
     );
 
     post_click(&harness.host, "Pick");
-    assert!(
-        !harness
-            .host
-            .pump()
-            .expect("present an open request after the rejections")
-    );
+    assert!(!harness.host.pump().expect("present after the save/folder"));
     assert_eq!(
         calls.borrow().len(),
-        1,
-        "the presenter slot survives the rejected requests"
+        3,
+        "the presenter survives each outcome"
     );
     assert_eq!(
         harness.outcomes.borrow().last(),
         Some(&FileDialogOutcome::Picked(vec![PathBuf::from(
             "picked.txt"
-        )])),
-        "open behavior is unchanged after save and folder are rejected"
+        )]))
     );
+}
+
+#[test]
+fn wrong_path_arity_is_reported_as_a_dialog_failure() {
+    let mut harness = open();
+    let calls: Calls = Rc::new(RefCell::new(Vec::new()));
+
+    install_recording(
+        &mut harness,
+        &calls,
+        FileDialogOutcome::Picked(vec![
+            PathBuf::from("first.txt"),
+            PathBuf::from("second.txt"),
+        ]),
+    );
+    post_click(&harness.host, "Save");
+    assert!(!harness.host.pump().expect("reject save arity"));
+    assert!(matches!(
+        harness.outcomes.borrow().as_slice(),
+        [FileDialogOutcome::Failed(FileDialogError::DialogFailed(_))]
+    ));
+
+    install_recording(&mut harness, &calls, FileDialogOutcome::Picked(Vec::new()));
+    post_click(&harness.host, "Folder");
+    assert!(!harness.host.pump().expect("reject folder arity"));
+    assert!(matches!(
+        harness.outcomes.borrow().last(),
+        Some(FileDialogOutcome::Failed(FileDialogError::DialogFailed(_)))
+    ));
+
+    install_recording(&mut harness, &calls, FileDialogOutcome::Picked(Vec::new()));
+    post_click(&harness.host, "Pick");
+    assert!(!harness.host.pump().expect("reject open-files arity"));
+    assert!(matches!(
+        harness.outcomes.borrow().last(),
+        Some(FileDialogOutcome::Failed(FileDialogError::DialogFailed(_)))
+    ));
+}
+
+#[test]
+fn save_and_folder_cancel_and_failure_are_delivered() {
+    let mut harness = open();
+    let calls: Calls = Rc::new(RefCell::new(Vec::new()));
+
+    install_recording(&mut harness, &calls, FileDialogOutcome::Cancelled);
+    post_click(&harness.host, "Save");
+    assert!(!harness.host.pump().expect("cancel save"));
+    assert_eq!(
+        harness.outcomes.borrow().as_slice(),
+        [FileDialogOutcome::Cancelled]
+    );
+
+    let failure =
+        FileDialogOutcome::Failed(FileDialogError::DialogFailed(String::from("folder failed")));
+    install_recording(&mut harness, &calls, failure.clone());
+    post_click(&harness.host, "Folder");
+    assert!(!harness.host.pump().expect("fail folder"));
+    assert_eq!(harness.outcomes.borrow().last(), Some(&failure));
 }
 
 #[test]
 fn a_hidden_host_without_a_presenter_completes_unsupported() {
     let mut harness = open();
     post_click(&harness.host, "Pick");
+    post_click(&harness.host, "Save");
+    post_click(&harness.host, "Folder");
     assert!(!harness.host.pump().expect("complete unsupported"));
     assert_eq!(
         harness.outcomes.borrow().as_slice(),
-        [FileDialogOutcome::Failed(FileDialogError::Unsupported)]
+        [
+            FileDialogOutcome::Failed(FileDialogError::Unsupported),
+            FileDialogOutcome::Failed(FileDialogError::Unsupported),
+            FileDialogOutcome::Failed(FileDialogError::Unsupported),
+        ]
     );
 }
 
