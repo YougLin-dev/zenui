@@ -24,6 +24,10 @@ pub enum NodeOperation {
     SetCaret,
     SetSelection,
     SelectAll,
+    /// 恢复该输入最近一次已提交编辑；空栈是静默无操作。
+    Undo,
+    /// 重新应用该输入最近一次被撤销的编辑；空栈是静默无操作。
+    Redo,
 }
 
 impl NodeOperation {
@@ -46,6 +50,8 @@ impl NodeOperation {
             Self::SetCaret => "set caret",
             Self::SetSelection => "set selection",
             Self::SelectAll => "select all",
+            Self::Undo => "undo",
+            Self::Redo => "redo",
         }
     }
 }

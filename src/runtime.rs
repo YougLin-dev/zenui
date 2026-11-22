@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
@@ -918,6 +918,7 @@ impl State {
             anchor,
             selection,
             composition,
+            ..
         } = &mut self.elements[element].local
         {
             if composition.is_some() {
@@ -1093,6 +1094,9 @@ enum LocalState {
         anchor: usize,
         selection: Option<(usize, usize)>,
         composition: Option<Composition>,
+        /// 这个输入自己的撤销/重做历史；随元素卸载释放。
+        /// Box 让每个元素槽位保持小尺寸，只有文本输入承担历史分配。
+        history: Box<TextHistory>,
     },
     Checkbox {
         checked: bool,
@@ -1127,6 +1131,127 @@ impl Composition {
             None => (self.base_caret, self.base_caret),
         }
     }
+}
+
+/// 一次可撤销编辑前后的完整本地状态；`value` 是已经提交到模型的值。
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct TextSnapshot {
+    value: String,
+    caret: usize,
+    anchor: usize,
+    selection: Option<(usize, usize)>,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct TextEntry {
+    before: TextSnapshot,
+    after: TextSnapshot,
+}
+
+impl TextEntry {
+    fn bytes(&self) -> usize {
+        self.before.value.len() + self.after.value.len()
+    }
+}
+
+const HISTORY_ENTRIES: usize = 100;
+const HISTORY_BYTES: usize = 256 * 1024;
+
+/// 每个文本输入自己的有界编辑历史。
+///
+/// 历史只保存已提交值的快照；撤销和重做都通过一次 `on:input` 写回模型，因此
+/// 应用始终是值的权威。`observed` 是最近一次刷新看到的已提交值，外部替换据此
+/// 清空两个栈；`settle_local` 让一次本地编辑自己的刷新不被误判为外部变化。
+#[derive(Default)]
+struct TextHistory {
+    undo: VecDeque<TextEntry>,
+    redo: VecDeque<TextEntry>,
+    undo_bytes: usize,
+    redo_bytes: usize,
+    observed: Option<String>,
+    settle_local: bool,
+}
+
+impl TextHistory {
+    /// 接受一次刷新看到的值；不是本地编辑结算时，变化即为外部替换。
+    fn observe(&mut self, value: &str) {
+        if self.settle_local {
+            self.settle_local = false;
+            self.observed = Some(value.to_owned());
+        } else if self.observed.as_deref() != Some(value) {
+            self.observed = Some(value.to_owned());
+            self.clear();
+        }
+    }
+
+    fn clear(&mut self) {
+        self.undo.clear();
+        self.redo.clear();
+        self.undo_bytes = 0;
+        self.redo_bytes = 0;
+    }
+
+    /// 元素卸载时释放历史与观察到的值，不在死槽位里保留文本。
+    fn reset(&mut self) {
+        self.clear();
+        self.observed = None;
+        self.settle_local = false;
+    }
+
+    /// 记录一次已提交编辑；提交前后值相同则不记录，也不清空 redo。
+    fn record(&mut self, before: TextSnapshot, after: TextSnapshot) {
+        if before.value == after.value {
+            return;
+        }
+        self.redo.clear();
+        self.redo_bytes = 0;
+        self.push_undo(TextEntry { before, after });
+    }
+
+    fn push_undo(&mut self, entry: TextEntry) {
+        self.undo_bytes += entry.bytes();
+        self.undo.push_back(entry);
+        trim_history(&mut self.undo, &mut self.undo_bytes);
+    }
+
+    fn push_redo(&mut self, entry: TextEntry) {
+        self.redo_bytes += entry.bytes();
+        self.redo.push_back(entry);
+        trim_history(&mut self.redo, &mut self.redo_bytes);
+    }
+}
+
+/// 淘汰最旧条目，直到条目数与快照文本字节数都回到上限内。
+fn trim_history(stack: &mut VecDeque<TextEntry>, bytes: &mut usize) {
+    while stack.len() > HISTORY_ENTRIES || (*bytes > HISTORY_BYTES && !stack.is_empty()) {
+        if let Some(entry) = stack.pop_front() {
+            *bytes -= entry.bytes();
+        }
+    }
+}
+
+fn text_snapshot(element: &MountedElement) -> Option<TextSnapshot> {
+    let LocalState::TextInput {
+        caret,
+        anchor,
+        selection,
+        ..
+    } = &element.local
+    else {
+        return None;
+    };
+    Some(TextSnapshot {
+        value: element.text_value().unwrap_or_default().to_owned(),
+        caret: *caret,
+        anchor: *anchor,
+        selection: *selection,
+    })
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HistoryDirection {
+    Undo,
+    Redo,
 }
 
 enum LocalUpdate {
@@ -2280,6 +2405,7 @@ impl Runtime {
                             anchor: 0,
                             selection: None,
                             composition: None,
+                            history: Box::default(),
                         },
                         "checkbox" => LocalState::Checkbox { checked: false },
                         _ => LocalState::None,
@@ -2386,6 +2512,7 @@ impl Runtime {
     }
 
     fn release_nodes(&mut self, nodes: &mut Vec<MountedNode>) {
+        with_state(|state| clear_history_in_nodes(state, nodes));
         let nodes = std::mem::take(nodes);
         for node in nodes {
             let owner = with_state(|state| match node {
@@ -2467,6 +2594,19 @@ impl Runtime {
             }
             element.attrs = attrs;
             element.inline_styles = styles;
+            if let LocalState::TextInput { history, .. } = &mut element.local {
+                let value = element
+                    .attrs
+                    .iter()
+                    .find(|attr| attr.name == "value")
+                    .and_then(|attr| attr.current.as_ref())
+                    .and_then(|current| match current {
+                        AttrCurrent::Text(text) => Some(text.as_str()),
+                        AttrCurrent::Bool(_) => None,
+                    })
+                    .unwrap_or_default();
+                history.observe(value);
+            }
         });
     }
 
@@ -2517,6 +2657,9 @@ impl Runtime {
             None => None,
         };
 
+        if let Some(branch) = &show.active {
+            with_state(|state| clear_history_in_nodes(state, &branch.children));
+        }
         if let Some(branch) = show.active.take() {
             with_state(|state| {
                 state.dispose_owner(branch.owner);
@@ -2590,6 +2733,7 @@ impl Runtime {
             .collect();
         for key in removed {
             if let Some(item) = for_node.items.remove(&key) {
+                with_state(|state| clear_history_in_nodes(state, &item.children));
                 with_state(|state| {
                     state.dispose_owner(item.owner);
                     state.unmounts += 1;
@@ -2699,6 +2843,9 @@ impl Runtime {
         Some(state.elements[element].id)
     }
 
+    /// label 助手的整体值替换；视为外部替换并清空该输入的撤销/重做历史。
+    ///
+    /// 它仍然派发一次 `on:input`，应用模型保持值的权威。
     pub fn input(&mut self, label: &str, value: &str) -> Result<(), MountError> {
         let target = FindTarget::Label(label.to_owned());
         let state = self.state.clone();
@@ -2724,6 +2871,9 @@ impl Runtime {
                 state.phase = Phase::Event;
                 state.fault = None;
                 state.write_error = None;
+                if let LocalState::TextInput { history, .. } = &mut state.elements[element].local {
+                    history.clear();
+                }
                 state.update_local(element, LocalUpdate::Input(value.to_owned()));
             });
             if let Event::Input(handler) = &mut event {
@@ -2822,24 +2972,29 @@ impl Runtime {
         operation: NodeOperation,
         edit: Edit<'_>,
     ) -> Result<(), DispatchError> {
-        let (value, caret, selection) = with_state(|state| {
+        let (before, caret, selection) = with_state(|state| {
             state.require_editable_text_input(node, element, operation)?;
             let LocalState::TextInput {
-                caret, selection, ..
+                caret,
+                anchor,
+                selection,
+                ..
             } = &state.elements[element].local
             else {
                 unreachable!("require_editable_text_input validated the input");
             };
-            Ok::<_, DispatchError>((
-                state.elements[element]
+            let before = TextSnapshot {
+                value: state.elements[element]
                     .text_value()
                     .unwrap_or_default()
                     .to_owned(),
-                *caret,
-                *selection,
-            ))
+                caret: *caret,
+                anchor: *anchor,
+                selection: *selection,
+            };
+            Ok::<_, DispatchError>((before, *caret, *selection))
         })?;
-        let Some(outcome) = text_edit::apply(&value, caret, selection, edit) else {
+        let Some(outcome) = text_edit::apply(&before.value, caret, selection, edit) else {
             return Ok(());
         };
         let text_edit::EditOutcome {
@@ -2853,6 +3008,7 @@ impl Runtime {
                 caret,
                 anchor,
                 selection,
+                history,
                 ..
             } = &mut state.elements[element].local
             else {
@@ -2861,6 +3017,8 @@ impl Runtime {
             *caret = next_caret;
             *anchor = next_caret;
             *selection = None;
+            // 这次编辑自己的模型写入不能被当作外部替换。
+            history.settle_local = true;
         });
         // handler unwind 不能把占位事件或 Event 阶段留在槽位里。
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -2873,11 +3031,140 @@ impl Runtime {
             state.phase = Phase::Idle;
         });
         if let Err(payload) = outcome {
+            with_state(|state| clear_history_settle(state, element));
             std::panic::resume_unwind(payload);
         }
-        self.finish_command().map_err(DispatchError::Command)?;
+        if let Err(error) = self.finish_command() {
+            with_state(|state| clear_history_settle(state, element));
+            return Err(DispatchError::Command(error));
+        }
         with_state(|state| clamp_local_edit(state, element));
+        self.record_text_edit(element, before);
         Ok(())
+    }
+
+    /// 把一次编辑前后的已提交状态记入该输入自己的历史。
+    ///
+    /// 只记录仍然挂载的元素；处理器改写的值以刷新后的已提交值为准，
+    /// 提交前后值相同的编辑不产生条目。
+    fn record_text_edit(&mut self, element: usize, before: TextSnapshot) {
+        with_state(|state| {
+            if !state.element_is_mounted(element) {
+                return;
+            }
+            let Some(after) = text_snapshot(&state.elements[element]) else {
+                return;
+            };
+            let LocalState::TextInput { history, .. } = &mut state.elements[element].local else {
+                return;
+            };
+            history.record(before, after);
+        });
+    }
+
+    /// 撤销该输入最近一次已提交编辑；空栈是静默无操作。
+    ///
+    /// 撤销通过一次 `on:input` 写回编辑前的值，应用模型仍是值的权威。
+    /// 精确恢复 caret/anchor/selection 只对原样提交值的处理器成立。
+    pub fn undo_node(&mut self, node: NodeId) -> Result<(), DispatchError> {
+        self.apply_history(node, NodeOperation::Undo, HistoryDirection::Undo)
+    }
+
+    /// 重做该输入最近一次被撤销的编辑；空栈是静默无操作。
+    ///
+    /// 重做同样通过一次 `on:input` 写回，恢复的是那次编辑提交后的状态。
+    pub fn redo_node(&mut self, node: NodeId) -> Result<(), DispatchError> {
+        self.apply_history(node, NodeOperation::Redo, HistoryDirection::Redo)
+    }
+
+    fn apply_history(
+        &mut self,
+        node: NodeId,
+        operation: NodeOperation,
+        direction: HistoryDirection,
+    ) -> Result<(), DispatchError> {
+        let state = self.state.clone();
+        context::install(&state, || {
+            let element = with_state(|state| state.element_for_node(node))?;
+            with_state(|state| state.require_editable_text_input(node, element, operation))?;
+            let entry = with_state(|state| {
+                let LocalState::TextInput { history, .. } = &state.elements[element].local else {
+                    unreachable!("require_editable_text_input validated the input");
+                };
+                match direction {
+                    HistoryDirection::Undo => history.undo.back(),
+                    HistoryDirection::Redo => history.redo.back(),
+                }
+                .cloned()
+            });
+            let Some(entry) = entry else {
+                return Ok(());
+            };
+            let target = match direction {
+                HistoryDirection::Undo => entry.before.clone(),
+                HistoryDirection::Redo => entry.after.clone(),
+            };
+            let (event_id, mut event) =
+                self.take_node_event(node, element, EventKind::Input, operation)?;
+            let (caret, anchor, selection) = (target.caret, target.anchor, target.selection);
+            with_state(|state| {
+                let LocalState::TextInput {
+                    caret: current_caret,
+                    anchor: current_anchor,
+                    selection: current_selection,
+                    history,
+                    ..
+                } = &mut state.elements[element].local
+                else {
+                    unreachable!("require_editable_text_input validated the input");
+                };
+                let length = target.value.chars().count();
+                *current_caret = caret.min(length);
+                *current_anchor = anchor.min(length);
+                *current_selection =
+                    selection.map(|(start, end)| text_edit::normalized_range(start, end, length));
+                history.settle_local = true;
+            });
+            // handler unwind 不能把占位事件或 Event 阶段留在槽位里。
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if let Event::Input(handler) = &mut event {
+                    handler(target.value);
+                }
+            }));
+            with_state(|state| {
+                state.put_event(event_id, event);
+                state.phase = Phase::Idle;
+            });
+            if let Err(payload) = outcome {
+                with_state(|state| clear_history_settle(state, element));
+                std::panic::resume_unwind(payload);
+            }
+            if let Err(error) = self.finish_command() {
+                with_state(|state| clear_history_settle(state, element));
+                return Err(DispatchError::Command(error));
+            }
+            with_state(|state| {
+                clamp_local_edit(state, element);
+                if !state.element_is_mounted(element) {
+                    return;
+                }
+                let LocalState::TextInput { history, .. } = &mut state.elements[element].local
+                else {
+                    return;
+                };
+                match direction {
+                    HistoryDirection::Undo => {
+                        history.undo.pop_back();
+                        history.push_redo(entry);
+                    }
+                    HistoryDirection::Redo => {
+                        history.redo.pop_back();
+                        history.push_undo(entry);
+                    }
+                }
+            });
+            Ok(())
+        })
     }
 
     /// 开始一次本地 composition；preedit 只进入编辑器，不写入模型。
@@ -2904,6 +3191,7 @@ impl Runtime {
                     anchor,
                     selection,
                     composition,
+                    ..
                 } = &mut state.elements[element].local
                 else {
                     unreachable!("require_enabled_text_input validated the input");
@@ -2966,6 +3254,7 @@ impl Runtime {
                     anchor,
                     selection,
                     composition,
+                    ..
                 } = &mut state.elements[element].local
                 else {
                     unreachable!("require_enabled_text_input validated the input");
@@ -3022,9 +3311,15 @@ impl Runtime {
                 state.require_composing_text_input(node, element, NodeOperation::CompositionCommit)
             })?;
             self.enter_event_phase();
-            self.commit_composition(node, element, text)?;
-            self.leave_event_phase().map_err(DispatchError::Command)?;
+            let before = self.commit_composition(node, element, text)?;
+            if let Err(error) = self.leave_event_phase() {
+                with_state(|state| clear_history_settle(state, element));
+                return Err(DispatchError::Command(error));
+            }
             with_state(|state| clamp_local_edit(state, element));
+            if let Some(before) = before {
+                self.record_text_edit(element, before);
+            }
             Ok(())
         })
     }
@@ -3060,7 +3355,7 @@ impl Runtime {
         node: NodeId,
         element: usize,
         text: &str,
-    ) -> Result<(), DispatchError> {
+    ) -> Result<Option<TextSnapshot>, DispatchError> {
         // 组合期间外部 value 可能已更新；候选插入当前文本并按长度夹取组合区间。
         let current_text = with_state(|state| {
             state.elements[element]
@@ -3068,12 +3363,14 @@ impl Runtime {
                 .unwrap_or_default()
                 .to_owned()
         });
-        let (new_text, caret) = with_state(|state| {
+        let (before, new_text, caret) = with_state(|state| {
             let LocalState::TextInput {
                 caret,
                 anchor,
                 selection,
                 composition,
+                history,
+                ..
             } = &mut state.elements[element].local
             else {
                 return Err(DispatchError::WrongKind {
@@ -3088,12 +3385,20 @@ impl Runtime {
                     reason: "text input is not composing",
                 });
             };
+            // 撤销回到组合开始前的已提交状态，而不是临时的 preedit caret。
+            let before = TextSnapshot {
+                value: current_text.clone(),
+                caret: composition.base_caret,
+                anchor: composition.base_anchor,
+                selection: composition.base_selection,
+            };
             let (start, end) = composition.base_range();
             let (new_text, next_caret) = text_edit::replace_range(&current_text, start, end, text);
             *caret = next_caret;
             *anchor = next_caret;
             *selection = None;
-            Ok((new_text, *caret))
+            history.settle_local = true;
+            Ok((before, new_text, *caret))
         })?;
         self.dispatch_element_event(element, EventKind::CompositionEnd, |event| {
             if let Event::CompositionEnd(handler) = event {
@@ -3110,7 +3415,7 @@ impl Runtime {
                 handler(new_text.clone());
             }
         });
-        Ok(())
+        Ok(Some(before))
     }
 
     fn cancel_composition(&mut self, node: NodeId, element: usize) -> Result<(), DispatchError> {
@@ -3120,6 +3425,7 @@ impl Runtime {
                 anchor,
                 selection,
                 composition,
+                ..
             } = &mut state.elements[element].local
             else {
                 return Err(DispatchError::WrongKind {
@@ -3709,6 +4015,23 @@ fn text_length(element: &MountedElement) -> usize {
         .map_or(0, |value| value.chars().count())
 }
 
+fn clear_history_settle(state: &mut State, element: usize) {
+    if let LocalState::TextInput { history, .. } = &mut state.elements[element].local {
+        history.settle_local = false;
+    }
+}
+
+/// 释放一批已卸载节点及其子树中的文本历史与观察值。
+fn clear_history_in_nodes(state: &mut State, nodes: &[MountedNode]) {
+    let mut elements = Vec::new();
+    collect_elements(state, nodes, &mut elements);
+    for element in elements {
+        if let LocalState::TextInput { history, .. } = &mut state.elements[element].local {
+            history.reset();
+        }
+    }
+}
+
 /// handler 可能改写了值；刷新后把本地 caret/selection 夹回新值范围。
 fn clamp_local_edit(state: &mut State, element: usize) {
     let length = text_length(&state.elements[element]);
@@ -3841,6 +4164,7 @@ fn snapshot_edit(local: &LocalState) -> Option<TextEditState> {
             anchor,
             selection,
             composition,
+            ..
         } => Some(TextEditState {
             caret: *caret,
             anchor: *anchor,
@@ -3952,5 +4276,63 @@ fn collect_items(state: &State, nodes: &[MountedNode], items: &mut Vec<ItemInfo>
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod history_tests {
+    #![allow(unused_braces)]
+
+    use super::*;
+    use crate::{component, memo, signal, view};
+
+    #[component]
+    fn Toggle() -> MountResult<MountPlan> {
+        let visible = signal(true);
+        let draft = signal(String::from("abcd"));
+        let shown = memo(move || visible.get());
+
+        view! {
+            <view>
+                <Show when={shown}>
+                    <text-input
+                        aria:label="toggle"
+                        value={draft}
+                        on:input={move |value: String| draft.set(value)}
+                    />
+                </Show>
+                <button aria:label="hide-toggle" on:click={move || visible.set(false)}>"Hide"</button>
+            </view>
+        }
+    }
+
+    #[test]
+    fn unmounting_clears_the_history_snapshot_text() {
+        let mut app = Runtime::new();
+        app.mount(|| view! { <Toggle /> }).expect("mount");
+        let input = app
+            .presentation()
+            .expect("snapshot")
+            .find_label("toggle")
+            .expect("the input")
+            .id();
+        app.set_caret_node(input, 4).expect("caret");
+        app.insert_text_node(input, "secret").expect("edit");
+
+        app.click_label("hide-toggle").expect("unmount the input");
+
+        let state = app.state.borrow();
+        let LocalState::TextInput { history, .. } = &state.elements[input.slot() as usize].local
+        else {
+            panic!("the slot was a text input");
+        };
+        assert!(history.undo.is_empty(), "the undo stack was released");
+        assert!(history.redo.is_empty(), "the redo stack was released");
+        assert_eq!(history.undo_bytes, 0);
+        assert_eq!(history.redo_bytes, 0);
+        assert!(
+            history.observed.is_none(),
+            "the observed value does not stay in the dead slot"
+        );
     }
 }
