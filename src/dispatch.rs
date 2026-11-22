@@ -61,6 +61,8 @@ pub enum DispatchError {
     StaleNode(NodeId),
     /// 元素仍挂在隐藏窗口里，不能接收输入。
     Hidden(NodeId),
+    /// 元素所属窗口正在等待关闭确认，输入已挂起。
+    Suspended(NodeId),
     /// 元素仍然存在，但不接受该操作：缺少事件 handler、不是文本输入或不可聚焦。
     WrongKind {
         node: NodeId,
@@ -82,6 +84,12 @@ impl fmt::Display for DispatchError {
             Self::UnknownNode(node) => write!(f, "unknown node {node:?}"),
             Self::StaleNode(node) => write!(f, "stale node {node:?}"),
             Self::Hidden(node) => write!(f, "node {node:?} belongs to a hidden window"),
+            Self::Suspended(node) => {
+                write!(
+                    f,
+                    "node {node:?} belongs to a window awaiting close confirmation"
+                )
+            }
             Self::WrongKind { node, operation } => {
                 write!(f, "node {node:?} does not accept {}", operation.as_str())
             }

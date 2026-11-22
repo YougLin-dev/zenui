@@ -22,11 +22,13 @@ use crate::view::{
     PlanNode, ResultBoolValue, StyleSlot, SubmitEvent, TextSlot,
 };
 use crate::window::{
-    CatalogEntry, CatalogError, WindowAction, WindowCatalog, WindowCtx, WindowError, WindowInfo,
-    WindowRecord, WindowRequest,
+    CatalogEntry, CatalogError, CloseError, CloseHandler, ClosePolicy, CloseReply, CloseRequest,
+    WindowAction, WindowCatalog, WindowCtx, WindowError, WindowInfo, WindowRecord, WindowRequest,
+    WindowRole,
 };
 
 const HIDDEN_TARGET: &str = "target window is hidden";
+const SUSPENDED_TARGET: &str = "target window input is suspended";
 
 pub(crate) enum Resource {
     Signal(u32),
@@ -87,6 +89,13 @@ pub(crate) struct State {
     windows: BTreeMap<&'static str, WindowRecord>,
     /// UI 处理期排队、在事件/交付结算后执行的窗口生命周期请求。
     window_requests: Vec<WindowRequest>,
+    /// 每个 activation 在 factory 中注册的关闭处理器，随窗口关闭释放。
+    close_handlers: BTreeMap<&'static str, CloseHandler>,
+    /// 按父窗口键索引的待决关闭 epoch；存在即表示父窗口输入被挂起。
+    close_epochs: BTreeMap<&'static str, CloseEpoch>,
+    /// UI 处理期排队的 Allow/Deny 回复，在事件/交付结算后执行。
+    close_replies: Vec<CloseReplyRequest>,
+    next_close_epoch: u64,
     /// 窗口打开/关闭/隐藏/显示时递增；原生宿主据此跳过无变化的扫描。
     window_revision: u64,
     pub(crate) tasks: BTreeMap<u32, TaskRecord>,
@@ -104,6 +113,22 @@ struct FocusSettlement {
     /// 旧目标仍在挂载树中（例如刚被禁用）时，需要向它派发一次 blur。
     blur_old: bool,
     target: Option<usize>,
+}
+
+/// 一次待决的 Confirm 关闭；`reply` 保证同一 epoch 只有一个有效回复。
+struct CloseEpoch {
+    id: u64,
+    parent: WindowCtx,
+    confirmation: &'static str,
+    /// 挂起前父窗口的焦点；Deny 时尝试恢复，节点已消失则走正常结算。
+    focus: Option<NodeId>,
+    reply: Option<CloseReply>,
+}
+
+/// 已排队、尚未执行的关闭回复。
+struct CloseReplyRequest {
+    request: CloseRequest,
+    reply: CloseReply,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -160,6 +185,10 @@ impl State {
             focused_window: None,
             windows: BTreeMap::new(),
             window_requests: Vec::new(),
+            close_handlers: BTreeMap::new(),
+            close_epochs: BTreeMap::new(),
+            close_replies: Vec::new(),
+            next_close_epoch: 1,
             window_revision: 0,
             tasks: BTreeMap::new(),
             next_task: 1,
@@ -473,6 +502,7 @@ impl State {
     }
 
     pub(crate) fn mark_window_closed(&mut self, key: &'static str) {
+        self.close_handlers.remove(key);
         let Some(record) = self.windows.get_mut(key) else {
             return;
         };
@@ -503,6 +533,119 @@ impl State {
         }
         self.window_requests.push(request);
         Ok(())
+    }
+
+    /// 在窗口 factory 中登记关闭处理器；必须是该 activation 自己的 Setup。
+    pub(crate) fn register_close_handler(
+        &mut self,
+        window: WindowCtx,
+        handler: CloseHandler,
+    ) -> Result<(), WindowError> {
+        if self.phase != Phase::Setup || self.current_owner != Some(window.owner) {
+            return Err(WindowError::State(
+                "close handlers must be registered during the window factory",
+            ));
+        }
+        if !self.window_is_live(window.key, window.activation, window.owner) {
+            return Err(WindowError::Stale);
+        }
+        if self.close_handlers.contains_key(window.key) {
+            return Err(WindowError::State(
+                "a close handler is already registered for this activation",
+            ));
+        }
+        self.close_handlers.insert(window.key, handler);
+        Ok(())
+    }
+
+    /// 确认窗口读取父窗口当前 epoch 的请求；普通窗口或没有待决请求时为 `None`。
+    pub(crate) fn close_request_for(
+        &self,
+        window: WindowCtx,
+    ) -> Result<Option<CloseRequest>, WindowError> {
+        if !self.window_is_live(window.key, window.activation, window.owner) {
+            return Err(WindowError::Stale);
+        }
+        let Some(entry) = self.catalog.get(window.key) else {
+            return Err(WindowError::UnknownWindow(window.key));
+        };
+        let WindowRole::CloseConfirmation { parent } = entry.spec.role() else {
+            return Ok(None);
+        };
+        let Some(epoch) = self.close_epochs.get(parent) else {
+            return Ok(None);
+        };
+        if epoch.confirmation != window.key
+            || !self.window_is_live(
+                epoch.parent.key,
+                epoch.parent.activation,
+                epoch.parent.owner,
+            )
+        {
+            return Ok(None);
+        }
+        Ok(Some(CloseRequest::new(self.id, epoch.parent, epoch.id)))
+    }
+
+    /// 记录一次回复；第一个有效回复赢得 epoch，其余返回 `Stale`。
+    pub(crate) fn queue_close_reply(
+        &mut self,
+        request: CloseRequest,
+        reply: CloseReply,
+    ) -> Result<(), WindowError> {
+        if !matches!(self.phase, Phase::Event | Phase::Delivery) {
+            return Err(WindowError::State(
+                "close replies are only available during event or delivery handlers",
+            ));
+        }
+        let epoch = self.close_epochs.get(request.parent.key);
+        let valid = epoch.is_some_and(|epoch| {
+            epoch.id == request.epoch
+                && epoch.parent == request.parent
+                && epoch.reply.is_none()
+                && self.window_is_live(
+                    request.parent.key,
+                    request.parent.activation,
+                    request.parent.owner,
+                )
+        });
+        if !valid {
+            return Err(WindowError::Stale);
+        }
+        let Some(epoch) = self.close_epochs.get_mut(request.parent.key) else {
+            return Err(WindowError::Stale);
+        };
+        epoch.reply = Some(reply);
+        self.close_replies
+            .push(CloseReplyRequest { request, reply });
+        Ok(())
+    }
+
+    /// 目录中绑定到 `parent` 的确认窗口；目录校验保证至多一个。
+    pub(crate) fn confirmation_window(&self, parent: &'static str) -> Option<&'static str> {
+        self.catalog.iter().find_map(|(key, entry)| {
+            (entry.spec.confirmation_parent() == Some(parent)).then_some(*key)
+        })
+    }
+
+    /// 作为某个待决 epoch 确认窗口的父窗口 identity。
+    pub(crate) fn pending_parent_for_confirmation(&self, key: &'static str) -> Option<WindowCtx> {
+        self.close_epochs
+            .values()
+            .find(|epoch| epoch.confirmation == key)
+            .map(|epoch| epoch.parent)
+    }
+
+    /// 可见且没有待决关闭的窗口才接收输入。
+    fn window_accepts_input(&self, key: &'static str) -> bool {
+        self.window_is_visible(key) && !self.close_epochs.contains_key(key)
+    }
+
+    fn element_accepts_input(&self, element: usize) -> bool {
+        self.tree_for_element(element).is_some_and(|key| match key {
+            TreeKey::Root => true,
+            TreeKey::Window(key) => self.window_accepts_input(key),
+        })
     }
 
     /// 正常关闭只取消窗口所有权交付；app 所有权任务按声明继续存活。
@@ -665,6 +808,16 @@ impl State {
 
     /// 解析一个存活的 Node ID；未知、已卸载与隐藏窗口分别报错，绝不猜测替代目标。
     fn element_for_node(&self, node: NodeId) -> Result<usize, DispatchError> {
+        self.element_for_node_with(node, false)
+    }
+
+    /// 与 [`State::element_for_node`] 相同；`allow_suspended` 仅供取消 IME 组合使用，
+    /// 否则用户无法从模态关闭提示中取消父窗口里已经开始的组合。
+    fn element_for_node_with(
+        &self,
+        node: NodeId,
+        allow_suspended: bool,
+    ) -> Result<usize, DispatchError> {
         if node.runtime_id() != self.id {
             return Err(DispatchError::UnknownNode(node));
         }
@@ -675,7 +828,13 @@ impl State {
             return Err(DispatchError::StaleNode(node));
         }
         match self.tree_for_element(node.slot() as usize) {
-            Some(key) if self.tree_is_visible(key) => Ok(node.slot() as usize),
+            Some(key) if self.tree_is_visible(key) => {
+                if allow_suspended || self.element_accepts_input(node.slot() as usize) {
+                    Ok(node.slot() as usize)
+                } else {
+                    Err(DispatchError::Suspended(node))
+                }
+            }
             Some(_) => Err(DispatchError::Hidden(node)),
             None => Err(DispatchError::StaleNode(node)),
         }
@@ -685,7 +844,7 @@ impl State {
         let Some(element) = self.find_element(target) else {
             return false;
         };
-        if !self.element_is_visible(element) {
+        if !self.element_accepts_input(element) {
             return false;
         }
         if let LocalState::TextInput {
@@ -1241,6 +1400,9 @@ impl Runtime {
     }
 
     /// 隐藏窗口：保留 activation、树、焦点与本地编辑状态，只停止输入与呈现。
+    ///
+    /// 参与待决关闭的窗口先按 Deny 结算：隐藏父窗口会恢复其输入与焦点后再隐藏；
+    /// 隐藏确认窗口等于关闭确认窗口，父窗口回到可编辑状态。
     pub fn hide(&mut self, window: WindowCtx) -> Result<(), WindowError> {
         let state = self.state.clone();
         if window.runtime != state.borrow().id {
@@ -1249,6 +1411,18 @@ impl Runtime {
         context::install(&state, || {
             if !with_state(|state| state.window_live_in_tree(window)) {
                 return Err(WindowError::Stale);
+            }
+            // 隐藏任何参与待决关闭的窗口都先按 Deny 结算，绝不隐式丢弃编辑。
+            if let Some(parent) =
+                with_state(|state| state.pending_parent_for_confirmation(window.key))
+            {
+                self.deny_close(parent)?;
+                if !with_state(|state| state.window_live_in_tree(window)) {
+                    return Ok(());
+                }
+            }
+            if with_state(|state| state.close_epochs.contains_key(window.key)) {
+                self.deny_close(window)?;
             }
             let mut state = state.borrow_mut();
             state.hide_window(window.key);
@@ -1355,6 +1529,9 @@ impl Runtime {
     }
 
     /// 关闭 activation：释放窗口 UI、取消窗口所有权交付；应用级模型保留。
+    ///
+    /// 参数是待决关闭的确认窗口时按 Deny 结算；参数是有待决 epoch 的父窗口时，
+    /// 确认窗口与父窗口作为一组释放，不留悬挂提示。
     pub fn close_window(&mut self, window: WindowCtx) -> Result<(), WindowError> {
         let state = self.state.clone();
         if window.runtime != state.borrow().id {
@@ -1364,31 +1541,136 @@ impl Runtime {
             if !with_state(|state| state.window_live_in_tree(window)) {
                 return Err(WindowError::Stale);
             }
-            let tree = with_state(|state| state.trees.remove(&TreeKey::Window(window.key)));
-            let Some(MountedTree { mut nodes, .. }) = tree else {
-                return Err(WindowError::Stale);
-            };
-            with_state(|state| {
-                state.cancel_window(window.key, window.activation);
-            });
-            self.release_nodes(&mut nodes);
-            with_state(|state| {
-                state.dispose_owner(window.owner);
-                if state.focused_window == Some(window.key) {
-                    state.focused_window = state.first_visible_window();
-                }
-            });
-            Ok(())
+            if let Some(parent) =
+                with_state(|state| state.pending_parent_for_confirmation(window.key))
+            {
+                return self.deny_close(parent);
+            }
+            if with_state(|state| state.close_epochs.contains_key(window.key)) {
+                return self.release_close_group(window.key);
+            }
+            self.close_window_now(window)
         })
     }
 
-    /// 结算 UI 处理器排队、尚未执行的窗口生命周期请求，返回已应用的数量。
+    /// 走目录声明的关闭策略：Immediate 直接释放；Confirm 建立或复用 epoch。
+    ///
+    /// 隐藏的 Confirm 窗口先恢复可见，再走关闭协议，避免不可见的确认提示；
+    /// 确认窗口在待决 epoch 中的关闭请求等价于 Deny。
+    pub fn request_close(&mut self, window: WindowCtx) -> Result<(), WindowError> {
+        let state = self.state.clone();
+        if window.runtime != state.borrow().id {
+            return Err(WindowError::WrongRuntime);
+        }
+        context::install(&state, || {
+            if !with_state(|state| state.window_live_in_tree(window)) {
+                return Err(WindowError::Stale);
+            }
+            if let Some(parent) =
+                with_state(|state| state.pending_parent_for_confirmation(window.key))
+            {
+                return self.deny_close(parent);
+            }
+            let Some(policy) = with_state(|state| {
+                state
+                    .catalog
+                    .get(window.key)
+                    .map(|entry| entry.spec.policy())
+            }) else {
+                return Err(WindowError::UnknownWindow(window.key));
+            };
+            if policy == ClosePolicy::Confirm {
+                if !with_state(|state| state.window_is_visible(window.key)) {
+                    self.show(window.key)?;
+                }
+                if let Some(confirmation) = with_state(|state| {
+                    state
+                        .close_epochs
+                        .get(window.key)
+                        .map(|epoch| epoch.confirmation)
+                }) {
+                    self.show(confirmation)?;
+                    return Ok(());
+                }
+                return self.begin_confirm_close(window);
+            }
+            self.close_window_now(window)
+        })
+    }
+
+    /// 确认窗口的工厂读取父窗口当前关闭请求。
+    pub fn confirmation_request(
+        &self,
+        window: WindowCtx,
+    ) -> Result<Option<CloseRequest>, WindowError> {
+        let state = self.state.borrow();
+        if window.runtime != state.id {
+            return Err(WindowError::WrongRuntime);
+        }
+        state.close_request_for(window)
+    }
+
+    /// 窗口当前是否接收输入；待决关闭的父窗口在 Deny/Allow 前保持挂起。
+    pub fn window_accepts_input(&self, window: WindowCtx) -> bool {
+        let state = self.state.borrow();
+        window.runtime == state.id
+            && state.window_is_live(window.key, window.activation, window.owner)
+            && state.window_accepts_input(window.key)
+    }
+
+    /// 结算 UI 处理器排队的窗口请求与关闭回复，返回已应用的数量。
     ///
     /// 原生宿主在每条输入消息与每次任务交付后自动调用；headless 驱动在
     /// 派发事件后调用。来源窗口在结算前关闭时请求被静默丢弃；其余错误
-    /// 继续应用后续请求，再返回第一个错误。结算只挂载、聚焦或释放窗口，
-    /// 不派发用户事件，因此不会在结算期间产生新的请求。
+    /// 继续应用后续动作，再返回第一个错误。关闭处理器可能在结算中要求
+    /// 显示确认窗口，因此 Confirm 的 request_close 内部也会结算这些 show 请求。
     pub fn apply_window_requests(&mut self) -> Result<usize, WindowError> {
+        let replies = std::mem::take(&mut self.state.borrow_mut().close_replies);
+        let mut applied = 0;
+        let mut first_error = None;
+        for reply in replies {
+            match self.apply_close_reply(reply) {
+                Ok(()) => applied += 1,
+                Err(WindowError::Stale) => {}
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        match self.settle_show_requests() {
+            Ok(requests) => applied += requests,
+            Err(error) => {
+                first_error.get_or_insert(error);
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(applied),
+        }
+    }
+
+    fn apply_close_reply(&mut self, reply: CloseReplyRequest) -> Result<(), WindowError> {
+        let valid = {
+            let state = self.state.borrow();
+            state
+                .close_epochs
+                .get(reply.request.parent.key)
+                .is_some_and(|epoch| {
+                    epoch.id == reply.request.epoch
+                        && epoch.parent == reply.request.parent
+                        && epoch.reply == Some(reply.reply)
+                })
+        };
+        if !valid {
+            return Err(WindowError::Stale);
+        }
+        match reply.reply {
+            CloseReply::Allow => self.release_close_group(reply.request.parent.key),
+            CloseReply::Deny => self.deny_close(reply.request.parent),
+        }
+    }
+
+    fn settle_show_requests(&mut self) -> Result<usize, WindowError> {
         let requests = std::mem::take(&mut self.state.borrow_mut().window_requests);
         let mut applied = 0;
         let mut first_error = None;
@@ -1415,8 +1697,236 @@ impl Runtime {
         match request.action {
             WindowAction::Show(key) => self.show(key).map(|_| ()),
             WindowAction::Hide => self.hide(request.from),
-            WindowAction::Close => self.close_window(request.from),
+            WindowAction::Close => self.request_close(request.from),
         }
+    }
+
+    /// 创建 pending epoch、挂起父窗口输入并调用注册的 close handler。
+    ///
+    /// handler 通过 `request_show` 显示目录声明的确认窗口；这里立即结算这些
+    /// show 请求并验证确认窗口可见，失败时绝不回退为 Allow。
+    fn begin_confirm_close(&mut self, window: WindowCtx) -> Result<(), WindowError> {
+        let state = self.state.clone();
+        context::install(&state, || {
+            let handler = self
+                .state
+                .borrow()
+                .close_handlers
+                .get(window.key)
+                .cloned()
+                .ok_or(WindowError::Close(CloseError::MissingHandler))?;
+            let confirmation = self
+                .state
+                .borrow()
+                .confirmation_window(window.key)
+                .ok_or(WindowError::Close(CloseError::ConfirmationNotDeclared))?;
+            let stale = self.state.borrow().window_ctx(confirmation);
+            if let Some(stale) = stale {
+                self.close_window(stale)?;
+            }
+
+            let request = {
+                let mut state = self.state.borrow_mut();
+                let epoch = state.next_close_epoch;
+                state.next_close_epoch += 1;
+                let focus = state
+                    .focused_in(TreeKey::Window(window.key))
+                    .map(|element| state.elements[element].id);
+                state.close_epochs.insert(
+                    window.key,
+                    CloseEpoch {
+                        id: epoch,
+                        parent: window,
+                        confirmation,
+                        focus,
+                        reply: None,
+                    },
+                );
+                CloseRequest::new(state.id, window, epoch)
+            };
+            let queued_before = self.state.borrow().window_requests.len();
+            self.invoke_close_handler(window, &handler, request, queued_before)?;
+
+            // 处理器可以直接 allow/deny（例如草稿为空时立即关闭），无需显示确认
+            // 窗口；这次决定在本次 request_close 内结算。
+            if let Some(reply) = self.take_handler_reply(window, request, confirmation) {
+                return match reply {
+                    CloseReply::Allow => self.release_close_group(window.key),
+                    CloseReply::Deny => self.deny_close(window),
+                };
+            }
+
+            let settled = self.settle_show_requests();
+            let shown = with_state(|state| state.window_is_visible(confirmation));
+            if let Err(error) = settled {
+                self.abort_close_epoch(window.key, queued_before);
+                self.close_visible_confirmation(confirmation);
+                return Err(error);
+            }
+            if !shown {
+                self.abort_close_epoch(window.key, queued_before);
+                self.close_visible_confirmation(confirmation);
+                return Err(WindowError::Close(CloseError::ConfirmationNotShown));
+            }
+            Ok(())
+        })
+    }
+
+    /// 在 Event 阶段调用 close handler；panic 时撤销 epoch 并报告失败。
+    fn invoke_close_handler(
+        &mut self,
+        window: WindowCtx,
+        handler: &CloseHandler,
+        request: CloseRequest,
+        queued_before: usize,
+    ) -> Result<(), WindowError> {
+        let previous_phase = with_state(|state| {
+            let previous = state.phase;
+            state.phase = Phase::Event;
+            previous
+        });
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            handler(request);
+        }));
+        with_state(|state| state.phase = previous_phase);
+        if outcome.is_err() {
+            self.abort_close_epoch(window.key, queued_before);
+            return Err(WindowError::Close(CloseError::HandlerPanicked));
+        }
+        Ok(())
+    }
+
+    /// 取走处理器在调用期间排队的立即回复，并丢弃它要求显示的陈旧确认窗口。
+    fn take_handler_reply(
+        &mut self,
+        window: WindowCtx,
+        request: CloseRequest,
+        confirmation: &'static str,
+    ) -> Option<CloseReply> {
+        let reply = with_state(|state| {
+            state
+                .close_epochs
+                .get(window.key)
+                .and_then(|epoch| epoch.reply)
+        })?;
+        with_state(|state| {
+            state.close_replies.retain(|queued| {
+                queued.request.epoch != request.epoch || queued.request.parent != window
+            });
+            state.window_requests.retain(|queued| {
+                !matches!(
+                    queued.action,
+                    WindowAction::Show(key) if key == confirmation
+                )
+            });
+        });
+        Some(reply)
+    }
+
+    fn abort_close_epoch(&mut self, parent: &'static str, queued_before: usize) {
+        with_state(|state| {
+            state.close_epochs.remove(parent);
+            state.window_requests.truncate(queued_before);
+        });
+    }
+
+    fn close_visible_confirmation(&mut self, confirmation: &'static str) {
+        let ctx = self.state.borrow().window_ctx(confirmation);
+        if let Some(ctx) = ctx {
+            let _ = self.close_window_now(ctx);
+        }
+    }
+
+    /// Allow：确认窗口与父窗口作为一组释放。
+    fn release_close_group(&mut self, parent: &'static str) -> Result<(), WindowError> {
+        let state = self.state.clone();
+        context::install(&state, || {
+            let epoch = { self.state.borrow_mut().close_epochs.remove(parent) };
+            let Some(epoch) = epoch else {
+                return Err(WindowError::Stale);
+            };
+            let mut first_error = None;
+            let confirmation = self.state.borrow().window_ctx(epoch.confirmation);
+            if let Some(confirmation) = confirmation
+                && let Err(error) = self.close_window_now(confirmation)
+                && error != WindowError::Stale
+            {
+                first_error = Some(error);
+            }
+            let parent_ctx = self.state.borrow().window_ctx(parent);
+            if let Some(parent_ctx) = parent_ctx {
+                self.close_window_now(parent_ctx)?;
+            }
+            match first_error {
+                Some(error) => Err(error),
+                None => Ok(()),
+            }
+        })
+    }
+
+    /// Deny：释放确认窗口、恢复父窗口输入，并尽量恢复挂起前的焦点。
+    fn deny_close(&mut self, parent: WindowCtx) -> Result<(), WindowError> {
+        let state = self.state.clone();
+        context::install(&state, || {
+            let epoch = { self.state.borrow_mut().close_epochs.remove(parent.key) };
+            let Some(epoch) = epoch else {
+                return Err(WindowError::Stale);
+            };
+            let mut first_error = None;
+            let confirmation = self.state.borrow().window_ctx(epoch.confirmation);
+            if let Some(confirmation) = confirmation
+                && let Err(error) = self.close_window_now(confirmation)
+                && error != WindowError::Stale
+            {
+                first_error = Some(error);
+            }
+            let still_live = self.state.borrow().window_ctx(parent.key).is_some();
+            if still_live {
+                with_state(|state| state.focused_window = Some(parent.key));
+                if let Some(focus) = epoch.focus {
+                    let target = with_state(|state| {
+                        (state.node_status(focus) == NodeStatus::Live
+                            && state.is_focusable(focus.slot() as usize))
+                        .then_some(focus.slot() as usize)
+                    });
+                    if let Some(target) = target {
+                        self.move_focus(TreeKey::Window(parent.key), Some(target))?;
+                    }
+                }
+            }
+            match first_error {
+                Some(error) => Err(error),
+                None => Ok(()),
+            }
+        })
+    }
+
+    /// 无条件释放一个 activation；调用方负责先结算 close epoch。
+    fn close_window_now(&mut self, window: WindowCtx) -> Result<(), WindowError> {
+        let state = self.state.clone();
+        if window.runtime != state.borrow().id {
+            return Err(WindowError::WrongRuntime);
+        }
+        context::install(&state, || {
+            if !with_state(|state| state.window_live_in_tree(window)) {
+                return Err(WindowError::Stale);
+            }
+            let tree = with_state(|state| state.trees.remove(&TreeKey::Window(window.key)));
+            let Some(MountedTree { mut nodes, .. }) = tree else {
+                return Err(WindowError::Stale);
+            };
+            with_state(|state| {
+                state.cancel_window(window.key, window.activation);
+            });
+            self.release_nodes(&mut nodes);
+            with_state(|state| {
+                state.dispose_owner(window.owner);
+                if state.focused_window == Some(window.key) {
+                    state.focused_window = state.first_visible_window();
+                }
+            });
+            Ok(())
+        })
     }
 
     pub fn window_alive(&self, window: WindowCtx) -> bool {
@@ -2032,6 +2542,7 @@ impl Runtime {
                 MountError::Component(not_found)
             }
             DispatchError::Hidden(_) => MountError::Component(HIDDEN_TARGET),
+            DispatchError::Suspended(_) => MountError::Component(SUSPENDED_TARGET),
             DispatchError::WrongKind { .. } => MountError::Component(wrong_kind),
             DispatchError::Rejected { reason, .. } => MountError::Component(reason),
             DispatchError::Command(error) => error,
@@ -2053,6 +2564,9 @@ impl Runtime {
             };
             if !with_state(|state| state.element_is_visible(element)) {
                 return Err(MountError::Component(HIDDEN_TARGET));
+            }
+            if !with_state(|state| state.element_accepts_input(element)) {
+                return Err(MountError::Component(SUSPENDED_TARGET));
             }
             if with_state(|state| state.elements[element].local.is_composing()) {
                 return Err(MountError::Component("text input is composing"));
@@ -2385,7 +2899,8 @@ impl Runtime {
     pub fn compose_cancel_node(&mut self, node: NodeId) -> Result<(), DispatchError> {
         let state = self.state.clone();
         context::install(&state, || {
-            let element = with_state(|state| state.element_for_node(node))?;
+            // 取消组合是模态提示下的清理动作，不写入模型；挂起的父窗口也必须允许。
+            let element = with_state(|state| state.element_for_node_with(node, true))?;
             with_state(|state| {
                 state.require_text_input(node, element, NodeOperation::CompositionCancel)?;
                 state.require_composing_text_input(node, element, NodeOperation::CompositionCancel)

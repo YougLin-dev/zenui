@@ -28,6 +28,18 @@ _Avoid_: closed window, minimized window (when meaning runtime visibility)
 UI 处理器通过 `WindowCtx` 排队的 show/hide/close 生命周期动作；在事件或交付结算后由 `Runtime::apply_window_requests` 执行，来源 activation 关闭后失效。
 _Avoid_: window command, deferred window event
 
+**Close policy**:
+目录窗口收到关闭请求时的处理方式：`Immediate` 直接释放 activation，`Confirm` 先创建一个 close epoch 并等待 Allow/Deny。
+_Avoid_: close mode, quit policy
+
+**Close epoch**:
+一个父窗口 activation 的一次待决关闭请求；绑定父窗口、声明的确认窗口和挂起前的焦点，只有第一个有效 Allow/Deny 生效。待决期间父窗口输入挂起。
+_Avoid_: close transaction, close session
+
+**Close confirmation window**:
+目录中以 `CloseConfirmation { parent }` 声明并绑定到 `Confirm` 父窗口的普通窗口；其 X、Escape 或关闭请求在 epoch 待决时表示 Deny。
+_Avoid_: dialog, modal (when meaning the catalog role)
+
 **Host**:
 拥有原生窗口、事件循环、DPI 与 surface，并驱动 target runtime 的平台层。
 _Avoid_: platform backend, shell
