@@ -31,7 +31,7 @@ fn PickerProbe(
             PickerScope::Window => window.task_scope(),
             PickerScope::App => window.app_task_scope(),
         };
-        match window.pick_file(options(), scope) {
+        match window.request_file_dialog(options(), scope) {
             Ok(task) => pickers.borrow_mut().push(task),
             Err(error) => errors.borrow_mut().push(error),
         }
@@ -47,7 +47,7 @@ fn PickerProbe(
 fn CloseAndPick(window: WindowCtx, pickers: Pickers, errors: Errors) -> MountResult<MountPlan> {
     let act = move || {
         let _ = window.request_close();
-        match window.pick_file(options(), window.task_scope()) {
+        match window.request_file_dialog(options(), window.task_scope()) {
             Ok(task) => pickers.borrow_mut().push(task),
             Err(error) => errors.borrow_mut().push(error),
         }
@@ -346,7 +346,7 @@ fn a_hidden_anchor_is_rejected_from_a_delivery_handler() {
         .expect("spawn a delivery driver");
     app.task_done(task, move |_| {
         slot.borrow_mut().push(
-            main.pick_file(options(), main.task_scope())
+            main.request_file_dialog(options(), main.task_scope())
                 .expect_err("a hidden window cannot own a picker"),
         );
         Ok(())
@@ -377,7 +377,7 @@ fn a_suspended_parent_rejects_a_picker() {
         .expect("spawn a delivery driver");
     app.task_done(task, move |_| {
         slot.borrow_mut().push(
-            main.pick_file(options(), main.task_scope())
+            main.request_file_dialog(options(), main.task_scope())
                 .expect_err("a suspended parent cannot own a picker"),
         );
         Ok(())
@@ -393,12 +393,12 @@ fn a_suspended_parent_rejects_a_picker() {
 
 #[component]
 fn PhaseProbe(window: WindowCtx, errors: Errors) -> MountResult<MountPlan> {
-    if let Err(error) = window.pick_file(options(), window.task_scope()) {
+    if let Err(error) = window.request_file_dialog(options(), window.task_scope()) {
         errors.borrow_mut().push(error);
     }
     let memo_error = memo(move || {
         window
-            .pick_file(options(), window.task_scope())
+            .request_file_dialog(options(), window.task_scope())
             .err()
             .map(|error| error.to_string())
             .unwrap_or_default()
@@ -442,10 +442,11 @@ fn a_foreign_runtime_picker_is_rejected_without_panicking() {
     second
         .open_window("main", move |_| {
             let errors = factory_errors.clone();
-            let foreign = move || match first_main.pick_file(options(), first_main.task_scope()) {
-                Ok(_) => {}
-                Err(error) => errors.borrow_mut().push(error),
-            };
+            let foreign =
+                move || match first_main.request_file_dialog(options(), first_main.task_scope()) {
+                    Ok(_) => {}
+                    Err(error) => errors.borrow_mut().push(error),
+                };
             view! { <button aria:label="Foreign" on:click={move || foreign()}>"Foreign"</button> }
         })
         .expect("open the second runtime");
@@ -477,7 +478,7 @@ fn a_scope_from_another_window_is_rejected() {
         .expect("spawn a delivery driver");
     app.task_done(task, move |_| {
         slot.borrow_mut().push(
-            main.pick_file(options(), secondary.task_scope())
+            main.request_file_dialog(options(), secondary.task_scope())
                 .expect_err("a window scope must name the same anchor"),
         );
         Ok(())
@@ -503,7 +504,7 @@ fn a_stale_picker_handle_is_rejected() {
         .expect("spawn a delivery driver");
     app.task_done(task, move |_| {
         slot.borrow_mut().push(
-            main.pick_file(options(), main.task_scope())
+            main.request_file_dialog(options(), main.task_scope())
                 .expect_err("a closed activation is stale"),
         );
         Ok(())
@@ -570,7 +571,7 @@ fn a_continuation_can_queue_another_pick() {
     app.task_done(first, move |first_outcome| {
         outcomes_slot.borrow_mut().push(first_outcome);
         let window = ctx_slot.borrow().expect("the picker window");
-        match window.pick_file(options(), window.app_task_scope()) {
+        match window.request_file_dialog(options(), window.app_task_scope()) {
             Ok(task) => {
                 pickers_slot.borrow_mut().push(task);
                 let nested_outcomes = second_outcomes_slot.clone();
