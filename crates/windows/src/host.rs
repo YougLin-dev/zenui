@@ -462,12 +462,12 @@ impl Host {
             .map_err(|error| HostError::Window(error.to_string()))
     }
 
-    /// 安装测试或嵌入方的打开文件选择器；未安装时可见宿主使用原生对话框。
+    /// 安装测试或嵌入方的文件选择器；未安装时可见宿主使用原生对话框。
     ///
-    /// 保存与文件夹请求在 presenter 之前以 `FileDialogError::Unsupported`
-    /// 完成，不会调用任何 presenter，也不会初始化 COM。原生弹窗期间拒绝
-    /// 替换。隐藏宿主没有注入 presenter 时，打开请求同样以 `Unsupported`
-    /// 完成，不会打开真实对话框。
+    /// 注入的 presenter 会收到打开、保存与选择文件夹请求；它必须按
+    /// [`FileDialogOptions::kind`] 返回合法路径数量。原生弹窗期间拒绝替换。
+    /// 隐藏宿主没有注入 presenter 时，请求以 `Unsupported` 完成，不会打开
+    /// 真实对话框。
     ///
     /// # Errors
     ///
@@ -581,14 +581,6 @@ impl Host {
         &mut self,
         request: &FileDialogRequest,
     ) -> Result<FileDialogWork, FileDialogError> {
-        // 保存与文件夹的原生映射尚未实现；在任何 presenter 或 COM 工作之前
-        // 拒绝，绝不复用打开文件对话框。
-        if !matches!(
-            request.options().kind(),
-            FileDialogKind::OpenFile | FileDialogKind::OpenFiles
-        ) {
-            return Err(FileDialogError::Unsupported);
-        }
         let anchor = request.anchor();
         let Some(window) = self.windows.get(anchor.key()) else {
             return Err(FileDialogError::AnchorClosed);
@@ -629,6 +621,7 @@ impl Host {
             self.file_dialog_presenter = Some(presenter);
         }
         self.file_dialog_active = false;
+        let outcome = validated_file_dialog_outcome(request.options(), outcome);
         match self.runtime.complete_file_dialog_request(request, outcome) {
             Ok(()) | Err(FileDialogRequestError::Stale) => {}
             Err(error) => return Err(HostError::FileDialog(error)),
@@ -2448,6 +2441,34 @@ fn request_backend(
         Some(message) => HostError::Device(message),
         None => HostError::NoAdapter,
     })
+}
+
+/// Presenter 可能返回与请求 kind 不匹配的路径数量；宿主不能把无效的
+/// `Picked` 交给应用。单路径 kind 必须恰好一个，打开多个至少一个。
+fn validated_file_dialog_outcome(
+    options: &FileDialogOptions,
+    outcome: FileDialogOutcome,
+) -> FileDialogOutcome {
+    if let FileDialogOutcome::Picked(paths) = &outcome {
+        let valid = if options.allows_multiple() {
+            !paths.is_empty()
+        } else {
+            paths.len() == 1
+        };
+        if !valid {
+            let expected = if options.allows_multiple() {
+                "at least one path"
+            } else {
+                "exactly one path"
+            };
+            return FileDialogOutcome::Failed(FileDialogError::DialogFailed(format!(
+                "the file dialog returned {} paths; {expected} is required for {:?}",
+                paths.len(),
+                options.kind()
+            )));
+        }
+    }
+    outcome
 }
 
 /// 命中元素可以没有对应 handler（例如静态按钮）、处于不可聚焦状态，

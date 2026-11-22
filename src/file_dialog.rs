@@ -290,7 +290,7 @@ impl WindowCtx {
     ///
     /// 对话框的用途、标题、过滤器、建议文件名与默认扩展名由 `options` 决定；
     /// 哪些字段生效取决于 [`FileDialogKind`]。平台宿主决定是否实现该 kind：
-    /// 当前 Windows 宿主只呈现打开文件请求，保存与选择文件夹请求以
+    /// Windows 宿主呈现打开、保存与选择文件夹请求；不提供该能力的宿主以
     /// [`FileDialogError::Unsupported`] 完成，不会打开替代对话框。
     ///
     /// 只能从 `Event` 或 `Delivery` 处理器调用；返回的任务按 `scope` 决定生命
