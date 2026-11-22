@@ -17,6 +17,7 @@ ZenUI 处在开发阶段。阶段一的 target API、阶段二的 Windows 原生
 - 多窗口窗口目录：show/hide/close/reopen、关闭确认 epoch、父窗口输入挂起与声明的确认窗口；
 - 原生打开文件对话框：窗口锚定、单选/多选、标题与类型过滤器、取消/失败结果，以及显式的窗口或应用任务所有权；
 - 宿主任务：文件选择结果与 worker 共用 Task/continuation 交付，但没有 worker 通道，也不会阻塞 `settle_tasks`；
+- 长列表场景构建：跨重建复用未变化的文本 layout 与测量结果，viewport 外的元素保留几何但跳过 glyph 与绘制；完整列表虚拟化仍在后续路线；
 - 有界运行时存储：最近发布快照按固定窗口保留，释放的 Owner 节点回到存活规模，Todo 的列表 reconciliation 与行句柄查找使用索引而不是逐行扫描；
 - 可复现的 Todo 场景：插入、删除、筛选、重排、焦点与拒绝句柄后的恢复；
 - 独立的宏、文本、布局和 GPU 原型；
@@ -90,6 +91,14 @@ cargo run --release -p zenui-app --example reconcile_bench --locked
 ```
 
 `reconcile_bench` 是固定负载的时间探针：扫描 500/1000/2000/4000 行，分别测量未变化列表 reconciliation 与空提交，并打印发布窗口和 Owner 存储规模。它只提供测量，不作为 wall-clock 断言。
+
+场景构建的同类探针：
+
+```sh
+cargo run --release -p zenui-render --example scene_bench --locked
+```
+
+它导入 100/500/1000 行，分别测量无缓存构建、缓存冷启动、稳定缓存重建，以及一次输入后的重建；只打印测量与元素数，不作绝对时间断言。
 
 独立的原型工作区使用各自的 `Cargo.toml`。宏原型可以这样运行：
 

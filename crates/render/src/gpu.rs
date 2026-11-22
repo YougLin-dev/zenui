@@ -346,8 +346,19 @@ fn paint(
     palette: RenderPalette,
 ) -> Result<(), RenderError> {
     let scale = scene.viewport().scale();
+    let width = scene.viewport().width();
+    let height = scene.viewport().height();
     for element in scene.elements() {
-        let rect = physical_rect(element.rect(), scale);
+        let logical = element.rect();
+        // 完全在 viewport 外的元素不会出现在目标纹理上；跳过绘制与装饰。
+        if logical.right() <= 0.0
+            || logical.x >= width
+            || logical.bottom() <= 0.0
+            || logical.y >= height
+        {
+            continue;
+        }
+        let rect = physical_rect(logical, scale);
         let style = element.resolved_style();
         paint_background(target, rect, element, style, palette, scale);
         paint_border(target, rect, element.visual(), style, palette, scale);
