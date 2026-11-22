@@ -153,6 +153,100 @@ fn new_outcomes() -> Outcomes {
     Rc::new(RefCell::new(Vec::new()))
 }
 
+#[component]
+fn KindProbe(window: WindowCtx, pickers: Pickers, errors: Errors) -> MountResult<MountPlan> {
+    let single_pickers = pickers.clone();
+    let single_errors = errors.clone();
+    let open_one = move || {
+        request_dialog(
+            window,
+            FileDialogOptions::open_file()
+                .titled("Open one")
+                .filter("Text files", ["txt"]),
+            &single_pickers,
+            &single_errors,
+        );
+    };
+
+    let open_pickers = pickers.clone();
+    let open_errors = errors.clone();
+    let open = move || {
+        request_dialog(
+            window,
+            FileDialogOptions::open_files()
+                .titled("Open tasks")
+                .filter("Text files", ["txt"]),
+            &open_pickers,
+            &open_errors,
+        );
+    };
+
+    let save_pickers = pickers.clone();
+    let save_errors = errors.clone();
+    let save = move || {
+        request_dialog(
+            window,
+            FileDialogOptions::save_file()
+                .titled("Save tasks")
+                .filter("Text files", [".txt"])
+                .with_suggested_name("tasks")
+                .with_default_extension(".txt"),
+            &save_pickers,
+            &save_errors,
+        );
+    };
+
+    let folder_pickers = pickers.clone();
+    let folder_errors = errors.clone();
+    let folder = move || {
+        request_dialog(
+            window,
+            FileDialogOptions::pick_folder()
+                .titled("Pick folder")
+                .filter("Ignored", ["txt"])
+                .with_suggested_name("ignored")
+                .with_default_extension(".ignored"),
+            &folder_pickers,
+            &folder_errors,
+        );
+    };
+
+    view! {
+        <view role="main">
+            <button aria:label="Open file" on:click={move || open_one()}>"Open file"</button>
+            <button aria:label="Open files" on:click={move || open()}>"Open files"</button>
+            <button aria:label="Save" on:click={move || save()}>"Save"</button>
+            <button aria:label="Folder" on:click={move || folder()}>"Folder"</button>
+        </view>
+    }
+}
+
+fn request_dialog(
+    window: WindowCtx,
+    options: FileDialogOptions,
+    pickers: &Pickers,
+    errors: &Errors,
+) {
+    match window.request_file_dialog(options, window.app_task_scope()) {
+        Ok(task) => pickers.borrow_mut().push(task),
+        Err(error) => errors.borrow_mut().push(error),
+    }
+}
+
+fn open_kind_probe(app: &mut Runtime) -> (Pickers, Errors) {
+    let pickers: Pickers = Rc::new(RefCell::new(Vec::new()));
+    let errors: Errors = Rc::new(RefCell::new(Vec::new()));
+    let factory_pickers = pickers.clone();
+    let factory_errors = errors.clone();
+    app.open_window("main", move |window| {
+        let pickers = factory_pickers.clone();
+        let errors = factory_errors.clone();
+        view! { <KindProbe window={window} pickers={pickers} errors={errors} /> }
+    })
+    .expect("open the kind probe");
+    (pickers, errors)
+}
+
 #[test]
 fn a_pick_queues_one_running_request() {
     let mut app = Runtime::new();
@@ -687,4 +781,113 @@ fn dropping_a_runtime_with_a_pending_request_does_not_panic() {
     let request = take_one(&mut app);
     drop(app);
     drop(request);
+}
+
+#[test]
+fn mixed_kind_requests_keep_queued_options_and_fifo_order() {
+    let mut app = Runtime::new();
+    let (pickers, errors) = open_kind_probe(&mut app);
+    app.click_label("Open file").expect("single open request");
+    app.click_label("Open files")
+        .expect("multiple open request");
+    app.click_label("Save").expect("save request");
+    app.click_label("Folder").expect("folder request");
+    assert!(errors.borrow().is_empty());
+
+    let requests = app.take_file_dialog_requests();
+    assert_eq!(
+        requests
+            .iter()
+            .map(|request| request.options().kind())
+            .collect::<Vec<_>>(),
+        [
+            FileDialogKind::OpenFile,
+            FileDialogKind::OpenFiles,
+            FileDialogKind::SaveFile,
+            FileDialogKind::PickFolder,
+        ]
+    );
+
+    let open_one = requests[0].options();
+    assert_eq!(open_one.title(), "Open one");
+    assert_eq!(open_one.filters()[0].name(), "Text files");
+    assert_eq!(open_one.suggested_name(), "");
+    assert_eq!(open_one.default_extension(), "");
+
+    let open = requests[1].options();
+    assert_eq!(open.title(), "Open tasks");
+    assert_eq!(open.filters()[0].name(), "Text files");
+    assert_eq!(open.suggested_name(), "");
+    assert_eq!(open.default_extension(), "");
+
+    let save = requests[2].options();
+    assert_eq!(save.title(), "Save tasks");
+    assert_eq!(save.filters()[0].name(), "Text files");
+    assert_eq!(save.suggested_name(), "tasks");
+    assert_eq!(save.default_extension(), "txt");
+
+    let folder = requests[3].options();
+    assert_eq!(folder.title(), "Pick folder");
+    assert!(folder.filters().is_empty());
+    assert_eq!(folder.suggested_name(), "");
+    assert_eq!(folder.default_extension(), "");
+
+    assert_eq!(
+        requests
+            .iter()
+            .map(FileDialogRequest::allows_multiple)
+            .collect::<Vec<_>>(),
+        [false, true, false, false],
+        "only open-multiple expects more than one path"
+    );
+    assert_eq!(pickers.borrow().len(), 4);
+}
+
+#[test]
+fn save_and_folder_requests_survive_drive_and_settle() {
+    let mut app = Runtime::new();
+    let (pickers, errors) = open_kind_probe(&mut app);
+    app.click_label("Save").expect("save request");
+    app.click_label("Folder").expect("folder request");
+    assert!(errors.borrow().is_empty());
+
+    let save = pickers.borrow()[0];
+    let folder = pickers.borrow()[1];
+    let outcomes = new_outcomes();
+    collect(&mut app, save, &outcomes);
+    collect(&mut app, folder, &outcomes);
+
+    app.drive_tasks().expect("drive without results");
+    app.settle_tasks().expect("settle workers only");
+    assert_eq!(
+        app.task_status(save),
+        Some(TaskStatus::Running),
+        "a save request has no receiver and is not a dead worker"
+    );
+    assert_eq!(app.task_status(folder), Some(TaskStatus::Running));
+
+    let mut requests = app.take_file_dialog_requests();
+    assert_eq!(requests.len(), 2);
+    let folder_request = requests.remove(1);
+    let save_request = requests.remove(0);
+    assert_eq!(save_request.options().kind(), FileDialogKind::SaveFile);
+    assert_eq!(folder_request.options().kind(), FileDialogKind::PickFolder);
+    app.complete_file_dialog_request(
+        save_request,
+        FileDialogOutcome::Picked(vec![PathBuf::from("tasks.txt")]),
+    )
+    .expect("complete the save");
+    app.complete_file_dialog_request(folder_request, FileDialogOutcome::Cancelled)
+        .expect("complete the folder");
+    app.drive_tasks().expect("deliver both");
+
+    assert_eq!(
+        *outcomes.borrow(),
+        vec![
+            FileDialogOutcome::Picked(vec![PathBuf::from("tasks.txt")]),
+            FileDialogOutcome::Cancelled,
+        ]
+    );
+    assert_eq!(app.task_status(save), Some(TaskStatus::Delivered));
+    assert_eq!(app.task_status(folder), Some(TaskStatus::Delivered));
 }

@@ -1,8 +1,10 @@
 //! Native open-file dialogs for the Windows host.
 //!
 //! The host owns the loop-level request drain; this module owns the presenter
-//! seam, the STA COM guard and the `IFileOpenDialog` mapping. Tests inject a
-//! presenter, so hidden/CI runs never open a real dialog.
+//! seam, the STA COM guard and the `IFileOpenDialog` mapping. Save and folder
+//! requests are rejected by the host before reaching this module; their native
+//! mapping is a later change. Tests inject a presenter, so hidden/CI runs never
+//! open a real dialog.
 
 use std::ffi::{OsString, c_void};
 use std::os::windows::ffi::OsStringExt;
@@ -25,10 +27,12 @@ use zenui::prelude::*;
 /// The host presents one request at a time on the UI thread.
 ///
 /// The default presenter is the native `IFileOpenDialog`; tests install a
-/// closure with [`crate::Host::set_file_dialog_presenter`]. A presenter must
-/// return an outcome and must not retain the anchor after it returns.
+/// closure with [`crate::Host::set_file_dialog_presenter`]. Only open-file
+/// requests reach a presenter: save and folder requests complete
+/// `Unsupported` in the Host before this seam. A presenter must return an
+/// outcome and must not retain the anchor after it returns.
 pub trait FileDialogPresenter {
-    /// Present a picker for `anchor` and return the user's choice.
+    /// Present an open-file picker for `anchor` and return the user's choice.
     fn present(&mut self, anchor: HWND, options: &FileDialogOptions) -> FileDialogOutcome;
 }
 
