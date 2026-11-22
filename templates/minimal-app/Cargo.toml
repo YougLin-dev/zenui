@@ -1,0 +1,20 @@
+[workspace]
+resolver = "3"
+
+[package]
+name = "minimal-app"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+zenui = { path = "../.." }
+zenui-windows = { path = "../../crates/windows" }
+
+# 与根 workspace 保持一致：开发构建只优化依赖，本地 crate 保留增量编译速度。
+# `tests/workspace_drift.rs` 会在任何 dev-profile 设置或工具链分叉时报错。
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.dev.package.zenui-render]
+opt-level = 2
