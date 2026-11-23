@@ -1,0 +1,44 @@
+Narrator 文本读取观察（150%，2026-11-24）
+
+目的
+  在可见 Todo 上确认 Narrator 在聚焦草稿与 Details note 时产生朗读语音，
+  并记录本环境无法逐字核对朗读内容的边界。
+
+环境
+  Windows 11 Pro 10.0.26300；单屏 2560×1600，150%。
+  Narrator（最小化 Narrator 主页后保持运行）。
+  OneCore 语音只有 zh-CN；Narrator 以 UIAccess 运行，注入的
+  Narrator+Alt+X / Narrator+Ctrl+X 被拒绝，Speech Recap 无法由脚本打开或读取。
+  应用：todo_host，主窗口 pid 36712；草稿与 Details note 均由 UIA TextPattern
+  选中全文后进入本录制。
+
+方法
+  使用 WASAPI loopback 捕获默认扬声器（48 kHz / 双声道 / 32-bit float），
+  转为 16 kHz / 16-bit / 单声道；动作由驱动脚本写时间标记。
+  语音区间按 100 ms 窗、RMS > 0.01 检测，间隔不超过 0.3 s 的相邻窗合并。
+
+动作（本地时间）
+  01:57:49.943  点击主窗口标题栏并置前
+  01:57:50.874  UIA SetFocus 草稿 "What needs to be done?"
+  01:57:55.489  Right（selection 折叠为 caret）
+  01:57:58.279  点击 Details 窗口标题栏并置前
+  01:57:59.115  UIA SetFocus "Details note"
+  01:58:04.136  停止
+
+  录制起点早于第一条动作约 1.5 s。检测到的语音区间（相对录制起点）：
+  0.0–3.4, 3.9–4.4, 4.8–8.2, 8.7–10.8 s
+
+  说明：聚焦草稿后出现一组语音，Right 后仍有一组语音，切换到 Details note
+  后又出现一组；区间覆盖两个输入框的聚焦与文本变化，不是持续背景声。
+
+识别
+  System.Speech zh-CN DictationGrammar 对同一音频得到近似文本：
+  「你一：反写稿敌人的反写稿子牛尾羽怀疑的辫子反写稿子该随口而质点EXE正在编辑关闭扫描」
+  whisper.cpp base.en 对该中文语音没有可用输出。两者都不能作为逐字判据。
+
+结论与边界
+  - 可观察事实：Narrator 在聚焦草稿、移动 caret 与聚焦 Details note 时产生语音。
+  - 不能声称：逐字朗读内容、朗读次数或“Narrator 主动完成文本选择”。
+    文本、selection 与 Select 的精确结果由进程外 UIA 客户端日志与 Inspect 证据证明。
+  - 该限制来自 Narrator 的 UIAccess 完整性级别与仅安装 zh-CN 语音，不是应用的
+    TextPattern provider 行为。

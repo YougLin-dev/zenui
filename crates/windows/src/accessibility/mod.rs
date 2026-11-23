@@ -19,6 +19,7 @@
 //! 焦点变化不投递聚焦事件，指针 hover/press 等呈现瞬态不改变树，因此不产生事件。
 
 mod events;
+mod text;
 
 use std::collections::{HashMap, VecDeque};
 use std::mem::ManuallyDrop;
@@ -51,7 +52,7 @@ use windows::Win32::UI::Accessibility::{
     UIA_IsEnabledPropertyId, UIA_IsKeyboardFocusablePropertyId, UIA_IsOffscreenPropertyId,
     UIA_ListControlTypeId, UIA_ListItemControlTypeId, UIA_NamePropertyId,
     UIA_NativeWindowHandlePropertyId, UIA_ProcessIdPropertyId, UIA_ProviderDescriptionPropertyId,
-    UIA_TextControlTypeId, UIA_TogglePatternId, UIA_ToggleToggleStatePropertyId,
+    UIA_TextControlTypeId, UIA_TextPatternId, UIA_TogglePatternId, UIA_ToggleToggleStatePropertyId,
     UIA_ToolBarControlTypeId, UIA_ValuePatternId, UIA_WindowControlTypeId, UiaAppendRuntimeId,
     UiaHostProviderFromHwnd, UiaRect,
 };
@@ -62,7 +63,7 @@ use zenui::{
     NodeId, PresentationSnapshot, SnapshotAction, SnapshotActions, SnapshotAttr, SnapshotElement,
     SnapshotNode,
 };
-use zenui_render::{Rect, Scene, Viewport};
+use zenui_render::{DecorationKind, Rect, Scene, Viewport};
 
 use crate::host::post_uia_action;
 
@@ -97,9 +98,41 @@ pub struct AccessibleNode {
     actions: SnapshotActions,
     value: Option<String>,
     composing: bool,
+    text: Option<TextGeometry>,
     rect: Rect,
     parent: Option<usize>,
     children: Vec<usize>,
+}
+
+/// 文本输入在本次发布中的选区与几何。
+///
+/// 偏移按已提交值的字符数计；`preedit` 不属于文档，也不参与这里的范围。
+/// 没有 selection 时折叠在 caret；运行时也可能记录折叠的 `(n, n)`。
+/// 组合期间 caret 记录被替换区间的终点，selection 为空。
+#[derive(Debug)]
+pub(crate) struct TextGeometry {
+    caret: usize,
+    selection: Option<(usize, usize)>,
+    caret_rect: Option<Rect>,
+    selection_rects: Vec<Rect>,
+}
+
+impl TextGeometry {
+    pub(crate) const fn caret(&self) -> usize {
+        self.caret
+    }
+
+    pub(crate) const fn selection(&self) -> Option<(usize, usize)> {
+        self.selection
+    }
+
+    pub(crate) const fn caret_rect(&self) -> Option<Rect> {
+        self.caret_rect
+    }
+
+    pub(crate) fn selection_rects(&self) -> &[Rect] {
+        &self.selection_rects
+    }
 }
 
 /// UIA 控制类型中本框架使用的最小子集。
@@ -291,6 +324,11 @@ impl AccessibleNode {
     pub const fn composing(&self) -> bool {
         self.composing
     }
+
+    /// 文本输入的选区与场景几何；只有 `text-input` 节点有值。
+    pub(crate) const fn text_geometry(&self) -> Option<&TextGeometry> {
+        self.text.as_ref()
+    }
 }
 
 /// 每个窗口的 provider 本地运行时 ID 分配器；Node ID 卸载后可回收表项。
@@ -327,6 +365,7 @@ pub(crate) enum AccessibilityAction {
     Invoke(NodeId),
     Toggle(NodeId),
     SetValue(NodeId, String),
+    SetSelection(NodeId, usize, usize),
     SetFocus(NodeId),
 }
 
@@ -336,6 +375,7 @@ impl AccessibilityAction {
             Self::Invoke(node)
             | Self::Toggle(node)
             | Self::SetValue(node, _)
+            | Self::SetSelection(node, _, _)
             | Self::SetFocus(node) => *node,
         }
     }
@@ -695,6 +735,13 @@ impl IRawElementProviderSimple_Impl for ZenProvider_Impl {
                 node: id,
             }
             .into());
+        }
+        if patternid == UIA_TextPatternId
+            && node.control_type() == ControlType::Edit
+            && node.value().is_some()
+        {
+            let id = node.node_id().ok_or_else(element_not_available)?;
+            return Ok(text::provider(self.window.clone(), id).into());
         }
         Err(Error::empty())
     }
@@ -1061,6 +1108,7 @@ pub(crate) fn build_tree(
         actions: SnapshotActions::default(),
         value: None,
         composing: false,
+        text: None,
         rect: Rect::new(0.0, 0.0, viewport.width(), viewport.height()),
         parent: None,
         children: Vec::new(),
@@ -1113,6 +1161,31 @@ impl TreeBuilder<'_> {
         let composing = element
             .edit()
             .is_some_and(|edit| edit.composition().is_some());
+        let text = (control_type == ControlType::Edit).then(|| {
+            let edit = element.edit();
+            let composition = edit.and_then(|edit| edit.composition());
+            TextGeometry {
+                // 组合期间 caret 是显示偏移（preedit 末尾）；文档偏移取被替换
+                // 区间的终点，selection 也不指向 preedit。
+                caret: composition
+                    .map_or_else(|| edit.map_or(0, |edit| edit.caret()), |(_, end)| end),
+                selection: if composition.is_some() {
+                    None
+                } else {
+                    edit.and_then(|edit| edit.selection())
+                },
+                caret_rect: self.scene.caret(id),
+                selection_rects: self
+                    .scene
+                    .decorations()
+                    .iter()
+                    .filter(|decoration| {
+                        decoration.node() == id && decoration.kind() == DecorationKind::Selection
+                    })
+                    .map(|decoration| decoration.rect())
+                    .collect(),
+            }
+        });
         let index = self.nodes.len();
         self.nodes.push(AccessibleNode {
             node_id: Some(id),
@@ -1135,6 +1208,7 @@ impl TreeBuilder<'_> {
             actions: element.semantics().actions(),
             value,
             composing,
+            text,
             rect,
             parent: Some(parent),
             children: Vec::new(),
