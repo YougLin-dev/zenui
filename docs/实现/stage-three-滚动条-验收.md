@@ -1,6 +1,8 @@
 # Stage-three 滚动条验收（实机记录）
 
-本页记录 #182 的可见 Windows 验收：覆盖层滚动条获得指针命中优先权，thumb 拖动与轨道点击、滚轮、PageUp/PageDown、Home/End 共享同一个夹取的滚动偏移，拖动与点击都不移动焦点、不取消 IME 组合。契约见 [ADR-0010](../adr/0010-scroll-is-presentation-state.md)；滚动条的渲染几何与测试见 #181，滚动条仍是覆盖层，不新增 Node ID。列表虚拟化属 ADR-0011，不在本页范围。
+本页记录 #182 的可见 Windows 验收：覆盖层滚动条获得指针命中优先权，thumb 拖动与轨道点击、滚轮、PageUp/PageDown、Home/End 共享同一个夹取的滚动偏移，拖动与点击都不移动焦点、不取消 IME 组合。契约见 [ADR-0010](../adr/0010-scroll-is-presentation-state.md)；滚动条的渲染几何与测试见 #181，滚动条仍是覆盖层，不新增 Node ID。
+
+**后续状态（2026-11）：** 窗口化 `For` 已由 #184 交付（[窗口化 For 验收](stage-three-窗口化-for-验收.md)），滚动总验收补充滚轮精度累积、hide/show 与 close/reopen 的汇总证据，见 [stage-three 滚动总验收](stage-three-滚动总验收.md)。
 
 **状态：可见自动驱动验收完成（100% 与 150%）。** 运行使用真实可见 HWND、真实 `WM_MOUSE*`/`WM_MOUSEWHEEL` 路径、宿主默认 DX12 presenter 与真实微软拼音输入法；拖动由 OS 级 `SendInput` 完成（左键按下、8 段真实鼠标移动、松开），点击、滚轮与键盘同样来自 `SendInput`。截图证明可见窗口的像素与场景状态，不证明用户注视下的 DWM 时序。
 
@@ -81,4 +83,4 @@
 - **可见运行（主证据）：** 真实 HWND、真实鼠标拖动/点击、真实滚轮与键盘消息、真实微软拼音、DX12 呈现；100% 与 150% 各一组截图和状态行，包含聚焦拖动保持焦点、组合中 Home 与轨道点击/翻页不编辑也不取消组合、Space 正常提交。
 - **隐藏 smoke（部分证据）：** `dragging_the_scrollbar_thumb_scrolls_the_shared_offset_and_clamps`、`a_scrollbar_track_click_pages_towards_the_clicked_side`、`the_scrollbar_wins_hit_priority_over_the_content_under_it`、`wheel_drag_and_keys_share_one_clamped_offset_without_stale_transients` 覆盖夹取、轨道方向、命中优先与拖动后的 hover/press 清理。它们运行在隐藏窗口与 CI 的 WARP/软件适配器上，不能替代可见验收。
 - **单元测试：** `pressing_the_scrollbar_pages_without_cancelling_a_composition` 覆盖滚动条命中不取消 IME 组合；`a_composing_editor_keeps_its_scroll_under_editing_keys` 覆盖组合中的 Home/End、方向键与 Backspace/Delete 不编辑、不显露、不滚动；`scrollbar_drag_offsets_follow_the_pointer_and_clamp` 覆盖拖动公式的夹取与无行程时保持偏移；渲染测试 `the_scrollbar_thumb_has_a_documented_minimum` 覆盖轨道容不下最小 thumb 或 thumb 会填满轨道时不绘制滚动条。
-- **未覆盖：** 触摸拖动与触控板惯性；滚动条 hover/按下配色（当前覆盖层没有专用状态色）；混合 DPI 多显示器与真实硬件设备丢失仍属 #63；列表虚拟化属 ADR-0011。
+- **未覆盖：** 触摸拖动与触控板惯性；滚动条 hover/按下配色（当前覆盖层没有专用状态色）；混合 DPI 多显示器与真实硬件设备丢失仍属 #63。列表虚拟化已由 #184 交付，见[窗口化 For 验收](stage-three-窗口化-for-验收.md)。

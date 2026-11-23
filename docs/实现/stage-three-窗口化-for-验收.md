@@ -1,6 +1,6 @@
 # Stage-three 窗口化 For 验收（实机记录）
 
-本页记录 #184 的可见 Windows 验收：10,000 行列表只挂载可见行窗口，上下 spacer 保持完整行范围；滚动、编辑、重排与过滤都在真实 HWND 上通过 OS 级输入完成。契约见 [ADR-0011](../adr/0011-windowed-for-mounting.md)。
+本页记录 #184 的可见 Windows 验收：10,000 行列表只挂载可见行窗口，上下 spacer 保持完整行范围；滚动、编辑、重排与过滤都在真实 HWND 上通过 OS 级输入完成。契约见 [ADR-0011](../adr/0011-windowed-for-mounting.md)。滚轮精度累积、hide/show、close/reopen 与模拟设备丢失的证据边界汇总在 [stage-three 滚动总验收](stage-three-滚动总验收.md)。
 
 **状态：可见自动驱动验收完成（100% 与 150%）。** 列表始终只提交 101–143 个元素（含界面 chrome 与上下 spacer），行带总行数保持 10,002；滚动推进挂载窗口，编辑只作用于已挂载行，重排与过滤后窗口仍正确。
 

@@ -4,6 +4,16 @@ Scrolling never changes what is mounted. The runtime keeps mounting every row, `
 
 The scene keeps every emitted element for Node queries and `NodeStatus`, but derives a visible index once per build; GPU paint and hit-testing iterate only that index, preserving paint order and half-open hit results. The host caches the runtime presentation snapshot together with `Runtime::presentation_revision`; wheel, hover, a press that changes no runtime state, and caret blink are host transients, and while the revision is unchanged the host rebuilds the scene from the cached snapshot and performs no runtime snapshot build or clone. A press that moves focus or ends a composition changes the revision and rebuilds the snapshot once. Input is still never hit-tested against a scene built for an older offset.
 
+## 状态更新（2026-11）
+
+本 ADR 的偏移所有权、夹取、几何、命中、IME、显露与生命周期契约仍然有效。以下“首个里程碑”表述已被后续实现取代，阅读时以本节为准：
+
+- **窗口化 `For`**：ADR-0011 为声明 `row-height` 的 `For` 引入可提交的可见行窗口，取代“滚动永不改变挂载”的全局表述。滚动仍是宿主拥有的 presentation 环境值；滚动只平移场景，宿主据此推进行窗口，同一行内滚动不重建快照，跨行重建一次。未声明 `row-height` 的 `For` 与所有其它元素仍全量挂载，本 ADR 的其余规则不变。行窗口刷新不重置滚轮 residue，因为它不改变模型顺序。
+- **滚动条已实现**：“No scrollbar is drawn in the first milestone” 是历史状态；覆盖层滚动条已由 #181/#182 交付，按本 ADR 的所有权规则由 `Scene` 度量推导、不新增 NodeId、支持 thumb 拖动与轨道翻页，并共享同一个宿主偏移。UIA `ScrollPattern` 尚未实现，仍是后续工作。
+- **长列表成本**：“5000-row list therefore remains O(rows) per scroll rebuild” 已被 scene_bench 的窗口化测量取代：100/1,000/10,000 行在 32 行窗口下的窗口内滚动构建、元素数与窗口更新耗时基本持平，总行数不影响每帧成本。
+- **模拟设备丢失**：可见验收清单中的 simulated device loss 目前只有单元测试证据；宿主没有公开的模拟设备丢失触发器（相关路径是私有的），因此滚动总验收将其标为部分证据，实机 device loss 仍属 #63。
+- **验收汇总**：100%/150% 单屏可见验收与各专题证据的汇总见 `docs/实现/stage-three-滚动总验收.md`。
+
 ## Ownership and clamping
 
 - The offset is an `i32` logical-pixel value on `SceneEnv`, whose default is zero; a positive offset moves content up (toward smaller y). `SceneEnv` remains `Clone + Copy + PartialEq + Eq`. A scroll-only change is an environment change, not a snapshot change: it does not touch snapshot equality, Node IDs, local edit state or the committed tree.
@@ -49,7 +59,7 @@ Wheel input is converted by the host into whole logical-pixel steps; the rendere
 
 - The OS mouse-wheel routing setting decides delivery. Under-pointer or hybrid routing sends the event to the ZenUI window under the cursor; if the window under the cursor is not ZenUI, that window keeps the event. Focus routing sends it to the focused ZenUI window regardless of what is under the cursor; if no ZenUI window has focus, the event is dropped. A ZenUI window only scrolls for wheel input it actually received.
 - Each activation keeps a signed `i64` fixed-point wheel accumulator and a signed `i64` anchor, private to the host. `lines_per_notch` is read once per activation (default 3). For a line-scrolling setting, one notch (`WHEEL_DELTA`, 120 units) is `lines_per_notch × 24` logical pixels; for the OS page-scroll sentinel (`WHEEL_PAGESCROLL`), one notch is one `PageDown`/`PageUp` step; a setting of zero disables wheel movement and resets the accumulator. On each event, add `delta_units × notch_pixels` to the accumulator, take `pixels = accumulator / 120` (truncating toward zero), compute `delta = pixels - anchor`, request `applied_offset - delta`, and set the anchor to `pixels`. Positive wheel units (forward, away from the user) therefore decrease the offset. The sub-pixel residue stays in the accumulator; truncating division makes sub-notch distances accumulate symmetrically in either direction.
-- The accumulator and anchor reset to zero whenever the scene clamps a wheel request, and whenever the offset changes outside wheel input (key scroll, reveal, resize, snapshot or content re-clamp, hide/show), so unapplied wheel distance is discarded rather than banked and the first reverse notch moves immediately. They are discarded on close/reopen, never shared between windows, and reset when `lines_per_notch` changes.
+- The accumulator and anchor reset to zero whenever the scene clamps a wheel request, and whenever the offset changes outside wheel input (key scroll, reveal, resize, snapshot or content re-clamp, hide/show), so unapplied wheel distance is discarded rather than banked and the first reverse notch moves immediately. They are discarded on close/reopen, never shared between windows, and reset when `lines_per_notch` changes. A windowed-`For` row-window refresh is not an offset change and does not reset the residue: it neither reorders the model nor alters wheel-to-pixel conversion, and a wheel event that crosses a row boundary consumes the same step it accumulated. A snapshot change caused by the model still resets, even when it arrives in the same frame as a window refresh.
 - Platforms that report pixel-precision wheel deltas convert them to logical pixels in a separate signed `i64` fixed-point buffer on the same activation with the same delta-and-reset rule; the two accumulator units are never mixed.
 - At an offset boundary the clamped wheel distance is discarded and the event is consumed; scroll does not chain to a parent container and does not overscroll.
 
@@ -116,3 +126,5 @@ Offset-zero regression evidence compares a scene built with the default environm
 `SceneEnv` stays small and `Copy`; scroll-only changes do not clone or mutate the snapshot. `Scene` reports the content extent, applied offset and maximum offset so the host can clamp, drive reveal and later paint a scrollbar. Node IDs, element count and snapshot equality are identical at every offset.
 
 Layout still runs over the full mounted tree on every scene build. The viewport culling introduced for long imported lists skips shaping, glyph runs, caret stops and paint for offscreen elements, but it does not skip Taffy layout; a 5000-row list therefore remains O(rows) per scroll rebuild until ADR-0011 defines a committed window. The scene benchmark is extended with scroll rows at 100, 500, 1000 and 5000 rows and reports build time plus element and visible counts; it remains a measurement, not a wall-clock assertion.
+
+（本段的长列表成本结论已被 ADR-0011 取代：声明 `row-height` 的 `For` 只挂载可见行窗口，窗口内滚动构建与窗口更新成本同总行数无关；scene_bench 现在测量 100/1,000/10,000 行与 32 行窗口。未声明 `row-height` 的列表仍按上述全量布局规则运行。）

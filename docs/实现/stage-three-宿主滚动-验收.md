@@ -1,6 +1,8 @@
 # Stage-three 宿主滚动验收（实机记录）
 
-本页记录 #179 的可见 Windows 验收：`zenui-windows` 宿主把真实滚轮与翻页键转换成整页滚动偏移，`Scene` 按偏移平移几何，指针、caret 与 IME 继续使用同一份已平移场景。契约见 [ADR-0010](../adr/0010-scroll-is-presentation-state.md)；焦点/IME 自动显露、滚动条与列表虚拟化是后续工单，不在本页范围。
+本页记录 #179 的可见 Windows 验收：`zenui-windows` 宿主把真实滚轮与翻页键转换成整页滚动偏移，`Scene` 按偏移平移几何，指针、caret 与 IME 继续使用同一份已平移场景。契约见 [ADR-0010](../adr/0010-scroll-is-presentation-state.md)；本页只覆盖 #179 当时交付的范围。
+
+**后续状态（2026-11）：** 文中提到的焦点/IME 自动显露已由 #180 交付（[焦点显露验收](stage-three-焦点显露-验收.md)），滚动条已由 #181/#182 交付（[滚动条验收](stage-three-滚动条-验收.md)），窗口化 `For` 已由 #184 交付（[窗口化 For 验收](stage-three-窗口化-for-验收.md)）。hide/show 与 close/reopen 的可见运行、滚轮精度累积与模拟设备丢失的证据边界汇总在 [stage-three 滚动总验收](stage-three-滚动总验收.md)。
 
 **状态：可见自动驱动验收完成（100% 与 150%）。** 运行使用真实可见 HWND、真实 `WM_MOUSEWHEEL` 路径与宿主默认 DX12 presenter；输入由 OS 级 `SendInput` 注入（鼠标移动、左键按下/松开、真实滚轮 notch、键盘按键），不是人工鼠标键盘。截图证明可见窗口的像素与场景状态，不证明用户注视下的 DWM 时序。
 
@@ -81,7 +83,7 @@
 - **可见自动驱动（本页）：** 真实可见 HWND、真实 OS 滚轮路由与 `SendInput`、宿主默认 DX12 presenter、真实窗口过程与 `PrintWindow` 像素。不是人工操作；不证明用户注视下的 DWM 合成、z-order 或被其它窗口遮挡时的表现。
 - **隐藏 smoke：** `crates/windows/tests/hidden_smoke.rs` 覆盖 `WM_MOUSEWHEEL`/翻页键的偏移与夹取、滚动后按同一指针位置重新命中并把 hover 与 `hit_test` 对齐、滚动不刷新快照与 Node ID、hide/show 保留偏移、close/reopen 归零、聚焦编辑器的 glyph 数与 End/Home caret 移动（并断言同一 NodeId 保持焦点）、滚动后重绘帧像素变化。它们是路由与状态证据，不是原生验收。滚轮移动断言只在系统 `SPI_GETWHEELSCROLLLINES` 非零时执行；禁用分支由单元测试覆盖。
 - **单元测试：** `WheelScroll` 的 notch 累积、亚 notch residue（5 × 24 单位 = 72 px，逐事件截断会得到 70）、符号、行数变化丢弃 residue、`SPI_GETWHEELSCROLLLINES` 原始值 0/`WHEEL_PAGESCROLL`/N 的映射与极端 delta；`host::tests::device_loss_preserves_the_applied_scroll_offset` 覆盖重建 surface 后偏移保留。
-- **未覆盖：** hide/show 与模拟设备丢失的可见运行（外部脚本只能 `ShowWindow`，不改变 activation），由隐藏 smoke 与单元测试覆盖；`WM_SETTINGCHANGE` 消息处理本身没有直接测试（只测 SPI 值映射与 `set_lines` 的丢弃行为）；IME 候选窗定位与焦点自动显露属于 #180；滚动条属于 #181/#182；列表虚拟化属于 ADR-0011；混合 DPI 多显示器与真实硬件设备丢失仍属 #63。
+- **未覆盖与后续证据：** 本页当时没有 hide/show 的可见运行（外部脚本只能 `ShowWindow`，不改变 activation）；该缺口已由滚动总验收使用公开 `Host::hide`/`Host::show` 补齐，hide/show 与 close/reopen 以汇总页为准。模拟设备丢失仍只有单元测试证据：宿主没有公开的模拟设备丢失触发器，汇总页将其标为部分证据。`WM_SETTINGCHANGE` 消息处理本身没有直接测试（只测 SPI 值映射与 `set_lines` 的丢弃行为）；IME 候选窗定位与焦点自动显露属于 #180；滚动条属于 #181/#182；列表虚拟化已由 #184 交付，见[窗口化 For 验收](stage-three-窗口化-for-验收.md)；混合 DPI 多显示器与真实硬件设备丢失仍属 #63。
 - `states.txt` 中的 hover/press NodeId 是场景元素身份；press 的 capture 语义与松开命中判定来自窗口过程，截图只能证明最终视觉状态。
 
 ## 判据对照

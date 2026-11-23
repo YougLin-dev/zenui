@@ -120,6 +120,10 @@ _Avoid_: computed style, final css
 宿主拥有、逐帧变化且不进入快照的呈现状态，例如 hovered、pressed 与键盘模态。
 _Avoid_: interaction state, hover state (when meaning committed state)
 
+**Applied scroll offset**:
+宿主保存的整页逻辑像素偏移，已按当前内容范围夹取并作为下一次 `SceneEnv` 的输入；滚动只平移场景几何，不改变快照、Node ID、焦点或 caret。它是持久的 presentation 环境值，不是 presentation transient，也不是应用状态。
+_Avoid_: scroll position (when meaning business state), scroll signal
+
 **Node ID**:
 presentation snapshot 中用于命中测试与事件派发的稳定元素身份；不是 label，也不是公开的内部数组下标。
 _Avoid_: element index, view ID

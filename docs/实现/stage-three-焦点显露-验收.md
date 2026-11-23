@@ -1,6 +1,8 @@
 # Stage-three 焦点显露验收（实机记录）
 
-本页记录 #180 的可见 Windows 验收：宿主在焦点、caret 与 IME 组合变化后把目标显露到视口内，显式滚动不改变焦点/caret 也不触发显露，组合期间的候选窗继续以翻译后的 caret 定位。契约见 [ADR-0010](../adr/0010-scroll-is-presentation-state.md)；滚动条属于 #181/#182，列表虚拟化属 ADR-0011，不在本页范围。
+本页记录 #180 的可见 Windows 验收：宿主在焦点、caret 与 IME 组合变化后把目标显露到视口内，显式滚动不改变焦点/caret 也不触发显露，组合期间的候选窗继续以翻译后的 caret 定位。契约见 [ADR-0010](../adr/0010-scroll-is-presentation-state.md)；本页只覆盖 #180 当时交付的范围。
+
+**后续状态（2026-11）：** 滚动条已由 #181/#182 交付（[滚动条验收](stage-three-滚动条-验收.md)），窗口化 `For` 已由 #184 交付（[窗口化 For 验收](stage-three-窗口化-for-验收.md)）。滚轮精度累积、hide/show、close/reopen 与模拟设备丢失的证据边界汇总在 [stage-three 滚动总验收](stage-three-滚动总验收.md)。
 
 **状态：可见自动驱动验收完成（100% 与 150%）。** 运行使用真实可见 HWND、真实 `WM_MOUSEWHEEL` 路径、宿主默认 DX12 presenter 与真实微软拼音输入法；输入由 OS 级 `SendInput` 注入（鼠标移动、左键按下/松开、真实滚轮 notch、键盘按键），不是人工鼠标键盘。截图证明可见窗口的像素与场景状态，不证明用户注视下的 DWM 时序。
 
@@ -22,7 +24,7 @@
 ## 方法
 
 - 临时探针（未提交）用公开的 `Runtime::input` / `submit` 在 `Host::open` 之前种入 500 行，用 `HostConfig::visible()` 运行宿主，并以 10ms 周期 `pump()`；场景/焦点/组合状态变化时打印一行 `state`：`offset`、`max`、`viewport`、`scale`、`elements`、`focus`、`label`、聚焦元素的翻译后 `rect`、`caret`、`composition`、`value` 与前三个完全可见的 `Edit Task` 输入中心。探针不绘制滚动条，也不注入额外 UI。
-- 滚轮与键盘由外部 PowerShell 脚本通过 `SendInput` 注入；IME 由脚本按键驱动，使用系统中已启用的微软拼音。应用截图用 `PrintWindow(PW_CLIENTONLY|PW_RENDERFULLCONTENT)` 读取客户区，先写 BMP 再转 PNG；候选窗截图用桌面 `CopyFromScreen` 读取窗口区域并裁掉窗口外的桌面像素。
+- 滚轮与键盘由外部 PowerShell 脚本通过 `SendInput` 注入；IME 由脚本按键驱动，使用系统中已启用的微软拼音。应用截图用 `PrintWindow(PW_CLIENTONLY|PW_RENDERFULLCONTENT)` 读取客户区，先写 BMP 再转 PNG；候选窗截图用桌面 `CopyFromScreen` 读取包含标题栏的窗口区域，因此 100% 下部分候选窗 PNG 为 905×739（客户区 900×700 加标题栏和少量桌面边缘），它们只用于证明候选窗位置，不参与客户区像素对比。
 - 每个 DPI 下重复同一组步骤：End 到底、Tab 显露视口外草稿输入、滚轮把焦点滚出视口、点击行内输入、输入拼音、组合期间滚动、组合中 preedit 更新、把组合行滚出视口、滚回并 Space 提交、滚轮把焦点滚出视口后 Tab 到行内按钮。
 - 两端都是 2519 个场景元素；内容 900×18654 逻辑像素；`max=17954`；一个 notch = 72 逻辑像素；Tab 显露的两次目标分别落在 `offset=44`（草稿输入）与 `offset=417`（行内 Delete）。完整状态见 [`证据/host-reveal/states.txt`](证据/host-reveal/states.txt)。
 
@@ -83,6 +85,6 @@
 ## 证据等级与边界
 
 - **可见运行（主证据）：** 真实 HWND、真实滚轮/键盘消息、真实微软拼音与 DX12 呈现；100% 与 150% 各一组截图和状态行。
-- **隐藏 smoke（部分证据）：** `tab_reveals_an_offscreen_focus_target_without_remounting` 与 `an_edit_after_wheel_scrolling_reveals_the_focused_input` 覆盖焦点/caret 显露与“滚动后下一次编辑再显露”，并在 CI 的 WARP/隐藏窗口里运行；它们不能替代可见验收。
+- **隐藏 smoke（部分证据）：** `tab_reveals_an_offscreen_focus_target_and_restores_the_top_window`（#184 后改名，覆盖随窗口化列表显露时把窗口带回顶部）与 `an_edit_after_wheel_scrolling_reveals_the_focused_input` 覆盖焦点/caret 显露与“滚动后下一次编辑再显露”，并在 CI 的 WARP/隐藏窗口里运行；它们不能替代可见验收。
 - **单元测试：** `reveal_offsets_are_minimal_vertical_moves` 覆盖上/下越界、完全可见、超高元素顶部优先、两端夹取与分数取整；`ime_anchors_follow_the_translated_caret_and_clamp_into_the_client_area` 与 `a_caret_that_leaves_the_viewport_hides_the_candidate` 覆盖候选锚点的 DPI 换算、客户区夹取与隐藏决策。
-- **未覆盖：** Shift+Tab（与 Tab 共用焦点遍历与显露路径，由隐藏 smoke 覆盖）；多行 preedit 的锚点与工作区夹取（demo 只有单行输入）；候选窗在 TSF IME 下的即时隐藏（见「候选窗边界」）；滚动条 #181/#182；列表虚拟化 ADR-0011；混合 DPI 多显示器与真实硬件设备丢失仍属 #63。
+- **未覆盖：** Shift+Tab（与 Tab 共用焦点遍历与显露路径，由隐藏 smoke 覆盖）；多行 preedit 的锚点与工作区夹取（demo 只有单行输入）；候选窗在 TSF IME 下的即时隐藏（见「候选窗边界」）；滚动条 #181/#182 与列表虚拟化已由后续工单交付，分别见对应验收页；混合 DPI 多显示器与真实硬件设备丢失仍属 #63。

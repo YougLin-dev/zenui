@@ -6,7 +6,7 @@ ZenUI 使用 Rust 编写原生桌面界面。它保留控件及其编辑状态�
 
 ## 当前能力
 
-ZenUI 处在开发阶段。阶段一的 target API、阶段二的 Windows 原生切片，以及阶段三的多窗口、关闭确认与原生打开/保存/文件夹对话框已可运行；菜单/托盘、辅助技术和跨平台支持仍在开发中。跨显示器混合 DPI 与实机 device loss 仍是 #63 的开放证据缺口。
+ZenUI 处在开发阶段。阶段一的 target API、阶段二的 Windows 原生切片，以及阶段三的多窗口、关闭确认、原生打开/保存/文件夹对话框、整页滚动、焦点显露、覆盖层滚动条与窗口化 `For` 已可运行；菜单/托盘、辅助技术和跨平台支持仍在开发中。跨显示器混合 DPI 与实机 device loss 仍是 #63 的开放证据缺口。
 
 仓库目前提供：
 
@@ -17,7 +17,7 @@ ZenUI 处在开发阶段。阶段一的 target API、阶段二的 Windows 原生
 - 多窗口窗口目录：show/hide/close/reopen、关闭确认 epoch、父窗口输入挂起与声明的确认窗口；
 - 原生打开/保存/文件夹对话框：窗口锚定、单选/多选、标题与类型过滤器、建议文件名与默认扩展名、取消/失败结果，以及显式的窗口或应用任务所有权；
 - 宿主任务：文件对话框结果与 worker 共用 Task/continuation 交付，但没有 worker 通道，也不会阻塞 `settle_tasks`；
-- 长列表场景构建：跨重建复用未变化的文本 layout 与测量结果，viewport 外的元素保留几何但跳过 glyph 与绘制；完整列表虚拟化仍在后续路线；
+- 长列表场景构建：跨重建复用未变化的文本 layout 与测量结果，viewport 外的元素保留几何但跳过 glyph 与绘制；声明 `row-height` 的窗口化 `For` 只挂载可见行窗口，完整行范围由上下 spacer 保持（[ADR-0011](docs/adr/0011-windowed-for-mounting.md)）；变量行高仍不在本里程碑；
 - 有界运行时存储：最近发布快照按固定窗口保留，释放的 Owner 节点回到存活规模，Todo 的列表 reconciliation 与行句柄查找使用索引而不是逐行扫描；
 - 可复现的 Todo 场景：插入、删除、筛选、重排、焦点与拒绝句柄后的恢复；
 - 独立的宏、文本、布局和 GPU 原型；
@@ -71,6 +71,7 @@ target API 的公开行为测试位于根包 `tests/`，其中 `tests/tasks.rs` 
 - [Stage-three 焦点显露验收](docs/实现/stage-three-焦点显露-验收.md)：Tab/编辑后的焦点与 caret 显露、滚动不移动焦点、组合中滚动与候选窗锚点在 100%/150% 下的可见证据。
 - [Stage-three 滚动条验收](docs/实现/stage-three-滚动条-验收.md)：覆盖层滚动条的 thumb 拖动、轨道翻页与键鼠共享偏移在 100%/150% 下的可见证据。
 - [Stage-three 窗口化 For 验收](docs/实现/stage-three-窗口化-for-验收.md)：10,000 行窗口化列表的滚动、编辑、重排与过滤在 100%/150% 下的可见证据。
+- [Stage-three 滚动总验收](docs/实现/stage-three-滚动总验收.md)：滚轮单位与精度累积、边界、翻页、显露、IME 锚点、滚动条、hide/show、close/reopen 与窗口化列表的汇总证据与边界。
 
 ## 界面语法
 
@@ -106,7 +107,7 @@ cargo run --release -p zenui-app --example reconcile_bench --locked
 cargo run --release -p zenui-render --example scene_bench --locked
 ```
 
-它导入 100/500/1000 行，分别测量无缓存构建、缓存冷启动、稳定缓存重建，以及一次输入后的重建；只打印测量与元素数，不作绝对时间断言。
+它导入 100/1,000/10,000 行，在 32 行窗口下分别测量无缓存构建、缓存冷启动、稳定缓存重建、输入后的重建、跨行窗口更新，以及窗口内的滚动构建；只打印测量、提交元素数与可见行窗口，不作绝对时间断言。
 
 独立的原型工作区使用各自的 `Cargo.toml`。宏原型可以这样运行：
 
