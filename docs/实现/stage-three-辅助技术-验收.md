@@ -111,10 +111,10 @@ UIA 客户端看到的 runtime ID 形如 `[42, hwnd, 4, 8]`；`42` 与窗口句�
 
 - **可见原生 UIA（主证据）：** 进程外 `IUIAutomation` 客户端读取真实 HWND 的 Raw View；100% 与 150% 各有初始树与滚动前后树。Inspect 以 UI Automation 模式识别同一窗口根。
 - **隐藏 smoke（部分证据）：** `cargo test -p zenui-windows --lib` 与 `crates/windows/tests/hidden_smoke.rs` 覆盖树形状、名称、状态、焦点、边界、runtime ID、隐藏/显示、确认禁用、Details 独立根与 stale provider；它不显示窗口，不代替可见 UIA。
-- **未覆盖的能力：** 没有 `InvokePattern`、`TogglePattern`、`ValuePattern`、`ScrollPattern` 或 UIA 事件。`checked`/`aria:pressed` 存在于只读树；标准 UIA pattern 客户端不会看到 ToggleState，原生 dump 的 `toggle` 列为空。读屏软件的实际朗读顺序、焦点事件订阅与文本范围接口也不在本工单。隐藏/CI 结果只按部分证据记录。
+- **未覆盖的能力：** 本页不声明 `InvokePattern`、`TogglePattern`、`ValuePattern`、`ScrollPattern` 或 UIA 事件；它们由后续的动作、事件、文本与滚动专题页覆盖。`checked`/`aria:pressed` 存在于只读树；标准 UIA pattern 客户端不会看到 ToggleState，原生 dump 的 `toggle` 列为空。读屏软件的实际朗读顺序、焦点事件订阅与文本范围接口也不在本工单。隐藏/CI 结果只按部分证据记录。
 - **单屏声明：** 只在单屏 2560×1600 上运行；100% 与 150% 是同一显示器的临时切换，不声称混合 DPI 或多显示器。
 - **脱敏：** 截图只含应用客户区与 Inspect 窗口，不含标题栏、用户名或本机路径。临时探针、UIA 客户端与缩放/截图脚本在提交前删除；`git ls-files` 中没有本工单的探针源码或脚本。
 
 ## 后续状态
 
-本页关闭 #188 的只读树与可见证据；写 pattern 已由 [stage-three 辅助技术动作验收](stage-three-辅助技术动作-验收.md) 交付，事件已由 [stage-three 辅助技术事件验收](stage-three-辅助技术事件-验收.md) 交付；`TextPattern` 已由 [stage-three 辅助技术文本验收](stage-three-辅助技术文本-验收.md) 交付；`ScrollPattern` 仍由 #218 交付。辅助技术决策仍由后续工单记录，本页不改变该范围。
+本页关闭 #188 的只读树与可见证据；写 pattern 已由 [stage-three 辅助技术动作验收](stage-three-辅助技术动作-验收.md) 交付，事件已由 [stage-three 辅助技术事件验收](stage-three-辅助技术事件-验收.md) 交付；`TextPattern` 已由 [stage-three 辅助技术文本验收](stage-three-辅助技术文本-验收.md) 交付；`ScrollPattern` 已由 [stage-three 辅助技术滚动验收](stage-three-辅助技术滚动-验收.md) 交付。辅助技术决策仍由后续工单记录，本页不改变该范围。

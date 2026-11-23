@@ -329,7 +329,7 @@ fn toggle_variant(value: bool) -> VARIANT {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::accessibility::ControlType;
+    use crate::accessibility::{ControlType, ScrollGeometry};
     use zenui::SnapshotActions;
     use zenui_render::Rect;
 
@@ -442,6 +442,7 @@ mod tests {
             nodes,
             by_node: HashMap::new(),
             scale: 1.0,
+            scroll: ScrollGeometry::new(100.0, 100.0, 0, 0),
         }
     }
 

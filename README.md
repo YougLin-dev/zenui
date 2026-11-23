@@ -6,7 +6,7 @@ ZenUI 使用 Rust 编写原生桌面界面。它保留控件及其编辑状态�
 
 ## 当前能力
 
-ZenUI 处在开发阶段。阶段一的 target API、阶段二的 Windows 原生切片，以及阶段三的多窗口、关闭确认、原生打开/保存/文件夹对话框、整页滚动、焦点显露、覆盖层滚动条、窗口化 `For`、只读 UIA 树、UIA Invoke/Toggle/Value/SetFocus 动作、UIA 焦点/状态/结构事件与 UIA TextPattern 已可运行；菜单/托盘、ScrollPattern、跨平台支持仍在开发中。跨显示器混合 DPI 与实机 device loss 仍是 #63 的开放证据缺口。
+ZenUI 处在开发阶段。阶段一的 target API、阶段二的 Windows 原生切片，以及阶段三的多窗口、关闭确认、原生打开/保存/文件夹对话框、整页滚动、焦点显露、覆盖层滚动条、窗口化 `For`、只读 UIA 树、UIA Invoke/Toggle/Value/SetFocus 动作、UIA 焦点/状态/结构事件、UIA TextPattern 与窗口根 ScrollPattern 已可运行；菜单/托盘、跨平台支持仍在开发中。跨显示器混合 DPI 与实机 device loss 仍是 #63 的开放证据缺口。
 
 仓库目前提供：
 
@@ -19,7 +19,8 @@ ZenUI 处在开发阶段。阶段一的 target API、阶段二的 Windows 原生
 - 宿主任务：文件对话框结果与 worker 共用 Task/continuation 交付，但没有 worker 通道，也不会阻塞 `settle_tasks`；
 - 长列表场景构建：跨重建复用未变化的文本 layout 与测量结果，viewport 外的元素保留几何但跳过 glyph 与绘制；声明 `row-height` 的窗口化 `For` 只挂载可见行窗口，完整行范围由上下 spacer 保持（[ADR-0011](docs/adr/0011-windowed-for-mounting.md)）；变量行高仍不在本里程碑；
 - UIA：每个窗口从已提交快照与场景发布根、角色、名称、AutomationId、状态与物理边界，`WM_GETOBJECT` 交回 fragment-root provider；滚动只平移边界并保持 runtime ID。Invoke、Toggle、Value 与 SetFocus 把动作排队到 UI 线程，按最新快照重验后复用 Runtime 命令路径。相邻两次发布按 runtime ID 比较，聚焦、启用、ToggleState、Value 与子节点增删/重排各投递一次事件；后台窗口不投递聚焦事件，指针 hover/press 瞬态不产生事件（[只读树验收](docs/实现/stage-three-辅助技术-验收.md)、[动作验收](docs/实现/stage-three-辅助技术动作-验收.md)、[事件验收](docs/实现/stage-three-辅助技术事件-验收.md)）；
-- UIA 文本：`text-input` 的 Edit 节点暴露最小 `ITextProvider`/`ITextRangeProvider`。文档取已提交值并排除 preedit，对外偏移是 UTF-16 code unit，运行时仍用字符偏移；GetText、GetSelection、GetVisibleRanges、GetBoundingRectangles 与 Select 可用，Select 经动作队列调用 `set_selection_node` 且不派发 `on:input`；查找、移动、扩展、比较、多选与滚动等 range 方法返回 `UIA_E_NOTSUPPORTED`，组合中、禁用或无 `on:input` 的输入保持只读（[文本验收](docs/实现/stage-three-辅助技术文本-验收.md)）。`ScrollPattern` 尚未实现。
+- UIA 文本：`text-input` 的 Edit 节点暴露最小 `ITextProvider`/`ITextRangeProvider`。文档取已提交值并排除 preedit，对外偏移是 UTF-16 code unit，运行时仍用字符偏移；GetText、GetSelection、GetVisibleRanges、GetBoundingRectangles 与 Select 可用，Select 经动作队列调用 `set_selection_node` 且不派发 `on:input`；查找、移动、扩展、比较、多选与滚动等 range 方法返回 `UIA_E_NOTSUPPORTED`，组合中、禁用或无 `on:input` 的输入保持只读（[文本验收](docs/实现/stage-three-辅助技术文本-验收.md)）；
+- UIA 滚动：可滚动窗口的根暴露垂直 `IScrollProvider`。`VerticallyScrollable` 取 `max_scroll_offset > 0`，垂直 view size 为 viewport/content 百分比，垂直百分比由已应用偏移换算；水平属性固定为 `NoScroll`。`Scroll` 的大小步长复用键盘翻页与滚轮行步长，`SetScrollPercent` 把 0..100 四舍五入到最近的整数逻辑像素后夹取。provider 只入队，UI 线程按当前场景重验；隐藏、禁用、零最大偏移与关闭中的窗口拒绝写入。滚动只改宿主偏移，Node ID、焦点、caret、selection、draft、组合、快照相等性与运行时计数不变（[滚动验收](docs/实现/stage-three-辅助技术滚动-验收.md)）。
 - 有界运行时存储：最近发布快照按固定窗口保留，释放的 Owner 节点回到存活规模，Todo 的列表 reconciliation 与行句柄查找使用索引而不是逐行扫描；
 - 可复现的 Todo 场景：插入、删除、筛选、重排、焦点与拒绝句柄后的恢复；
 - 独立的宏、文本、布局和 GPU 原型；
@@ -74,6 +75,7 @@ target API 的公开行为测试位于根包 `tests/`，其中 `tests/tasks.rs` 
 - [Stage-three 滚动条验收](docs/实现/stage-three-滚动条-验收.md)：覆盖层滚动条的 thumb 拖动、轨道翻页与键鼠共享偏移在 100%/150% 下的可见证据。
 - [Stage-three 窗口化 For 验收](docs/实现/stage-three-窗口化-for-验收.md)：10,000 行窗口化列表的滚动、编辑、重排与过滤在 100%/150% 下的可见证据。
 - [Stage-three 滚动总验收](docs/实现/stage-three-滚动总验收.md)：滚轮单位与精度累积、边界、翻页、显露、IME 锚点、滚动条、hide/show、close/reopen 与窗口化列表的汇总证据与边界。
+- [Stage-three 辅助技术滚动验收](docs/实现/stage-three-辅助技术滚动-验收.md)：窗口根垂直 ScrollPattern 的读取、百分比映射、动作队列重验与 100%/150% 可见证据。
 
 ## 界面语法
 
