@@ -8,7 +8,7 @@ The scene keeps every emitted element for Node queries and `NodeStatus`, but der
 
 本 ADR 的偏移所有权、夹取、几何、命中、IME、显露与生命周期契约仍然有效。以下“首个里程碑”表述已被后续实现取代，阅读时以本节为准：
 
-- **窗口化 `For`**：ADR-0011 为声明 `row-height` 的 `For` 引入可提交的可见行窗口，取代“滚动永不改变挂载”的全局表述。滚动仍是宿主拥有的 presentation 环境值；滚动只平移场景，宿主据此推进行窗口，同一行内滚动不重建快照，跨行重建一次。未声明 `row-height` 的 `For` 与所有其它元素仍全量挂载，本 ADR 的其余规则不变。行窗口刷新不重置滚轮 residue，因为它不改变模型顺序。
+- **窗口化 `For`**：ADR-0011 为声明 `row-height` 的 `For` 引入可提交的可见行窗口，取代“滚动永不改变挂载”的全局表述。滚动仍是宿主拥有的 presentation 环境值；滚动只平移场景，宿主据此推进行窗口：行窗口不变时只重建场景，首行变化或视口下缘跨入新行（trailing `count` 增加）时提交一次行窗口更新并重建快照。未声明 `row-height` 的 `For` 与所有其它元素仍全量挂载，本 ADR 的其余规则不变。行窗口刷新不重置滚轮 residue，因为它不改变模型顺序。
 - **滚动条已实现**：“No scrollbar is drawn in the first milestone” 是历史状态；覆盖层滚动条已由 #181/#182 交付，按本 ADR 的所有权规则由 `Scene` 度量推导、不新增 NodeId、支持 thumb 拖动与轨道翻页，并共享同一个宿主偏移。UIA `ScrollPattern` 尚未实现，仍是后续工作。
 - **长列表成本**：“5000-row list therefore remains O(rows) per scroll rebuild” 已被 scene_bench 的窗口化测量取代：100/1,000/10,000 行在 32 行窗口下的窗口内滚动构建、元素数与窗口更新耗时基本持平，总行数不影响每帧成本。
 - **模拟设备丢失**：可见验收清单中的 simulated device loss 目前只有单元测试证据；宿主没有公开的模拟设备丢失触发器（相关路径是私有的），因此滚动总验收将其标为部分证据，实机 device loss 仍属 #63。

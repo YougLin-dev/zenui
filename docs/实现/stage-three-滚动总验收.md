@@ -33,14 +33,14 @@
 | 初始 | 0 | 0 | 内容顶 |
 | down 1 | 14 | 14 | 24 × 72 / 120 = 14.4，截断为 14 |
 | down 2 | 28 | 28 | 残留 0.8 累积 |
-| down 3 | 43 | 43 | 28.8 截断 |
+| down 3 | 43 | 43 | 43.2 截断 |
 | down 4 | 57 | 57 | 57.6 截断 |
 | down 5 | 72 | 72 | 恰好一个常规 notch 的 72 逻辑像素 |
 | up 1–5 | 57、43、28、14、0 | 57、43、28、14、0 | 反向对称，无幽灵偏移 |
 
 100% 与 150% 的状态行见 [`100-states.txt`](证据/host-scroll-total/100-states.txt) 与 [`150-states.txt`](证据/host-scroll-total/150-states.txt)。截图：[100% offset 14](证据/host-scroll-total/100-01-precision-14.png)、[150% offset 14](证据/host-scroll-total/150-01-precision-14.png)、[100% offset 72](证据/host-scroll-total/100-02-precision-72.png)、[150% offset 72](证据/host-scroll-total/150-02-precision-72.png)。
 
-这两张截图只相差 58 逻辑像素的平移（顶部工具栏与首行位置变化），不改变元素、焦点或模型；滚动条 thumb 仍按同一份偏移定位。
+这两张截图只相差 58 逻辑像素的平移（顶部工具栏与首行位置变化），焦点、模型与组件身份不变；滚动条 thumb 仍按同一份偏移定位。视口下缘在 14→72 之间跨入后续行时，窗口化 `For` 会按契约多挂载一行，这是行窗口更新，不是模型变化。
 
 ## 边界、翻页与显露
 
@@ -51,7 +51,7 @@
 
 ## 偏移生命周期
 
-探针先以十个 120 单位 notch 滚到 `offset=720`，此时行带 `first_row=14`，滚动条 thumb 位于中上部。
+探针先以十个 120 单位 notch 滚到 `offset=720`，此时行带 `first_row=14`，滚动条 thumb 位于轨道顶部附近（约 4%）。
 
 | 步骤 | 100% | 150% | 证据 |
 | --- | --- | --- | --- |
@@ -75,7 +75,7 @@ hide/show 前后的 PNG 在两种缩放下都逐字节相同（100%：`494e9e…
 | close/reopen 归零 | 通过 | 本页 04/05 与 states |
 | 模拟设备丢失 | 部分（仅单元测试） | `host::tests::device_loss_preserves_the_applied_scroll_offset` |
 | 窗口化 `For` | 通过 | [窗口化 For 验收](stage-three-窗口化-for-验收.md) |
-| 临时探针移除、截图脱敏 | 通过 | 本页「证据等级与边界」 |
+| 临时探针移除、截图脱敏 | 通过 | 本页「证据等级与边界」；既有 file-picker 的 09/11/12/13 已补遮蔽账户名 |
 
 ## 证据等级与边界
 
