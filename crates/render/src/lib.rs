@@ -14,6 +14,7 @@ mod error;
 mod geometry;
 pub mod gpu;
 mod scene;
+mod scrollbar;
 mod text;
 
 pub use error::SceneError;
@@ -24,4 +25,5 @@ pub use scene::{
     Decoration, DecorationKind, PositionedGlyph, ResolvedStyle, Scene, SceneCache, SceneElement,
     SceneEnv, TextRun, Visual,
 };
+pub use scrollbar::Scrollbar;
 pub use wgpu;

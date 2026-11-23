@@ -15,6 +15,7 @@ use zenui_style::{Color, Condition, Property, StyleDeclaration, StyleOrigin, Sty
 
 use crate::SceneError;
 use crate::geometry::{Point, Rect, Viewport};
+use crate::scrollbar::Scrollbar;
 use crate::text::{self, CharRange, TextShaper};
 
 /// 场景理解的 intrinsic；其他 tag 是显式错误。
@@ -513,6 +514,21 @@ impl Scene {
     /// 最大可用滚动偏移：内容高度减 viewport 高度，向下取整且不小于 0。
     pub const fn max_scroll_offset(&self) -> i32 {
         self.max_scroll_offset
+    }
+
+    /// 覆盖在视口右缘的滚动条几何；内容能够滚动且轨道容得下最小 thumb 时才存在。
+    ///
+    /// 由 viewport、内容范围、已应用偏移与最大偏移推导，不新增元素或快照
+    /// 属性，也不改变布局与 Node ID。thumb 高度按 viewport/content 比例缩放
+    /// 且最小 24 逻辑像素；轨道本身短于 24 逻辑像素的退化视口不绘制。
+    /// GPU 绘制与宿主命中测试使用同一份几何。
+    pub fn scrollbar(&self) -> Option<Scrollbar> {
+        Scrollbar::from_metrics(
+            self.viewport,
+            self.content_extent,
+            self.scroll_offset,
+            self.max_scroll_offset,
+        )
     }
 
     /// 是否绘制 caret；几何在 `decorations` 中保留，供 IME 定位使用。
