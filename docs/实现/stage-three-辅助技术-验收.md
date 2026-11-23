@@ -117,4 +117,4 @@ UIA 客户端看到的 runtime ID 形如 `[42, hwnd, 4, 8]`；`42` 与窗口句�
 
 ## 后续状态
 
-本页关闭 #188 的只读树与可见证据；写 pattern 已由 [stage-three 辅助技术动作验收](stage-three-辅助技术动作-验收.md) 交付，事件已由 [stage-three 辅助技术事件验收](stage-three-辅助技术事件-验收.md) 交付；`TextPattern` 已由 [stage-three 辅助技术文本验收](stage-three-辅助技术文本-验收.md) 交付；`ScrollPattern` 已由 [stage-three 辅助技术滚动验收](stage-three-辅助技术滚动-验收.md) 交付。辅助技术决策仍由后续工单记录，本页不改变该范围。
+本页关闭 #188 的只读树与可见证据；写 pattern 已由 [stage-three 辅助技术动作验收](stage-three-辅助技术动作-验收.md) 交付，事件已由 [stage-three 辅助技术事件验收](stage-three-辅助技术事件-验收.md) 交付；`TextPattern` 已由 [stage-three 辅助技术文本验收](stage-three-辅助技术文本-验收.md) 交付；`ScrollPattern` 已由 [stage-three 辅助技术滚动验收](stage-three-辅助技术滚动-验收.md) 交付。完整契约由 [ADR-0012](../adr/0012-uia-derived-tree-and-action-queue.md) 与 [stage-three 辅助技术合同与朗读验收](stage-three-辅助技术总验收.md) 记录，本页不改变该范围。

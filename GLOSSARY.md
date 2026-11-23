@@ -129,8 +129,12 @@ presentation snapshot 中用于命中测试与事件派发的稳定元素身份�
 _Avoid_: element index, view ID
 
 **Accessibility tree**:
-每个已提交窗口从 presentation snapshot 与同一份 `Scene` 派生的只读 UIA 树；发布时整体替换，节点身份沿用 Node ID，provider 解析当前发布而不是保留第二份界面。写 pattern、TextPattern 的 Select 与窗口根的 ScrollPattern 从这棵树派生动作并排给 UI 线程，不在 provider 线程修改 Runtime；事件由相邻两次发布派生，见 accessibility event。
+每个已提交窗口从 presentation snapshot 与同一份 `Scene` 派生的只读 UIA 树；发布时整体替换，节点身份沿用 Node ID，provider 解析当前发布而不是保留第二份界面。每个已发布窗口有自己的 fragment root（ADR-0012）。写 pattern、TextPattern 的 Select 与窗口根的 ScrollPattern 从这棵树派生动作并排给 UI 线程，不在 provider 线程修改 Runtime；事件由相邻两次发布派生，见 accessibility event。
 _Avoid_: a11y DOM, accessibility model (when meaning a separate retained tree)
+
+**Accessibility provider**:
+每个已发布窗口的 UIA fragment root 与元素 provider；持有窗口发布单元的弱引用，按调用线程解析当前不可变树，不保存第二份界面，也不在 provider 线程修改 Runtime。写操作经每窗口动作队列交给 UI 线程重验；隐藏、过期或清除发布的查询返回 `UIA_E_ELEMENTNOTAVAILABLE`。
+_Avoid_: a11y proxy, retained UIA model
 
 **Accessibility action**:
 provider 从当前 UIA 树派生、经窗口队列交给 UI 线程重验后执行的写操作（Invoke、Toggle、SetValue、SetSelection、SetFocus、Scroll）；节点动作最终调用 Runtime 的按 Node ID 命令，Scroll 只改宿主的 applied scroll offset，两者都不保留第二份界面状态。
