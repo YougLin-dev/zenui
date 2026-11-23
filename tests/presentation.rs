@@ -803,3 +803,66 @@ fn class_literals_become_typed_declarations() {
         "class is compiled away, not a presentation attribute"
     );
 }
+
+/// 断言一次操作确实改变了呈现版本，并返回新版本。
+fn revision_bumped(app: &mut Runtime, previous: u64, action: impl FnOnce(&mut Runtime)) -> u64 {
+    action(app);
+    let revision = app.presentation_revision();
+    assert_ne!(
+        revision, previous,
+        "the action must bump the presentation revision"
+    );
+    revision
+}
+
+#[test]
+fn the_presentation_revision_tracks_snapshot_visible_changes_only() {
+    let mut app = runtime();
+    add(&mut app, "Task 0");
+    add(&mut app, "Task 1");
+    let mut revision = app.presentation_revision();
+    app.presentation().expect("snapshot");
+    assert_eq!(
+        app.presentation_revision(),
+        revision,
+        "building a snapshot is not a state change"
+    );
+
+    revision = revision_bumped(&mut app, revision, |app| add(app, "Task 2"));
+    revision = revision_bumped(&mut app, revision, |app| {
+        app.focus("Edit Task 0").expect("focus");
+    });
+    let node = app
+        .presentation()
+        .expect("snapshot")
+        .find_label("Edit Task 0")
+        .expect("input")
+        .id();
+    revision = revision_bumped(&mut app, revision, |app| {
+        app.set_selection_node(node, 0, 2).expect("selection");
+    });
+    revision = revision_bumped(&mut app, revision, |app| {
+        app.set_caret_node(node, 1).expect("caret");
+    });
+    revision = revision_bumped(&mut app, revision, |app| {
+        app.compose_start_node(node).expect("start");
+    });
+    revision = revision_bumped(&mut app, revision, |app| {
+        app.compose_update_node(node, "ni").expect("update");
+    });
+    revision = revision_bumped(&mut app, revision, |app| {
+        app.compose_cancel_node(node).expect("cancel");
+    });
+    revision = revision_bumped(&mut app, revision, |app| {
+        app.compose_start_node(node).expect("start");
+    });
+    revision = revision_bumped(&mut app, revision, |app| {
+        app.compose_update_node(node, "ni").expect("update");
+    });
+    revision = revision_bumped(&mut app, revision, |app| {
+        app.compose_commit_node(node, "你").expect("commit");
+    });
+    let _ = revision_bumped(&mut app, revision, |app| {
+        app.set_appearance(Appearance::Dark).expect("theme");
+    });
+}

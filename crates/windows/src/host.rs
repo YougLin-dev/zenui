@@ -343,6 +343,8 @@ struct WindowHost {
     /// 场景构建发生在获取 surface 图像之前，所以 `Timeout` / `Occluded` 时
     /// 这里可能比屏幕上的帧更新。
     last_snapshot: Option<PresentationSnapshot>,
+    /// `last_snapshot` 对应的运行时呈现版本；版本未变时滚动与指针直接复用。
+    snapshot_revision: u64,
 }
 
 impl WindowHost {
@@ -908,7 +910,7 @@ impl Host {
             if window.close_requested {
                 return Ok(());
             }
-            host.render_fresh(window)
+            host.render_current(window)
         });
         if let Err(error) = result {
             self.deferred_error.get_or_insert(error);
@@ -960,12 +962,12 @@ impl Host {
 
     /// 闪烁 caret；只有聚焦输入、非组合且窗口在前台时才翻转。
     fn blink_caret(&mut self, window: &mut WindowHost) -> Result<(), HostError> {
-        let snapshot = self
-            .runtime
-            .presentation_of(window.ctx)
-            .map_err(HostError::Snapshot)?;
-        let focused = focused_input(&snapshot).is_some();
-        let composing = focused_composition(&snapshot);
+        let (focused, composing) = self.with_presentation(window, |snapshot| {
+            (
+                focused_input(snapshot).is_some(),
+                focused_composition(snapshot),
+            )
+        })?;
         // 安全：只读取前台窗口句柄用于比较。
         let foreground = unsafe { GetForegroundWindow() } == window.hwnd();
         let visible = blinked(window.caret_visible, focused, composing, foreground);
@@ -1066,6 +1068,37 @@ impl Host {
         self.render_window(window, snapshot)
     }
 
+    /// 重绘当前窗口：运行时呈现未变时复用缓存快照，否则重建快照。
+    fn render_current(&mut self, window: &mut WindowHost) -> Result<(), HostError> {
+        let revision = self.runtime.presentation_revision();
+        if window.last_snapshot.is_some() && window.snapshot_revision == revision {
+            return self.render_cached(window);
+        }
+        self.render_fresh(window)
+    }
+
+    /// 读取当前呈现快照：版本未变时借用缓存（取出再放回），否则重建一次。
+    fn with_presentation<T>(
+        &mut self,
+        window: &mut WindowHost,
+        read: impl FnOnce(&PresentationSnapshot) -> T,
+    ) -> Result<T, HostError> {
+        let revision = self.runtime.presentation_revision();
+        if window.last_snapshot.is_some() && window.snapshot_revision == revision {
+            let Some(snapshot) = window.last_snapshot.take() else {
+                unreachable!("the cache check guarantees a snapshot");
+            };
+            let value = read(&snapshot);
+            window.last_snapshot = Some(snapshot);
+            return Ok(value);
+        }
+        let snapshot = self
+            .runtime
+            .presentation_of(window.ctx)
+            .map_err(HostError::Snapshot)?;
+        Ok(read(&snapshot))
+    }
+
     /// 输入前确保内存场景使用当前滚动偏移与显露结果。
     ///
     /// `render_window` 在 surface `Timeout`/`Occluded` 时不会更新 `window.scene`；
@@ -1077,30 +1110,66 @@ impl Host {
         if fresh {
             return Ok(());
         }
-        let Some(snapshot) = window.last_snapshot.clone() else {
+        // 快照先取出再放回：输入前同步场景不复制 snapshot。
+        let Some(snapshot) = window.last_snapshot.take() else {
             return Ok(());
         };
-        let (width, height) = client_size(window.hwnd())?;
-        if width == 0 || height == 0 {
-            return Ok(());
+        let result = (|| {
+            let (width, height) = client_size(window.hwnd())?;
+            if width == 0 || height == 0 {
+                return Ok(None);
+            }
+            let scene = self.build_scene_with_reveal(window, &snapshot, width, height, false)?;
+            Ok(Some(scene))
+        })();
+        window.last_snapshot = Some(snapshot);
+        if let Some(scene) = result? {
+            window.scene = Some(scene);
         }
-        let scene = self.build_scene_with_reveal(window, &snapshot, width, height)?;
-        window.scene = Some(scene);
         Ok(())
     }
 
-    /// 把一个窗口的快照渲染到它自己的 surface；共享 renderer 按目标尺寸切换。
+    /// 把一个窗口的新快照渲染到它自己的 surface；共享 renderer 按目标尺寸切换。
     fn render_window(
         &mut self,
         window: &mut WindowHost,
         snapshot: PresentationSnapshot,
     ) -> Result<(), HostError> {
+        let snapshot_changed = window.last_snapshot.as_ref() != Some(&snapshot);
+        let revision = self.runtime.presentation_revision();
+        if self.render_snapshot(window, &snapshot, snapshot_changed)? {
+            window.last_snapshot = Some(snapshot);
+            window.snapshot_revision = revision;
+        }
+        Ok(())
+    }
+
+    /// 用缓存的快照重绘；滚动、悬停与 pressed 都是宿主瞬态，不需要重建运行时快照。
+    ///
+    /// 快照先取出再放回，整个路径不复制 snapshot。
+    fn render_cached(&mut self, window: &mut WindowHost) -> Result<(), HostError> {
+        let Some(snapshot) = window.last_snapshot.take() else {
+            return Ok(());
+        };
+        let result = self.render_snapshot(window, &snapshot, false);
+        window.last_snapshot = Some(snapshot);
+        result.map(|_| ())
+    }
+
+    /// 构建场景并呈现；返回是否真的完成了场景构建。
+    fn render_snapshot(
+        &mut self,
+        window: &mut WindowHost,
+        snapshot: &PresentationSnapshot,
+        snapshot_changed: bool,
+    ) -> Result<bool, HostError> {
         self.ensure_surface(window)?;
         let (width, height) = client_size(window.hwnd())?;
         if width == 0 || height == 0 {
-            return Ok(());
+            return Ok(false);
         }
-        let scene = self.build_scene_with_reveal(window, &snapshot, width, height)?;
+        let scene =
+            self.build_scene_with_reveal(window, snapshot, width, height, snapshot_changed)?;
         let target = target_config(self.format, width, height)?;
         if self.renderer_target != target {
             self.renderer.resize(target);
@@ -1116,7 +1185,7 @@ impl Host {
                 | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
                 wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
                     window.paint_requested = false;
-                    return Ok(());
+                    return Ok(true);
                 }
                 wgpu::CurrentSurfaceTexture::Outdated => {
                     if reconfigured {
@@ -1129,7 +1198,10 @@ impl Host {
                     reconfigured = true;
                     continue;
                 }
-                wgpu::CurrentSurfaceTexture::Lost => return self.surface_lost(),
+                wgpu::CurrentSurfaceTexture::Lost => {
+                    self.surface_lost()?;
+                    return Ok(false);
+                }
                 wgpu::CurrentSurfaceTexture::Validation => {
                     return Err(HostError::Surface(String::from(
                         "the surface failed validation; rebuilding would mask an API misuse",
@@ -1142,14 +1214,15 @@ impl Host {
                 if reconfigured {
                     return Err(HostError::Render(error));
                 }
-                return self.surface_lost();
+                self.surface_lost()?;
+                return Ok(false);
             }
             self.queue.submit([encoder.finish()]);
             self.queue.present(frame);
             window.scene = Some(scene);
             window.paint_requested = false;
-            self.position_ime(window, &snapshot);
-            return Ok(());
+            self.position_ime(window, snapshot);
+            return Ok(true);
         }
     }
 
@@ -1557,7 +1630,8 @@ impl Host {
                 "cannot read a frame from an empty client area",
             )));
         }
-        let scene = self.build_scene(window, &snapshot, width, height)?;
+        let snapshot_changed = window.last_snapshot.as_ref() != Some(&snapshot);
+        let scene = self.build_scene(window, &snapshot, width, height, snapshot_changed)?;
         let target = target_config(self.format, width, height)?;
         if self.renderer_target != target {
             self.renderer.resize(target);
@@ -1633,6 +1707,10 @@ impl Host {
         buffer.unmap();
         window.scene = Some(scene);
         window.paint_requested = false;
+        // 这次读回构建了场景，缓存也要同步；否则下一次呈现会把同一快照
+        // 当成新快照并再次清空滚轮 residue。
+        window.snapshot_revision = self.runtime.presentation_revision();
+        window.last_snapshot = Some(snapshot);
         Ok(Frame {
             width,
             height,
@@ -1936,20 +2014,7 @@ impl Host {
     ///
     /// 扫描该窗口全部输入而不是只看焦点，焦点已在宿主内移走或输入被禁用时也能清理。
     fn cancel_compositions(&mut self, window: &mut WindowHost) -> Result<bool, HostError> {
-        let snapshot = self
-            .runtime
-            .presentation_of(window.ctx)
-            .map_err(HostError::Snapshot)?;
-        let composing: Vec<NodeId> = snapshot
-            .elements()
-            .filter(|element| element.tag() == "text-input")
-            .filter(|element| {
-                element
-                    .edit()
-                    .is_some_and(|edit| edit.composition().is_some())
-            })
-            .map(SnapshotElement::id)
-            .collect();
+        let composing = self.with_presentation(window, composing_nodes)?;
         let mut cancelled = false;
         for node in composing {
             match self.runtime.compose_cancel_node(node) {
@@ -2174,6 +2239,7 @@ impl Host {
         snapshot: &PresentationSnapshot,
         width: u32,
         height: u32,
+        snapshot_changed: bool,
     ) -> Result<Scene, HostError> {
         // 安全：HWND 在窗口条目析构前有效。
         let dpi = unsafe { GetDpiForWindow(window.hwnd()) };
@@ -2185,7 +2251,7 @@ impl Host {
             window.wheel.reset();
         }
         // 快照变化（增删、过滤、重排）也丢弃未应用的滚轮 residue。
-        if window.last_snapshot.as_ref() != Some(snapshot) {
+        if snapshot_changed {
             window.wheel.reset();
         }
         let requested = window.scroll_offset;
@@ -2215,7 +2281,6 @@ impl Host {
         // 组合期间不绘制 caret，草稿由 preedit 下划线标识；闪烁只在非组合状态生效。
         let composing = focused_composition(snapshot);
         scene.set_caret_visible(window.caret_visible && !composing);
-        window.last_snapshot = Some(snapshot.clone());
         Ok(scene)
     }
 
@@ -2229,8 +2294,9 @@ impl Host {
         snapshot: &PresentationSnapshot,
         width: u32,
         height: u32,
+        snapshot_changed: bool,
     ) -> Result<Scene, HostError> {
-        let mut scene = self.build_scene(window, snapshot, width, height)?;
+        let mut scene = self.build_scene(window, snapshot, width, height, snapshot_changed)?;
         if !window.reveal_requested {
             return Ok(scene);
         }
@@ -2241,13 +2307,13 @@ impl Host {
         let used_caret = scene.caret(focused).is_some();
         if let Some(target) = reveal_target(&scene, focused) {
             window.scroll_offset = target;
-            scene = self.build_scene(window, snapshot, width, height)?;
+            scene = self.build_scene(window, snapshot, width, height, false)?;
             if !used_caret
                 && scene.caret(focused).is_some()
                 && let Some(target) = reveal_target(&scene, focused)
             {
                 window.scroll_offset = target;
-                scene = self.build_scene(window, snapshot, width, height)?;
+                scene = self.build_scene(window, snapshot, width, height, false)?;
             }
         }
         Ok(scene)
@@ -2595,11 +2661,21 @@ impl Host {
     }
 
     /// 逐窗口比较最新快照与瞬时重绘请求；只重绘确有变化的窗口。
+    ///
+    /// 运行时呈现版本没有变化时复用缓存快照：滚动、hover、pressed 与 caret
+    /// 闪烁都是宿主瞬态，不重建运行时快照，也不复制它。
     fn repaint_changed_windows(&mut self) -> Result<(), HostError> {
+        let revision = self.runtime.presentation_revision();
         for key in self.windows.keys().copied().collect::<Vec<_>>() {
             let Some(window) = self.windows.get(&key) else {
                 continue;
             };
+            if window.last_snapshot.is_some() && window.snapshot_revision == revision {
+                if window.paint_requested {
+                    self.with_window(key, |host, window| host.render_cached(window))?;
+                }
+                continue;
+            }
             let ctx = window.ctx;
             let requested = window.paint_requested;
             let snapshot = match self.runtime.presentation_of(ctx) {
@@ -2655,6 +2731,7 @@ impl WindowHost {
             reveal_requested: false,
             paint_requested: true,
             last_snapshot: None,
+            snapshot_revision: 0,
         }
     }
 
@@ -3069,6 +3146,20 @@ fn is_composing(snapshot: &PresentationSnapshot, node: NodeId) -> bool {
 /// 聚焦输入是否仍在组合；没有聚焦输入时视为未组合。
 fn focused_composition(snapshot: &PresentationSnapshot) -> bool {
     focused_input(snapshot).is_some_and(|node| is_composing(snapshot, node))
+}
+
+/// 快照里所有仍在组合的文本输入。
+fn composing_nodes(snapshot: &PresentationSnapshot) -> Vec<NodeId> {
+    snapshot
+        .elements()
+        .filter(|element| element.tag() == "text-input")
+        .filter(|element| {
+            element
+                .edit()
+                .is_some_and(|edit| edit.composition().is_some())
+        })
+        .map(SnapshotElement::id)
+        .collect()
 }
 
 /// 隐藏候选窗的锚点：远离所有显示器工作区。
@@ -4922,6 +5013,120 @@ mod tests {
             edit.composition().is_some(),
             "composing editing keys do not end the composition"
         );
+    }
+
+    #[test]
+    fn wheel_and_pointer_ticks_reuse_the_runtime_snapshot() {
+        let mut host = open_host();
+        for index in 0..1000 {
+            host.runtime
+                .input("What needs to be done?", &format!("Task {index}"))
+                .expect("fill the draft");
+            host.runtime.submit("Add task").expect("add a row");
+        }
+        host.render().expect("render the tall window");
+        // 测试不依赖机器的滚轮设置：固定为一个 notch 三行。
+        host.windows.get_mut(MAIN).expect("the main window").wheel = wheel(WheelLines::Lines(3));
+        assert_eq!(
+            host.windows[MAIN].snapshot_revision,
+            host.runtime.presentation_revision(),
+            "the render stores the current presentation revision"
+        );
+        let scale = host.scene(MAIN).expect("scene").viewport().scale();
+        let point = Point::new(200.0, 200.0);
+        let lparam = pointer_lparam(point, scale);
+        let blank = pointer_lparam(Point::new(5.0, 5.0), scale);
+        // 第一次空白按压把焦点窗口切到 main，这是运行时变化，允许一次重建。
+        for message in [WM_LBUTTONDOWN, WM_LBUTTONUP] {
+            send_msg(
+                &mut host,
+                MSG {
+                    message,
+                    lParam: blank,
+                    ..Default::default()
+                },
+            );
+        }
+        assert_eq!(
+            host.windows[MAIN].snapshot_revision,
+            host.runtime.presentation_revision(),
+            "the warm-up press leaves a current cached snapshot"
+        );
+        let before: Vec<NodeId> = host
+            .runtime
+            .presentation()
+            .expect("snapshot")
+            .elements()
+            .map(zenui::SnapshotElement::id)
+            .collect();
+        let builds = host.runtime.presentation_builds();
+        let counters = host.runtime.counters();
+        for step in 0..30 {
+            send_msg(
+                &mut host,
+                MSG {
+                    message: WM_MOUSEWHEEL,
+                    wParam: WPARAM(((-120i16 as u16) as usize) << 16),
+                    ..Default::default()
+                },
+            );
+            assert_eq!(
+                host.runtime.presentation_builds(),
+                builds,
+                "snapshot rebuilt after wheel {step}"
+            );
+            send_msg(
+                &mut host,
+                MSG {
+                    message: WM_MOUSEMOVE,
+                    lParam: lparam,
+                    ..Default::default()
+                },
+            );
+            for message in [WM_LBUTTONDOWN, WM_LBUTTONUP] {
+                send_msg(
+                    &mut host,
+                    MSG {
+                        message,
+                        lParam: blank,
+                        ..Default::default()
+                    },
+                );
+            }
+            assert_eq!(
+                host.runtime.presentation_builds(),
+                builds,
+                "snapshot rebuilt after pointer tick {step}"
+            );
+            with_main(&mut host, |host, window| host.blink_caret(window));
+            assert_eq!(
+                host.runtime.presentation_builds(),
+                builds,
+                "snapshot rebuilt after blink {step}"
+            );
+        }
+        assert!(
+            host.scene(MAIN).expect("scene").scroll_offset() > 0,
+            "the wheel ticks really scrolled"
+        );
+        assert_eq!(
+            host.runtime.presentation_builds(),
+            builds,
+            "wheel and pointer ticks reuse the runtime snapshot"
+        );
+        assert_eq!(
+            host.runtime.counters(),
+            counters,
+            "wheel and pointer ticks leave runtime counters flat"
+        );
+        let after: Vec<NodeId> = host
+            .runtime
+            .presentation()
+            .expect("snapshot")
+            .elements()
+            .map(zenui::SnapshotElement::id)
+            .collect();
+        assert_eq!(before, after, "Node IDs stay flat while scrolling");
     }
 
     #[test]

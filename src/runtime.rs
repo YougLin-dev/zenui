@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -101,6 +101,10 @@ pub(crate) struct State {
     next_close_epoch: u64,
     /// 窗口打开/关闭/隐藏/显示时递增；原生宿主据此跳过无变化的扫描。
     window_revision: u64,
+    /// 本地编辑状态（焦点、caret、selection、组合、勾选）的版本。
+    presentation_revision: u64,
+    /// 已构建的 presentation snapshot 次数；宿主与基准用它验证滚动不重建快照。
+    presentation_builds: Cell<u64>,
     pub(crate) tasks: BTreeMap<u32, TaskRecord>,
     pub(crate) next_task: u32,
     /// 已排队、等待宿主弹出的文件选择请求；任务本身在 `tasks` 中。
@@ -196,6 +200,8 @@ impl State {
             close_replies: Vec::new(),
             next_close_epoch: 1,
             window_revision: 0,
+            presentation_revision: 0,
+            presentation_builds: Cell::new(0),
             tasks: BTreeMap::new(),
             next_task: 1,
             pending_file_dialogs: Vec::new(),
@@ -306,6 +312,11 @@ impl State {
         self.window_revision = self.window_revision.wrapping_add(1);
     }
 
+    /// 记录一次快照可见的本地状态变化；宿主据此决定是否重建快照。
+    fn bump_presentation(&mut self) {
+        self.presentation_revision = self.presentation_revision.wrapping_add(1);
+    }
+
     fn tree_for_element(&self, element: usize) -> Option<TreeKey> {
         self.trees
             .iter()
@@ -333,8 +344,11 @@ impl State {
     }
 
     fn set_focused_in(&mut self, key: TreeKey, focused: Option<usize>) {
-        if let Some(tree) = self.tree_mut(key) {
+        if let Some(tree) = self.tree_mut(key)
+            && tree.focused != focused
+        {
             tree.focused = focused;
+            self.bump_presentation();
         }
     }
 
@@ -350,6 +364,8 @@ impl State {
     }
 
     fn snapshot(&self, key: TreeKey) -> Option<PresentationSnapshot> {
+        self.presentation_builds
+            .set(self.presentation_builds.get().wrapping_add(1));
         let tree = self.tree(key)?;
         let mut roots = Vec::new();
         collect_snapshot(self, &tree.nodes, &mut roots);
@@ -464,6 +480,7 @@ impl State {
             return;
         }
         self.appearance = appearance;
+        self.bump_presentation();
         self.bump(DepKey::Appearance);
     }
 
@@ -773,8 +790,9 @@ impl State {
             (LocalState::Checkbox { checked }, LocalUpdate::Change(value)) => {
                 *checked = value;
             }
-            _ => {}
+            _ => return,
         }
+        self.bump_presentation();
     }
 
     fn text_input(&self, target: &FindTarget) -> Option<usize> {
@@ -927,10 +945,11 @@ impl State {
             *caret = offset;
             *anchor = offset;
             *selection = Some((offset, offset));
-            true
         } else {
-            false
+            return false;
         }
+        self.bump_presentation();
+        true
     }
 
     /// 原生控件与显式挂接 focus/blur 的元素参与遍历；禁用元素不参与接任或 Tab 顺序。
@@ -2249,6 +2268,9 @@ impl Runtime {
     }
 
     fn refresh_all_once(&mut self) -> Result<(), MountError> {
+        // 刷新会重新绑定组件并可能改写文本、属性和可见性；即使没有计数器
+        // 变化，也必须让宿主知道快照可能过期。
+        self.state.borrow_mut().bump_presentation();
         for key in self.tree_keys() {
             self.refresh_tree_once(key)?;
         }
@@ -2982,6 +3004,7 @@ impl Runtime {
             Movement::SelectAll => (0, length),
         };
         set_local_selection(&mut state.elements[element].local, anchor, focus);
+        state.bump_presentation();
         Ok(())
     }
 
@@ -3040,6 +3063,7 @@ impl Runtime {
             // 这次编辑自己的模型写入不能被当作外部替换。
             history.settle_local = true;
         });
+        with_state(State::bump_presentation);
         // handler unwind 不能把占位事件或 Event 阶段留在槽位里。
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             if let Event::Input(handler) = &mut event {
@@ -3145,6 +3169,7 @@ impl Runtime {
                     selection.map(|(start, end)| text_edit::normalized_range(start, end, length));
                 history.settle_local = true;
             });
+            with_state(State::bump_presentation);
             // handler unwind 不能把占位事件或 Event 阶段留在槽位里。
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 if let Event::Input(handler) = &mut event {
@@ -3233,6 +3258,7 @@ impl Runtime {
                 });
                 Ok((*caret, *selection))
             })?;
+            with_state(State::bump_presentation);
             self.enter_event_phase();
             self.dispatch_element_event(element, EventKind::CompositionStart, |event| {
                 if let Event::CompositionStart(handler) = event {
@@ -3294,6 +3320,7 @@ impl Runtime {
                 *selection = None;
                 Ok((*caret, *selection))
             })?;
+            with_state(State::bump_presentation);
             self.enter_event_phase();
             self.dispatch_element_event(element, EventKind::CompositionUpdate, |event| {
                 if let Event::CompositionUpdate(handler) = event {
@@ -3422,6 +3449,7 @@ impl Runtime {
             history.settle_local = true;
             Ok((before, new_text, *caret))
         })?;
+        with_state(State::bump_presentation);
         self.dispatch_element_event(element, EventKind::CompositionEnd, |event| {
             if let Event::CompositionEnd(handler) = event {
                 handler(CompositionEvent::new(
@@ -3467,6 +3495,7 @@ impl Runtime {
             *selection = composition.base_selection;
             Ok((composition.preedit, *caret, *selection))
         })?;
+        with_state(State::bump_presentation);
         self.dispatch_element_event(element, EventKind::CompositionCancel, |event| {
             if let Event::CompositionCancel(handler) = event {
                 handler(CompositionEvent::new(
@@ -3865,6 +3894,45 @@ impl Runtime {
 
     pub fn counters(&self) -> Counters {
         self.state.borrow().core.counters()
+    }
+
+    /// 呈现版本：任何可能改变 presentation snapshot 的状态变化都会让它变化。
+    ///
+    /// 原生宿主在重绘前比较它；版本未变时可以直接复用上一次快照，滚动与
+    /// 指针瞬态因此不需要重建运行时快照。
+    pub fn presentation_revision(&self) -> u64 {
+        let state = self.state.borrow();
+        let counters = state.core.counters();
+        let mut revision = state.presentation_revision;
+        let mut mix = |value: u64| {
+            revision = revision.rotate_left(9) ^ value;
+            revision = revision.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        };
+        // 任何核心计数变化都可能对应一次组件刷新或挂载；宁可多重建一次，
+        // 也不能复用已经过期的快照。
+        mix(counters.total());
+        mix(state.unmounts);
+        mix(state.next_node_mount);
+        mix(state.window_revision);
+        // `Runtime::presentation()` 跟随焦点窗口；切换到已可见窗口不改变
+        // window_revision，必须单独进入版本。
+        mix(state.focused_window.map_or(0, |key| {
+            key.as_bytes()
+                .iter()
+                .fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+                    (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3)
+                })
+        }));
+        mix(match state.appearance {
+            Appearance::Light => 0,
+            Appearance::Dark => 1,
+        });
+        revision
+    }
+
+    /// 已构建的 presentation snapshot 次数；用于验证滚动与指针输入不重建快照。
+    pub fn presentation_builds(&self) -> u64 {
+        self.state.borrow().presentation_builds.get()
     }
 
     pub fn caret(&self, label: &str) -> Option<usize> {

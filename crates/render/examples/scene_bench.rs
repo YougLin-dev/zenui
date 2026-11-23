@@ -38,30 +38,19 @@ fn measure(repetitions: u32, mut step: impl FnMut()) -> Duration {
     start.elapsed() / repetitions
 }
 
-fn visible_elements(scene: &Scene) -> usize {
-    let viewport = scene.viewport();
-    scene
-        .elements()
-        .iter()
-        .filter(|element| {
-            let rect = element.rect();
-            rect.width > 0.0
-                && rect.height > 0.0
-                && rect.x < viewport.width()
-                && rect.right() > 0.0
-                && rect.y < viewport.height()
-                && rect.bottom() > 0.0
-        })
-        .count()
-}
-
 fn main() {
     const REPETITIONS: u32 = 20;
     let viewport = Viewport::new(900.0, 700.0, 1.0).expect("viewport");
 
     for rows in [100usize, 500, 1000, 5000] {
         let (mut app, path) = imported_runtime(rows);
+        let presentation = measure(REPETITIONS, || {
+            let _ = app.presentation().expect("presentation");
+        });
         let snapshot = app.presentation().expect("presentation");
+        let snapshot_clone = measure(REPETITIONS, || {
+            let _ = snapshot.clone();
+        });
         let fresh = measure(REPETITIONS, || {
             let _ = Scene::build(&snapshot, viewport).expect("scene");
         });
@@ -99,14 +88,14 @@ fn main() {
         };
         let scroll_scene = Scene::build_cached(&input_snapshot, viewport, &scroll_env, &mut cache)
             .expect("scroll scene");
-        let visible = visible_elements(&scroll_scene);
+        let visible = scroll_scene.visible_elements().count();
         let shaped = scroll_scene
             .elements()
             .iter()
             .filter(|element| !element.text().is_empty())
             .count();
         println!(
-            "rows={rows} fresh={fresh:?} cold_cached={cold:?} warm_cached={warm:?} input_rebuild={input_rebuild:?} scroll_build={scroll_build:?} offset={offset} max_offset={max_offset} content_height={:.1} visible={visible} shaped={shaped} elements={elements}",
+            "rows={rows} presentation={presentation:?} snapshot_clone={snapshot_clone:?} fresh={fresh:?} cold_cached={cold:?} warm_cached={warm:?} input_rebuild={input_rebuild:?} scroll_build={scroll_build:?} offset={offset} max_offset={max_offset} content_height={:.1} visible={visible} shaped={shaped} elements={elements}",
             scroll_scene.content_extent().height
         );
         let _ = std::fs::remove_file(&path);
