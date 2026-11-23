@@ -48,7 +48,7 @@ use crate::file_dialog::{FileDialogPresenter, NativeFileDialog};
 use crate::ole::{OleApartment, OleError};
 use crate::shortcuts::{EditorAction, editor_shortcut};
 use zenui_render::{
-    GpuRenderer, Point, RenderPalette, RenderTargetConfig, Scene, SceneCache, SceneElement,
+    GpuRenderer, Point, Rect, RenderPalette, RenderTargetConfig, Scene, SceneCache, SceneElement,
     SceneEnv, Viewport, Visual, wgpu,
 };
 
@@ -332,6 +332,8 @@ struct WindowHost {
     last_viewport: Option<Viewport>,
     /// 滚动触发的重建只更新 hover，不清除 capture-based 的按压目标。
     preserve_press_on_next_rebuild: bool,
+    /// 下一次构建前把聚焦元素或 caret 显露到视口内；显式滚动会清除它。
+    reveal_requested: bool,
     /// 指针、按压、模态或 caret 等瞬时状态变化需要重绘；它们不进入快照。
     paint_requested: bool,
     /// 最近一次构建的呈现快照；未变化的窗口跳过重绘。
@@ -1062,15 +1064,14 @@ impl Host {
         self.render_window(window, snapshot)
     }
 
-    /// 输入前确保内存场景使用当前滚动偏移。
+    /// 输入前确保内存场景使用当前滚动偏移与显露结果。
     ///
     /// `render_window` 在 surface `Timeout`/`Occluded` 时不会更新 `window.scene`；
     /// 指针与键盘输入必须命中最新偏移的场景，因此这里只重建并保存，不呈现。
     fn ensure_scene(&mut self, window: &mut WindowHost) -> Result<(), HostError> {
-        let fresh = window
-            .scene
-            .as_ref()
-            .is_some_and(|scene| scene.scroll_offset() == window.scroll_offset);
+        let fresh = window.scene.as_ref().is_some_and(|scene| {
+            scene.scroll_offset() == window.scroll_offset && !window.reveal_requested
+        });
         if fresh {
             return Ok(());
         }
@@ -1081,7 +1082,7 @@ impl Host {
         if width == 0 || height == 0 {
             return Ok(());
         }
-        let scene = self.build_scene(window, &snapshot, width, height)?;
+        let scene = self.build_scene_with_reveal(window, &snapshot, width, height)?;
         window.scene = Some(scene);
         Ok(())
     }
@@ -1097,7 +1098,7 @@ impl Host {
         if width == 0 || height == 0 {
             return Ok(());
         }
-        let scene = self.build_scene(window, &snapshot, width, height)?;
+        let scene = self.build_scene_with_reveal(window, &snapshot, width, height)?;
         let target = target_config(self.format, width, height)?;
         if self.renderer_target != target {
             self.renderer.resize(target);
@@ -1223,6 +1224,9 @@ impl Host {
                 if let Some(offset) = caret {
                     pointer_dispatch(self.runtime.set_caret_node(node, offset))?;
                 }
+                // 可见切片内的点击通常不需要移动；caret 落在视口外时由同一
+                // 显露规则拉回。
+                window.reveal_requested = true;
             }
             Visual::Checkbox { .. } | Visual::Button { .. } => {
                 window.pressed = Some(node);
@@ -1296,6 +1300,8 @@ impl Host {
         if step == 0 {
             return Ok(());
         }
+        // 显式滚动优先：丢弃尚未应用的显露请求。
+        window.reveal_requested = false;
         window.scroll_offset = window.scroll_offset.saturating_sub(step);
         window.preserve_press_on_next_rebuild = true;
         window.paint_requested = true;
@@ -1317,6 +1323,8 @@ impl Host {
             // ADR：最大偏移为零时不消费滚动键；这里不改变任何状态。
             return Ok(());
         }
+        // 显式滚动优先：丢弃尚未应用的显露请求。
+        window.reveal_requested = false;
         let step = page_step(Some(scene));
         let target = match key {
             VK_PRIOR => window.scroll_offset.saturating_sub(step),
@@ -1568,6 +1576,7 @@ impl Host {
         } else {
             pointer_dispatch(self.runtime.insert_text_node(focused, text))?;
         }
+        window.reveal_requested = true;
         window.paint_requested = true;
         Ok(())
     }
@@ -1610,6 +1619,7 @@ impl Host {
                 self.runtime.focus_next_in(window.ctx)
             }
             .map_err(HostError::WindowState)?;
+            window.reveal_requested = true;
             window.paint_requested = true;
             return Ok(());
         }
@@ -1655,6 +1665,7 @@ impl Host {
             pointer_dispatch(self.runtime.keydown_node(focused, Key::Escape))?;
             if composing {
                 self.notify_ime_cancel(window);
+                window.reveal_requested = true;
             }
             window.paint_requested = true;
             return Ok(());
@@ -1663,6 +1674,7 @@ impl Host {
             match action {
                 EditorAction::SelectAll => {
                     pointer_dispatch(self.runtime.select_all_node(focused))?;
+                    window.reveal_requested = true;
                     window.paint_requested = true;
                 }
                 // Undo/Redo/Cut/Copy/Paste 已由后续工单保留；在接线前消费按键，
@@ -1687,11 +1699,13 @@ impl Host {
         }
         if key == VK_BACK {
             pointer_dispatch(self.runtime.backspace_node(focused))?;
+            window.reveal_requested = true;
             window.paint_requested = true;
             return Ok(());
         }
         if key == VK_DELETE {
             pointer_dispatch(self.runtime.delete_forward_node(focused))?;
+            window.reveal_requested = true;
             window.paint_requested = true;
             return Ok(());
         }
@@ -1707,6 +1721,7 @@ impl Host {
                 pointer_dispatch(self.runtime.set_selection_node(focused, anchor, focus))?;
             }
         }
+        window.reveal_requested = true;
         window.paint_requested = true;
         Ok(())
     }
@@ -1723,6 +1738,7 @@ impl Host {
         if !is_composing(&snapshot, node) {
             pointer_dispatch(self.runtime.compose_start_node(node))?;
         }
+        window.reveal_requested = true;
         window.paint_requested = true;
         Ok(())
     }
@@ -1748,6 +1764,7 @@ impl Host {
             None
         };
         self.apply_ime_composition(window, node, request, commit, update)?;
+        window.reveal_requested = true;
         window.paint_requested = true;
         Ok(())
     }
@@ -1829,6 +1846,7 @@ impl Host {
         }
         if cancelled {
             self.notify_ime_cancel(window);
+            window.reveal_requested = true;
         }
         Ok(cancelled)
     }
@@ -1905,6 +1923,7 @@ impl Host {
     ///
     /// 系统组合窗口本身被 `WM_IME_STARTCOMPOSITION` 的窗口过程分支抑制；这里的
     /// `COMPOSITIONFORM` 仍参与候选窗定位。两个结构的坐标相对窗口左上角，不是屏幕坐标。
+    /// 组合起点 caret 离开视口时把两个窗口移出工作区，隐藏候选窗。
     fn position_ime(&self, window: &WindowHost, snapshot: &PresentationSnapshot) {
         let Some(node) = focused_input(snapshot) else {
             return;
@@ -1928,15 +1947,10 @@ impl Host {
                     .and_then(|element| element.caret_at_value(start))
             })
             .or_else(|| scene.caret(node));
-        let Some(caret) = caret else {
-            return;
-        };
-        let scale = scene.viewport().scale();
-        let point = POINT {
-            x: (caret.x * scale).round() as i32,
-            y: (caret.y * scale).round() as i32,
-        };
-        // 安全：HIMC 由 ImmGetContext 获取，两个结构都是本地值。
+        let point = caret
+            .and_then(|caret| ime_candidate_point(scene.viewport(), caret))
+            .unwrap_or(HIDDEN_IME_POINT);
+        // 安全：HIMC 由 ImmGetContext 获取；两个结构都是本地值。
         unsafe {
             let himc = ImmGetContext(window.hwnd());
             if himc.0.is_null() {
@@ -2089,6 +2103,40 @@ impl Host {
         let composing = focused_composition(snapshot);
         scene.set_caret_visible(window.caret_visible && !composing);
         window.last_snapshot = Some(snapshot.clone());
+        Ok(scene)
+    }
+
+    /// 构建场景，并在需要时按 ADR-0010 把聚焦元素或 caret 显露到视口内。
+    ///
+    /// 先在当前偏移构建一次；需要移动时重建一次，只有第一遍用了元素边框且
+    /// 重建后出现 caret 几何时才做第二遍。显露本身最多两次重建。
+    fn build_scene_with_reveal(
+        &mut self,
+        window: &mut WindowHost,
+        snapshot: &PresentationSnapshot,
+        width: u32,
+        height: u32,
+    ) -> Result<Scene, HostError> {
+        let mut scene = self.build_scene(window, snapshot, width, height)?;
+        if !window.reveal_requested {
+            return Ok(scene);
+        }
+        window.reveal_requested = false;
+        let Some(focused) = snapshot.focus() else {
+            return Ok(scene);
+        };
+        let used_caret = scene.caret(focused).is_some();
+        if let Some(target) = reveal_target(&scene, focused) {
+            window.scroll_offset = target;
+            scene = self.build_scene(window, snapshot, width, height)?;
+            if !used_caret
+                && scene.caret(focused).is_some()
+                && let Some(target) = reveal_target(&scene, focused)
+            {
+                window.scroll_offset = target;
+                scene = self.build_scene(window, snapshot, width, height)?;
+            }
+        }
         Ok(scene)
     }
 
@@ -2358,6 +2406,8 @@ impl Host {
         };
         window.native.shown = show;
         window.wheel.reset();
+        // 隐藏保留焦点与偏移；显示按 ADR 不触发显露，因此丢弃待处理请求。
+        window.reveal_requested = false;
         window.paint_requested = true;
         if !show {
             window.clear_pointer_transients();
@@ -2480,6 +2530,7 @@ impl WindowHost {
             wheel: WheelScroll::from_system(),
             last_viewport: None,
             preserve_press_on_next_rebuild: false,
+            reveal_requested: false,
             paint_requested: true,
             last_snapshot: None,
         }
@@ -2510,6 +2561,34 @@ fn file_dialog_ole_error(error: OleError) -> FileDialogError {
         OleError::ChangedMode => FileDialogError::Unsupported,
         OleError::Failed(message) => FileDialogError::DialogFailed(message),
     }
+}
+
+/// 聚焦元素的显露目标：优先 caret 几何，否则用元素边框。
+///
+/// 返回新的偏移；`None` 表示不需要移动。几何已经是场景坐标（已按当前偏移
+/// 平移）。
+fn reveal_target(scene: &Scene, focused: NodeId) -> Option<i32> {
+    let element = scene.node(focused)?;
+    let rect = scene.caret(focused).unwrap_or_else(|| element.rect());
+    reveal_offset(
+        scene.viewport().height(),
+        rect,
+        scene.scroll_offset(),
+        scene.max_scroll_offset(),
+    )
+}
+
+/// ADR-0010 的显露规则：顶部优先，只做垂直移动，夹到 `[0, max]`。
+fn reveal_offset(viewport_height: f32, rect: Rect, applied: i32, max: i32) -> Option<i32> {
+    let delta = if rect.y < 0.0 {
+        rect.y.floor() as i32
+    } else if rect.bottom() > viewport_height {
+        (rect.bottom() - viewport_height).ceil() as i32
+    } else {
+        return None;
+    };
+    let target = applied.saturating_add(delta).clamp(0, max);
+    (target != applied).then_some(target)
 }
 
 /// ADR-0010 的翻页步长：保留 24 逻辑像素重叠，至少 1 像素。
@@ -2840,6 +2919,35 @@ fn is_composing(snapshot: &PresentationSnapshot, node: NodeId) -> bool {
 /// 聚焦输入是否仍在组合；没有聚焦输入时视为未组合。
 fn focused_composition(snapshot: &PresentationSnapshot) -> bool {
     focused_input(snapshot).is_some_and(|node| is_composing(snapshot, node))
+}
+
+/// 隐藏候选窗的锚点：远离所有显示器工作区。
+const HIDDEN_IME_POINT: POINT = POINT {
+    x: -32_000,
+    y: -32_000,
+};
+
+/// 组合窗与候选窗的客户区物理锚点；`None` 表示组合起点 caret 已完全离开视口。
+///
+/// 锚点取 caret 左上角并 clamp 进客户区：部分越界的 caret 仍把候选窗留在窗口内，
+/// 完全离开视口时调用方隐藏候选窗，而不是沿用上一次场景的锚点（ADR-0010）。
+fn ime_candidate_point(viewport: Viewport, caret: Rect) -> Option<POINT> {
+    if caret.right() <= 0.0
+        || caret.bottom() <= 0.0
+        || caret.x >= viewport.width()
+        || caret.y >= viewport.height()
+    {
+        return None;
+    }
+    let scale = viewport.scale();
+    Some(POINT {
+        x: (caret.x * scale)
+            .round()
+            .clamp(0.0, viewport.width() * scale) as i32,
+        y: (caret.y * scale)
+            .round()
+            .clamp(0.0, viewport.height() * scale) as i32,
+    })
 }
 
 /// 一次闪烁后的 caret 可见性：只有聚焦输入、非组合且窗口在前台时才翻转；
@@ -3461,6 +3569,93 @@ mod tests {
         assert!(up > 0);
         let down = wheel.step(i32::MIN, 100);
         assert!(down < 0);
+    }
+
+    #[test]
+    fn reveal_offsets_are_minimal_vertical_moves() {
+        // Above the viewport: add the (floored) top.
+        assert_eq!(
+            reveal_offset(700.0, Rect::new(0.0, -50.0, 100.0, 20.0), 100, 1000),
+            Some(50)
+        );
+        // Below: add the ceiling of the overflow.
+        assert_eq!(
+            reveal_offset(700.0, Rect::new(0.0, 690.0, 100.0, 20.0), 100, 1000),
+            Some(110)
+        );
+        // Fully visible: no movement.
+        assert_eq!(
+            reveal_offset(700.0, Rect::new(0.0, 10.0, 100.0, 20.0), 100, 1000),
+            None
+        );
+        // Taller than the viewport: the top edge wins.
+        assert_eq!(
+            reveal_offset(700.0, Rect::new(0.0, -50.0, 100.0, 900.0), 100, 1000),
+            Some(50)
+        );
+        // Clamped at both ends.
+        assert_eq!(
+            reveal_offset(700.0, Rect::new(0.0, -50.0, 100.0, 20.0), 10, 1000),
+            Some(0)
+        );
+        assert_eq!(
+            reveal_offset(700.0, Rect::new(0.0, -50.0, 100.0, 20.0), 0, 1000),
+            None
+        );
+        assert_eq!(
+            reveal_offset(700.0, Rect::new(0.0, 690.0, 100.0, 20.0), 1000, 1000),
+            None
+        );
+        // Fractional geometry rounds away from the viewport edge.
+        assert_eq!(
+            reveal_offset(700.0, Rect::new(0.0, -49.5, 100.0, 20.0), 100, 1000),
+            Some(50)
+        );
+        assert_eq!(
+            reveal_offset(700.0, Rect::new(0.0, 699.5, 100.0, 1.0), 100, 1000),
+            Some(101)
+        );
+    }
+
+    #[test]
+    fn ime_anchors_follow_the_translated_caret_and_clamp_into_the_client_area() {
+        let viewport = Viewport::new(900.0, 700.0, 1.5).expect("viewport");
+        // Scene caret to client pixels at 150%.
+        assert_eq!(
+            ime_candidate_point(viewport, Rect::new(96.0, 62.0, 1.0, 19.0)),
+            Some(POINT { x: 144, y: 93 })
+        );
+        // A partially clipped caret stays inside the client area.
+        assert_eq!(
+            ime_candidate_point(viewport, Rect::new(-0.5, -10.0, 1.0, 19.0)),
+            Some(POINT { x: 0, y: 0 })
+        );
+        assert_eq!(
+            ime_candidate_point(viewport, Rect::new(899.5, 695.0, 1.0, 19.0)),
+            Some(POINT { x: 1349, y: 1043 })
+        );
+    }
+
+    #[test]
+    fn a_caret_that_leaves_the_viewport_hides_the_candidate() {
+        let viewport = Viewport::new(900.0, 700.0, 1.5).expect("viewport");
+        // Fully above, below, left and right; the half-open edge itself is outside.
+        assert_eq!(
+            ime_candidate_point(viewport, Rect::new(96.0, -20.0, 1.0, 19.0)),
+            None
+        );
+        assert_eq!(
+            ime_candidate_point(viewport, Rect::new(96.0, 700.0, 1.0, 19.0)),
+            None
+        );
+        assert_eq!(
+            ime_candidate_point(viewport, Rect::new(-1.0, 20.0, 1.0, 19.0)),
+            None
+        );
+        assert_eq!(
+            ime_candidate_point(viewport, Rect::new(900.0, 20.0, 1.0, 19.0)),
+            None
+        );
     }
 
     #[test]
