@@ -1863,6 +1863,18 @@ fn the_scrollbar_thumb_has_a_documented_minimum() {
         None,
         "a track shorter than the minimum thumb has no scrollbar"
     );
+
+    let full_track = Viewport::new(900.0, 32.0, 1.0).expect("full-track viewport");
+    let full_track_scene = Scene::build(&snapshot, full_track).expect("full-track scene");
+    assert!(
+        full_track_scene.max_scroll_offset() > 0,
+        "the 32-point viewport still has scrollable content"
+    );
+    assert_eq!(
+        full_track_scene.scrollbar(),
+        None,
+        "a thumb that fills the whole track has no drag travel"
+    );
 }
 
 #[test]

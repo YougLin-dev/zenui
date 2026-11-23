@@ -22,12 +22,12 @@ const MIN_THUMB: f32 = 24.0;
 pub(crate) const RADIUS: f32 = 4.0;
 
 impl Scrollbar {
-    /// 从场景的滚动度量推导覆盖层；内容可以滚动且轨道容得下最小 thumb 时才存在。
+    /// 从场景的滚动度量推导覆盖层；内容可以滚动且 thumb 短于轨道时才存在。
     ///
     /// 轨道位于视口右缘内侧并覆盖内容，不预留布局空间。thumb 高度按
     /// `viewport.height / content.height` 缩放，最小 24 逻辑像素；位置按
-    /// 已应用偏移在最大偏移中的比例落在剩余轨道上。轨道短于最小 thumb 的
-    /// 退化视口没有滚动条。
+    /// 已应用偏移在最大偏移中的比例落在剩余轨道上。轨道短于最小 thumb、
+    /// 或 thumb 会填满轨道（没有拖动行程）的退化视口没有滚动条。
     pub(crate) fn from_metrics(
         viewport: Viewport,
         content_extent: Rect,
@@ -44,6 +44,10 @@ impl Scrollbar {
         let fraction = scroll_offset as f32 / max_scroll_offset as f32;
         let thumb_height =
             (track_height * viewport.height() / content_extent.height).max(MIN_THUMB);
+        // 填满轨道的 thumb 没有拖动行程，也没有可以分页的轨道。
+        if thumb_height >= track_height {
+            return None;
+        }
         let track = Rect::new(
             viewport.width() - INSET - THICKNESS,
             INSET,
