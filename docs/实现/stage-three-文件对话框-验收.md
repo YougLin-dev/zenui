@@ -23,10 +23,10 @@
 - 使用一个临时的可见验收探针（未提交）包裹 `zenui_demo::TodoApp`，增加 `Slow task` 按钮与结果文本，以便观察对话框打开期间的 worker 交付；demo 的按钮、任务与共享模型都是实际实现。宿主用 `HostConfig::visible()` 与默认 presenter，没有 `set_file_dialog_presenter`。
 - 主窗口的点击和字符输入走与隐藏 smoke 相同的窗口过程；对话框由 UIAutomation 定位：`文件名(N)` 编辑框 AutomationId `1148`，Open 按钮 `1`，Cancel 按钮 `2`。对话框用 class `#32770`、标题 `Import tasks` 与 owner HWND 识别。
 - 每个对话框先导航到临时数据目录，再截图与选择，避免文件列表包含用户其它目录。截图用 `PrintWindow(PW_RENDERFULLCONTENT)` 读取完整窗口，先写 BMP，再转 PNG。
-- **隐私裁剪：** 对话框 PNG 的左侧导航窗格用纯色矩形遮盖，因为其中显示当前登录账户的 OneDrive 显示名；标题栏、地址栏、文件列表、文件类型过滤器和按钮未改动。主窗口截图未裁剪。
+- **隐私裁剪：** 对话框 PNG 的左侧导航窗格用纯色矩形遮盖，因为其中显示当前登录账户的 OneDrive 显示名；文件名编辑框中的本机账户名同样用同色矩形遮蔽（#185 文档清理时补做）。标题栏、地址栏、文件列表、文件类型过滤器和按钮未改动。主窗口截图未裁剪。
 - owner 禁用由 `IsWindowEnabled(main)` 在对话框打开时读取；主窗口截图同时显示非活动标题栏。取消和 Open 都由 UIAutomation 调用 shell 按钮完成，没有程序化关闭对话框。
 - 对话框期间的 worker 完成用两次主窗口 `PrintWindow` 比较：慢任务 sleep 1200ms；第一次截图在对话框打开后约 0.4s，第二次在约 2s；`states.txt` 记录 `changed_pixels=2952`。第二张截图在对话框仍然打开时取得，画面出现 `slow task done`。
-- 窗口状态、标题、class、owner、过滤器和完整文件名记录在 [`证据/file-picker/states.txt`](证据/file-picker/states.txt)。日志中 `changed_pixels` 是两次 BGRA 截图的逐字节差异数；`owner_enabled=false` 是原生启用位。
+- 窗口状态、标题、class、owner、过滤器和完整文件名记录在 [`证据/file-picker/states.txt`](证据/file-picker/states.txt)。日志中 `changed_pixels` 是两次 BGRA 截图的逐字节差异数；`owner_enabled=false` 是原生启用位。`states.txt` 中的本机临时路径前缀 `C:\Users\<user>\AppData\Local\Temp` 已在 #185 文档清理时替换为 `%TEMP%`，其余字段未改动；这属于隐私归一，不影响文件名、Unicode 路径与错误文本的结论。
 
 ## 可见结果
 
