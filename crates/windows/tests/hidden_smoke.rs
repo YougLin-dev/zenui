@@ -2239,3 +2239,183 @@ fn an_edit_after_wheel_scrolling_reveals_the_focused_input() {
     assert_eq!(glyphs(&host, input), 2, "the second character was inserted");
     assert_eq!(focused_id(&host), Some(input), "the editor keeps focus");
 }
+
+#[test]
+fn dragging_the_scrollbar_thumb_scrolls_the_shared_offset_and_clamps() {
+    let mut host = open_tall_host(100);
+    host.render().expect("initial render");
+    let scene = host.scene(MAIN).expect("scene");
+    let scale = scene.viewport().scale();
+    let bar = scene.scrollbar().expect("overflow has a scrollbar");
+    let max = scene.max_scroll_offset();
+    assert!(max > 0);
+
+    let track = bar.track();
+    let thumb = bar.thumb();
+    let grab = Point::new(thumb.x + thumb.width / 2.0, thumb.y + 4.0);
+    post_down(&host, grab, scale);
+    host.pump().expect("grab the thumb");
+    let past_bottom = Point::new(grab.x, track.bottom() + 200.0);
+    post_move(&host, past_bottom, scale);
+    host.pump().expect("drag past the bottom");
+    assert_eq!(
+        host.scene(MAIN).expect("scene").scroll_offset(),
+        max,
+        "the drag clamps at the maximum"
+    );
+    post_up(&host, past_bottom, scale);
+    host.pump().expect("release at the bottom");
+
+    let scene = host.scene(MAIN).expect("scene at max");
+    let bar = scene.scrollbar().expect("scrollbar at max");
+    let thumb = bar.thumb();
+    let grab = Point::new(thumb.x + thumb.width / 2.0, thumb.y + thumb.height / 2.0);
+    post_down(&host, grab, scale);
+    host.pump().expect("grab the bottom thumb");
+    let past_top = Point::new(grab.x, bar.track().y - 200.0);
+    post_move(&host, past_top, scale);
+    host.pump().expect("drag past the top");
+    assert_eq!(
+        host.scene(MAIN).expect("scene").scroll_offset(),
+        0,
+        "the drag clamps at zero"
+    );
+    post_up(&host, past_top, scale);
+    host.pump().expect("release at the top");
+    assert_eq!(host.scene(MAIN).expect("scene").scroll_offset(), 0);
+
+    post_close(&host);
+    host.run().expect("process the close");
+}
+
+#[test]
+fn a_scrollbar_track_click_pages_towards_the_clicked_side() {
+    let mut host = open_tall_host(100);
+    host.render().expect("initial render");
+    let scene = host.scene(MAIN).expect("scene");
+    let scale = scene.viewport().scale();
+    let page = ((scene.viewport().height() - 24.0).floor() as i32).max(1);
+    let bar = scene.scrollbar().expect("scrollbar");
+    let below = Point::new(
+        bar.track().x + bar.track().width / 2.0,
+        bar.thumb().bottom() + 40.0,
+    );
+    post_click(&host, below, scale);
+    host.pump().expect("page down");
+    assert_eq!(host.scene(MAIN).expect("scene").scroll_offset(), page);
+
+    let scene = host.scene(MAIN).expect("scene after paging");
+    let bar = scene.scrollbar().expect("scrollbar");
+    let above = Point::new(
+        bar.track().x + bar.track().width / 2.0,
+        bar.thumb().y - 40.0,
+    );
+    post_click(&host, above, scale);
+    host.pump().expect("page up");
+    assert_eq!(host.scene(MAIN).expect("scene").scroll_offset(), 0);
+
+    post_close(&host);
+    host.run().expect("process the close");
+}
+
+#[test]
+fn the_scrollbar_wins_hit_priority_over_the_content_under_it() {
+    let mut host = open_tall_host(100);
+    host.render().expect("initial render");
+    let (_, point, scale) = center_label(&host, MAIN, "What needs to be done?");
+    post_click(&host, point, scale);
+    host.pump().expect("focus the draft input");
+    let focused = focused_id(&host).expect("a focused input");
+
+    let scene = host.scene(MAIN).expect("scene");
+    let bar = scene.scrollbar().expect("scrollbar");
+    let click = Point::new(bar.track().x + 2.0, bar.thumb().bottom() + 20.0);
+    assert!(
+        scene.hit_test(click).is_some(),
+        "content sits under the overlay"
+    );
+    post_click(&host, click, scale);
+    host.pump().expect("click the track over content");
+    assert_eq!(
+        focused_id(&host),
+        Some(focused),
+        "the scrollbar does not blur the focused input"
+    );
+    assert!(
+        host.scene(MAIN).expect("scene").scroll_offset() > 0,
+        "the track click pages instead of activating content"
+    );
+
+    post_close(&host);
+    host.run().expect("process the close");
+}
+
+#[test]
+fn wheel_drag_and_keys_share_one_clamped_offset_without_stale_transients() {
+    let mut host = open_tall_host(100);
+    host.render().expect("initial render");
+    post_wheel(&host, -120);
+    host.pump().expect("one wheel step");
+    let scrolled = host.scene(MAIN).expect("scene").scroll_offset();
+    assert!(scrolled > 0);
+
+    let (scale, bar) = {
+        let scene = host.scene(MAIN).expect("scene");
+        (
+            scene.viewport().scale(),
+            scene.scrollbar().expect("scrollbar"),
+        )
+    };
+    let grab = Point::new(
+        bar.thumb().x + bar.thumb().width / 2.0,
+        bar.thumb().y + bar.thumb().height / 2.0,
+    );
+    post_down(&host, grab, scale);
+    host.pump().expect("grab the thumb");
+    let middle = Point::new(grab.x, bar.track().y + bar.track().height / 2.0);
+    post_move(&host, middle, scale);
+    host.pump().expect("drag to the middle");
+    let dragged = host.scene(MAIN).expect("scene").scroll_offset();
+    assert!(
+        dragged > scrolled,
+        "the drag continues from the wheel offset"
+    );
+    post_up(&host, middle, scale);
+    host.pump().expect("release the drag");
+
+    let scene = host.scene(MAIN).expect("scene");
+    let max = scene.max_scroll_offset();
+    let page = ((scene.viewport().height() - 24.0).floor() as i32).max(1);
+    post_key(&host, VK_END);
+    host.pump().expect("End");
+    assert_eq!(host.scene(MAIN).expect("scene").scroll_offset(), max);
+    post_key(&host, VK_PRIOR);
+    host.pump().expect("PageUp");
+    assert_eq!(
+        host.scene(MAIN).expect("scene").scroll_offset(),
+        (max - page).max(0)
+    );
+
+    // 拖动结束后指针移动仍能正常 hover 内容，没有残留的按压状态。
+    let scene = host.scene(MAIN).expect("scene");
+    let button = scene
+        .elements()
+        .iter()
+        .find(|element| {
+            matches!(element.visual(), Visual::Button { .. })
+                && element.rect().y >= 0.0
+                && element.rect().bottom() <= scene.viewport().height()
+        })
+        .expect("a visible button");
+    let id = button.id();
+    let rect = button.rect();
+    let point = Point::new(rect.x + rect.width / 2.0, rect.y + rect.height / 2.0);
+    post_move(&host, point, scale);
+    host.pump().expect("hover a button after the drag");
+    let node = host.scene(MAIN).expect("scene").node(id).expect("button");
+    assert!(node.hovered(), "the drag leaves no stale hover block");
+    assert!(!node.pointer_pressed(), "the drag leaves no pressed state");
+
+    post_close(&host);
+    host.run().expect("process the close");
+}

@@ -516,12 +516,12 @@ impl Scene {
         self.max_scroll_offset
     }
 
-    /// 覆盖在视口右缘的滚动条几何；内容能够滚动且轨道容得下最小 thumb 时才存在。
+    /// 覆盖在视口右缘的滚动条几何；内容能够滚动且 thumb 短于轨道时才存在。
     ///
     /// 由 viewport、内容范围、已应用偏移与最大偏移推导，不新增元素或快照
     /// 属性，也不改变布局与 Node ID。thumb 高度按 viewport/content 比例缩放
-    /// 且最小 24 逻辑像素；轨道本身短于 24 逻辑像素的退化视口不绘制。
-    /// GPU 绘制与宿主命中测试使用同一份几何。
+    /// 且最小 24 逻辑像素；轨道短于最小 thumb 或 thumb 会填满轨道的退化视口
+    /// 不绘制。GPU 绘制与宿主命中测试使用同一份几何。
     pub fn scrollbar(&self) -> Option<Scrollbar> {
         Scrollbar::from_metrics(
             self.viewport,

@@ -49,7 +49,7 @@ use crate::ole::{OleApartment, OleError};
 use crate::shortcuts::{EditorAction, editor_shortcut};
 use zenui_render::{
     GpuRenderer, Point, Rect, RenderPalette, RenderTargetConfig, Scene, SceneCache, SceneElement,
-    SceneEnv, Viewport, Visual, wgpu,
+    SceneEnv, Scrollbar, Viewport, Visual, wgpu,
 };
 
 /// 宿主私有的窗口消息注册表；其他模块不得自行定义 `WM_APP + N`。
@@ -332,6 +332,8 @@ struct WindowHost {
     last_viewport: Option<Viewport>,
     /// 滚动触发的重建只更新 hover，不清除 capture-based 的按压目标。
     preserve_press_on_next_rebuild: bool,
+    /// 滚动条 thumb 拖动中指针相对 thumb 顶部的逻辑偏移；捕获与它同生共死。
+    scrollbar_drag: Option<f32>,
     /// 下一次构建前把聚焦元素或 caret 显露到视口内；显式滚动会清除它。
     reveal_requested: bool,
     /// 指针、按压、模态或 caret 等瞬时状态变化需要重绘；它们不进入快照。
@@ -1180,8 +1182,6 @@ impl Host {
         window: &mut WindowHost,
         lparam: LPARAM,
     ) -> Result<(), HostError> {
-        // 指针操作会移动焦点或 caret；先结束任何组合，避免 preedit 跟随到别处。
-        self.cancel_compositions(window)?;
         // 一次指针按下只属于一个窗口；其它窗口的按压瞬态立即结束。
         self.clear_pressed_except(window.ctx.key());
         let scale = window
@@ -1192,6 +1192,18 @@ impl Host {
         window.pointer = Some(point);
         window.paint_requested = true;
 
+        // 覆盖层滚动条先于内容获得命中：拖动 thumb 或点击轨道只滚动，
+        // 不移动焦点、不取消 IME 组合（ADR-0010：滚动永不提交或取消组合）。
+        if let Some(bar) = window.scene.as_ref().and_then(Scene::scrollbar)
+            && bar.hit(point)
+        {
+            window.hovered = None;
+            window.pressed = None;
+            return self.scrollbar_pressed(window, bar, point);
+        }
+
+        // 指针操作会移动焦点或 caret；先结束任何组合，避免 preedit 跟随到别处。
+        self.cancel_compositions(window)?;
         let Some((node, visual, caret, disabled)) = window.scene.as_ref().and_then(|scene| {
             let node = scene.hit_test(point)?;
             let element = scene.node(node)?;
@@ -1247,6 +1259,91 @@ impl Host {
         Ok(())
     }
 
+    /// 滚动条按下：thumb 开始拖动并捕获指针，轨道点击向指针一侧翻一页。
+    fn scrollbar_pressed(
+        &mut self,
+        window: &mut WindowHost,
+        bar: Scrollbar,
+        point: Point,
+    ) -> Result<(), HostError> {
+        // 上一次拖动只会在捕获丢失后留下；按下总是重新开始一次手势。
+        window.scrollbar_drag = None;
+        let thumb = bar.thumb();
+        if thumb.contains(point) {
+            // 捕获指针：拖动离开轨道后松开仍回到本窗口。
+            // 安全：捕获转移会同步向旧捕获窗口送出 WM_CAPTURECHANGED；
+            // 在禁止重入的窗口里调用 SetCapture。
+            self.without_routing(Some(window.hwnd()), |_| unsafe {
+                SetCapture(window.hwnd());
+            });
+            window.scrollbar_drag = Some(point.y - thumb.y);
+            return Ok(());
+        }
+        let Some(scene) = window.scene.as_ref() else {
+            return Ok(());
+        };
+        let max = scene.max_scroll_offset();
+        if max == 0 {
+            return Ok(());
+        }
+        let step = page_step(Some(scene));
+        let target = if point.y < thumb.y {
+            window.scroll_offset.saturating_sub(step)
+        } else {
+            window.scroll_offset.saturating_add(step)
+        }
+        .clamp(0, max);
+        self.explicit_scroll(window, target);
+        Ok(())
+    }
+
+    /// thumb 拖动：按指针位置换算夹取后的偏移，不重新评估元素按压。
+    fn drag_scrollbar(&mut self, window: &mut WindowHost, point: Point) -> Result<(), HostError> {
+        let Some(grab) = window.scrollbar_drag else {
+            return Ok(());
+        };
+        let Some(scene) = window.scene.as_ref() else {
+            return Ok(());
+        };
+        let Some(bar) = scene.scrollbar() else {
+            self.end_scrollbar_drag(window);
+            return Ok(());
+        };
+        let max = scene.max_scroll_offset();
+        if max == 0 {
+            self.end_scrollbar_drag(window);
+            return Ok(());
+        }
+        let Some(offset) = scrollbar_drag_offset(bar.track(), bar.thumb(), grab, point.y, max)
+        else {
+            return Ok(());
+        };
+        window.hovered = None;
+        if window.scroll_offset != offset {
+            self.explicit_scroll(window, offset);
+        }
+        Ok(())
+    }
+
+    /// 结束 thumb 拖动并安排释放捕获；没有拖动时是空操作。
+    fn end_scrollbar_drag(&mut self, window: &mut WindowHost) -> bool {
+        if window.scrollbar_drag.take().is_none() {
+            return false;
+        }
+        window.release_capture = true;
+        window.paint_requested = true;
+        true
+    }
+
+    /// 显式滚动落点：丢弃待决显露与滚轮 residue，保留 capture-based 按压目标。
+    fn explicit_scroll(&mut self, window: &mut WindowHost, offset: i32) {
+        window.reveal_requested = false;
+        window.wheel.reset();
+        window.scroll_offset = offset;
+        window.preserve_press_on_next_rebuild = true;
+        window.paint_requested = true;
+    }
+
     /// 指针移动：更新悬停目标；按住时离开原目标会清除按住状态。
     fn pointer_moved(&mut self, window: &mut WindowHost, lparam: LPARAM) -> Result<(), HostError> {
         let scale = window
@@ -1256,11 +1353,14 @@ impl Host {
         let point = pointer_point(lparam, scale);
         window.pointer = Some(point);
         self.arm_leave_tracking(window);
+        if window.scrollbar_drag.is_some() {
+            return self.drag_scrollbar(window, point);
+        }
 
-        let hovered = window.scene.as_ref().and_then(|scene| {
-            let node = scene.hit_test(point)?;
-            (!scene.node(node)?.disabled()).then_some(node)
-        });
+        let hovered = window
+            .scene
+            .as_ref()
+            .and_then(|scene| hover_at(scene, point));
         let mut changed = hovered != window.hovered;
         window.hovered = hovered;
         if window.pressed.is_some() && window.pressed != hovered {
@@ -1324,7 +1424,6 @@ impl Host {
             return Ok(());
         }
         // 显式滚动优先：丢弃尚未应用的显露请求。
-        window.reveal_requested = false;
         let step = page_step(Some(scene));
         let target = match key {
             VK_PRIOR => window.scroll_offset.saturating_sub(step),
@@ -1333,10 +1432,7 @@ impl Host {
             VK_END => max,
             _ => return Ok(()),
         };
-        window.wheel.reset();
-        window.scroll_offset = target;
-        window.preserve_press_on_next_rebuild = true;
-        window.paint_requested = true;
+        self.explicit_scroll(window, target);
         Ok(())
     }
 
@@ -1352,6 +1448,16 @@ impl Host {
             .map_or(1.0, |scene| scene.viewport().scale());
         let point = pointer_point(lparam, scale);
         window.pointer = Some(point);
+        if window.scrollbar_drag.take().is_some() {
+            // 松开只结束拖动：不激活指针下的元素，也不改焦点。
+            window.release_capture = true;
+            window.hovered = window
+                .scene
+                .as_ref()
+                .and_then(|scene| hover_at(scene, point));
+            window.paint_requested = true;
+            return Ok(());
+        }
         // 先取走目标：松开后的捕获释放会同步送出 WM_CAPTURECHANGED，
         // 那条消息不能把这次松开要激活的目标一起清掉。
         let target = window.pressed.take();
@@ -1380,29 +1486,31 @@ impl Host {
             }
         }
 
-        window.hovered = window.scene.as_ref().and_then(|scene| {
-            let node = scene.hit_test(point)?;
-            (!scene.node(node)?.disabled()).then_some(node)
-        });
+        window.hovered = window
+            .scene
+            .as_ref()
+            .and_then(|scene| hover_at(scene, point));
         Ok(())
     }
 
-    /// 捕获丢失（例如系统抢走指针）：按住状态不能残留。
+    /// 捕获丢失（例如系统抢走指针）：按住状态与 thumb 拖动都不能残留。
     fn capture_lost(&mut self, window: &mut WindowHost) -> Result<(), HostError> {
-        if window.pressed.take().is_some() {
+        let drag = window.scrollbar_drag.take().is_some();
+        if window.pressed.take().is_some() || drag {
             window.paint_requested = true;
         }
         Ok(())
     }
 
-    /// 焦点丢失：清除按住瞬态与组合，并让下一帧不再绘制按下状态。
+    /// 焦点丢失：清除按住瞬态、thumb 拖动与组合，并让下一帧不再绘制按下状态。
     fn focus_lost(&mut self, window: &mut WindowHost) -> Result<(), HostError> {
+        let was_dragging = window.scrollbar_drag.take().is_some();
         let was_pressed = window.pressed.take().is_some();
-        if was_pressed {
+        if was_pressed || was_dragging {
             window.release_capture = true;
         }
         let cancelled = self.cancel_compositions(window)?;
-        if cancelled || was_pressed {
+        if cancelled || was_pressed || was_dragging {
             window.paint_requested = true;
         }
         Ok(())
@@ -1668,6 +1776,11 @@ impl Host {
                 window.reveal_requested = true;
             }
             window.paint_requested = true;
+            return Ok(());
+        }
+        // 组合期间编辑键归 IME：未被 IME 消费而送到宿主的箭头、Home/End、
+        // Backspace/Delete 与选择键在这里丢弃，不编辑也不触发显露。
+        if composing {
             return Ok(());
         }
         if let Some(action) = editor_shortcut(key, control, true, composing) {
@@ -2153,7 +2266,10 @@ impl Host {
         let Some(point) = window.pointer else {
             return false;
         };
-        let hit = scene.hit_test(point);
+        // 覆盖层滚动条优先：指针在它上面时没有元素 hover，按压也不保留。
+        let hit = (!scene.scrollbar().is_some_and(|bar| bar.hit(point)))
+            .then(|| scene.hit_test(point))
+            .flatten();
         let enabled = hit.filter(|node| scene.node(*node).is_some_and(|e| !e.disabled()));
         let hover_changed = enabled != window.hovered;
         let press_cleared = clear_press
@@ -2245,7 +2361,12 @@ impl Host {
 
     fn clear_pressed_except(&mut self, key: &'static str) {
         for (other_key, other) in &mut self.windows {
-            if *other_key != key && other.pressed.take().is_some() {
+            if *other_key == key {
+                continue;
+            }
+            let pressed = other.pressed.take().is_some();
+            let drag = other.scrollbar_drag.take().is_some();
+            if pressed || drag {
                 other.paint_requested = true;
             }
         }
@@ -2530,6 +2651,7 @@ impl WindowHost {
             wheel: WheelScroll::from_system(),
             last_viewport: None,
             preserve_press_on_next_rebuild: false,
+            scrollbar_drag: None,
             reveal_requested: false,
             paint_requested: true,
             last_snapshot: None,
@@ -2550,6 +2672,7 @@ impl WindowHost {
         self.pointer = None;
         self.hovered = None;
         self.pressed = None;
+        self.scrollbar_drag = None;
         self.release_capture = false;
         self.tracking_leave = false;
     }
@@ -2596,6 +2719,33 @@ fn page_step(scene: Option<&Scene>) -> i32 {
     scene.map_or(1, |scene| {
         ((scene.viewport().height() - 24.0).floor() as i32).max(1)
     })
+}
+
+/// 指针下的悬停目标；覆盖层滚动条优先，落在它上面时没有元素 hover。
+fn hover_at(scene: &Scene, point: Point) -> Option<NodeId> {
+    if scene.scrollbar().is_some_and(|bar| bar.hit(point)) {
+        return None;
+    }
+    let node = scene.hit_test(point)?;
+    (!scene.node(node)?.disabled()).then_some(node)
+}
+
+/// thumb 拖动落点：指针位置与抓取偏移换算为 `[0, max]` 内的滚动偏移。
+///
+/// 没有行程（thumb 填满轨道）或内容不可滚动时返回 `None`，拖动保持原偏移。
+fn scrollbar_drag_offset(
+    track: Rect,
+    thumb: Rect,
+    grab: f32,
+    pointer_y: f32,
+    max: i32,
+) -> Option<i32> {
+    let travel = track.height - thumb.height;
+    if travel <= 0.0 || max <= 0 {
+        return None;
+    }
+    let fraction = ((pointer_y - grab - track.y) / travel).clamp(0.0, 1.0);
+    Some((fraction * max as f32).round() as i32)
 }
 
 /// 采用场景夹取后的偏移；被夹取时丢弃滚轮 residue。
@@ -3659,6 +3809,31 @@ mod tests {
     }
 
     #[test]
+    fn scrollbar_drag_offsets_follow_the_pointer_and_clamp() {
+        let track = Rect::new(888.0, 4.0, 8.0, 692.0);
+        let thumb = Rect::new(888.0, 4.0, 8.0, 100.0);
+        // 抓在 thumb 顶部下方 10 像素，指针落在轨道行程的中点。
+        let travel = track.height - thumb.height;
+        let middle = track.y + travel / 2.0 + 10.0;
+        assert_eq!(
+            scrollbar_drag_offset(track, thumb, 10.0, middle, 1000),
+            Some(500)
+        );
+        assert_eq!(
+            scrollbar_drag_offset(track, thumb, 10.0, -1000.0, 1000),
+            Some(0)
+        );
+        assert_eq!(
+            scrollbar_drag_offset(track, thumb, 10.0, 10_000.0, 1000),
+            Some(1000)
+        );
+        // 轨道高度等于 thumb 时没有行程；不可滚动的场景没有可拖的偏移。
+        // 两者都返回 None，调用方保持现有偏移不动。
+        assert_eq!(scrollbar_drag_offset(track, track, 0.0, 320.0, 1000), None);
+        assert_eq!(scrollbar_drag_offset(track, thumb, 0.0, 320.0, 0), None);
+    }
+
+    #[test]
     fn host_messages_are_distinct_and_reserved_in_the_app_range() {
         use windows::Win32::UI::WindowsAndMessaging::WM_APP;
 
@@ -4645,6 +4820,108 @@ mod tests {
 
     fn request(commit: bool, update: bool) -> ImeRequest {
         ImeRequest { commit, update }
+    }
+
+    fn pointer_lparam(point: Point, scale: f32) -> LPARAM {
+        let x = (point.x * scale).round() as i16;
+        let y = (point.y * scale).round() as i16;
+        LPARAM((x as isize & 0xffff) | ((y as isize & 0xffff) << 16))
+    }
+
+    #[test]
+    fn pressing_the_scrollbar_pages_without_cancelling_a_composition() {
+        let mut host = open_host();
+        for index in 0..100 {
+            host.runtime
+                .input("What needs to be done?", &format!("Task {index}"))
+                .expect("fill the draft");
+            host.runtime.submit("Add task").expect("add a row");
+        }
+        host.render().expect("render the tall window");
+        host.runtime
+            .focus("Edit Task 0")
+            .expect("focus the row input");
+        let node = host
+            .runtime
+            .presentation()
+            .expect("snapshot")
+            .find_label("Edit Task 0")
+            .expect("row input")
+            .id();
+        let (page, offset, pressed) = with_main(&mut host, |host, window| {
+            host.ime_start(window).expect("start the composition");
+            host.apply_ime_composition(window, node, request(false, true), None, Some("ni".into()))
+                .expect("preedit");
+            let scene = window.scene.as_ref().expect("scene");
+            let bar = scene.scrollbar().expect("scrollbar");
+            let page = ((scene.viewport().height() - 24.0).floor() as i32).max(1);
+            let point = Point::new(bar.track().x + 2.0, bar.thumb().bottom() + 30.0);
+            let lparam = pointer_lparam(point, scene.viewport().scale());
+            host.pointer_pressed(window, lparam)
+                .expect("press the track");
+            Ok((page, window.scroll_offset, window.pressed))
+        });
+        assert_eq!(offset, page, "the track click pages by one page");
+        assert_eq!(pressed, None, "the scrollbar press is not a content press");
+        let snapshot = host.runtime.presentation().expect("snapshot");
+        let edit = snapshot.node(node).expect("editor").edit().expect("edit");
+        assert_eq!(edit.preedit(), Some("ni"), "the composition survives");
+        assert!(
+            edit.composition().is_some(),
+            "pressing the scrollbar does not cancel the composition"
+        );
+    }
+
+    #[test]
+    fn a_composing_editor_keeps_its_scroll_under_editing_keys() {
+        let mut host = open_host();
+        for index in 0..100 {
+            host.runtime
+                .input("What needs to be done?", &format!("Task {index}"))
+                .expect("fill the draft");
+            host.runtime.submit("Add task").expect("add a row");
+        }
+        host.render().expect("render the tall window");
+        host.runtime
+            .focus("Edit Task 0")
+            .expect("focus the row input");
+        let node = host
+            .runtime
+            .presentation()
+            .expect("snapshot")
+            .find_label("Edit Task 0")
+            .expect("row input")
+            .id();
+        with_main(&mut host, |host, window| {
+            host.ime_start(window).expect("start the composition");
+            host.apply_ime_composition(window, node, request(false, true), None, Some("ni".into()))
+                .expect("preedit");
+            // 组合启动本身请求过显露；只观察按键造成的请求。
+            window.reveal_requested = false;
+            // 组合中的输入滚出视口：编辑键不得编辑、显露或滚动。
+            window.scroll_offset = 1000;
+            for key in [VK_HOME, VK_END, VK_LEFT, VK_RIGHT, VK_BACK, VK_DELETE] {
+                host.key_down_with(window, key, false, false)
+                    .expect("composing editing key");
+            }
+            assert!(
+                !window.reveal_requested,
+                "composing editing keys do not request a reveal"
+            );
+            Ok(())
+        });
+        host.render().expect("render after the composing keys");
+        assert_eq!(
+            host.windows[MAIN].scroll_offset, 1000,
+            "composing editing keys do not scroll the window"
+        );
+        let snapshot = host.runtime.presentation().expect("snapshot");
+        let edit = snapshot.node(node).expect("editor").edit().expect("edit");
+        assert_eq!(edit.preedit(), Some("ni"), "the composition survives");
+        assert!(
+            edit.composition().is_some(),
+            "composing editing keys do not end the composition"
+        );
     }
 
     #[test]
