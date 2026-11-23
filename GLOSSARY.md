@@ -60,6 +60,22 @@ _Avoid_: platform backend, shell
 从已提交界面状态生成的一次性只读描述，含稳定 node ID、tag、渲染所需属性、文本与本地编辑状态；不含几何、闭包或句柄，也不是第二棵保留树。
 _Avoid_: render tree, view tree, frame
 
+**Windowed For**:
+声明 `row-height` 的 `For`：只挂载宿主行窗口内的行，上下两个 spacer 保持 `总行数 × 行高` 的声明范围；不声明 `row-height` 的 `For` 继续全量挂载。
+_Avoid_: virtual list, lazy list
+
+**Row band**:
+一个窗口化 `For` 的完整行范围与当前挂载窗口元数据：稳定 band key、顶端 spacer Node ID、统一行高、起始行与总行数。快照携带元数据，场景携带解析后的几何。
+_Avoid_: list range, viewport band
+
+**Row window**:
+宿主从行带几何、已应用滚动偏移与视口高度换算、经 `Runtime::set_row_window` 应用的 `(first, count)` 挂载区间；运行时是唯一挂载或卸载行的一方。
+_Avoid_: visible range, slice
+
+**Row height**:
+窗口化 `For` 声明的统一外层行槽高度；父容器必须零间距，每一行必须恰好占满它。
+_Avoid_: item height, row extent
+
 **Scene**:
 `zenui-render` 根据 presentation snapshot 产出的布局几何、文本 run 与绘制指令；与 GPU 后端无关。
 _Avoid_: display list, frame

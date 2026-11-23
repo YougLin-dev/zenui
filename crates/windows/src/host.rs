@@ -49,7 +49,7 @@ use crate::ole::{OleApartment, OleError};
 use crate::shortcuts::{EditorAction, editor_shortcut};
 use zenui_render::{
     GpuRenderer, Point, Rect, RenderPalette, RenderTargetConfig, Scene, SceneCache, SceneElement,
-    SceneEnv, Scrollbar, Viewport, Visual, wgpu,
+    SceneEnv, SceneRowBand, Scrollbar, Viewport, Visual, wgpu,
 };
 
 /// 宿主私有的窗口消息注册表；其他模块不得自行定义 `WM_APP + N`。
@@ -1110,8 +1110,20 @@ impl Host {
         if fresh {
             return Ok(());
         }
+        // 运行时版本已经前进时缓存快照不再可信；行窗口更新也会改变版本。
+        let revision = self.runtime.presentation_revision();
+        if window.snapshot_revision != revision || window.last_snapshot.is_none() {
+            match self.runtime.presentation_of(window.ctx) {
+                Ok(snapshot) => {
+                    window.last_snapshot = Some(snapshot);
+                    window.snapshot_revision = revision;
+                }
+                Err(WindowError::Hidden) => return Ok(()),
+                Err(error) => return Err(HostError::Snapshot(error)),
+            }
+        }
         // 快照先取出再放回：输入前同步场景不复制 snapshot。
-        let Some(snapshot) = window.last_snapshot.take() else {
+        let Some(mut snapshot) = window.last_snapshot.take() else {
             return Ok(());
         };
         let result = (|| {
@@ -1119,48 +1131,111 @@ impl Host {
             if width == 0 || height == 0 {
                 return Ok(None);
             }
-            let scene = self.build_scene_with_reveal(window, &snapshot, width, height, false)?;
+            let mut scene =
+                self.build_scene_with_reveal(window, &snapshot, width, height, false)?;
+            if self.sync_row_windows(window, &mut snapshot, &scene)? {
+                scene = self.build_scene_with_reveal(window, &snapshot, width, height, false)?;
+            }
             Ok(Some(scene))
         })();
         window.last_snapshot = Some(snapshot);
+        window.snapshot_revision = self.runtime.presentation_revision();
         if let Some(scene) = result? {
             window.scene = Some(scene);
         }
         Ok(())
     }
 
+    /// 同步该窗口里每个窗口化 `For` 的挂载窗口；返回快照是否被替换。
+    ///
+    /// 行区间只由行带几何、已应用的滚动偏移和视口高度决定；运行时是唯一
+    /// 挂载或卸载行的一方。聚焦行超过一行 grace 时，宿主先结束焦点并取消
+    /// 组合，再应用新窗口，避免 IME 候选窗跟随一个即将卸载的编辑器。
+    fn sync_row_windows(
+        &mut self,
+        window: &mut WindowHost,
+        snapshot: &mut PresentationSnapshot,
+        scene: &Scene,
+    ) -> Result<bool, HostError> {
+        if scene.row_bands().is_empty() {
+            return Ok(false);
+        }
+        let offset = scene.scroll_offset() as f32;
+        let height = scene.viewport().height();
+        let mut replaced = false;
+        let mut focus_cleared = false;
+        for band in scene.row_bands() {
+            let Some((first, count)) = row_window_for(*band, offset, height) else {
+                continue;
+            };
+            if !focus_cleared
+                && let Some(focused) = snapshot.focus()
+                && let Some(element) = scene.node(focused)
+                && let Some(row) = row_containing(*band, element.rect().y + offset)
+                && (row + 1 < first || row > first + count)
+            {
+                self.runtime
+                    .blur_in(window.ctx)
+                    .map_err(HostError::WindowState)?;
+                self.cancel_compositions(window)?;
+                focus_cleared = true;
+                replaced = true;
+            }
+            if self
+                .runtime
+                .set_row_window(window.ctx, band.key(), first, count)
+                .map_err(HostError::WindowState)?
+            {
+                replaced = true;
+            }
+        }
+        if replaced {
+            *snapshot = self
+                .runtime
+                .presentation_of(window.ctx)
+                .map_err(HostError::Snapshot)?;
+        }
+        Ok(replaced)
+    }
+
     /// 把一个窗口的新快照渲染到它自己的 surface；共享 renderer 按目标尺寸切换。
     fn render_window(
         &mut self,
         window: &mut WindowHost,
-        snapshot: PresentationSnapshot,
+        mut snapshot: PresentationSnapshot,
     ) -> Result<(), HostError> {
         let snapshot_changed = window.last_snapshot.as_ref() != Some(&snapshot);
-        let revision = self.runtime.presentation_revision();
-        if self.render_snapshot(window, &snapshot, snapshot_changed)? {
+        if self.render_snapshot(window, &mut snapshot, snapshot_changed)? {
             window.last_snapshot = Some(snapshot);
-            window.snapshot_revision = revision;
+            window.snapshot_revision = self.runtime.presentation_revision();
         }
         Ok(())
     }
 
     /// 用缓存的快照重绘；滚动、悬停与 pressed 都是宿主瞬态，不需要重建运行时快照。
     ///
-    /// 快照先取出再放回，整个路径不复制 snapshot。
+    /// 快照先取出再放回，整个路径不复制 snapshot。窗口化 `For` 在此发现需要
+    /// 更换挂载窗口时，会用运行时的新快照替换缓存并更新版本。
     fn render_cached(&mut self, window: &mut WindowHost) -> Result<(), HostError> {
-        let Some(snapshot) = window.last_snapshot.take() else {
+        let Some(mut snapshot) = window.last_snapshot.take() else {
             return Ok(());
         };
-        let result = self.render_snapshot(window, &snapshot, false);
+        let result = self.render_snapshot(window, &mut snapshot, false);
         window.last_snapshot = Some(snapshot);
-        result.map(|_| ())
+        if result? {
+            window.snapshot_revision = self.runtime.presentation_revision();
+        }
+        Ok(())
     }
 
-    /// 构建场景并呈现；返回是否真的完成了场景构建。
+    /// 构建场景并呈现；返回快照是否可以被宿主缓存（surface 丢失或零尺寸时不缓存）。
+    ///
+    /// 窗口化 `For` 的第一遍场景提供行带几何；需要更换挂载窗口时，宿主先按
+    /// 焦点策略结束焦点，再应用窗口并用新快照重建一次。一帧最多两遍场景。
     fn render_snapshot(
         &mut self,
         window: &mut WindowHost,
-        snapshot: &PresentationSnapshot,
+        snapshot: &mut PresentationSnapshot,
         snapshot_changed: bool,
     ) -> Result<bool, HostError> {
         self.ensure_surface(window)?;
@@ -1168,8 +1243,12 @@ impl Host {
         if width == 0 || height == 0 {
             return Ok(false);
         }
-        let scene =
+        let mut scene =
             self.build_scene_with_reveal(window, snapshot, width, height, snapshot_changed)?;
+        if self.sync_row_windows(window, snapshot, &scene)? {
+            // 行带顶端锚定在内容起点，第二遍场景与第一遍的偏移一致且精确。
+            scene = self.build_scene_with_reveal(window, snapshot, width, height, false)?;
+        }
         let target = target_config(self.format, width, height)?;
         if self.renderer_target != target {
             self.renderer.resize(target);
@@ -3128,6 +3207,40 @@ fn ime_request(flags: u32) -> ImeRequest {
     }
 }
 
+/// 把已应用的滚动偏移与视口高度换算成行窗口（ADR-0011）。
+///
+/// `first` 是视口顶端所在行，`count` 覆盖视口内的完整/部分行；行带完整地
+/// 在视口外时仍挂载一行，给焦点与显露保留锚点。行带总范围不受窗口影响。
+fn row_window_for(band: SceneRowBand, offset: f32, viewport_height: f32) -> Option<(usize, usize)> {
+    let row_height = band.row_height();
+    let total = band.total_rows();
+    if !row_height.is_finite() || row_height <= 0.0 || total == 0 {
+        return None;
+    }
+    let local_top = offset - band.top();
+    let visible_end = local_top + viewport_height.max(0.0);
+    let total_f = total as f32;
+    let first = (local_top / row_height).floor().clamp(0.0, total_f) as usize;
+    let end = (visible_end / row_height).ceil().clamp(0.0, total_f) as usize;
+    Some(if end > first {
+        (first, end - first)
+    } else if first >= total {
+        (total - 1, 1)
+    } else {
+        (first, 1)
+    })
+}
+
+/// `content_y` 在行带里所属的行；行带外或退化行高返回 `None`。
+fn row_containing(band: SceneRowBand, content_y: f32) -> Option<usize> {
+    let row_height = band.row_height();
+    if !row_height.is_finite() || row_height <= 0.0 {
+        return None;
+    }
+    let row = (content_y - band.top()) / row_height;
+    (row >= 0.0 && row < band.total_rows() as f32).then_some(row.floor() as usize)
+}
+
 fn focused_input(snapshot: &PresentationSnapshot) -> Option<NodeId> {
     snapshot
         .focus()
@@ -4983,14 +5096,17 @@ mod tests {
             .find_label("Edit Task 0")
             .expect("row input")
             .id();
+        // 滚到聚焦行恰好在窗口上方一行的 grace 里：编辑键仍不得编辑、显露
+        // 或滚动，组合与 caret 保持挂载（ADR-0011 的焦点 grace）。
+        let band = host.scene(MAIN).expect("scene").row_bands()[0];
+        let away = (band.top() + band.row_height() + 10.0) as i32;
         with_main(&mut host, |host, window| {
             host.ime_start(window).expect("start the composition");
             host.apply_ime_composition(window, node, request(false, true), None, Some("ni".into()))
                 .expect("preedit");
             // 组合启动本身请求过显露；只观察按键造成的请求。
             window.reveal_requested = false;
-            // 组合中的输入滚出视口：编辑键不得编辑、显露或滚动。
-            window.scroll_offset = 1000;
+            window.scroll_offset = away;
             for key in [VK_HOME, VK_END, VK_LEFT, VK_RIGHT, VK_BACK, VK_DELETE] {
                 host.key_down_with(window, key, false, false)
                     .expect("composing editing key");
@@ -5003,7 +5119,7 @@ mod tests {
         });
         host.render().expect("render after the composing keys");
         assert_eq!(
-            host.windows[MAIN].scroll_offset, 1000,
+            host.windows[MAIN].scroll_offset, away,
             "composing editing keys do not scroll the window"
         );
         let snapshot = host.runtime.presentation().expect("snapshot");
@@ -5012,6 +5128,53 @@ mod tests {
         assert!(
             edit.composition().is_some(),
             "composing editing keys do not end the composition"
+        );
+    }
+
+    #[test]
+    fn scrolling_a_focused_composing_row_out_of_the_grace_window_blurs_it() {
+        let mut host = open_host();
+        for index in 0..100 {
+            host.runtime
+                .input("What needs to be done?", &format!("Task {index}"))
+                .expect("fill the draft");
+            host.runtime.submit("Add task").expect("add a row");
+        }
+        host.render().expect("render the tall window");
+        host.runtime
+            .focus("Edit Task 0")
+            .expect("focus the row input");
+        let node = host
+            .runtime
+            .presentation()
+            .expect("snapshot")
+            .find_label("Edit Task 0")
+            .expect("row input")
+            .id();
+        with_main(&mut host, |host, window| {
+            host.ime_start(window).expect("start the composition");
+            host.apply_ime_composition(window, node, request(false, true), None, Some("ni".into()))
+                .expect("preedit");
+            // 开始时请求的显露已经发生；这里只观察滚动后的行为。
+            window.reveal_requested = false;
+            Ok(())
+        });
+
+        // 远距离滚动：目标窗口从列表顶部离开，聚焦行超过一行 grace。
+        host.windows
+            .get_mut(MAIN)
+            .expect("the main window")
+            .scroll_offset = 2000;
+        host.render().expect("render the far window");
+        assert!(
+            host.runtime.focused().is_none(),
+            "the focused row is blurred before it unmounts"
+        );
+        let snapshot = host.runtime.presentation().expect("snapshot");
+        assert_eq!(snapshot.focus(), None);
+        assert!(
+            snapshot.node(node).is_none(),
+            "the composing row was unmounted by the new window"
         );
     }
 
@@ -5061,20 +5224,8 @@ mod tests {
             .collect();
         let builds = host.runtime.presentation_builds();
         let counters = host.runtime.counters();
+        // 不移动滚动偏移的瞬态输入完全复用快照；每次 tick 都不构建。
         for step in 0..30 {
-            send_msg(
-                &mut host,
-                MSG {
-                    message: WM_MOUSEWHEEL,
-                    wParam: WPARAM(((-120i16 as u16) as usize) << 16),
-                    ..Default::default()
-                },
-            );
-            assert_eq!(
-                host.runtime.presentation_builds(),
-                builds,
-                "snapshot rebuilt after wheel {step}"
-            );
             send_msg(
                 &mut host,
                 MSG {
@@ -5105,15 +5256,52 @@ mod tests {
                 "snapshot rebuilt after blink {step}"
             );
         }
+        // 滚轮跨过行边界时窗口推进；每次事件至多重建一次快照（一帧两遍场景）。
+        let before_wheel = host.runtime.presentation_builds();
+        send_msg(
+            &mut host,
+            MSG {
+                message: WM_MOUSEWHEEL,
+                wParam: WPARAM(((-120i16 as u16) as usize) << 16),
+                ..Default::default()
+            },
+        );
         assert!(
             host.scene(MAIN).expect("scene").scroll_offset() > 0,
-            "the wheel ticks really scrolled"
+            "the wheel tick really scrolled"
         );
-        assert_eq!(
-            host.runtime.presentation_builds(),
-            builds,
-            "wheel and pointer ticks reuse the runtime snapshot"
+        let builds = host.runtime.presentation_builds();
+        assert!(
+            builds <= before_wheel + 1,
+            "crossing a row boundary rebuilds the snapshot at most once"
         );
+        // 新窗口内继续指针/闪烁瞬态：再次完全复用快照。
+        for step in 0..10 {
+            send_msg(
+                &mut host,
+                MSG {
+                    message: WM_MOUSEMOVE,
+                    lParam: lparam,
+                    ..Default::default()
+                },
+            );
+            for message in [WM_LBUTTONDOWN, WM_LBUTTONUP] {
+                send_msg(
+                    &mut host,
+                    MSG {
+                        message,
+                        lParam: blank,
+                        ..Default::default()
+                    },
+                );
+            }
+            with_main(&mut host, |host, window| host.blink_caret(window));
+            assert_eq!(
+                host.runtime.presentation_builds(),
+                builds,
+                "the new row window reuses its snapshot after tick {step}"
+            );
+        }
         assert_eq!(
             host.runtime.counters(),
             counters,
@@ -5126,7 +5314,10 @@ mod tests {
             .elements()
             .map(zenui::SnapshotElement::id)
             .collect();
-        assert_eq!(before, after, "Node IDs stay flat while scrolling");
+        assert_ne!(
+            before, after,
+            "crossing a row boundary remounts the visible rows"
+        );
     }
 
     #[test]

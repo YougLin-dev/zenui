@@ -1988,25 +1988,67 @@ fn wheel_and_paging_scroll_the_native_scene() {
 }
 
 #[test]
-fn scroll_only_input_keeps_the_snapshot_and_node_ids() {
+fn scroll_only_input_moves_the_row_window_without_touching_the_model() {
     let mut host = open_tall_host(500);
     host.render().expect("initial render");
     let before = host.presentation(MAIN).expect("a committed snapshot");
-    let ids: Vec<NodeId> = before.elements().map(|element| element.id()).collect();
+    let band = before.row_bands()[0];
+    assert_eq!(band.total_rows(), 500, "the whole list is declared");
+    assert_eq!(band.first_row(), 0);
+    assert!(
+        before.elements().count() < 500,
+        "only the visible window is mounted"
+    );
+    let draft = before
+        .find_label("What needs to be done?")
+        .expect("the draft input")
+        .id();
+    let first_row = before
+        .find_label("Edit Task 0")
+        .expect("the first row")
+        .id();
 
     post_key(&host, VK_END);
     host.pump().expect("scroll to the bottom");
-    assert!(host.scene(MAIN).expect("scene").scroll_offset() > 0);
+    let scene = host.scene(MAIN).expect("scene");
+    assert!(scene.scroll_offset() > 0);
 
     let after = host.presentation(MAIN).expect("the committed snapshot");
-    assert_eq!(
-        before, after,
-        "scroll-only input does not refresh the runtime"
+    let band = after.row_bands()[0];
+    assert_eq!(band.total_rows(), 500, "the declared extent stays whole");
+    assert!(
+        band.first_row() > 0,
+        "the mounted window followed the scroll"
     );
-    let scene = host.scene(MAIN).expect("scene");
-    for id in ids.iter().take(32) {
-        assert!(scene.node(*id).is_some(), "Node IDs survive scrolling");
-    }
+    assert!(
+        after.elements().count() < 500,
+        "the mounted window stays bounded"
+    );
+    assert!(
+        after.node(draft).is_some(),
+        "the chrome outside the list stays mounted"
+    );
+    assert!(
+        after.node(first_row).is_none(),
+        "a row outside the window is unmounted"
+    );
+    assert!(
+        scene.node(first_row).is_none(),
+        "the scene is scoped to the mounted window"
+    );
+
+    post_key(&host, VK_HOME);
+    host.pump().expect("scroll to the top");
+    let top = host.presentation(MAIN).expect("the committed snapshot");
+    assert_eq!(top.row_bands()[0].first_row(), 0);
+    let remounted = top
+        .find_label("Edit Task 0")
+        .expect("the first row is mounted again")
+        .id();
+    assert_ne!(
+        remounted, first_row,
+        "a re-entering row mounts with a fresh NodeId"
+    );
 }
 
 #[test]
@@ -2166,16 +2208,15 @@ fn paging_keys_leave_a_focused_editor_in_place() {
 }
 
 #[test]
-fn tab_reveals_an_offscreen_focus_target_without_remounting() {
+fn tab_reveals_an_offscreen_focus_target_and_restores_the_top_window() {
     let mut host = open_tall_host(100);
     host.render().expect("initial render");
-    let ids: Vec<NodeId> = host
-        .scene(MAIN)
-        .expect("scene")
-        .elements()
-        .iter()
-        .map(SceneElement::id)
-        .collect();
+    let header = host
+        .presentation(MAIN)
+        .expect("a committed snapshot")
+        .find_label("What needs to be done?")
+        .expect("the draft input")
+        .id();
 
     post_key(&host, VK_END);
     host.pump().expect("scroll to the bottom");
@@ -2186,6 +2227,10 @@ fn tab_reveals_an_offscreen_focus_target_without_remounting() {
     post_key(&host, VK_TAB);
     host.pump().expect("focus the first control");
     let focused = focused_id(&host).expect("a focused control");
+    assert_eq!(
+        focused, header,
+        "Tab focuses the first control in paint order"
+    );
     let scene = host.scene(MAIN).expect("scene");
     let rect = scene.node(focused).expect("focused element").rect();
     assert!(
@@ -2196,8 +2241,16 @@ fn tab_reveals_an_offscreen_focus_target_without_remounting() {
         scene.scroll_offset() < bottom,
         "the reveal moves the offset back"
     );
-    let after: Vec<NodeId> = scene.elements().iter().map(SceneElement::id).collect();
-    assert_eq!(ids, after, "reveal does not remount the rows");
+    let snapshot = host.presentation(MAIN).expect("the committed snapshot");
+    assert_eq!(
+        snapshot.row_bands()[0].first_row(),
+        0,
+        "the reveal restores the top row window"
+    );
+    assert!(
+        snapshot.node(header).is_some(),
+        "the focused chrome element survives the window change"
+    );
 }
 
 #[test]

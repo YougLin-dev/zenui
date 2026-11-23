@@ -13,6 +13,7 @@ pub enum Property {
     AlignItems,
     JustifyContent,
     Width,
+    Height,
     FlexGrow,
     Background,
     TextColor,
@@ -443,6 +444,7 @@ fn spacing(token: &str, prefix: &str) -> Result<Option<i32>, &'static str> {
         return Ok(None);
     };
     let points = match step {
+        "0" => 0,
         "1" => 4,
         "2" => 8,
         "3" => 12,

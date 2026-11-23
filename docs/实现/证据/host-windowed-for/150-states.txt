@@ -1,0 +1,19 @@
+dpi=144	offset=0	max=369613	band_first=0	band_top=223	total=10002	row_height=37	view=900x700	elements=101	focus=-	preedit=	value=	ui=All@37.0,99.5;Active@98.5,99.5;Done@169.0,99.5;Reverse@55.5,136.5;Edit Imported task 00000@496.5,311.5;Complete Imported task 00000@24.0,311.0
+dpi=144	offset=2160	max=369613	band_first=52	band_top=223	total=10002	row_height=37	view=900x700	elements=143	focus=-	preedit=	value=	ui=
+dpi=144	offset=369613	max=369613	band_first=9983	band_top=223	total=10002	row_height=37	view=900x700	elements=137	focus=-	preedit=	value=	ui=
+dpi=144	offset=0	max=369613	band_first=0	band_top=223	total=10002	row_height=37	view=900x700	elements=101	focus=-	preedit=	value=	ui=All@37.0,99.5;Active@98.5,99.5;Done@169.0,99.5;Reverse@55.5,136.5;Edit Imported task 00000@496.5,311.5;Complete Imported task 00000@24.0,311.0
+dpi=144	offset=1080	max=369613	band_first=23	band_top=223	total=10002	row_height=37	view=900x700	elements=143	focus=-	preedit=	value=	ui=
+dpi=144	offset=1080	max=369613	band_first=23	band_top=223	total=10002	row_height=37	view=900x700	elements=143	focus=Edit Imported task 00026	preedit=	value=	ui=
+dpi=144	offset=1080	max=369613	band_first=23	band_top=223	total=10002	row_height=37	view=900x700	elements=143	focus=Edit Imported task 00026	preedit=	value=e	ui=
+dpi=144	offset=1080	max=369613	band_first=23	band_top=223	total=10002	row_height=37	view=900x700	elements=143	focus=Edit Imported task 00026	preedit=	value=ed	ui=
+dpi=144	offset=1080	max=369613	band_first=23	band_top=223	total=10002	row_height=37	view=900x700	elements=143	focus=Edit Imported task 00026	preedit=	value=edi	ui=
+dpi=144	offset=1080	max=369613	band_first=23	band_top=223	total=10002	row_height=37	view=900x700	elements=143	focus=Edit Imported task 00026	preedit=	value=edit	ui=
+dpi=144	offset=1080	max=369613	band_first=23	band_top=223	total=10002	row_height=37	view=900x700	elements=143	focus=Edit Imported task 00026	preedit=	value=edite	ui=
+dpi=144	offset=1080	max=369613	band_first=23	band_top=223	total=10002	row_height=37	view=900x700	elements=143	focus=Edit Imported task 00026	preedit=	value=edited	ui=
+dpi=144	offset=0	max=369613	band_first=0	band_top=223	total=10002	row_height=37	view=900x700	elements=101	focus=-	preedit=	value=	ui=All@37.0,99.5;Active@98.5,99.5;Done@169.0,99.5;Reverse@55.5,136.5;Edit Imported task 00000@496.5,311.5;Complete Imported task 00000@24.0,311.0
+dpi=144	offset=0	max=369613	band_first=0	band_top=223	total=10002	row_height=37	view=900x700	elements=101	focus=-	preedit=	value=	ui=All@37.0,99.5;Active@98.5,99.5;Done@169.0,99.5;Reverse@55.5,136.5
+dpi=144	offset=0	max=0	band_first=0	band_top=223	total=1	row_height=37	view=900x700	elements=29	focus=-	preedit=	value=	ui=All@37.0,99.5;Active@98.5,99.5;Done@169.0,99.5;Reverse@55.5,136.5
+dpi=144	offset=0	max=369613	band_first=0	band_top=223	total=10002	row_height=37	view=900x700	elements=101	focus=-	preedit=	value=	ui=All@37.0,99.5;Active@98.5,99.5;Done@169.0,99.5;Reverse@55.5,136.5
+dpi=144	offset=0	max=369613	band_first=0	band_top=223	total=10002	row_height=37	view=900x700	elements=101	focus=Edit Imported task 09997	preedit=	value=	ui=All@37.0,99.5;Active@98.5,99.5;Done@169.0,99.5;Reverse@55.5,136.5
+dpi=144	offset=676	max=369613	band_first=12	band_top=223	total=10002	row_height=37	view=900x700	elements=143	focus=-	preedit=	value=	ui=
+dpi=0	offset=0	max=0	band_first=0	band_top=0	total=0	row_height=0	view=0x0	elements=0	focus=-	preedit=	value=	ui=

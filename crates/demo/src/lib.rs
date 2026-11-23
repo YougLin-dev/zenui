@@ -575,9 +575,15 @@ pub fn TodoApp(window: WindowCtx, state: TodoState) -> MountResult<MountPlan> {
             <Show when={no_matches}>
                 <text>"Nothing matches"</text>
             </Show>
-            <For each={visible} key={|id: TodoId| id}>
-                {move |todo: TodoId| view! { <TodoItem todo={todo} todos={todos} /> }}
-            </For>
+            <view class="gap-0">
+                <For each={visible} key={|id: TodoId| id} row-height={px(37.0)}>
+                    {move |todo: TodoId| view! {
+                        <view style:height={px(37.0)}>
+                            <TodoItem todo={todo} todos={todos} />
+                        </view>
+                    }}
+                </For>
+            </view>
         </view>
     }
 }

@@ -194,6 +194,14 @@ pub fn style_width(value: impl Into<ValueSlot<Length>>) -> InlineStyle {
     }
 }
 
+/// `style:height` 的类型化值。
+pub fn style_height(value: impl Into<ValueSlot<Length>>) -> InlineStyle {
+    InlineStyle {
+        property: Property::Height,
+        slot: StyleSlot::Length(value.into()),
+    }
+}
+
 pub struct ComponentPlan {
     pub(crate) label: &'static str,
     pub(crate) mount: Box<dyn FnOnce() -> MountResult<MountPlan>>,
@@ -209,6 +217,8 @@ pub struct ForPlan {
     pub(crate) each: Memo<RowSet>,
     pub(crate) key: Box<dyn Fn(TodoId) -> TodoId>,
     pub(crate) item: Box<dyn Fn(TodoId) -> MountResult<MountPlan>>,
+    /// 窗口化 For 的统一行高；`None` 保持全量挂载（ADR-0010）。
+    pub(crate) row_height: Option<Length>,
 }
 
 pub struct Children {
@@ -547,6 +557,25 @@ pub fn for_each(
         each,
         key: Box::new(key),
         item: Box::new(item),
+        row_height: None,
+    })
+}
+
+/// 窗口化 `For`：只挂载宿主声明的可见行窗口，行槽高由 `row_height` 声明。
+///
+/// 行高是每行的外层高度，父容器必须是零间距的纵向布局；For 用上下两个
+/// spacer 保持 `总行数 × row_height` 的声明范围（ADR-0011）。
+pub fn for_each_windowed(
+    each: Memo<RowSet>,
+    key: impl Fn(TodoId) -> TodoId + 'static,
+    row_height: Length,
+    item: impl Fn(TodoId) -> MountResult<MountPlan> + 'static,
+) -> PlanNode {
+    PlanNode::For(ForPlan {
+        each,
+        key: Box::new(key),
+        item: Box::new(item),
+        row_height: Some(row_height),
     })
 }
 

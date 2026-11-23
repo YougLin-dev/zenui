@@ -84,6 +84,10 @@ fn a_mounted_todo_exposes_committed_elements_text_attributes_and_order() {
             ("-", "Choose folder"),
             ("text", "Nothing here yet"),
             ("-", "Nothing here yet"),
+            // 窗口化 For 的零间距容器，以及上下两个零高 spacer。
+            ("view", ""),
+            ("view", ""),
+            ("view", ""),
         ]),
         "the committed tree keeps declaration order"
     );

@@ -61,6 +61,7 @@ target API 的公开行为测试位于根包 `tests/`，其中 `tests/tasks.rs` 
 - [ADR-0008](docs/adr/0008-file-picker-host-tasks.md)：打开文件选择器、宿主任务、显式所有权与 STA 模态对话框。
 - [ADR-0009](docs/adr/0009-file-dialog-family.md)：打开/保存/文件夹对话框家族、kind 矩阵与单路径校验。
 - [ADR-0010](docs/adr/0010-scroll-is-presentation-state.md)：滚动是宿主拥有的整页呈现偏移，几何、命中与 IME 共享同一份已平移场景。
+- [ADR-0011](docs/adr/0011-windowed-for-mounting.md)：窗口化 `For` 只挂载可见行窗口，spacer 保持完整行范围，宿主是窗口换算方。
 - [Stage-one 验收](docs/实现/stage-one-验收.md)：headless Todo 的可执行完成判据、边界证据与原生缺口。
 - [Stage-two 验收](docs/实现/stage-two-验收.md)：Windows 原生切片、IME、样式与 150% 实机证据。
 - [Stage-three 多窗口验收](docs/实现/stage-three-多窗口-验收.md)：主窗口与详情窗口、hide/show、close/reopen 与关闭确认在 100%/150% 下的可见证据。
@@ -69,6 +70,7 @@ target API 的公开行为测试位于根包 `tests/`，其中 `tests/tasks.rs` 
 - [Stage-three 宿主滚动验收](docs/实现/stage-three-宿主滚动-验收.md)：真实滚轮与翻页键、边界夹取、hover/press 复核、聚焦编辑器与缩放在 100%/150% 下的可见证据。
 - [Stage-three 焦点显露验收](docs/实现/stage-three-焦点显露-验收.md)：Tab/编辑后的焦点与 caret 显露、滚动不移动焦点、组合中滚动与候选窗锚点在 100%/150% 下的可见证据。
 - [Stage-three 滚动条验收](docs/实现/stage-three-滚动条-验收.md)：覆盖层滚动条的 thumb 拖动、轨道翻页与键鼠共享偏移在 100%/150% 下的可见证据。
+- [Stage-three 窗口化 For 验收](docs/实现/stage-three-窗口化-for-验收.md)：10,000 行窗口化列表的滚动、编辑、重排与过滤在 100%/150% 下的可见证据。
 
 ## 界面语法
 

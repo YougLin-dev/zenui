@@ -114,7 +114,18 @@ fn the_todo_snapshot_lays_out_non_zero_ordered_boxes() {
     let actual: Vec<NodeId> = scene.elements().iter().map(SceneElement::id).collect();
     assert_eq!(actual, expected, "the scene keeps committed pre-order");
 
+    // 窗口化 For 的 spacer 在窗口恰好覆盖全部行时高度为零，这是声明范围的一部分。
+    let spacers: Vec<NodeId> = snapshot
+        .elements()
+        .filter(|element| element.attr("role").and_then(SnapshotAttr::as_text) == Some("spacer"))
+        .map(SnapshotElement::id)
+        .collect();
+    assert_eq!(spacers.len(), 2, "the windowed list has two spacers");
+
     for element in scene.elements() {
+        if spacers.contains(&element.id()) {
+            continue;
+        }
         let rect = element.rect();
         assert!(
             rect.width > 0.0 && rect.height > 0.0,
@@ -2340,11 +2351,89 @@ fn the_synthetic_root_gap_is_not_hit_testable() {
 }
 
 #[test]
+fn a_windowed_list_keeps_its_declared_extent_and_band_geometry() {
+    let mut app = Runtime::new();
+    let window = open_todo_window(&mut app).expect("open window");
+    for index in 0..100 {
+        add(&mut app, &format!("row-{index:02}"));
+    }
+    let snapshot = app.presentation().expect("snapshot");
+    let base = build_scene(&snapshot, 800.0);
+    let band = base.row_bands()[0];
+    assert_eq!(band.total_rows(), 100);
+    assert_eq!(band.first_row(), 0);
+    assert!((band.row_height() - 37.0).abs() < 0.001);
+    let top = band.top();
+    let extent = base.content_extent().height;
+    assert!(
+        base.elements().len() < 300,
+        "only the mounted window is laid out, not 100 rows"
+    );
+    assert!(snapshot.find_label("Edit row-99").is_none());
+
+    assert!(
+        app.set_row_window(window, snapshot.row_bands()[0].key(), 40, 10)
+            .expect("apply the row window"),
+        "the requested window differs"
+    );
+    let snapshot = app.presentation().expect("window snapshot");
+    let scene = build_scene(&snapshot, 800.0);
+    let band = scene.row_bands()[0];
+    assert_eq!(band.first_row(), 40);
+    assert_eq!(band.top(), top, "the band anchors at the content top");
+    assert!(
+        (scene.content_extent().height - extent).abs() < 0.01,
+        "the declared extent is independent of the mounted window"
+    );
+    assert!(
+        scene.elements().len() < 300,
+        "the second window stays bounded"
+    );
+
+    let top_spacer = scene
+        .node(snapshot.row_bands()[0].top())
+        .expect("the top spacer has geometry");
+    assert!(
+        (top_spacer.rect().height - 40.0 * 37.0).abs() < 0.01,
+        "the top spacer covers every row before the window"
+    );
+    let bottom_spacer = scene
+        .elements()
+        .iter()
+        .rfind(|element| {
+            snapshot
+                .node(element.id())
+                .and_then(|node| node.attr("role"))
+                .and_then(SnapshotAttr::as_text)
+                == Some("spacer")
+        })
+        .expect("the bottom spacer has geometry");
+    assert!(
+        (bottom_spacer.rect().height - 50.0 * 37.0).abs() < 0.01,
+        "the bottom spacer covers every row after the window"
+    );
+
+    assert!(snapshot.find_label("Edit row-40").is_some());
+    assert!(
+        snapshot.find_label("Edit row-00").is_none(),
+        "rows outside the window are not committed"
+    );
+}
+
+#[test]
 fn offscreen_rows_keep_geometry_but_skip_glyphs() {
-    let mut app = runtime();
+    let mut app = Runtime::new();
+    let window = open_todo_window(&mut app).expect("open window");
     for index in 0..60 {
         add(&mut app, &format!("row-{index:02}"));
     }
+    // 默认窗口只挂载前 32 行；显式请求完整窗口后再比较离屏几何。
+    let band = app.presentation().expect("snapshot").row_bands()[0].key();
+    assert!(
+        app.set_row_window(window, band, 0, 60)
+            .expect("mount every row"),
+        "the requested window differs from the default"
+    );
     let snapshot = app.presentation().expect("snapshot");
     let short = Scene::build(
         &snapshot,
