@@ -9,7 +9,7 @@ use zenui_style::{Length, Property, StyleValue};
 
 use crate::context::{self, ContextFault, DepKey, Phase, with_state};
 use crate::dispatch::{DispatchError, NodeOperation};
-use crate::menu::{CommandError, CommandEvent, CommandHandler, CommandSource};
+use crate::menu::{CommandError, CommandEvent, CommandHandler, CommandSource, MenuSpec};
 use crate::presentation::{
     Appearance, NodeId, NodeStatus, PresentationSnapshot, SnapshotAction, SnapshotActions,
     SnapshotAttr, SnapshotElement, SnapshotNode, SnapshotRowBand, SnapshotSemantics, SnapshotValue,
@@ -1707,6 +1707,17 @@ impl Runtime {
                 })
             })
             .collect()
+    }
+
+    /// 窗口目录声明的静态菜单；没有菜单、窗口已关闭或属于另一个 Runtime 时为 `None`。
+    ///
+    /// 原生宿主在创建 HWND 时读取这份声明；菜单命令仍经运行时命令路径派发。
+    pub fn window_menu(&self, window: WindowCtx) -> Option<MenuSpec> {
+        if !self.window_alive(window) {
+            return None;
+        }
+        let state = self.state.borrow();
+        state.catalog.get(window.key)?.menu.clone()
     }
 
     /// 显示目录中的窗口：未打开时运行 factory 产生新 activation；已打开时只聚焦，

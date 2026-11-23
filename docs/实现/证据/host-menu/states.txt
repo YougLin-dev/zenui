@@ -1,0 +1,23 @@
+#193 原生菜单栏可见证据
+日期: 2026-11-24
+示例: crates/windows/examples/menu_host.rs (ZenUI Menu)
+窗口位置: 屏幕 (300,150)；外框尺寸随 DPI；目录尺寸 560x320 逻辑像素
+
+缩放  DPI  外框      客户区    菜单栏        命令
+100%  96   576x379   560x320   File / View   View > Show status：Ready -> Command ran
+150%  144  862x566   840x480   File / View   View > Show status：Ready -> Command ran
+
+采集方式:
+- 100-window.png / 100-command.png / 150-window.png / 150-command.png:
+  PrintWindow(PW_RENDERFULLCONTENT) 读取完整窗口；包含标题栏、菜单栏与客户区。
+  PrintWindow 不绘制窗口外框的缩放宽边，图片边缘的黑色条是该采集产物，不是应用绘制。
+- 100-view-menu.png / 150-view-menu.png:
+  View 菜单由 SendInput 注入 Alt+V 打开；用 DPI-aware 的屏幕读取窗口可见区域
+  (100%: 300,158 起 560x355；150%: 311,161 起 840x545)，不包含窗口外的桌面内容。
+- 命令由菜单循环执行：打开 View 后按 Enter，随后再采集完整窗口。
+
+读数:
+- 100%: GetWindowRect 576x379, GetClientRect 560x320, 外框减客户区 16x59。
+- 150%: GetWindowRect 862x566, GetClientRect 840x480, 外框减客户区 22x86。
+- 两个缩放都保持 560x320 逻辑客户区；菜单栏高度包含在非客户区。
+- 菜单标签 File / View；子项 Close / Show status；命令执行后 status 文本由 Ready 变为 Command ran。

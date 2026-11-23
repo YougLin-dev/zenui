@@ -174,6 +174,48 @@ fn menu_and_window_declaration_order_does_not_matter() {
 }
 
 #[test]
+fn the_window_menu_is_readable_for_a_live_window_only() {
+    let menu = MenuSpec::new().command("file.new", "New");
+    let declaration = menu.clone();
+    let mut app = Runtime::new();
+    app.declare_windows(move |catalog| {
+        catalog.window(WindowSpec::new("main").primary(), |window| {
+            window.on_command("file.new", |_| {}).expect("register");
+            view! { <view /> }
+        })?;
+        catalog.window(WindowSpec::new("plain"), |_| view! { <view /> })?;
+        catalog.menu("main", declaration)?;
+        Ok(())
+    })
+    .expect("catalog");
+
+    let main = app.show("main").expect("show main");
+    let plain = app.show("plain").expect("show plain");
+    assert_eq!(app.window_menu(main), Some(menu.clone()));
+    assert_eq!(app.window_menu(plain), None, "a window without a menu");
+
+    app.close_window(main).expect("close main");
+    assert_eq!(
+        app.window_menu(main),
+        None,
+        "a closed activation has no menu"
+    );
+
+    let mut other = Runtime::new();
+    let foreign = other
+        .open_window("foreign", |_| view! { <view /> })
+        .expect("foreign window");
+    assert_eq!(
+        app.window_menu(foreign),
+        None,
+        "a foreign context cannot read this runtime"
+    );
+
+    let reopened = app.show("main").expect("reopen main");
+    assert_eq!(app.window_menu(reopened), Some(menu));
+}
+
+#[test]
 fn an_empty_menu_needs_no_handlers() {
     let mut app = Runtime::new();
     app.declare_windows(|catalog| {
