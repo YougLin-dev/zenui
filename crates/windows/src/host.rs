@@ -12,6 +12,9 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, PAINTSTRUCT, ValidateRect};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Accessibility::{
+    IRawElementProviderSimple, UiaReturnRawElementProvider, UiaRootObjectId,
+};
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows::Win32::UI::HiDpi::{
     AdjustWindowRectExForDpi, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForSystem,
@@ -35,7 +38,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
     SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
     SystemParametersInfoW, TranslateMessage, WINDOW_EX_STYLE, WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE,
-    WM_DESTROY, WM_DPICHANGED, WM_GETDPISCALEDSIZE, WM_IME_CHAR, WM_IME_COMPOSITION,
+    WM_DESTROY, WM_DPICHANGED, WM_GETDPISCALEDSIZE, WM_GETOBJECT, WM_IME_CHAR, WM_IME_COMPOSITION,
     WM_IME_ENDCOMPOSITION, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN,
     WM_LBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_SETTINGCHANGE, WM_SIZE,
     WM_TIMER, WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
@@ -44,6 +47,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::{HSTRING, w};
 use zenui::prelude::*;
 
+use crate::accessibility::{self, AccessibilityIds, AccessibilityTree, WindowAccessibility};
 use crate::file_dialog::{FileDialogPresenter, NativeFileDialog};
 use crate::ole::{OleApartment, OleError};
 use crate::shortcuts::{EditorAction, editor_shortcut};
@@ -345,12 +349,34 @@ struct WindowHost {
     last_snapshot: Option<PresentationSnapshot>,
     /// `last_snapshot` 对应的运行时呈现版本；版本未变时滚动与指针直接复用。
     snapshot_revision: u64,
+    /// 目录标题；UIA 根节点的名称。
+    title: String,
+    /// 当前发布的可访问性树；provider 通过弱引用解析，随窗口条目一起释放。
+    accessibility: Arc<WindowAccessibility>,
+    /// UIA 运行时 ID 分配器；与发布树一起更新。
+    accessibility_ids: AccessibilityIds,
 }
 
 impl WindowHost {
     const fn hwnd(&self) -> HWND {
         self.native.hwnd
     }
+}
+
+/// 提交场景并整体替换窗口的可访问性树。
+///
+/// 树与场景来自同一份快照，因此名称、状态和边界始终对应屏幕上这一帧。
+/// 所有呈现路径都经这里提交，避免新增路径只更新其中一个发布物。
+fn commit_scene(window: &mut WindowHost, snapshot: &PresentationSnapshot, scene: Scene) {
+    let tree = accessibility::build_tree(
+        snapshot,
+        &scene,
+        &window.title,
+        window.enabled,
+        &mut window.accessibility_ids,
+    );
+    window.accessibility.publish(tree);
+    window.scene = Some(scene);
 }
 
 /// 从 Host 取出的一次弹窗工作；presenter 在调用期间不持有 Host 引用。
@@ -521,6 +547,7 @@ impl Host {
         host.insert_window(WindowHost::new(
             window,
             primary_info.window,
+            primary_info.spec.title().to_owned(),
             surface,
             surface_config,
             blink_timer,
@@ -1129,6 +1156,7 @@ impl Host {
         let result = (|| {
             let (width, height) = client_size(window.hwnd())?;
             if width == 0 || height == 0 {
+                window.accessibility.clear();
                 return Ok(None);
             }
             let mut scene =
@@ -1141,7 +1169,16 @@ impl Host {
         window.last_snapshot = Some(snapshot);
         window.snapshot_revision = self.runtime.presentation_revision();
         if let Some(scene) = result? {
-            window.scene = Some(scene);
+            match window.last_snapshot.take() {
+                Some(snapshot) => {
+                    commit_scene(window, &snapshot, scene);
+                    window.last_snapshot = Some(snapshot);
+                }
+                None => {
+                    window.accessibility.clear();
+                    window.scene = Some(scene);
+                }
+            }
         }
         Ok(())
     }
@@ -1245,6 +1282,7 @@ impl Host {
         self.ensure_surface(window)?;
         let (width, height) = client_size(window.hwnd())?;
         if width == 0 || height == 0 {
+            window.accessibility.clear();
             return Ok(false);
         }
         let mut scene =
@@ -1302,7 +1340,7 @@ impl Host {
             }
             self.queue.submit([encoder.finish()]);
             self.queue.present(frame);
-            window.scene = Some(scene);
+            commit_scene(window, snapshot, scene);
             window.paint_requested = false;
             self.position_ime(window, snapshot);
             return Ok(true);
@@ -1701,6 +1739,26 @@ impl Host {
         self.with_window(key, |host, window| host.read_frame_inner(window))
     }
 
+    /// 返回窗口当前发布的只读辅助功能树。
+    ///
+    /// 隐藏窗口、关闭中的窗口以及尚未提交场景的窗口没有发布树，返回
+    /// `None`。该入口供隐藏 smoke 与测试检查树形状；可见窗口的 UIA 结果以
+    /// Inspect 为准。
+    pub fn accessibility_tree(&self, key: &str) -> Option<Arc<AccessibilityTree>> {
+        self.windows
+            .get(key)
+            .and_then(|window| window.accessibility.tree())
+    }
+
+    /// `WM_GETOBJECT` 的 provider 交付；只有已发布树的窗口应答根对象。
+    fn accessibility_provider(&mut self, hwnd: HWND) -> Option<IRawElementProviderSimple> {
+        self.ensure_ole().ok()?;
+        let key = self.key_for(hwnd)?;
+        let window = self.windows.get(key)?;
+        window.accessibility.tree()?;
+        Some(accessibility::fragment_root(&window.accessibility))
+    }
+
     fn read_frame_inner(&mut self, window: &mut WindowHost) -> Result<Frame, HostError> {
         let snapshot = self
             .runtime
@@ -1788,7 +1846,7 @@ impl Host {
         }
         drop(mapped);
         buffer.unmap();
-        window.scene = Some(scene);
+        commit_scene(window, &snapshot, scene);
         window.paint_requested = false;
         // 这次读回构建了场景，缓存也要同步；否则下一次呈现会把同一快照
         // 当成新快照并再次清空滚轮 residue。
@@ -2565,6 +2623,7 @@ impl Host {
         self.insert_window(WindowHost::new(
             window,
             info.window,
+            info.spec.title().to_owned(),
             surface,
             config,
             blink_timer,
@@ -2626,8 +2685,28 @@ impl Host {
         }
         self.sync_visibility();
         self.sync_enabled()?;
+        self.sync_accessibility();
         self.update_wake_target();
         Ok(())
+    }
+
+    /// 隐藏与关闭中的窗口不发布可访问性树；缓存的 provider 解析失败。
+    fn sync_accessibility(&mut self) {
+        let states: Vec<(&'static str, bool)> = self
+            .windows
+            .iter()
+            .map(|(key, window)| {
+                (
+                    *key,
+                    !window.close_requested && self.runtime.window_visible(window.ctx),
+                )
+            })
+            .collect();
+        for (key, live) in states {
+            if !live && let Some(window) = self.windows.get_mut(key) {
+                window.accessibility.clear();
+            }
+        }
     }
 
     /// 运行时可见性与 native `ShowWindow` 状态对齐；隐藏模式从不显示窗口。
@@ -2791,10 +2870,12 @@ impl WindowHost {
     fn new(
         native: NativeWindow,
         ctx: WindowCtx,
+        title: String,
         surface: wgpu::Surface<'static>,
         surface_config: wgpu::SurfaceConfiguration,
         blink_timer: Option<usize>,
     ) -> Self {
+        let accessibility = Arc::new(WindowAccessibility::new(native.hwnd));
         Self {
             surface: Some(surface),
             surface_config,
@@ -2821,6 +2902,9 @@ impl WindowHost {
             paint_requested: true,
             last_snapshot: None,
             snapshot_revision: 0,
+            title,
+            accessibility,
+            accessibility_ids: AccessibilityIds::new(),
         }
     }
 
@@ -3755,6 +3839,25 @@ unsafe extern "system" fn wndproc(
             // 这里不投递 WM_QUIT，避免关闭一个附属窗口时结束其他窗口的消息循环。
             LRESULT(0)
         }
+        WM_GETOBJECT => {
+            // UIA 把根对象标识放在 lParam；其它对象标识仍由默认过程决定。
+            // Provider 在宿主借用结束后才交回 UIA，回调期间不再持有 Host 引用。
+            if lparam.0 as i32 != UiaRootObjectId {
+                return unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
+            }
+            let mut provider = None;
+            // 安全：派发期间不持有宿主引用，窗口过程借出一次。
+            unsafe {
+                with_host(hwnd, |host| provider = host.accessibility_provider(hwnd));
+            }
+            match provider {
+                // 安全：窗口仍由宿主持有；provider 的生命周期转交 UIA。
+                Some(provider) => unsafe {
+                    UiaReturnRawElementProvider(hwnd, wparam, lparam, &provider)
+                },
+                None => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
+            }
+        }
         WM_GETDPISCALEDSIZE => {
             // 系统默认按 DPI 比例线性缩放外框，非客户区取整会让客户区的逻辑
             // 尺寸漂移一两像素。这里按当前物理客户区的比例算出目标客户区，
@@ -3863,8 +3966,16 @@ mod tests {
     #![allow(unused_braces)]
 
     use super::*;
+    use crate::accessibility::ControlType;
+    use windows::Win32::System::Ole::{SafeArrayDestroy, SafeArrayGetElement};
+    use windows::Win32::UI::Accessibility::{
+        IRawElementProviderFragment, NavigateDirection_FirstChild,
+        ProviderOptions_ServerSideProvider, UIA_E_ELEMENTNOTAVAILABLE, UIA_NamePropertyId,
+        UiaAppendRuntimeId,
+    };
     use windows::Win32::UI::Input::KeyboardAndMouse::{IsWindowEnabled, VK_A};
     use windows::Win32::UI::WindowsAndMessaging::SendMessageW;
+    use windows::core::{HRESULT, Interface};
 
     const MAIN: &str = "main";
 
@@ -4162,6 +4273,188 @@ mod tests {
         host.resize(MAIN, 320, 240).expect("restore size");
         let frame = host.read_frame(MAIN).expect("frame after restore");
         assert!(frame.width() > 0 && frame.height() > 0);
+    }
+
+    #[test]
+    fn accessibility_tree_maps_roles_names_and_states() {
+        let mut host = open_host();
+        host.render().expect("render");
+
+        let tree = host.accessibility_tree(MAIN).expect("published tree");
+        assert_eq!(tree.root().control_type(), ControlType::Window);
+        assert_eq!(tree.root().name(), "ZenUI Todo");
+        assert!(tree.root().node_id().is_none());
+
+        let form = tree.find_name("Add task").expect("the add form");
+        assert_eq!(form.control_type(), ControlType::Group);
+        let input = tree
+            .find_name("What needs to be done?")
+            .expect("the draft input");
+        assert_eq!(input.control_type(), ControlType::Edit);
+        assert!(input.focusable(), "a mounted text input is focusable");
+
+        let toolbar = tree
+            .iter()
+            .find(|node| node.control_type() == ControlType::ToolBar)
+            .expect("a toolbar");
+        assert!(
+            tree.children(toolbar)
+                .any(|node| node.name() == "Reverse" && node.control_type() == ControlType::Button),
+            "toolbar children expose their text as names"
+        );
+
+        assert_eq!(
+            tree.find_name("All").and_then(|node| node.toggle_state()),
+            Some(true),
+            "aria:pressed maps to the toggle state"
+        );
+        assert_eq!(
+            tree.find_name("Active")
+                .and_then(|node| node.toggle_state()),
+            Some(false)
+        );
+        let checkbox = tree
+            .find_name("Complete Write tests")
+            .expect("the completed task checkbox");
+        assert_eq!(checkbox.control_type(), ControlType::CheckBox);
+        assert_eq!(checkbox.toggle_state(), Some(true));
+        assert!(tree.find_name("Delete Write tests").is_some());
+        assert_eq!(
+            tree.find_name("Write tests")
+                .map(|node| node.control_type()),
+            Some(ControlType::Text),
+            "text elements keep their own accessible node"
+        );
+        assert!(tree.find_name("Nothing here yet").is_none());
+
+        let bounds = tree.bounds(form, (0, 0));
+        let logical = tree.logical_rect(form);
+        assert!((bounds.width - f64::from(logical.width) * f64::from(tree.scale())).abs() < 0.01);
+    }
+
+    #[test]
+    fn scrolling_updates_accessibility_bounds_and_keeps_runtime_ids() {
+        let mut host = open_host();
+        host.resize(MAIN, 320, 100).expect("shrink the window");
+        host.render().expect("render");
+        let max = host.scene(MAIN).expect("scene").max_scroll_offset();
+        assert!(
+            max >= 100,
+            "the demo content is taller than the small viewport: {max}"
+        );
+
+        let before = host.accessibility_tree(MAIN).expect("published tree");
+        let form = before.find_name("Add task").expect("the add form");
+        let node = form.node_id().expect("a node id");
+        let runtime_id = form.runtime_id().expect("a runtime id");
+        let top = before.logical_rect(form).y;
+
+        host.windows
+            .get_mut(MAIN)
+            .expect("a live window")
+            .scroll_offset = 100;
+        host.render().expect("render after scrolling");
+
+        let after = host.accessibility_tree(MAIN).expect("republished tree");
+        let moved = after.node(node).expect("the form stays mounted");
+        assert_eq!(
+            moved.runtime_id(),
+            Some(runtime_id),
+            "runtime ids are stable"
+        );
+        assert!(
+            (after.logical_rect(moved).y - (top - 100.0)).abs() < 0.5,
+            "bounds follow the applied scroll offset"
+        );
+        assert!(moved.offscreen(), "the scrolled form leaves the viewport");
+    }
+
+    #[test]
+    fn spacer_views_are_transparent_for_accessibility() {
+        let mut runtime = Runtime::new();
+        runtime
+            .declare_windows(|catalog| {
+                catalog.window(WindowSpec::new(MAIN).primary(), |_| {
+                    view! {
+                        <view role="spacer">
+                            <button id="inner-button" aria:label="Inner">"Go"</button>
+                        </view>
+                    }
+                })?;
+                Ok(())
+            })
+            .expect("declare the window");
+        let mut host = Host::open(runtime, HostConfig::hidden()).expect("open the host");
+        host.render().expect("render");
+
+        let tree = host.accessibility_tree(MAIN).expect("published tree");
+        assert!(
+            tree.iter().all(|node| node.tag() != "view"),
+            "spacer layout views do not become accessibility nodes"
+        );
+        let inner = tree.find_name("Inner").expect("the inner button");
+        assert_eq!(inner.control_type(), ControlType::Button);
+        assert_eq!(inner.automation_id(), "inner-button");
+        assert!(
+            tree.children(tree.root())
+                .any(|node| node.node_id() == inner.node_id()),
+            "the inner button is re-parented to the root"
+        );
+    }
+
+    #[test]
+    fn details_is_an_independent_accessibility_root() {
+        let mut host = open_host();
+        host.render().expect("render");
+        host.show(zenui_demo::DETAILS_WINDOW)
+            .expect("show the details window");
+        host.render().expect("render details");
+
+        let details = host
+            .accessibility_tree(zenui_demo::DETAILS_WINDOW)
+            .expect("a details tree");
+        assert_eq!(details.root().name(), "ZenUI Details");
+        assert!(details.find_name("Details rows").is_some());
+        assert_eq!(
+            host.accessibility_tree(MAIN)
+                .expect("a main tree")
+                .root()
+                .name(),
+            "ZenUI Todo",
+            "each window publishes its own root"
+        );
+    }
+
+    #[test]
+    fn the_root_provider_reports_identity_and_rejects_stale_publications() {
+        let mut host = open_host();
+        host.render().expect("render");
+        let hwnd = host.hwnd(MAIN).expect("a live window");
+        let provider = host.accessibility_provider(hwnd).expect("a root provider");
+
+        let options = unsafe { provider.ProviderOptions() }.expect("provider options");
+        assert_eq!(options, ProviderOptions_ServerSideProvider);
+        let name = unsafe { provider.GetPropertyValue(UIA_NamePropertyId) }.expect("name");
+        // 安全：provider 返回的 VT_BSTR 由这个 VARIANT 持有。
+        let name = unsafe { &name.Anonymous.Anonymous.Anonymous.bstrVal }.to_string();
+        assert_eq!(name, "ZenUI Todo");
+
+        let fragment: IRawElementProviderFragment = provider.cast().expect("fragment");
+        let child = unsafe { fragment.Navigate(NavigateDirection_FirstChild) }
+            .expect("the root has children");
+        let runtime = unsafe { child.GetRuntimeId() }.expect("a runtime id");
+        let mut first = 0i32;
+        // 安全：runtime 是 UIA 返回的两元素 SAFEARRAY。
+        unsafe {
+            SafeArrayGetElement(runtime, &0, (&mut first as *mut i32).cast()).expect("element");
+            let _ = SafeArrayDestroy(runtime);
+        }
+        assert_eq!(first, UiaAppendRuntimeId as i32);
+
+        host.hide(MAIN).expect("hide");
+        let error = unsafe { provider.GetPropertyValue(UIA_NamePropertyId) }
+            .expect_err("a hidden window has no published tree");
+        assert_eq!(error.code(), HRESULT(UIA_E_ELEMENTNOTAVAILABLE as i32));
     }
 
     #[test]
@@ -5785,6 +6078,13 @@ mod tests {
         );
         assert!(host.windows["confirm"].enabled);
         assert!(host.scene("confirm").is_some());
+        let parent = host
+            .accessibility_tree(MAIN)
+            .expect("the disabled parent keeps its tree");
+        let draft = parent.find_name("draft").expect("the draft input");
+        assert!(!draft.enabled(), "the close prompt disables the parent");
+        assert!(!draft.focusable());
+        assert!(host.accessibility_tree("confirm").is_some());
 
         send_msg(
             &mut host,

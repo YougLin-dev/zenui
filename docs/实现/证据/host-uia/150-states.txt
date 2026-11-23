@@ -1,0 +1,6 @@
+# 150% (144 DPI) · ZenUI Todo · 可见宿主状态
+# initial: 900x700 逻辑客户区 = 1350x1050 物理像素；UIA dump 见 150-initial.txt
+offset=0 max=0 viewport=900x700 scale=1.5 tree=33
+# scrolled: 逻辑客户区 518.6667x109.3333 = 778x164 物理像素；
+# OS 滚轮向下一个 notch（-120）；dump 见 150-before-scroll.txt / 150-after-scroll.txt
+offset=72 max=176 viewport=518.6667x109.333336 scale=1.5 tree=27

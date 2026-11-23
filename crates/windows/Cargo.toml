@@ -9,6 +9,8 @@ license = "MIT OR Apache-2.0"
 [target.'cfg(windows)'.dependencies]
 pollster = "=0.4.0"
 wgpu = "=30.0.2"
+# `#[implement]` 展开为 `::windows_core::*` 绝对路径，必须直接依赖且版本一致。
+windows-core = "=0.62.2"
 # 一次声明后续平台工单需要的 API 面：OLE/拖放（含 IDataObject/STGMEDIUM）、
 # UIA（含 Variant）、剪贴板、菜单与托盘。只加 feature，不改变当前行为。
 windows = { version = "=0.62.2", features = [

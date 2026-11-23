@@ -1,0 +1,5 @@
+# 100% (96 DPI) · ZenUI Todo · 可见宿主状态
+# initial: 900x700 客户区，内容不溢出；UIA dump 见 100-initial.txt
+offset=0 max=0 viewport=900x700 scale=1 tree=33
+# scrolled: 客户区 784x181，OS 滚轮向下一个 notch（-120）；dump 见 100-before-scroll.txt / 100-after-scroll.txt
+offset=72 max=105 viewport=784x181 scale=1 tree=33

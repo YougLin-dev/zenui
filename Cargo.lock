@@ -2473,6 +2473,7 @@ dependencies = [
  "pollster",
  "wgpu",
  "windows",
+ "windows-core",
  "zenui",
  "zenui-demo",
  "zenui-render",
