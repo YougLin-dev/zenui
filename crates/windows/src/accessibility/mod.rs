@@ -9,10 +9,11 @@
 //! 旧 provider 能看到滚动后的边界；已卸载的 Node ID 返回
 //! `UIA_E_ELEMENTNOTAVAILABLE`。隐藏窗口与关闭中的窗口不发布树。
 //!
-//! 写操作只经排队通道：Invoke、Toggle、Value 与 SetFocus 在 provider 线程上
-//! 检查当前树与启用状态后把 [`AccessibilityAction`] 入队并唤醒窗口，UI 线程
-//! 再按最新快照重验，最后走与指针、键盘相同的 Runtime 命令路径。provider 线程
-//! 从不直接修改 Runtime；`UIA_ACTION` 消息只负责唤醒，具体动作以队列顺序为准。
+//! 写操作只经排队通道：Invoke、Toggle、Value、SetSelection、SetFocus 与 Scroll
+//! 在 provider 线程上检查当前树与启用状态后把 [`AccessibilityAction`] 入队并
+//! 唤醒窗口；UI 线程再按最新快照或当前场景重验。前五者走 Runtime 命令路径，
+//! Scroll 只改宿主呈现偏移，不进入 Runtime。provider 线程从不直接修改 Runtime；
+//! `UIA_ACTION` 消息只负责唤醒，具体动作以队列顺序为准。
 //!
 //! 相邻两次发布还会按 runtime ID 比较：聚焦、启用、开关状态、值与子节点的
 //! 增删/重排各产生一条事件。事件在发布线程上、发布锁释放后投递；后台窗口的
@@ -784,6 +785,8 @@ impl IRawElementProviderSimple_Impl for ZenProvider_Impl {
             if !matches!(self.key, ProviderKey::Window) {
                 return Err(Error::empty());
             }
+            // 零最大偏移时仍暴露 pattern，客户端据此读取
+            // `VerticallyScrollable = false`；写动作由 UI 线程重验后拒绝。
             return Ok(scroll::provider(self.window.clone()).into());
         }
         if patternid == UIA_InvokePatternId && node.has_action(SnapshotAction::Click) {

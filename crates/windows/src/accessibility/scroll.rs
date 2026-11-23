@@ -55,6 +55,9 @@ impl ScrollPatternProvider {
 }
 
 /// 只接受垂直滚动；UIA 的 `NoAmount` 是合法空操作，其它未知值无效。
+///
+/// Windows 的 UIA 常量名不符合 Rust 的 upper-case 规则；按符号匹配比裸整数
+/// 更能表达协议，因此只在这里收紧 lint。
 #[allow(non_upper_case_globals)]
 fn vertical_command(amount: ScrollAmount) -> WinResult<Option<ScrollCommand>> {
     match amount {

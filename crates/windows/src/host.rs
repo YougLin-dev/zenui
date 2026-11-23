@@ -104,6 +104,17 @@ enum WheelLines {
     Page,
 }
 
+impl WheelLines {
+    /// 一个 notch 的逻辑像素；`page` 只由 `Page` 使用。
+    fn notch_pixels(self, page: i32) -> i64 {
+        match self {
+            Self::Disabled | Self::Lines(0) => 0,
+            Self::Lines(lines) => i64::from(lines) * WHEEL_LINE_HEIGHT,
+            Self::Page => i64::from(page.max(1)),
+        }
+    }
+}
+
 /// 一个 activation 的滚轮累积器与锚点。
 ///
 /// 单位是 1/120 notch 的逻辑像素；正值表示向前滚动（内容向上）。
@@ -140,18 +151,11 @@ impl WheelScroll {
     ///
     /// `page` 是 `WheelLines::Page` 使用的逻辑页高。
     fn step(&mut self, delta: i32, page: i32) -> i32 {
-        let notch = match self.lines {
-            WheelLines::Disabled => {
-                self.reset();
-                return 0;
-            }
-            WheelLines::Lines(0) => {
-                self.reset();
-                return 0;
-            }
-            WheelLines::Lines(lines) => i64::from(lines) * WHEEL_LINE_HEIGHT,
-            WheelLines::Page => i64::from(page.max(1)),
-        };
+        if matches!(self.lines, WheelLines::Disabled | WheelLines::Lines(0)) {
+            self.reset();
+            return 0;
+        }
+        let notch = self.lines.notch_pixels(page);
         self.accumulator = self
             .accumulator
             .saturating_add(i64::from(delta).saturating_mul(notch));
@@ -159,6 +163,11 @@ impl WheelScroll {
         let step = pixels.saturating_sub(self.anchor);
         self.anchor = pixels;
         step.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+    }
+
+    /// UIA 小步长的行像素；与一个滚轮 notch 使用同一系统设置。
+    fn line_step(&self, page: i32) -> i32 {
+        i32::try_from(self.lines.notch_pixels(page)).unwrap_or(i32::MAX)
     }
 }
 
@@ -1592,12 +1601,14 @@ impl Host {
         Ok(())
     }
 
+    /// 宿主当前是否接受这个窗口的指针、键盘或 UIA 输入。
+    fn window_accepts_host_input(&self, window: &WindowHost) -> bool {
+        !window.close_requested && window.enabled && self.runtime.window_accepts_input(window.ctx)
+    }
+
     /// 一次滚轮事件：按 ADR-0010 累积、取整、夹取；正向 notch 减小 offset。
     fn wheel_scrolled(&mut self, window: &mut WindowHost, wparam: WPARAM) -> Result<(), HostError> {
-        if window.close_requested
-            || !window.enabled
-            || !self.runtime.window_accepts_input(window.ctx)
-        {
+        if !self.window_accepts_host_input(window) {
             return Ok(());
         }
         let delta = ((wparam.0 >> 16) as u16) as i16;
@@ -1873,10 +1884,7 @@ impl Host {
     /// provider 已按发布树过滤；这里按当前场景重验窗口与最大偏移，并在两端
     /// 夹取。被拒绝的动作不读取运行时快照，也不触发 reveal。
     fn apply_accessibility_scroll(&mut self, window: &mut WindowHost, command: ScrollCommand) {
-        if window.close_requested
-            || !window.enabled
-            || !self.runtime.window_accepts_input(window.ctx)
-        {
+        if !self.window_accepts_host_input(window) {
             return;
         }
         let Some(scene) = window.scene.as_ref() else {
@@ -1887,7 +1895,7 @@ impl Host {
             return;
         }
         let page = page_step(Some(scene));
-        let line = line_step(window);
+        let line = window.wheel.line_step(page);
         let Some(target) = scroll_target(window.scroll_offset, max, command, page, line) else {
             return;
         };
@@ -3115,18 +3123,6 @@ fn page_step(scene: Option<&Scene>) -> i32 {
     })
 }
 
-/// UIA `SmallIncrement`/`SmallDecrement` 的行步长，与滚轮使用同一系统设置。
-fn line_step(window: &WindowHost) -> i32 {
-    match window.wheel.lines {
-        WheelLines::Disabled | WheelLines::Lines(0) => 0,
-        WheelLines::Lines(lines) => {
-            let step = i64::from(lines) * WHEEL_LINE_HEIGHT;
-            i32::try_from(step).unwrap_or(i32::MAX)
-        }
-        WheelLines::Page => page_step(window.scene.as_ref()),
-    }
-}
-
 /// 一次 UIA 滚动请求的夹取落点；返回 `None` 表示无需改变偏移。
 fn scroll_target(
     current: i32,
@@ -3151,7 +3147,7 @@ fn scroll_target(
     (target != current).then_some(target)
 }
 
-/// 0..=100 映射到 `[0, max]`，四舍五入到最近的整数逻辑像素。
+/// 0..=100 映射到 `[0, max]`，按最近整数逻辑像素四舍五入，半值远离零。
 fn percent_offset(percent: f64, max: i32) -> i32 {
     (f64::from(max) * (percent / 100.0)).round() as i32
 }
@@ -4733,6 +4729,30 @@ mod tests {
             .expect("NoScroll is a no-op");
         host.pump().expect("drain the no-op");
         assert_eq!(host.scene(MAIN).expect("scene").scroll_offset(), max);
+    }
+
+    #[test]
+    fn scroll_pattern_revalidates_a_queued_percent_against_the_current_scene() {
+        let mut host = open_host();
+        host.resize(MAIN, 320, 100).expect("shrink the window");
+        let first_max = host.scene(MAIN).expect("scene").max_scroll_offset();
+        assert!(first_max > 0);
+        let scroll = scroll_pattern(&mut host);
+        unsafe { scroll.SetScrollPercent(UIA_ScrollPatternNoScroll, 100.0) }
+            .expect("queue the end scroll");
+
+        host.resize(MAIN, 320, 160).expect("grow the window");
+        let second_max = host.scene(MAIN).expect("scene").max_scroll_offset();
+        assert!(
+            second_max > 0 && second_max < first_max,
+            "the scene changed before the queued action drained"
+        );
+        host.pump().expect("drain the queued scroll");
+        assert_eq!(
+            host.scene(MAIN).expect("scene").scroll_offset(),
+            second_max,
+            "the UI thread remaps the percent against the current scene"
+        );
     }
 
     #[test]
