@@ -2387,6 +2387,7 @@ impl Host {
         let Some(focused) = snapshot.focus() else {
             return Ok(scene);
         };
+        let before = window.scroll_offset;
         let used_caret = scene.caret(focused).is_some();
         if let Some(target) = reveal_target(&scene, focused) {
             window.scroll_offset = target;
@@ -2398,6 +2399,11 @@ impl Host {
                 window.scroll_offset = target;
                 scene = self.build_scene(window, snapshot, width, height, false)?;
             }
+        }
+        // 显露不是滚轮输入：它改变偏移时丢弃尚未应用的滚轮距离，
+        // 与键盘滚动和内容重新夹取遵循同一条 ADR-0010 规则。
+        if window.scroll_offset != before {
+            window.wheel.reset();
         }
         Ok(scene)
     }
@@ -5133,6 +5139,46 @@ mod tests {
             edit.composition().is_some(),
             "composing editing keys do not end the composition"
         );
+    }
+
+    #[test]
+    fn a_reveal_that_moves_the_offset_resets_the_wheel_residue() {
+        let mut host = open_host();
+        host.render().expect("render the initial window");
+        host.windows.get_mut(MAIN).expect("the main window").wheel = wheel(WheelLines::Lines(3));
+        let sub_notch = WPARAM((((-24i16) as u16 as u32) << 16) as usize);
+        with_main(&mut host, |host, window| {
+            host.wheel_scrolled(window, sub_notch)
+                .expect("apply a sub-notch wheel step");
+            assert_eq!(window.scroll_offset, 14, "the sub-notch step applies");
+            assert_ne!(
+                window.wheel.accumulator, 0,
+                "the sub-notch residue is retained"
+            );
+            Ok(())
+        });
+
+        // 把草稿输入滚出视口后再聚焦：显露会把它拉回顶部并改变偏移。
+        with_main(&mut host, |_host, window| {
+            window.scroll_offset = 400;
+            Ok(())
+        });
+        host.render().expect("render the scrolled window");
+        host.runtime
+            .focus("What needs to be done?")
+            .expect("focus the offscreen draft");
+        host.render().expect("reveal the draft");
+
+        let window = &host.windows[MAIN];
+        assert!(
+            window.scroll_offset < 400,
+            "the reveal really moved the offset"
+        );
+        assert_eq!(
+            window.wheel.accumulator, 0,
+            "a reveal that moves the offset discards the wheel residue"
+        );
+        assert_eq!(window.wheel.anchor, 0);
     }
 
     #[test]
