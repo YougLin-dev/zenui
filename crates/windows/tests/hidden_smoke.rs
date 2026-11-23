@@ -18,6 +18,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use zenui::prelude::*;
 use zenui::{Appearance, Color, ColorRole, NodeId};
 use zenui_render::{Point, SceneElement, Visual};
+use zenui_windows::accessibility::ControlType;
 use zenui_windows::{Host, HostConfig, HostError};
 
 /// Todo demo 的 primary 目录键。
@@ -2471,4 +2472,84 @@ fn wheel_drag_and_keys_share_one_clamped_offset_without_stale_transients() {
 
     post_close(&host);
     host.run().expect("process the close");
+}
+
+#[test]
+fn accessibility_tree_mirrors_the_committed_scene_and_scroll() {
+    let mut host = open_tall_host(40);
+    host.render().expect("render");
+
+    let tree = host.accessibility_tree(MAIN).expect("published tree");
+    assert_eq!(tree.root().control_type(), ControlType::Window);
+    assert_eq!(tree.root().name(), "ZenUI Todo");
+    let form = tree.find_name("Add task").expect("the add form");
+    assert_eq!(form.control_type(), ControlType::Group);
+    let input = tree
+        .find_name("What needs to be done?")
+        .expect("the draft input");
+    assert_eq!(input.control_type(), ControlType::Edit);
+    assert!(input.focusable());
+    let delete = tree
+        .find_name("Delete Task 0")
+        .expect("the first delete button");
+    assert_eq!(delete.control_type(), ControlType::Button);
+    assert_eq!(delete.automation_id(), "");
+
+    let scene = host.scene(MAIN).expect("scene");
+    let bounds = tree.root_bounds((0, 0));
+    assert!(
+        (bounds.width - f64::from(scene.viewport().width()) * f64::from(scene.viewport().scale()))
+            .abs()
+            < 0.01,
+        "the root bounds use the committed viewport and scale"
+    );
+
+    let node = form.node_id().expect("a node id");
+    let runtime_id = form.runtime_id().expect("a runtime id");
+    let top = tree.logical_rect(form).y;
+
+    let input_id = input.node_id().expect("a node id");
+    let input_rect = scene.node(input_id).expect("the input scene node").rect();
+    let point = Point::new(
+        input_rect.x + input_rect.width / 2.0,
+        input_rect.y + input_rect.height / 2.0,
+    );
+    let scale = scene.viewport().scale();
+    post_down(&host, point, scale);
+    post_up(&host, point, scale);
+    host.pump().expect("focus the draft input");
+    let focused = host.accessibility_tree(MAIN).expect("published tree");
+    assert!(
+        focused
+            .find_name("What needs to be done?")
+            .is_some_and(|input| input.focused()),
+        "the snapshot focus is exposed on the matching node"
+    );
+
+    if system_wheel_lines() != 0 {
+        post_wheel(&host, -120);
+        host.pump().expect("one wheel notch");
+        let offset = host.scene(MAIN).expect("scene").scroll_offset();
+        let after = host.accessibility_tree(MAIN).expect("republished tree");
+        let moved = after.node(node).expect("the form stays mounted");
+        assert_eq!(moved.runtime_id(), Some(runtime_id));
+        assert!(
+            (after.logical_rect(moved).y - (top - offset as f32)).abs() < 0.5,
+            "accessibility bounds follow the applied offset"
+        );
+    }
+}
+
+#[test]
+fn hiding_a_window_withdraws_its_accessibility_tree() {
+    let mut host = open_host();
+    host.render().expect("render");
+    assert!(host.accessibility_tree(MAIN).is_some());
+
+    host.hide(MAIN).expect("hide");
+    assert!(host.accessibility_tree(MAIN).is_none());
+
+    host.show(MAIN).expect("show");
+    host.render().expect("render after showing");
+    assert!(host.accessibility_tree(MAIN).is_some());
 }

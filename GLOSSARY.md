@@ -128,6 +128,10 @@ _Avoid_: scroll position (when meaning business state), scroll signal
 presentation snapshot 中用于命中测试与事件派发的稳定元素身份；不是 label，也不是公开的内部数组下标。
 _Avoid_: element index, view ID
 
+**Accessibility tree**:
+每个已提交窗口从 presentation snapshot 与同一份 `Scene` 派生的只读 UIA 树；发布时整体替换，节点身份沿用 Node ID，provider 解析当前发布而不是保留第二份界面。只覆盖读模型；UIA pattern、事件与动作不属于该术语。
+_Avoid_: a11y DOM, accessibility model (when meaning a separate retained tree)
+
 **Text edit**:
 在 caret/selection 上执行的平台无关编辑操作，例如插入、退格、删除；每次编辑派发一次 `on:input`。
 _Avoid_: input event, keystroke
