@@ -1590,6 +1590,25 @@ fn tall_app(rows: usize) -> Runtime {
     app
 }
 
+/// 与 `Scene::hit_test` 的旧实现相同的全量反向扫描，作为可见索引的对照组。
+fn full_reverse_hit(scene: &Scene, point: Point) -> Option<NodeId> {
+    let viewport = scene.viewport();
+    let inside = point.x >= 0.0
+        && point.x < viewport.width()
+        && point.y >= 0.0
+        && point.y < viewport.height();
+    inside
+        .then(|| {
+            scene
+                .elements()
+                .iter()
+                .rev()
+                .find(|element| element.rect().contains(point))
+        })
+        .flatten()
+        .map(SceneElement::id)
+}
+
 #[test]
 fn scroll_translates_every_rect_and_reports_extent() {
     let app = tall_app(500);
@@ -1919,6 +1938,11 @@ fn a_zero_area_viewport_culls_everything_and_hit_tests_nothing() {
     );
     assert!(scene.caret(id).is_none());
     assert_eq!(scene.hit_test(Point::new(0.0, 0.0)), None);
+    assert_eq!(
+        scene.visible_elements().count(),
+        0,
+        "a zero-area viewport has no visible elements"
+    );
 
     let scrolled = Scene::build_with(
         &snapshot,
@@ -1946,6 +1970,11 @@ fn a_zero_area_viewport_culls_everything_and_hit_tests_nothing() {
         );
         assert!(straddling.caret(id).is_none());
         assert_eq!(straddling.hit_test(Point::new(0.0, 0.0)), None);
+        assert_eq!(
+            straddling.visible_elements().count(),
+            0,
+            "a zero {width}x{height} viewport has no visible elements"
+        );
     }
 }
 
@@ -2168,6 +2197,107 @@ fn scroll_hit_testing_uses_translated_geometry_and_stays_inside_the_viewport() {
         None,
         "the half-open viewport bottom is not hit"
     );
+}
+
+#[test]
+fn the_visible_index_keeps_paint_order_and_offscreen_elements_queryable() {
+    let app = tall_app(80);
+    let snapshot = app.presentation().expect("snapshot");
+    let viewport = Viewport::new(400.0, 300.0, 1.0).expect("viewport");
+    let scene = Scene::build_with(
+        &snapshot,
+        viewport,
+        &SceneEnv::default().with_scroll_offset(100),
+    )
+    .expect("scrolled scene");
+
+    let expected: Vec<NodeId> = scene
+        .elements()
+        .iter()
+        .filter(|element| {
+            let rect = element.rect();
+            rect.right() > 0.0
+                && rect.x < viewport.width()
+                && rect.bottom() > 0.0
+                && rect.y < viewport.height()
+        })
+        .map(SceneElement::id)
+        .collect();
+    let visible: Vec<NodeId> = scene.visible_elements().map(SceneElement::id).collect();
+    assert_eq!(visible, expected, "the index filters in paint order");
+    assert!(
+        visible.len() < scene.elements().len(),
+        "offscreen elements stay in the scene but leave the index: {} vs {}",
+        visible.len(),
+        scene.elements().len()
+    );
+
+    let offscreen = scene
+        .elements()
+        .iter()
+        .find(|element| {
+            !visible.contains(&element.id()) && element.rect().height > 0.0 && {
+                let rect = element.rect();
+                rect.bottom() <= 0.0 || rect.y >= viewport.height()
+            }
+        })
+        .expect("a vertically offscreen element");
+    let id = offscreen.id();
+    let rect = offscreen.rect();
+    assert_eq!(
+        scene.node(id).expect("offscreen element").rect(),
+        rect,
+        "node() still returns every committed element with its geometry"
+    );
+}
+
+#[test]
+fn visible_hit_testing_matches_a_full_reverse_scan_at_half_open_edges() {
+    let app = tall_app(80);
+    let snapshot = app.presentation().expect("snapshot");
+    let viewport = Viewport::new(400.0, 300.0, 1.0).expect("viewport");
+    let width = viewport.width();
+    let height = viewport.height();
+    for offset in [0, 100, 1000] {
+        let scene = Scene::build_with(
+            &snapshot,
+            viewport,
+            &SceneEnv::default().with_scroll_offset(offset),
+        )
+        .expect("scrolled scene");
+        let mut points = Vec::new();
+        for x in [-5.0, 0.0, 0.5, width / 2.0, width - 0.5, width, width + 5.0] {
+            for y in [
+                -5.0,
+                0.0,
+                1.0,
+                height / 2.0,
+                height - 0.5,
+                height,
+                height + 5.0,
+            ] {
+                points.push(Point::new(x, y));
+            }
+        }
+        for element in scene.elements() {
+            let rect = element.rect();
+            for point in [
+                Point::new(rect.x, rect.y),
+                Point::new(rect.right() - 0.25, rect.bottom() - 0.25),
+                Point::new(rect.right(), rect.y),
+                Point::new(rect.x, rect.bottom()),
+            ] {
+                points.push(point);
+            }
+        }
+        for point in points {
+            assert_eq!(
+                scene.hit_test(point),
+                full_reverse_hit(&scene, point),
+                "the visible index must not change the hit at {point:?} (offset {offset})"
+            );
+        }
+    }
 }
 
 #[test]

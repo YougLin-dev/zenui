@@ -2,6 +2,8 @@
 
 Scrolling never changes what is mounted. The runtime keeps mounting every row, `PresentationSnapshot` keeps every mounted element, and `Scene` keeps one `SceneElement` per snapshot element. A scroll is one integer logical-pixel offset supplied by the host in `SceneEnv`; the scene translates the emitted geometry by that offset and reports the content extent, the applied offset and the maximum offset. The renderer never filters the snapshot down to visible rows, never remounts rows and never owns a second scroll model. True virtualization — mounting only a committed window of rows — is a different contract, reserved as ADR-0011 and not part of this milestone.
 
+The scene keeps every emitted element for Node queries and `NodeStatus`, but derives a visible index once per build; GPU paint and hit-testing iterate only that index, preserving paint order and half-open hit results. The host caches the runtime presentation snapshot together with `Runtime::presentation_revision`; wheel, hover, a press that changes no runtime state, and caret blink are host transients, and while the revision is unchanged the host rebuilds the scene from the cached snapshot and performs no runtime snapshot build or clone. A press that moves focus or ends a composition changes the revision and rebuilds the snapshot once. Input is still never hit-tested against a scene built for an older offset.
+
 ## Ownership and clamping
 
 - The offset is an `i32` logical-pixel value on `SceneEnv`, whose default is zero; a positive offset moves content up (toward smaller y). `SceneEnv` remains `Clone + Copy + PartialEq + Eq`. A scroll-only change is an environment change, not a snapshot change: it does not touch snapshot equality, Node IDs, local edit state or the committed tree.

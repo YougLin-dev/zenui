@@ -460,6 +460,11 @@ pub struct Scene {
     scroll_offset: i32,
     max_scroll_offset: i32,
     elements: Vec<SceneElement>,
+    /// 与视口相交的元素在 `elements` 中的下标，按绘制顺序。
+    ///
+    /// 绘制与命中只遍历这份索引；`elements` 仍保留全部已提交元素，供
+    /// Node 查询与未来的辅助功能树使用。
+    visible: Vec<u32>,
     decorations: Vec<Decoration>,
     caret_visible: bool,
 }
@@ -554,18 +559,29 @@ impl Scene {
         self.elements.iter().find(|element| element.id == id)
     }
 
+    /// 与视口相交的元素，按绘制顺序；离屏元素只存在于 [`Scene::elements`]。
+    ///
+    /// 索引在场景构建时一次算好，绘制与命中都不再扫描全部已提交元素。
+    pub fn visible_elements(&self) -> impl Iterator<Item = &SceneElement> {
+        self.visible
+            .iter()
+            .map(|index| &self.elements[*index as usize])
+    }
+
     /// 最上层命中：后绘制的元素优先，半开区间。
     ///
     /// `point` 是场景坐标；视口外的点始终返回 `None`，即使平移后的内容
-    /// 几何覆盖该点。
+    /// 几何覆盖该点。视口内的点只可能落在与视口相交的元素上，因此只扫描
+    /// 可见索引，结果与全量反向扫描一致。
     pub fn hit_test(&self, point: Point) -> Option<NodeId> {
         let viewport = Rect::new(0.0, 0.0, self.viewport.width(), self.viewport.height());
         if !viewport.contains(point) {
             return None;
         }
-        self.elements
+        self.visible
             .iter()
             .rev()
+            .map(|index| &self.elements[*index as usize])
             .find(|element| element.rect.contains(point))
             .map(SceneElement::id)
     }
@@ -708,6 +724,7 @@ impl<'a> Builder<'a> {
             scroll_offset,
             max_scroll_offset,
             elements: Vec::new(),
+            visible: Vec::new(),
             decorations: Vec::new(),
             caret_visible: true,
         };
@@ -715,6 +732,14 @@ impl<'a> Builder<'a> {
         // 平移发生在布局之后：内容坐标不变，所有 emitted 几何共享同一偏移。
         let origin = Point::new(0.0, 0.0 - scroll_offset as f32);
         self.emit(shaper, root, origin, &mut scene, clip)?;
+        // 与 GPU 剔除谓词一致：视口内的点只可能命中这份索引里的元素。
+        scene.visible = scene
+            .elements
+            .iter()
+            .enumerate()
+            .filter(|(_, element)| viewport_intersects(element.rect(), viewport))
+            .map(|(index, _)| index as u32)
+            .collect();
         Ok(scene)
     }
 
@@ -1101,6 +1126,18 @@ fn visual(intrinsic: Intrinsic, element: &SnapshotElement) -> Visual {
 }
 
 /// 半开区间相交；完全在 viewport 之外的文本无需整形或生成 glyph run。
+/// 元素是否可能影响视口内的像素；与 GPU 绘制使用的剔除谓词一致。
+///
+/// 零面积元素也保留在索引里，避免丢掉带 glyph run 的退化元素。
+fn viewport_intersects(rect: Rect, viewport: Viewport) -> bool {
+    viewport.width() > 0.0
+        && viewport.height() > 0.0
+        && rect.right() > 0.0
+        && rect.x < viewport.width()
+        && rect.bottom() > 0.0
+        && rect.y < viewport.height()
+}
+
 fn intersects(rect: Rect, clip: Rect) -> bool {
     rect.width > 0.0
         && rect.height > 0.0
