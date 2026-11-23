@@ -1,0 +1,41 @@
+Narrator 音频观察（150%，2026-11-24）
+
+目的
+  在真实可见 Todo 上确认 Narrator 会对焦点与 ToggleState 变化发声。
+
+环境
+  Windows 11 Pro 10.0.26300；单屏 2560×1600，150%。
+  Narrator（Standard 布局，CapsLock 或 Insert 为 Narrator 键）。
+  OneCore 语音只有 zh-CN（Huihui/Kangkang/Yaoyao）；SAPI 另有 en-US Zira，
+  但 Narrator 不使用 SAPI 语音。
+  Narrator 以 UIAccess 运行：注入的 Narrator+Alt+X / Narrator+Ctrl+X 被拒绝，
+  Speech Recap 无法由脚本打开或读取。
+
+方法
+  使用 WASAPI loopback 捕获默认扬声器，48 kHz / 双声道 / 32-bit float，
+  转为 16 kHz / 16-bit / 单声道后离线识别。
+  动作时间由驱动脚本写入 ActionsPath；识别使用 System.Speech zh-CN
+  DictationGrammar 与 whisper.cpp base.en，两者都只得到近似或不可用文本，
+  因此下面只记录语音活动区间，不作为逐字内容。
+
+第二次录制（narr_ev.wav，10.6 s）
+  +1.0 s   SetFocus "Complete Event row"（UIA fragment SetFocus）
+  +3.3 s   Space（宿主键盘路径切换 ToggleState）
+  +6.0 s   SetFocus "All"
+  +8.2 s   停止
+
+  检测到的语音区间（RMS > 0.005，100 ms 窗）：
+  2.0–2.1, 2.7–2.8, 3.0–3.1, 3.8–4.0, 4.2–4.4, 4.6–4.7, 5.0–5.1,
+  7.6–7.8, 8.4–8.6 s
+  说明：焦点动作后出现一组语音（2.0–3.1 s），Space 后又出现一组
+  （3.8–5.1 s），SetFocus "All" 后出现一组（7.6–8.6 s）。
+  zh-CN 识别把 "Add button" 近似为「俺家按钮」；Whisper base.en 对同一
+  中文语音得到不可用文本。语音文本不能作为判据。
+
+结论与边界
+  - 可观察事实：Narrator 在每次焦点或 ToggleState 变化后产生语音；没有观察到
+    同一动作后重复朗读同一短语的音频证据。
+  - 不能声称：逐字朗读内容、精确的朗读次数。精确的一次性由同一 UIA 事件流上的
+    进程外客户端日志与 Inspect Watch Focus 证明。
+  - 该限制来自 Narrator 的 UIAccess 完整性级别与仅安装 zh-CN 语音，不是应用
+    事件实现的一部分。

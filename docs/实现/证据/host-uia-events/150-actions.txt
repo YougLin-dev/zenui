@@ -1,0 +1,14 @@
+00:21:10.510 ACTION click input
+00:21:11.755 ACTION tab to Add
+00:21:12.855 ACTION shift+tab to input
+00:21:13.935 ACTION click Complete Read docs
+00:21:15.085 ACTION set draft to Event row
+00:21:16.008 ACTION invoke Add
+00:21:16.923 ACTION invoke Reverse
+00:21:17.833 ACTION invoke Delete Read docs
+00:21:18.745 ACTION click Active filter
+00:21:19.903 ACTION set draft to pending draft
+00:21:20.816 ACTION alt+f4 to request close
+00:21:21.938 ACTION confirmation hwnd 539361556
+00:21:21.944 ACTION invoke Continue editing
+00:21:22.854 ACTION done
