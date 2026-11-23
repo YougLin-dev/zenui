@@ -452,6 +452,47 @@ impl Default for SceneCache {
     }
 }
 
+/// 一个窗口化 `For` 的行带几何；宿主据此把滚动偏移换算成挂载窗口（ADR-0011）。
+///
+/// `top` 是行带内容顶端的场景布局坐标（不含滚动偏移），`row_height` 是
+/// 已解析的逻辑点行高。行带总高度恒为 `total_rows × row_height`，与当前
+/// 挂载了哪些行无关。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SceneRowBand {
+    key: u64,
+    top: f32,
+    row_height: f32,
+    first_row: usize,
+    total_rows: usize,
+}
+
+impl SceneRowBand {
+    /// 跨快照稳定的行带键；用于 [`crate::Scene::row_bands`] 与运行时窗口更新。
+    pub const fn key(self) -> u64 {
+        self.key
+    }
+
+    /// 行带内容顶端的场景布局坐标；不随滚动偏移改变。
+    pub const fn top(self) -> f32 {
+        self.top
+    }
+
+    /// 已解析的统一行槽高度（逻辑点）。
+    pub const fn row_height(self) -> f32 {
+        self.row_height
+    }
+
+    /// 当前已挂载的起始行。
+    pub const fn first_row(self) -> usize {
+        self.first_row
+    }
+
+    /// 完整行数。
+    pub const fn total_rows(self) -> usize {
+        self.total_rows
+    }
+}
+
 /// 一次完整重排的结果；几何都是逻辑像素与绝对坐标。
 #[derive(Clone, Debug)]
 pub struct Scene {
@@ -465,6 +506,8 @@ pub struct Scene {
     /// 绘制与命中只遍历这份索引；`elements` 仍保留全部已提交元素，供
     /// Node 查询与未来的辅助功能树使用。
     visible: Vec<u32>,
+    /// 窗口化 `For` 的行带几何，保持挂载顺序。
+    row_bands: Vec<SceneRowBand>,
     decorations: Vec<Decoration>,
     caret_visible: bool,
 }
@@ -566,6 +609,11 @@ impl Scene {
         self.visible
             .iter()
             .map(|index| &self.elements[*index as usize])
+    }
+
+    /// 窗口化 `For` 的行带几何，保持呈现顺序；没有窗口化 `For` 时为空。
+    pub fn row_bands(&self) -> &[SceneRowBand] {
+        &self.row_bands
     }
 
     /// 最上层命中：后绘制的元素优先，半开区间。
@@ -725,6 +773,7 @@ impl<'a> Builder<'a> {
             max_scroll_offset,
             elements: Vec::new(),
             visible: Vec::new(),
+            row_bands: Vec::new(),
             decorations: Vec::new(),
             caret_visible: true,
         };
@@ -740,6 +789,22 @@ impl<'a> Builder<'a> {
             .filter(|(_, element)| viewport_intersects(element.rect(), viewport))
             .map(|(index, _)| index as u32)
             .collect();
+        for band in self.snapshot.row_bands() {
+            let element = scene
+                .elements
+                .iter()
+                .find(|element| element.id() == band.top())
+                .ok_or_else(|| SceneError::Layout {
+                    message: String::from("a row band lost its top spacer"),
+                })?;
+            scene.row_bands.push(SceneRowBand {
+                key: band.key(),
+                top: element.rect().y + scroll_offset as f32,
+                row_height: band.row_height().resolve(element.resolved.font_size()),
+                first_row: band.first_row(),
+                total_rows: band.total_rows(),
+            });
+        }
         Ok(scene)
     }
 
@@ -1182,6 +1247,7 @@ fn resolve_style(
 ) -> Result<(Style, ResolvedStyle), SceneError> {
     let mut resolved = ResolvedStyle::initial();
     let mut width = None;
+    let mut height = None;
     let mut winners: HashMap<Property, (StyleOrigin, Condition)> = HashMap::new();
     for declaration in declarations {
         let condition = declaration.condition();
@@ -1210,11 +1276,21 @@ fn resolve_style(
             continue;
         }
         winners.insert(declaration.property(), (origin, condition));
-        apply_declaration(&mut style, &mut resolved, &mut width, node, *declaration)?;
+        apply_declaration(
+            &mut style,
+            &mut resolved,
+            &mut width,
+            &mut height,
+            node,
+            *declaration,
+        )?;
     }
-    // `em` 宽度依赖最终字号，所以等所有声明处理完再换成 Taffy 长度。
+    // `em` 宽度与高度依赖最终字号，所以等所有声明处理完再换成 Taffy 长度。
     if let Some(width) = width {
         style.size.width = length(width.resolve(resolved.text.size));
+    }
+    if let Some(height) = height {
+        style.size.height = length(height.resolve(resolved.text.size));
     }
     Ok((style, resolved))
 }
@@ -1223,6 +1299,7 @@ fn apply_declaration(
     style: &mut Style,
     resolved: &mut ResolvedStyle,
     width: &mut Option<zenui_style::Length>,
+    height: &mut Option<zenui_style::Length>,
     node: NodeId,
     declaration: StyleDeclaration,
 ) -> Result<(), SceneError> {
@@ -1256,6 +1333,7 @@ fn apply_declaration(
             *width = None;
         }
         (Property::Width, StyleValue::Length(extent)) => *width = Some(extent),
+        (Property::Height, StyleValue::Length(extent)) => *height = Some(extent),
         (Property::FlexGrow, StyleValue::Grow) => {
             style.flex_grow = 1.0;
             style.flex_shrink = 1.0;

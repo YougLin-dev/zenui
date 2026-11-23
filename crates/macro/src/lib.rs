@@ -157,6 +157,7 @@ fn lower_style(key: &str, attribute: &rstml::node::KeyedAttribute) -> syn::Resul
         "style:border-color" => quote! { style_border_color },
         "style:opacity" => quote! { style_opacity },
         "style:width" => quote! { style_width },
+        "style:height" => quote! { style_height },
         other => {
             return Err(syn::Error::new_spanned(
                 &attribute.key,
@@ -248,6 +249,7 @@ fn property_tokens(property: Property) -> TokenStream {
         Property::AlignItems => quote! { AlignItems },
         Property::JustifyContent => quote! { JustifyContent },
         Property::Width => quote! { Width },
+        Property::Height => quote! { Height },
         Property::FlexGrow => quote! { FlexGrow },
         Property::Background => quote! { Background },
         Property::TextColor => quote! { TextColor },
@@ -479,6 +481,7 @@ fn lower_show(element: &NodeElement<rstml::Infallible>) -> syn::Result<TokenStre
 fn lower_for(element: &NodeElement<rstml::Infallible>) -> syn::Result<TokenStream> {
     let mut each = None;
     let mut key = None;
+    let mut row_height = None;
     for attribute in element.attributes() {
         let NodeAttribute::Attribute(attribute) = attribute else {
             return Err(syn::Error::new_spanned(
@@ -489,6 +492,7 @@ fn lower_for(element: &NodeElement<rstml::Infallible>) -> syn::Result<TokenStrea
         match attribute.key.to_string().as_str() {
             "each" => each = Some(expression(attribute)?),
             "key" => key = Some(expression(attribute)?),
+            "row-height" => row_height = Some(expression(attribute)?),
             other => {
                 return Err(syn::Error::new_spanned(
                     &attribute.key,
@@ -517,8 +521,13 @@ fn lower_for(element: &NodeElement<rstml::Infallible>) -> syn::Result<TokenStrea
             "For expects one row factory closure",
         ));
     };
-    Ok(quote_spanned! {element.span()=>
-        ::zenui::view::for_each(#each, #key, #block)
+    Ok(match row_height {
+        Some(row_height) => quote_spanned! {element.span()=>
+            ::zenui::view::for_each_windowed(#each, #key, #row_height, #block)
+        },
+        None => quote_spanned! {element.span()=>
+            ::zenui::view::for_each(#each, #key, #block)
+        },
     })
 }
 

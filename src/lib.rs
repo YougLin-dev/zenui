@@ -31,7 +31,7 @@ pub use menu::{
 };
 pub use presentation::{
     Appearance, NodeId, NodeStatus, PresentationSnapshot, SnapshotAttr, SnapshotElement,
-    SnapshotNode, SnapshotValue, TextEditState,
+    SnapshotNode, SnapshotRowBand, SnapshotValue, TextEditState,
 };
 pub use runtime::{FocusInfo, Runtime};
 pub use signal::{Memo, Once, Signal, memo, once, signal};
@@ -62,10 +62,10 @@ pub mod prelude {
         Key, KeyEvent, Length, LengthUnit, Memo, MenuCommand, MenuItem, MenuSpec, MountError,
         MountPlan, MountResult, NodeId, NodeOperation, NodeStatus, Once, Opacity,
         PresentationSnapshot, Property, Runtime, Signal, SnapshotAttr, SnapshotElement,
-        SnapshotNode, SnapshotValue, Store, StyleDeclaration, StyleOrigin, StyleValue, Submenu,
-        SubmitEvent, Task, TaskError, TaskScope, TaskStatus, TaskToken, TextEditState, TodoId,
-        Transaction, WindowCatalog, WindowCtx, WindowError, WindowInfo, WindowRole, WindowSpec,
-        WriteError, WriteOp, component, em, memo, once, px, signal, view,
+        SnapshotNode, SnapshotRowBand, SnapshotValue, Store, StyleDeclaration, StyleOrigin,
+        StyleValue, Submenu, SubmitEvent, Task, TaskError, TaskScope, TaskStatus, TaskToken,
+        TextEditState, TodoId, Transaction, WindowCatalog, WindowCtx, WindowError, WindowInfo,
+        WindowRole, WindowSpec, WriteError, WriteOp, component, em, memo, once, px, signal, view,
     };
     pub use zenui_core::Filter;
 }

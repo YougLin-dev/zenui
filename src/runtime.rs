@@ -5,13 +5,14 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
 
 use zenui_core::{Counters, RowSet};
+use zenui_style::{Length, Property, StyleValue};
 
 use crate::context::{self, ContextFault, DepKey, Phase, with_state};
 use crate::dispatch::{DispatchError, NodeOperation};
 use crate::menu::{CommandError, CommandEvent, CommandHandler, CommandSource};
 use crate::presentation::{
     Appearance, NodeId, NodeStatus, PresentationSnapshot, SnapshotAttr, SnapshotElement,
-    SnapshotNode, SnapshotValue, TextEditState,
+    SnapshotNode, SnapshotRowBand, SnapshotValue, TextEditState,
 };
 use crate::signal::{Memo, MemoCell, SignalCell};
 use crate::store::{TodoId, WriteError};
@@ -20,7 +21,7 @@ use crate::text_edit::{self, Edit, Movement};
 use crate::view::{
     Attr, AttrValue, BlurEvent, ChildrenFactory, CompositionEvent, CompositionPhase, Event,
     FocusCause, FocusEvent, InlineStyle, Key, KeyEvent, MountError, MountPlan, MountResult,
-    PlanNode, ResultBoolValue, StyleSlot, SubmitEvent, TextSlot,
+    PlanNode, ResultBoolValue, StyleSlot, SubmitEvent, TextSlot, ValueSlot,
 };
 use crate::window::{
     CatalogEntry, CatalogError, CloseError, CloseHandler, ClosePolicy, CloseReply, CloseRequest,
@@ -60,6 +61,16 @@ struct MountedTree {
     focused: Option<usize>,
     settle_before: Option<Vec<usize>>,
 }
+
+/// 宿主为一行带请求的挂载窗口；`count` 为零表示该行带当前不需要行。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RowWindow {
+    first: usize,
+    count: usize,
+}
+
+/// 没有宿主窗口时的默认挂载行数；ADR-0011 要求它远大于常见视口行数。
+const DEFAULT_WINDOW_ROWS: usize = 32;
 
 pub(crate) struct State {
     pub(crate) id: u32,
@@ -105,6 +116,15 @@ pub(crate) struct State {
     presentation_revision: u64,
     /// 已构建的 presentation snapshot 次数；宿主与基准用它验证滚动不重建快照。
     presentation_builds: Cell<u64>,
+    /// 宿主为窗口化 For 声明的行窗口，按行带键索引。
+    row_windows: BTreeMap<u64, RowWindow>,
+    /// 每个 For owner 拥有的行带键；owner 释放时一并丢弃请求。
+    owner_bands: BTreeMap<u32, Vec<u64>>,
+    next_row_band: u64,
+    /// 正在刷新的树在刷新前的焦点元素，供窗口化 For 的行 grace 使用。
+    refresh_focus: Option<usize>,
+    /// 本帧窗口化 For 卸载了焦点所在行；刷新后清除焦点而不是结算到邻居。
+    window_focus_dropped: Option<usize>,
     pub(crate) tasks: BTreeMap<u32, TaskRecord>,
     pub(crate) next_task: u32,
     /// 已排队、等待宿主弹出的文件选择请求；任务本身在 `tasks` 中。
@@ -202,6 +222,11 @@ impl State {
             window_revision: 0,
             presentation_revision: 0,
             presentation_builds: Cell::new(0),
+            row_windows: BTreeMap::new(),
+            owner_bands: BTreeMap::new(),
+            next_row_band: 1,
+            refresh_focus: None,
+            window_focus_dropped: None,
             tasks: BTreeMap::new(),
             next_task: 1,
             pending_file_dialogs: Vec::new(),
@@ -323,6 +348,12 @@ impl State {
             .find_map(|(key, tree)| contains_element(self, &tree.nodes, element).then_some(*key))
     }
 
+    /// 指定树里是否还有这个行带的行窗口化 For；过期行带由宿主忽略。
+    fn tree_has_band(&self, key: TreeKey, band: u64) -> bool {
+        self.tree(key)
+            .is_some_and(|tree| contains_band(self, &tree.nodes, band))
+    }
+
     fn element_is_visible(&self, element: usize) -> bool {
         self.tree_for_element(element)
             .is_some_and(|key| self.tree_is_visible(key))
@@ -369,6 +400,8 @@ impl State {
         let tree = self.tree(key)?;
         let mut roots = Vec::new();
         collect_snapshot(self, &tree.nodes, &mut roots);
+        let mut row_bands = Vec::new();
+        collect_row_bands(self, &tree.nodes, &mut row_bands);
         let focus = self
             .presented_focus_in(key)
             .map(|element| self.elements[element].id);
@@ -376,6 +409,7 @@ impl State {
             roots,
             focus,
             appearance: self.appearance,
+            row_bands,
         })
     }
 
@@ -421,6 +455,13 @@ impl State {
         let resources = std::mem::take(&mut record.resources);
         let parent = record.parent;
 
+        // 随 owner 释放的行带请求不会再有宿主读取；同时丢弃，避免窗口化
+        // For 反复挂载/卸载时累积失效请求。
+        if let Some(bands) = self.owner_bands.remove(&id) {
+            for band in bands {
+                self.row_windows.remove(&band);
+            }
+        }
         self.release_resources(resources);
         for child in children {
             self.dispose_owner(child);
@@ -1322,7 +1363,22 @@ pub struct MountedFor {
     each: Memo<RowSet>,
     key: Box<dyn Fn(TodoId) -> TodoId>,
     item: Box<dyn Fn(TodoId) -> MountResult<MountPlan>>,
+    /// 窗口化 For 的统一行高；`None` 挂载全部行（ADR-0010）。
+    row_height: Option<Length>,
+    /// 跨快照稳定的行带键；宿主按它声明行窗口。
+    band: u64,
+    total_rows: usize,
+    first_row: usize,
+    /// 窗口化 For 的上下 spacer 元素槽位；保持内容总高度不变。
+    spacers: Option<(usize, usize)>,
+    /// 最近一次完整映射的 row set 投影；同一份投影不重复映射与查重。
+    rows: Option<RowSet>,
+    /// 完整的 keyed 顺序 `(mapped, todo)`，只在 row set 变化时重建。
+    entries: Vec<(TodoId, TodoId)>,
+    /// 完整顺序里每个 key 的行号；窗口更新与焦点 grace 的 O(log n) 查表。
+    row_of: BTreeMap<TodoId, usize>,
     items: BTreeMap<TodoId, MountedItem>,
+    /// 当前已挂载的行键，按业务顺序；窗口外的行不在其中。
     order: Vec<TodoId>,
 }
 
@@ -1331,6 +1387,58 @@ pub struct MountedItem {
     todo: TodoId,
     instance: u64,
     children: Vec<MountedNode>,
+}
+
+/// `row_height × rows` 保持单位不变；定点乘法饱和，极端行数不会回绕。
+fn rows_height(row_height: Length, rows: usize) -> Length {
+    let factor = i64::try_from(rows).unwrap_or(i64::MAX);
+    let fixed = i64::from(row_height.fixed())
+        .saturating_mul(factor)
+        .clamp(i64::from(i32::MIN), i64::from(i32::MAX));
+    Length::from_fixed(fixed as i32, row_height.unit())
+}
+
+/// 为窗口化 For 创建上下两个零高 spacer；高度由每次刷新按窗口更新。
+fn ensure_spacers(state: &mut State, owner: u32) -> (usize, usize) {
+    let mut make = || {
+        let id = state.mint_node();
+        let slot = state.elements.len();
+        state.elements.push(MountedElement {
+            id,
+            tag: "view",
+            owner,
+            attrs: vec![MountedAttr {
+                name: "role",
+                value: AttrValue::Text(TextSlot::Static("spacer")),
+                current: Some(AttrCurrent::Text(String::from("spacer"))),
+            }],
+            class_styles: &[],
+            inline_styles: vec![MountedInlineStyle {
+                property: Property::Height,
+                slot: StyleSlot::Length(ValueSlot::Static(Length::px(0.0))),
+                current: Some(StyleValue::Length(Length::px(0.0))),
+            }],
+            events: Vec::new(),
+            local: LocalState::None,
+            children: Vec::new(),
+        });
+        slot
+    };
+    (make(), make())
+}
+
+/// 更新 spacer 的已提交高度；数量和单位一起保留，em 在场景里按最终字号解析。
+fn set_spacer_height(state: &mut State, spacer: usize, rows: usize, row_height: Length) {
+    let height = rows_height(row_height, rows);
+    let element = &mut state.elements[spacer];
+    if let Some(style) = element
+        .inline_styles
+        .iter_mut()
+        .find(|style| style.property == Property::Height)
+    {
+        style.slot = StyleSlot::Length(ValueSlot::Static(height));
+        style.current = Some(StyleValue::Length(height));
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2251,6 +2359,48 @@ impl Runtime {
             && state.window_is_visible(window.key)
     }
 
+    /// 声明一个窗口化 `For` 的挂载窗口。
+    ///
+    /// `band` 来自快照的 [`SnapshotRowBand::key`]；`first`/`count` 是宿主从行带
+    /// 几何和滚动偏移换算出的行区间。运行时在这里挂载进入窗口的行、卸载离开
+    /// 窗口的行并更新上下 spacer；聚焦行在窗口外一行以内时窗口自动扩大一行，
+    /// 更远时该行被卸载且焦点清除。返回是否真的有变化；未变化的请求不刷新
+    /// 也不改变呈现版本。窗口、行带已失效时返回 [`WindowError::Stale`]。
+    pub fn set_row_window(
+        &mut self,
+        window: WindowCtx,
+        band: u64,
+        first: usize,
+        count: usize,
+    ) -> Result<bool, WindowError> {
+        let state = self.state.clone();
+        if window.runtime != state.borrow().id {
+            return Err(WindowError::WrongRuntime);
+        }
+        context::install(&state, || {
+            if !with_state(|state| state.window_live_in_tree(window)) {
+                return Err(WindowError::Stale);
+            }
+            let key = TreeKey::Window(window.key);
+            if !with_state(|state| state.tree_has_band(key, band)) {
+                return Err(WindowError::Stale);
+            }
+            let changed = with_state(|state| {
+                let request = RowWindow { first, count };
+                if state.row_windows.get(&band) == Some(&request) {
+                    return false;
+                }
+                state.row_windows.insert(band, request);
+                state.bump_presentation();
+                true
+            });
+            if changed {
+                self.refresh_tree_once(key).map_err(WindowError::Mount)?;
+            }
+            Ok(changed)
+        })
+    }
+
     pub fn refresh(&mut self) -> Result<(), MountError> {
         if self.tree_keys().is_empty() {
             return Err(MountError::Component("no committed interface is mounted"));
@@ -2280,21 +2430,34 @@ impl Runtime {
     fn refresh_tree_once(&mut self, key: TreeKey) -> Result<(), MountError> {
         let state = self.state.clone();
         context::install(&state, || {
-            let Some(mut tree) = with_state(|state| {
+            let taken = with_state(|state| {
                 state.fault = None;
                 state.phase = Phase::Binding;
                 let focused = state.focused_in(key);
+                // 窗口化 For 在刷新里据此判断聚焦行是否仍在挂载窗口内。
+                state.refresh_focus = focused;
                 let settle_before = focused.is_some().then(|| state.element_order(key));
                 if let Some(entry) = state.tree_mut(key) {
                     entry.settle_before = settle_before;
                 }
                 state.take_tree(key)
-            }) else {
+            });
+            let Some(mut tree) = taken else {
+                with_state(|state| state.refresh_focus = None);
                 return Ok(());
             };
             let result = self.refresh_nodes(&mut tree.nodes);
             let fault = with_state(|state| {
                 state.put_tree(key, tree);
+                state.refresh_focus = None;
+                // 焦点行被滚动窗口卸载时直接清除焦点；它不能结算到相邻行，
+                // 那会把 Tab 的语义变成一次隐式焦点跳转（ADR-0011）。
+                if let Some(dropped) = state.window_focus_dropped.take()
+                    && state.focused_in(key) == Some(dropped)
+                    && !state.element_is_mounted(dropped)
+                {
+                    state.set_focused_in(key, None);
+                }
                 state.phase = Phase::Idle;
                 state.fault
             });
@@ -2536,11 +2699,25 @@ impl Runtime {
             }
             PlanNode::For(plan) => {
                 let owner = with_state(|state| state.create_owner(Some(parent)));
+                let band = with_state(|state| {
+                    let band = state.next_row_band;
+                    state.next_row_band += 1;
+                    state.owner_bands.entry(owner).or_default().push(band);
+                    band
+                });
                 let mut node = MountedFor {
                     owner,
                     each: plan.each,
                     key: plan.key,
                     item: plan.item,
+                    row_height: plan.row_height,
+                    band,
+                    total_rows: 0,
+                    first_row: 0,
+                    spacers: None,
+                    rows: None,
+                    entries: Vec::new(),
+                    row_of: BTreeMap::new(),
                     items: BTreeMap::new(),
                     order: Vec::new(),
                 };
@@ -2717,24 +2894,84 @@ impl Runtime {
 
     fn refresh_for(&mut self, for_node: &mut MountedFor) -> Result<(), MountError> {
         let rows: RowSet = for_node.each.get();
-        let mut entries = Vec::with_capacity(rows.len());
-        let mut seen = BTreeSet::new();
-        for key in rows.iter() {
-            let todo = TodoId::from_key(key);
-            let mapped = (for_node.key)(todo);
-            if !seen.insert(mapped) {
-                return Err(MountError::DuplicateKey);
+        // 完整的 keyed 顺序只在 row set 投影变化时重建：重复键在窗口化之前
+        // 就拒绝，窗口只影响挂载哪些行，绝不改变行顺序（ADR-0011）。key 只应
+        // 依赖行身份，因此同一份投影可以复用映射结果；窗口更新是 O(窗口)。
+        if for_node
+            .rows
+            .as_ref()
+            .is_none_or(|cached| !cached.shares_with(&rows))
+        {
+            let mut entries = Vec::with_capacity(rows.len());
+            let mut seen = BTreeSet::new();
+            for key in rows.iter() {
+                let todo = TodoId::from_key(key);
+                let mapped = (for_node.key)(todo);
+                if !seen.insert(mapped) {
+                    return Err(MountError::DuplicateKey);
+                }
+                entries.push((mapped, todo));
             }
-            entries.push((mapped, todo));
+            for_node.row_of = entries
+                .iter()
+                .enumerate()
+                .map(|(index, (mapped, _))| (*mapped, index))
+                .collect();
+            for_node.entries = entries;
+            for_node.rows = Some(rows);
+        }
+        let total = for_node.entries.len();
+
+        let mut first = 0;
+        let mut count = total;
+        if for_node.row_height.is_some() {
+            if for_node.spacers.is_none() {
+                let spacers = with_state(|state| ensure_spacers(state, for_node.owner));
+                for_node.spacers = Some(spacers);
+            }
+            let requested = with_state(|state| state.row_windows.get(&for_node.band).copied())
+                .unwrap_or(RowWindow {
+                    first: 0,
+                    count: DEFAULT_WINDOW_ROWS,
+                });
+            first = requested.first.min(total);
+            count = requested.count.min(total - first);
+            // 聚焦行在窗口外一行以内时扩大窗口，保留它的节点、caret 与组合；
+            // 更远则由宿主在应用新窗口前完成 blur 与组合取消。只在已挂载行
+            // 里查找焦点所属行，因此刷新成本与总行数无关。
+            let focused = with_state(|state| {
+                state.refresh_focus.and_then(|focused| {
+                    for_node
+                        .items
+                        .iter()
+                        .find(|(_, item)| contains_element(state, &item.children, focused))
+                        .and_then(|(key, _)| for_node.row_of.get(key).copied())
+                })
+            });
+            if let Some(row) = focused {
+                if row + 1 == first {
+                    first = row;
+                    count += 1;
+                } else if row == first + count {
+                    count += 1;
+                }
+                count = count.min(total - first);
+                if row < first || row >= first + count {
+                    with_state(|state| state.window_focus_dropped = state.refresh_focus);
+                }
+            }
         }
 
+        let mut order = Vec::with_capacity(count);
         let mut fresh = Vec::new();
-        for (mapped, todo) in &entries {
-            if for_node.items.contains_key(mapped) {
+        for index in first..first + count {
+            let (mapped, todo) = for_node.entries[index];
+            order.push(mapped);
+            if for_node.items.contains_key(&mapped) {
                 continue;
             }
             let owner = with_state(|state| state.create_owner(Some(for_node.owner)));
-            let plan = match with_owner(owner, || (for_node.item)(*todo)) {
+            let plan = match with_owner(owner, || (for_node.item)(todo)) {
                 Ok(plan) => plan,
                 Err(error) => {
                     with_state(|state| state.dispose_owner(owner));
@@ -2756,17 +2993,17 @@ impl Runtime {
                 instance
             });
             fresh.push((
-                *mapped,
+                mapped,
                 MountedItem {
                     owner,
-                    todo: *todo,
+                    todo,
                     instance,
                     children,
                 },
             ));
         }
 
-        let keep: BTreeSet<TodoId> = entries.iter().map(|(mapped, _)| *mapped).collect();
+        let keep: BTreeSet<TodoId> = order.iter().copied().collect();
         let removed: Vec<TodoId> = for_node
             .items
             .keys()
@@ -2785,10 +3022,19 @@ impl Runtime {
         for (key, item) in fresh {
             for_node.items.insert(key, item);
         }
-        for_node.order = entries.iter().map(|(mapped, _)| *mapped).collect();
+        for_node.order = order;
         for item in for_node.items.values_mut() {
             self.refresh_nodes(&mut item.children)?;
         }
+        if let (Some(row_height), Some((top, bottom))) = (for_node.row_height, for_node.spacers) {
+            let mounted = for_node.order.len().min(total - first);
+            with_state(|state| {
+                set_spacer_height(state, top, first, row_height);
+                set_spacer_height(state, bottom, total - first - mounted, row_height);
+            });
+        }
+        for_node.total_rows = total;
+        for_node.first_row = first;
         Ok(())
     }
 
@@ -4054,12 +4300,41 @@ fn contains_element(state: &State, nodes: &[MountedNode], wanted: usize) -> bool
             .active
             .as_ref()
             .is_some_and(|branch| contains_element(state, &branch.children, wanted)),
-        MountedNode::For(for_node) => for_node.order.iter().any(|key| {
-            for_node
-                .items
-                .get(key)
-                .is_some_and(|item| contains_element(state, &item.children, wanted))
-        }),
+        MountedNode::For(for_node) => {
+            if for_node
+                .spacers
+                .is_some_and(|(top, bottom)| top == wanted || bottom == wanted)
+            {
+                return true;
+            }
+            for_node.order.iter().any(|key| {
+                for_node
+                    .items
+                    .get(key)
+                    .is_some_and(|item| contains_element(state, &item.children, wanted))
+            })
+        }
+    })
+}
+
+fn contains_band(state: &State, nodes: &[MountedNode], band: u64) -> bool {
+    nodes.iter().any(|node| match node {
+        MountedNode::Text(_) => false,
+        MountedNode::Element(id) => contains_band(state, &state.elements[*id].children, band),
+        MountedNode::Component(id) => contains_band(state, &state.components[*id].children, band),
+        MountedNode::Show(show) => show
+            .active
+            .as_ref()
+            .is_some_and(|branch| contains_band(state, &branch.children, band)),
+        MountedNode::For(for_node) => {
+            for_node.band == band
+                || for_node.order.iter().any(|key| {
+                    for_node
+                        .items
+                        .get(key)
+                        .is_some_and(|item| contains_band(state, &item.children, band))
+                })
+        }
     })
 }
 
@@ -4171,10 +4446,16 @@ fn collect_elements(state: &State, nodes: &[MountedNode], order: &mut Vec<usize>
                 }
             }
             MountedNode::For(for_node) => {
+                if let Some((top, _)) = for_node.spacers {
+                    order.push(top);
+                }
                 for key in &for_node.order {
                     if let Some(item) = for_node.items.get(key) {
                         collect_elements(state, &item.children, order);
                     }
+                }
+                if let Some((_, bottom)) = for_node.spacers {
+                    order.push(bottom);
                 }
             }
         }
@@ -4215,19 +4496,7 @@ fn collect_snapshot(state: &State, nodes: &[MountedNode], out: &mut Vec<Snapshot
     for node in nodes {
         match node {
             MountedNode::Text(text) => out.push(SnapshotNode::Text(text.value.clone())),
-            MountedNode::Element(id) => {
-                let element = &state.elements[*id];
-                let mut children = Vec::new();
-                collect_snapshot(state, &element.children, &mut children);
-                out.push(SnapshotNode::Element(SnapshotElement {
-                    id: element.id,
-                    tag: element.tag,
-                    attrs: snapshot_attrs(element),
-                    styles: snapshot_styles(element),
-                    edit: snapshot_edit(&element.local),
-                    children,
-                }));
-            }
+            MountedNode::Element(id) => collect_element(state, *id, out),
             MountedNode::Component(id) => {
                 collect_snapshot(state, &state.components[*id].children, out);
             }
@@ -4237,9 +4506,66 @@ fn collect_snapshot(state: &State, nodes: &[MountedNode], out: &mut Vec<Snapshot
                 }
             }
             MountedNode::For(for_node) => {
+                if let Some((top, _)) = for_node.spacers {
+                    collect_element(state, top, out);
+                }
                 for key in &for_node.order {
                     if let Some(item) = for_node.items.get(key) {
                         collect_snapshot(state, &item.children, out);
+                    }
+                }
+                if let Some((_, bottom)) = for_node.spacers {
+                    collect_element(state, bottom, out);
+                }
+            }
+        }
+    }
+}
+
+fn collect_element(state: &State, id: usize, out: &mut Vec<SnapshotNode>) {
+    let element = &state.elements[id];
+    let mut children = Vec::new();
+    collect_snapshot(state, &element.children, &mut children);
+    out.push(SnapshotNode::Element(SnapshotElement {
+        id: element.id,
+        tag: element.tag,
+        attrs: snapshot_attrs(element),
+        styles: snapshot_styles(element),
+        edit: snapshot_edit(&element.local),
+        children,
+    }));
+}
+
+/// 收集窗口化 For 的行带元数据；窗口外行没有节点，几何全靠这条记录定位。
+fn collect_row_bands(state: &State, nodes: &[MountedNode], out: &mut Vec<SnapshotRowBand>) {
+    for node in nodes {
+        match node {
+            MountedNode::Text(_) => {}
+            MountedNode::Element(id) => {
+                collect_row_bands(state, &state.elements[*id].children, out);
+            }
+            MountedNode::Component(id) => {
+                collect_row_bands(state, &state.components[*id].children, out);
+            }
+            MountedNode::Show(show) => {
+                if let Some(branch) = &show.active {
+                    collect_row_bands(state, &branch.children, out);
+                }
+            }
+            MountedNode::For(for_node) => {
+                if let (Some(row_height), Some((top, _))) = (for_node.row_height, for_node.spacers)
+                {
+                    out.push(SnapshotRowBand {
+                        key: for_node.band,
+                        top: state.elements[top].id,
+                        row_height,
+                        first_row: for_node.first_row,
+                        total_rows: for_node.total_rows,
+                    });
+                }
+                for key in &for_node.order {
+                    if let Some(item) = for_node.items.get(key) {
+                        collect_row_bands(state, &item.children, out);
                     }
                 }
             }

@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 use std::fmt;
 
-use zenui_style::StyleDeclaration;
+use zenui_style::{Length, StyleDeclaration};
 
 /// Presentation snapshot 中一个已提交元素的稳定身份。
 ///
@@ -67,6 +67,48 @@ pub struct PresentationSnapshot {
     pub(crate) roots: Vec<SnapshotNode>,
     pub(crate) focus: Option<NodeId>,
     pub(crate) appearance: Appearance,
+    pub(crate) row_bands: Vec<SnapshotRowBand>,
+}
+
+/// 一个窗口化 `For` 的行带元数据；宿主据此把滚动偏移换算成行窗口。
+///
+/// `top` 是行带起点处的 spacer 元素，`first_row` 是当前已挂载的起始行，
+/// `total_rows` 是完整行数。行高是已声明的外层行槽高度；几何在场景构建
+/// 时才解析成逻辑点。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SnapshotRowBand {
+    pub(crate) key: u64,
+    pub(crate) top: NodeId,
+    pub(crate) row_height: Length,
+    pub(crate) first_row: usize,
+    pub(crate) total_rows: usize,
+}
+
+impl SnapshotRowBand {
+    /// 跨快照稳定的行带键；只对产生它的 `For` 有效。
+    pub const fn key(self) -> u64 {
+        self.key
+    }
+
+    /// 行带内容起点处的 spacer 元素。
+    pub const fn top(self) -> NodeId {
+        self.top
+    }
+
+    /// 声明的统一行槽高度。
+    pub const fn row_height(self) -> Length {
+        self.row_height
+    }
+
+    /// 当前已挂载的起始行。
+    pub const fn first_row(self) -> usize {
+        self.first_row
+    }
+
+    /// 完整行数；与当前挂载窗口无关。
+    pub const fn total_rows(self) -> usize {
+        self.total_rows
+    }
 }
 
 impl PresentationSnapshot {
@@ -83,6 +125,11 @@ impl PresentationSnapshot {
     /// 当前焦点元素；没有可聚焦的已提交目标时为 `None`。
     pub const fn focus(&self) -> Option<NodeId> {
         self.focus
+    }
+
+    /// 窗口化 `For` 的行带，保持挂载顺序；没有窗口化 `For` 时为空。
+    pub fn row_bands(&self) -> &[SnapshotRowBand] {
+        &self.row_bands
     }
 
     /// 先序遍历全部已提交元素。

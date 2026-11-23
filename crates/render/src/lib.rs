@@ -23,7 +23,7 @@ pub use gpu::{GpuContext, GpuRenderer, RenderError, RenderPalette, RenderTargetC
 pub use parley::FontData;
 pub use scene::{
     Decoration, DecorationKind, PositionedGlyph, ResolvedStyle, Scene, SceneCache, SceneElement,
-    SceneEnv, TextRun, Visual,
+    SceneEnv, SceneRowBand, TextRun, Visual,
 };
 pub use scrollbar::Scrollbar;
 pub use wgpu;
