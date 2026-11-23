@@ -48,7 +48,8 @@ use windows::core::{HSTRING, w};
 use zenui::prelude::*;
 
 use crate::accessibility::{
-    self, AccessibilityAction, AccessibilityIds, AccessibilityTree, WindowAccessibility,
+    self, AccessibilityAction, AccessibilityIds, AccessibilityTree, ScrollCommand,
+    WindowAccessibility,
 };
 use crate::file_dialog::{FileDialogPresenter, NativeFileDialog};
 use crate::ole::{OleApartment, OleError};
@@ -1791,7 +1792,16 @@ impl Host {
     fn run_accessibility_actions(&mut self, window: &mut WindowHost) -> Result<(), HostError> {
         let mut failure = None;
         for action in window.accessibility.take_actions() {
-            let node = action.node();
+            let action = match action {
+                AccessibilityAction::Scroll(command) => {
+                    self.apply_accessibility_scroll(window, command);
+                    continue;
+                }
+                action => action,
+            };
+            let Some(node) = action.node() else {
+                continue;
+            };
             let Ok(snapshot) = self.runtime.presentation_of(window.ctx) else {
                 continue;
             };
@@ -1845,6 +1855,7 @@ impl Host {
                     }
                     ignore_expected_dispatch(self.runtime.focus_node(node))
                 }
+                AccessibilityAction::Scroll(_) => continue,
             };
             // 继续执行剩余动作；真正失败仍报告给宿主，但不丢弃已经应答的动作。
             if let Err(error) = dispatched {
@@ -1855,6 +1866,32 @@ impl Host {
             Some(error) => Err(error),
             None => Ok(()),
         }
+    }
+
+    /// UIA 滚动动作的 UI 线程落点：只改宿主呈现偏移，不刷新 runtime。
+    ///
+    /// provider 已按发布树过滤；这里按当前场景重验窗口与最大偏移，并在两端
+    /// 夹取。被拒绝的动作不读取运行时快照，也不触发 reveal。
+    fn apply_accessibility_scroll(&mut self, window: &mut WindowHost, command: ScrollCommand) {
+        if window.close_requested
+            || !window.enabled
+            || !self.runtime.window_accepts_input(window.ctx)
+        {
+            return;
+        }
+        let Some(scene) = window.scene.as_ref() else {
+            return;
+        };
+        let max = scene.max_scroll_offset();
+        if max == 0 {
+            return;
+        }
+        let page = page_step(Some(scene));
+        let line = line_step(window);
+        let Some(target) = scroll_target(window.scroll_offset, max, command, page, line) else {
+            return;
+        };
+        self.explicit_scroll(window, target);
     }
 
     /// `WM_GETOBJECT` 的 provider 交付；只有已发布树的窗口应答根对象。
@@ -3078,6 +3115,47 @@ fn page_step(scene: Option<&Scene>) -> i32 {
     })
 }
 
+/// UIA `SmallIncrement`/`SmallDecrement` 的行步长，与滚轮使用同一系统设置。
+fn line_step(window: &WindowHost) -> i32 {
+    match window.wheel.lines {
+        WheelLines::Disabled | WheelLines::Lines(0) => 0,
+        WheelLines::Lines(lines) => {
+            let step = i64::from(lines) * WHEEL_LINE_HEIGHT;
+            i32::try_from(step).unwrap_or(i32::MAX)
+        }
+        WheelLines::Page => page_step(window.scene.as_ref()),
+    }
+}
+
+/// 一次 UIA 滚动请求的夹取落点；返回 `None` 表示无需改变偏移。
+fn scroll_target(
+    current: i32,
+    max: i32,
+    request: ScrollCommand,
+    page: i32,
+    line: i32,
+) -> Option<i32> {
+    let target = match request {
+        ScrollCommand::PageUp => current.saturating_sub(page),
+        ScrollCommand::PageDown => current.saturating_add(page),
+        ScrollCommand::LineUp => current.saturating_sub(line),
+        ScrollCommand::LineDown => current.saturating_add(line),
+        ScrollCommand::Percent(percent) => {
+            if !percent.is_finite() || !(0.0..=100.0).contains(&percent) {
+                return None;
+            }
+            percent_offset(percent, max)
+        }
+    };
+    let target = target.clamp(0, max);
+    (target != current).then_some(target)
+}
+
+/// 0..=100 映射到 `[0, max]`，四舍五入到最近的整数逻辑像素。
+fn percent_offset(percent: f64, max: i32) -> i32 {
+    (f64::from(max) * (percent / 100.0)).round() as i32
+}
+
 /// 指针下的悬停目标；覆盖层滚动条优先，落在它上面时没有元素 hover。
 fn hover_at(scene: &Scene, point: Point) -> Option<NodeId> {
     if scene.scrollbar().is_some_and(|bar| bar.hit(point)) {
@@ -4083,14 +4161,16 @@ mod tests {
     };
     use windows::Win32::System::Variant::VARIANT;
     use windows::Win32::UI::Accessibility::{
-        IInvokeProvider, IRawElementProviderFragment, ITextProvider, ITextRangeProvider,
-        IToggleProvider, IValueProvider, NavigateDirection_FirstChild,
-        NavigateDirection_NextSibling, ProviderOptions_ServerSideProvider,
-        SupportedTextSelection_Single, TextPatternRangeEndpoint_End,
-        TextPatternRangeEndpoint_Start, TextUnit_Character, ToggleState_Off, ToggleState_On,
-        UIA_E_ELEMENTNOTAVAILABLE, UIA_E_NOTSUPPORTED, UIA_FontNameAttributeId,
-        UIA_InvokePatternId, UIA_NamePropertyId, UIA_TextPatternId, UIA_TogglePatternId,
-        UIA_ValuePatternId, UiaAppendRuntimeId, UiaPoint,
+        IInvokeProvider, IRawElementProviderFragment, IScrollProvider, ITextProvider,
+        ITextRangeProvider, IToggleProvider, IValueProvider, NavigateDirection_FirstChild,
+        NavigateDirection_NextSibling, ProviderOptions_ServerSideProvider, ScrollAmount,
+        ScrollAmount_LargeDecrement, ScrollAmount_LargeIncrement, ScrollAmount_NoAmount,
+        ScrollAmount_SmallDecrement, ScrollAmount_SmallIncrement, SupportedTextSelection_Single,
+        TextPatternRangeEndpoint_End, TextPatternRangeEndpoint_Start, TextUnit_Character,
+        ToggleState_Off, ToggleState_On, UIA_E_ELEMENTNOTAVAILABLE, UIA_E_INVALIDOPERATION,
+        UIA_E_NOTSUPPORTED, UIA_FontNameAttributeId, UIA_InvokePatternId, UIA_NamePropertyId,
+        UIA_ScrollItemPatternId, UIA_ScrollPatternId, UIA_ScrollPatternNoScroll, UIA_TextPatternId,
+        UIA_TogglePatternId, UIA_ValuePatternId, UiaAppendRuntimeId, UiaPoint,
     };
     use windows::Win32::UI::Input::KeyboardAndMouse::{IsWindowEnabled, VK_A, VK_NEXT};
     use windows::Win32::UI::WindowsAndMessaging::SendMessageW;
@@ -4164,6 +4244,66 @@ mod tests {
         assert!(up > 0);
         let down = wheel.step(i32::MIN, 100);
         assert!(down < 0);
+    }
+
+    #[test]
+    fn uia_scroll_percent_rounds_to_the_nearest_pixel_and_clamps() {
+        assert_eq!(percent_offset(0.0, 101), 0);
+        assert_eq!(percent_offset(50.0, 101), 51);
+        assert_eq!(percent_offset(100.0, 101), 101);
+        assert_eq!(
+            scroll_target(0, 100, ScrollCommand::Percent(50.0), 40, 72),
+            Some(50)
+        );
+        assert_eq!(
+            scroll_target(100, 100, ScrollCommand::Percent(100.0), 40, 72),
+            None,
+            "the maximum is a no-op"
+        );
+        assert_eq!(
+            scroll_target(0, 100, ScrollCommand::Percent(-1.0), 40, 72),
+            None,
+            "NoScroll is not a domain percent"
+        );
+        assert_eq!(
+            scroll_target(0, 100, ScrollCommand::Percent(f64::NAN), 40, 72),
+            None
+        );
+    }
+
+    #[test]
+    fn uia_scroll_amounts_use_page_and_line_steps_and_clamp() {
+        assert_eq!(
+            scroll_target(0, 100, ScrollCommand::PageDown, 40, 72),
+            Some(40)
+        );
+        assert_eq!(
+            scroll_target(80, 100, ScrollCommand::PageDown, 40, 72),
+            Some(100),
+            "large increments clamp at the bottom"
+        );
+        assert_eq!(
+            scroll_target(0, 100, ScrollCommand::PageUp, 40, 72),
+            None,
+            "page up at the top is a no-op"
+        );
+        assert_eq!(
+            scroll_target(0, 100, ScrollCommand::LineDown, 40, 72),
+            Some(72)
+        );
+        assert_eq!(
+            scroll_target(72, 100, ScrollCommand::LineDown, 40, 72),
+            Some(100)
+        );
+        assert_eq!(
+            scroll_target(100, 100, ScrollCommand::LineDown, 40, 72),
+            None
+        );
+        assert_eq!(
+            scroll_target(0, 100, ScrollCommand::LineDown, 40, 0),
+            None,
+            "a disabled wheel line setting maps to no line movement"
+        );
     }
 
     #[test]
@@ -4487,6 +4627,332 @@ mod tests {
             "bounds follow the applied scroll offset"
         );
         assert!(moved.offscreen(), "the scrolled form leaves the viewport");
+    }
+
+    #[test]
+    fn scroll_pattern_reports_vertical_geometry_and_horizontal_no_scroll() {
+        let mut host = open_host();
+        host.resize(MAIN, 320, 100).expect("shrink the window");
+        host.render().expect("render the small window");
+        let scene = host.scene(MAIN).expect("scene");
+        let max = scene.max_scroll_offset();
+        let viewport = scene.viewport().height();
+        let content = scene.content_extent().height;
+        assert!(max >= 100, "the demo content is taller than the viewport");
+
+        let tree = host.accessibility_tree(MAIN).expect("published tree");
+        let geometry = tree.scroll_geometry();
+        assert_eq!(geometry.max_offset(), max);
+        assert!(geometry.vertically_scrollable());
+        assert_close(
+            geometry.vertical_view_size(),
+            f64::from(viewport) / f64::from(content) * 100.0,
+        );
+        assert_eq!(geometry.vertical_scroll_percent(), Some(0.0));
+
+        let scroll = scroll_pattern(&mut host);
+        assert!(
+            unsafe { scroll.VerticallyScrollable() }
+                .expect("vertical")
+                .as_bool()
+        );
+        assert!(
+            !unsafe { scroll.HorizontallyScrollable() }
+                .expect("horizontal")
+                .as_bool()
+        );
+        assert_eq!(
+            unsafe { scroll.HorizontalScrollPercent() }.expect("horizontal percent"),
+            UIA_ScrollPatternNoScroll
+        );
+        assert_eq!(
+            unsafe { scroll.HorizontalViewSize() }.expect("horizontal view size"),
+            UIA_ScrollPatternNoScroll
+        );
+        assert_close(
+            unsafe { scroll.VerticalViewSize() }.expect("vertical view size"),
+            f64::from(viewport) / f64::from(content) * 100.0,
+        );
+        assert_eq!(
+            unsafe { scroll.VerticalScrollPercent() }.expect("vertical percent"),
+            0.0
+        );
+    }
+
+    #[test]
+    fn scroll_pattern_set_percent_rounds_and_clamps() {
+        let mut host = open_host();
+        host.resize(MAIN, 320, 100).expect("shrink the window");
+        host.render().expect("render the small window");
+        let max = host.scene(MAIN).expect("scene").max_scroll_offset();
+        assert!(max >= 2, "the percent mapping needs a real range");
+        let scroll = scroll_pattern(&mut host);
+
+        unsafe { scroll.SetScrollPercent(UIA_ScrollPatternNoScroll, 50.0) }.expect("queue half");
+        host.pump().expect("drain the half scroll");
+        assert_eq!(
+            host.scene(MAIN).expect("scene").scroll_offset(),
+            percent_offset(50.0, max)
+        );
+        let percent = unsafe { scroll.VerticalScrollPercent() }.expect("vertical percent");
+        assert_close(
+            percent,
+            f64::from(percent_offset(50.0, max)) / f64::from(max) * 100.0,
+        );
+
+        unsafe { scroll.SetScrollPercent(UIA_ScrollPatternNoScroll, 100.0) }.expect("queue end");
+        host.pump().expect("drain the end scroll");
+        assert_eq!(host.scene(MAIN).expect("scene").scroll_offset(), max);
+        let end = unsafe { scroll.VerticalScrollPercent() }.expect("vertical percent");
+        assert_close(end, 100.0);
+        assert!(
+            host.accessibility_tree(MAIN)
+                .expect("tree")
+                .find_name("Add task")
+                .expect("the add form")
+                .offscreen(),
+            "UIA bounds/IsOffscreen follow the translated scene at the end offset"
+        );
+
+        let before = host.scene(MAIN).expect("scene").scroll_offset();
+        let error = unsafe { scroll.SetScrollPercent(UIA_ScrollPatternNoScroll, 100.1) }
+            .expect_err("out-of-range percent");
+        assert_invalid_operation(error);
+        let error = unsafe { scroll.SetScrollPercent(0.0, 50.0) }.expect_err("horizontal percent");
+        assert_invalid_operation(error);
+        let error = unsafe { scroll.SetScrollPercent(UIA_ScrollPatternNoScroll, f64::NAN) }
+            .expect_err("NaN percent");
+        assert_invalid_operation(error);
+        assert_eq!(
+            host.scene(MAIN).expect("scene").scroll_offset(),
+            before,
+            "rejected percents leave the offset untouched"
+        );
+
+        unsafe { scroll.SetScrollPercent(UIA_ScrollPatternNoScroll, UIA_ScrollPatternNoScroll) }
+            .expect("NoScroll is a no-op");
+        host.pump().expect("drain the no-op");
+        assert_eq!(host.scene(MAIN).expect("scene").scroll_offset(), max);
+    }
+
+    #[test]
+    fn scroll_pattern_amounts_match_page_and_line_steps_and_clamp() {
+        let mut host = open_host();
+        host.resize(MAIN, 320, 100).expect("shrink the window");
+        host.render().expect("render the small window");
+        host.windows.get_mut(MAIN).expect("the window").wheel = wheel(WheelLines::Lines(3));
+        let scene = host.scene(MAIN).expect("scene");
+        let max = scene.max_scroll_offset();
+        let page = page_step(Some(scene));
+        assert!(max >= page + 72, "the test needs room for both steps");
+        let scroll = scroll_pattern(&mut host);
+
+        unsafe { scroll.Scroll(ScrollAmount_NoAmount, ScrollAmount_LargeIncrement) }
+            .expect("page down");
+        host.pump().expect("drain page down");
+        assert_eq!(host.scene(MAIN).expect("scene").scroll_offset(), page);
+
+        unsafe { scroll.Scroll(ScrollAmount_NoAmount, ScrollAmount_SmallIncrement) }
+            .expect("line down");
+        host.pump().expect("drain line down");
+        assert_eq!(
+            host.scene(MAIN).expect("scene").scroll_offset(),
+            page + 72,
+            "the small increment uses the wheel line step"
+        );
+
+        unsafe { scroll.Scroll(ScrollAmount_NoAmount, ScrollAmount_SmallDecrement) }
+            .expect("line up");
+        host.pump().expect("drain line up");
+        assert_eq!(
+            host.scene(MAIN).expect("scene").scroll_offset(),
+            page,
+            "the small decrement uses the wheel line step"
+        );
+
+        unsafe { scroll.Scroll(ScrollAmount_NoAmount, ScrollAmount_LargeDecrement) }
+            .expect("page up");
+        host.pump().expect("drain page up");
+        assert_eq!(host.scene(MAIN).expect("scene").scroll_offset(), 0);
+
+        let before = host.scene(MAIN).expect("scene").scroll_offset();
+        unsafe { scroll.Scroll(ScrollAmount_NoAmount, ScrollAmount_NoAmount) }.expect("no amount");
+        host.pump().expect("drain no amount");
+        assert_eq!(host.scene(MAIN).expect("scene").scroll_offset(), before);
+
+        let error = unsafe { scroll.Scroll(ScrollAmount_LargeIncrement, ScrollAmount_NoAmount) }
+            .expect_err("horizontal scrolling is not exposed");
+        assert_invalid_operation(error);
+        let error = unsafe { scroll.Scroll(ScrollAmount_NoAmount, ScrollAmount(99)) }
+            .expect_err("unknown vertical amount");
+        assert_invalid_operation(error);
+
+        unsafe { scroll.SetScrollPercent(UIA_ScrollPatternNoScroll, 100.0) }.expect("go to end");
+        host.pump().expect("drain end scroll");
+        unsafe { scroll.Scroll(ScrollAmount_NoAmount, ScrollAmount_LargeIncrement) }
+            .expect("page down at the end");
+        host.pump().expect("drain clamped page down");
+        assert_eq!(
+            host.scene(MAIN).expect("scene").scroll_offset(),
+            max,
+            "large increments never overscroll"
+        );
+    }
+
+    #[test]
+    fn scroll_pattern_changes_only_the_presentation_offset() {
+        let (mut host, _probe) = open_uia_probe();
+        host.resize(MAIN, 320, 100).expect("shrink the probe");
+        host.render().expect("render the probe");
+        assert!(
+            host.scene(MAIN).expect("scene").max_scroll_offset() > 0,
+            "the probe has scrollable content"
+        );
+        let node = host
+            .runtime
+            .presentation()
+            .expect("snapshot")
+            .find_label("Field")
+            .expect("the field")
+            .id();
+        host.runtime.focus_node(node).expect("focus the field");
+        host.runtime
+            .set_selection_node(node, 1, 2)
+            .expect("place the selection");
+        host.render().expect("render the focused field");
+        with_main(&mut host, |host, window| {
+            host.ime_start(window).expect("start the composition");
+            host.apply_ime_composition(window, node, request(false, true), None, Some("ni".into()))
+                .expect("preedit");
+            window.reveal_requested = false;
+            Ok(())
+        });
+        host.render().expect("render the composition");
+        host.pump().expect("settle the composition");
+        host.render().expect("render the settled composition");
+
+        let before_snapshot = host.presentation(MAIN).expect("snapshot").clone();
+        let builds = host.runtime.presentation_builds();
+        let counters = host.runtime.counters();
+        let revision = host.runtime.presentation_revision();
+        let before_tree = host.accessibility_tree(MAIN).expect("tree");
+        let before_node = before_tree.node(node).expect("field node");
+        let runtime_id = before_node.runtime_id().expect("runtime id");
+        let top = before_tree.logical_rect(before_node).y;
+        let scroll = scroll_pattern(&mut host);
+
+        unsafe { scroll.SetScrollPercent(UIA_ScrollPatternNoScroll, 25.0) }
+            .expect("queue a small scroll");
+        host.pump().expect("drain the scroll");
+
+        assert_eq!(
+            host.runtime.presentation_builds(),
+            builds,
+            "UIA scrolling reuses the committed snapshot"
+        );
+        assert_eq!(
+            host.runtime.counters(),
+            counters,
+            "UIA scrolling leaves runtime counters flat"
+        );
+        assert_eq!(
+            host.runtime.presentation_revision(),
+            revision,
+            "UIA scrolling does not advance the presentation revision"
+        );
+        assert_eq!(
+            host.presentation(MAIN).expect("snapshot"),
+            before_snapshot,
+            "focus, selection, draft and composition are unchanged"
+        );
+        assert!(
+            !host.windows[MAIN].reveal_requested,
+            "UIA scrolling does not request reveal"
+        );
+        let offset = host.scene(MAIN).expect("scene").scroll_offset();
+        assert!(offset > 0, "the scroll was applied");
+        let after_tree = host.accessibility_tree(MAIN).expect("tree");
+        let after_node = after_tree.node(node).expect("field node stays mounted");
+        assert_eq!(after_node.runtime_id(), Some(runtime_id));
+        assert!(
+            (after_tree.logical_rect(after_node).y - (top - offset as f32)).abs() < 0.5,
+            "UIA bounds follow the applied offset"
+        );
+    }
+
+    #[test]
+    fn scroll_pattern_rejects_zero_maximum_hidden_and_disabled_targets() {
+        let mut zero = open_two_input_host();
+        zero.render().expect("render the short window");
+        assert_eq!(zero.scene(MAIN).expect("scene").max_scroll_offset(), 0);
+        let scroll = scroll_pattern(&mut zero);
+        let error = unsafe { scroll.SetScrollPercent(UIA_ScrollPatternNoScroll, 50.0) }
+            .expect_err("zero maximum");
+        assert_invalid_operation(error);
+        let error = unsafe { scroll.Scroll(ScrollAmount_NoAmount, ScrollAmount_LargeIncrement) }
+            .expect_err("zero maximum");
+        assert_invalid_operation(error);
+
+        let mut hidden = open_host();
+        hidden.resize(MAIN, 320, 100).expect("shrink the window");
+        hidden.render().expect("render the small window");
+        let scroll = scroll_pattern(&mut hidden);
+        hidden.hide(MAIN).expect("hide the window");
+        let error = unsafe { scroll.VerticallyScrollable() }.expect_err("hidden tree");
+        assert_eq!(error.code(), HRESULT(UIA_E_ELEMENTNOTAVAILABLE as i32));
+        let error = unsafe { scroll.SetScrollPercent(UIA_ScrollPatternNoScroll, 50.0) }
+            .expect_err("hidden window");
+        assert_eq!(error.code(), HRESULT(UIA_E_ELEMENTNOTAVAILABLE as i32));
+
+        let mut disabled = open_host();
+        disabled.resize(MAIN, 320, 100).expect("shrink the window");
+        disabled.render().expect("render the small window");
+        let scroll = scroll_pattern(&mut disabled);
+        disabled
+            .set_native_enabled(MAIN, false)
+            .expect("disable the window");
+        disabled.render().expect("render the disabled window");
+        let error = unsafe { scroll.SetScrollPercent(UIA_ScrollPatternNoScroll, 50.0) }
+            .expect_err("disabled window");
+        assert_eq!(error.code(), HRESULT(UIA_E_ELEMENTNOTAVAILABLE as i32));
+
+        let mut closing = open_host();
+        closing.resize(MAIN, 320, 100).expect("shrink the window");
+        closing.render().expect("render the small window");
+        let builds = closing.runtime.presentation_builds();
+        let counters = closing.runtime.counters();
+        let revision = closing.runtime.presentation_revision();
+        with_main(&mut closing, |host, window| {
+            window.close_requested = true;
+            host.apply_accessibility_scroll(window, ScrollCommand::Percent(50.0));
+            Ok(())
+        });
+        assert_eq!(closing.scene(MAIN).expect("scene").scroll_offset(), 0);
+        assert_eq!(closing.runtime.presentation_builds(), builds);
+        assert_eq!(closing.runtime.counters(), counters);
+        assert_eq!(closing.runtime.presentation_revision(), revision);
+    }
+
+    #[test]
+    fn scroll_pattern_is_only_exposed_on_the_window_root() {
+        let mut host = open_host();
+        host.render().expect("render");
+        let root = root_fragment(&mut host);
+        let simple: IRawElementProviderSimple = root.cast().expect("simple root");
+        let _: IScrollProvider = pattern(&simple, UIA_ScrollPatternId);
+        let node = provider_named(&root, "What needs to be done?");
+        assert!(
+            unsafe { node.GetPatternProvider(UIA_ScrollPatternId) }.is_err(),
+            "nodes do not expose ScrollPattern"
+        );
+        assert!(
+            unsafe { simple.GetPatternProvider(UIA_ScrollItemPatternId) }.is_err(),
+            "ScrollItemPattern is deferred"
+        );
+        assert!(
+            unsafe { node.GetPatternProvider(UIA_ScrollItemPatternId) }.is_err(),
+            "ScrollItemPattern is deferred for nodes too"
+        );
     }
 
     #[test]
@@ -6065,6 +6531,12 @@ mod tests {
             .expect("fragment root")
     }
 
+    fn scroll_pattern(host: &mut Host) -> IScrollProvider {
+        let root = root_fragment(host);
+        let simple: IRawElementProviderSimple = root.cast().expect("simple root provider");
+        pattern(&simple, UIA_ScrollPatternId)
+    }
+
     fn provider_name(simple: &IRawElementProviderSimple) -> String {
         let variant = unsafe { simple.GetPropertyValue(UIA_NamePropertyId) }.expect("element name");
         // 安全：provider 返回的 VT_BSTR 由这个 VARIANT 持有。
@@ -6165,6 +6637,10 @@ mod tests {
 
     fn assert_not_supported(error: windows::core::Error) {
         assert_eq!(error.code(), HRESULT(UIA_E_NOTSUPPORTED as i32));
+    }
+
+    fn assert_invalid_operation(error: windows::core::Error) {
+        assert_eq!(error.code(), HRESULT(UIA_E_INVALIDOPERATION as i32));
     }
 
     fn pattern<T: Interface>(

@@ -19,6 +19,7 @@
 //! 焦点变化不投递聚焦事件，指针 hover/press 等呈现瞬态不改变树，因此不产生事件。
 
 mod events;
+mod scroll;
 mod text;
 
 use std::collections::{HashMap, VecDeque};
@@ -46,15 +47,15 @@ use windows::Win32::UI::Accessibility::{
     ToggleState, ToggleState_Off, ToggleState_On, UIA_AutomationIdPropertyId,
     UIA_BoundingRectanglePropertyId, UIA_ButtonControlTypeId, UIA_CheckBoxControlTypeId,
     UIA_ClassNamePropertyId, UIA_ControlTypePropertyId, UIA_CustomControlTypeId,
-    UIA_E_ELEMENTNOTAVAILABLE, UIA_E_NOTSUPPORTED, UIA_EditControlTypeId,
+    UIA_E_ELEMENTNOTAVAILABLE, UIA_E_INVALIDOPERATION, UIA_E_NOTSUPPORTED, UIA_EditControlTypeId,
     UIA_FrameworkIdPropertyId, UIA_GroupControlTypeId, UIA_HasKeyboardFocusPropertyId,
     UIA_InvokePatternId, UIA_IsContentElementPropertyId, UIA_IsControlElementPropertyId,
     UIA_IsEnabledPropertyId, UIA_IsKeyboardFocusablePropertyId, UIA_IsOffscreenPropertyId,
     UIA_ListControlTypeId, UIA_ListItemControlTypeId, UIA_NamePropertyId,
     UIA_NativeWindowHandlePropertyId, UIA_ProcessIdPropertyId, UIA_ProviderDescriptionPropertyId,
-    UIA_TextControlTypeId, UIA_TextPatternId, UIA_TogglePatternId, UIA_ToggleToggleStatePropertyId,
-    UIA_ToolBarControlTypeId, UIA_ValuePatternId, UIA_WindowControlTypeId, UiaAppendRuntimeId,
-    UiaHostProviderFromHwnd, UiaRect,
+    UIA_ScrollPatternId, UIA_TextControlTypeId, UIA_TextPatternId, UIA_TogglePatternId,
+    UIA_ToggleToggleStatePropertyId, UIA_ToolBarControlTypeId, UIA_ValuePatternId,
+    UIA_WindowControlTypeId, UiaAppendRuntimeId, UiaHostProviderFromHwnd, UiaRect,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled;
 use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
@@ -76,6 +77,7 @@ pub struct AccessibilityTree {
     nodes: Vec<AccessibleNode>,
     by_node: HashMap<NodeId, usize>,
     scale: f32,
+    scroll: ScrollGeometry,
 }
 
 /// 树中一个可访问节点。
@@ -132,6 +134,58 @@ impl TextGeometry {
 
     pub(crate) fn selection_rects(&self) -> &[Rect] {
         &self.selection_rects
+    }
+}
+
+/// 发布树对应的垂直滚动几何。
+///
+/// 高度是场景的逻辑像素；`offset` 是场景已经夹取后的实际偏移，`max_offset`
+/// 是同一场景计算的 `max(0, content - viewport)`。UIA 百分比由这两个值派生，
+/// 不在 provider 线程重新布局。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ScrollGeometry {
+    viewport_height: f32,
+    content_height: f32,
+    offset: i32,
+    max_offset: i32,
+}
+
+impl ScrollGeometry {
+    pub(crate) const fn new(
+        viewport_height: f32,
+        content_height: f32,
+        offset: i32,
+        max_offset: i32,
+    ) -> Self {
+        Self {
+            viewport_height,
+            content_height,
+            offset,
+            max_offset,
+        }
+    }
+
+    pub(crate) const fn max_offset(&self) -> i32 {
+        self.max_offset
+    }
+
+    pub(crate) const fn vertically_scrollable(&self) -> bool {
+        self.max_offset() > 0
+    }
+
+    /// 视口占内容高度的百分比；内容不高于视口时封顶为 100。
+    pub(crate) fn vertical_view_size(&self) -> f64 {
+        if self.content_height <= 0.0 {
+            return 100.0;
+        }
+        (f64::from(self.viewport_height) / f64::from(self.content_height) * 100.0).clamp(0.0, 100.0)
+    }
+
+    /// 已应用偏移占最大偏移的百分比；内容不可滚动时没有 UIA 滚动百分比。
+    pub(crate) fn vertical_scroll_percent(&self) -> Option<f64> {
+        (self.max_offset > 0).then(|| {
+            (f64::from(self.offset) / f64::from(self.max_offset) * 100.0).clamp(0.0, 100.0)
+        })
     }
 }
 
@@ -214,6 +268,11 @@ impl AccessibilityTree {
     /// 发布时的 Window scale。
     pub const fn scale(&self) -> f32 {
         self.scale
+    }
+
+    /// 发布时场景的垂直滚动几何。
+    pub(crate) const fn scroll_geometry(&self) -> &ScrollGeometry {
+        &self.scroll
     }
 
     /// 节点已平移的逻辑矩形；`node` 应来自本树。
@@ -367,16 +426,28 @@ pub(crate) enum AccessibilityAction {
     SetValue(NodeId, String),
     SetSelection(NodeId, usize, usize),
     SetFocus(NodeId),
+    Scroll(ScrollCommand),
+}
+
+/// UIA 滚动动作；`Percent` 以 0..=100 的垂直百分比表达目标。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum ScrollCommand {
+    PageUp,
+    PageDown,
+    LineUp,
+    LineDown,
+    Percent(f64),
 }
 
 impl AccessibilityAction {
-    pub(crate) const fn node(&self) -> NodeId {
+    pub(crate) const fn node(&self) -> Option<NodeId> {
         match self {
             Self::Invoke(node)
             | Self::Toggle(node)
             | Self::SetValue(node, _)
             | Self::SetSelection(node, _, _)
-            | Self::SetFocus(node) => *node,
+            | Self::SetFocus(node) => Some(*node),
+            Self::Scroll(_) => None,
         }
     }
 }
@@ -709,6 +780,12 @@ impl IRawElementProviderSimple_Impl for ZenProvider_Impl {
     ) -> WinResult<windows::core::IUnknown> {
         let (_, tree, index) = self.resolve()?;
         let node = tree.node_at(index).ok_or_else(element_not_available)?;
+        if patternid == UIA_ScrollPatternId {
+            if !matches!(self.key, ProviderKey::Window) {
+                return Err(Error::empty());
+            }
+            return Ok(scroll::provider(self.window.clone()).into());
+        }
         if patternid == UIA_InvokePatternId && node.has_action(SnapshotAction::Click) {
             let id = node.node_id().ok_or_else(element_not_available)?;
             return Ok(InvokePattern {
@@ -991,6 +1068,10 @@ fn not_supported() -> Error {
     Error::from_hresult(HRESULT(UIA_E_NOTSUPPORTED as i32))
 }
 
+fn invalid_operation() -> Error {
+    Error::from_hresult(HRESULT(UIA_E_INVALIDOPERATION as i32))
+}
+
 pub(crate) fn window_is_foreground(hwnd: HWND) -> bool {
     // 安全：只比较前台窗口句柄。
     unsafe { GetForegroundWindow() == hwnd }
@@ -1126,6 +1207,12 @@ pub(crate) fn build_tree(
         nodes: builder.nodes,
         by_node: builder.by_node,
         scale: builder.scale,
+        scroll: ScrollGeometry::new(
+            viewport.height(),
+            scene.content_extent().height,
+            scene.scroll_offset(),
+            scene.max_scroll_offset(),
+        ),
     }
 }
 
@@ -1276,5 +1363,45 @@ mod tests {
         assert_send_sync::<ZenProvider>();
         assert_send_sync::<WindowAccessibility>();
         assert_send_sync::<AccessibilityTree>();
+    }
+
+    fn assert_close(actual: f64, expected: f64) {
+        assert!(
+            (actual - expected).abs() < 1e-9,
+            "expected {expected}, got {actual}"
+        );
+    }
+
+    #[test]
+    fn scroll_geometry_reports_view_size_and_percent() {
+        let geometry = ScrollGeometry::new(100.0, 400.0, 50, 200);
+        assert_eq!(geometry.max_offset(), 200);
+        assert!(geometry.vertically_scrollable());
+        assert_close(geometry.vertical_view_size(), 25.0);
+        assert_eq!(geometry.vertical_scroll_percent(), Some(25.0));
+    }
+
+    #[test]
+    fn scroll_geometry_has_no_percent_without_scrollable_content() {
+        let geometry = ScrollGeometry::new(200.0, 100.0, 0, 0);
+        assert!(!geometry.vertically_scrollable());
+        assert_close(geometry.vertical_view_size(), 100.0);
+        assert_eq!(geometry.vertical_scroll_percent(), None);
+    }
+
+    #[test]
+    fn scroll_geometry_clamps_percentages_to_the_applied_range() {
+        assert_eq!(
+            ScrollGeometry::new(100.0, 400.0, -20, 200).vertical_scroll_percent(),
+            Some(0.0)
+        );
+        assert_eq!(
+            ScrollGeometry::new(100.0, 400.0, 250, 200).vertical_scroll_percent(),
+            Some(100.0)
+        );
+        assert_close(
+            ScrollGeometry::new(0.0, 0.0, 0, 0).vertical_view_size(),
+            100.0,
+        );
     }
 }
