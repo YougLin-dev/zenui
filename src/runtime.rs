@@ -3187,6 +3187,19 @@ impl Runtime {
         })
     }
 
+    /// 整体替换文本输入的已提交值；一次编辑、一次 `on:input`，caret 到末尾。
+    ///
+    /// 与 `input` 的外部替换语义不同，这次替换保留既有撤销/重做历史，并作为
+    /// 一条新的撤销记录；新值与当前值相同时是静默无操作。组合中、禁用或
+    /// 非文本输入的目标被拒绝。
+    pub fn replace_text_node(&mut self, node: NodeId, value: &str) -> Result<(), DispatchError> {
+        let state = self.state.clone();
+        context::install(&state, || {
+            let element = with_state(|state| state.element_for_node(node))?;
+            self.apply_text_edit(node, element, NodeOperation::SetValue, Edit::Replace(value))
+        })
+    }
+
     /// 删除 selection，或 caret 前一个字符；没有可删除内容时是不派发事件的无操作。
     pub fn backspace_node(&mut self, node: NodeId) -> Result<(), DispatchError> {
         let state = self.state.clone();
@@ -4771,5 +4784,53 @@ mod history_tests {
             history.observed.is_none(),
             "the observed value does not stay in the dead slot"
         );
+    }
+
+    #[test]
+    fn replacing_the_value_dispatches_one_input_and_records_one_undo_entry() {
+        use std::cell::{Cell, RefCell};
+        use std::rc::Rc;
+
+        let calls = Rc::new(Cell::new(0));
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let input_calls = Rc::clone(&calls);
+        let input_seen = Rc::clone(&seen);
+        let mut app = Runtime::new();
+        app.mount(move || {
+            let draft = signal(String::from("old"));
+            view! {
+                <text-input
+                    aria:label="field"
+                    value={draft}
+                    on:input={move |value: String| {
+                        input_calls.set(input_calls.get() + 1);
+                        input_seen.borrow_mut().push(value.clone());
+                        draft.set(value);
+                    }}
+                />
+            }
+        })
+        .expect("mount");
+
+        let input = app
+            .presentation()
+            .expect("snapshot")
+            .find_label("field")
+            .expect("the input")
+            .id();
+        app.replace_text_node(input, "new").expect("replace");
+        assert_eq!(calls.get(), 1);
+        assert_eq!(seen.borrow().as_slice(), ["new"]);
+        let edited = app.presentation().expect("snapshot");
+        let field = edited.find_label("field").expect("the input");
+        assert_eq!(field.text_value(), Some("new"));
+        assert_eq!(field.edit().expect("edit state").caret(), 3);
+
+        app.undo_node(input).expect("undo");
+        assert_eq!(calls.get(), 2);
+        assert_eq!(seen.borrow().as_slice(), ["new", "old"]);
+        app.redo_node(input).expect("redo");
+        assert_eq!(calls.get(), 3);
+        assert_eq!(seen.borrow().as_slice(), ["new", "old", "new"]);
     }
 }

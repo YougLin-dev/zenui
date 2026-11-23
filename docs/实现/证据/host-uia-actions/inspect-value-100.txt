@@ -1,0 +1,79 @@
+﻿How found:	Mouse move (745,990)
+	hwnd=0x000000000DEB077E 64bit class="ZenUIHostWindow" style=0x14CF0000 ex=0x100
+Name:	"What needs to be done?"
+ControlType:	UIA_EditControlTypeId (0xC354)
+LocalizedControlType:	"编辑"
+BoundingRectangle:	{l:24 t:975 r:1466 b:1004}
+IsEnabled:	true
+IsOffscreen:	false
+IsKeyboardFocusable:	true
+HasKeyboardFocus:	false
+ProcessId:	14472
+RuntimeId:	[2A.DEB077E.4.4]
+AutomationId:	""
+FrameworkId:	"ZenUI"
+ClassName:	"text-input"
+IsControlElement:	true
+IsContentElement:	true
+ProviderDescription:	"[pid:14472,providerId:0x0 Main(parent link):ZenUI accessibility provider (unmanaged:uia_probe.exe)]"
+LegacyIAccessible.ChildId:	0
+LegacyIAccessible.DefaultAction:	""
+LegacyIAccessible.Description:	""
+LegacyIAccessible.Help:	""
+LegacyIAccessible.KeyboardShortcut:	""
+LegacyIAccessible.Name:	"What needs to be done?"
+LegacyIAccessible.Role:	可编辑文本 (0x2A)
+LegacyIAccessible.State:	可设定焦点 (0x100000)
+LegacyIAccessible.Value:	""
+Value.IsReadOnly:	false
+Value.Value:	""
+IsAnnotationPatternAvailable:	false
+IsDragPatternAvailable:	false
+IsDockPatternAvailable:	false
+IsDropTargetPatternAvailable:	false
+IsExpandCollapsePatternAvailable:	false
+IsGridItemPatternAvailable:	false
+IsGridPatternAvailable:	false
+IsInvokePatternAvailable:	false
+IsItemContainerPatternAvailable:	false
+IsLegacyIAccessiblePatternAvailable:	true
+IsMultipleViewPatternAvailable:	false
+IsObjectModelPatternAvailable:	false
+IsRangeValuePatternAvailable:	false
+IsScrollItemPatternAvailable:	false
+IsScrollPatternAvailable:	false
+IsSelectionItemPatternAvailable:	false
+IsSelectionPatternAvailable:	false
+IsSpreadsheetItemPatternAvailable:	false
+IsSpreadsheetPatternAvailable:	false
+IsStylesPatternAvailable:	false
+IsSynchronizedInputPatternAvailable:	false
+IsTableItemPatternAvailable:	false
+IsTablePatternAvailable:	false
+IsTextChildPatternAvailable:	false
+IsTextEditPatternAvailable:	false
+IsTextPatternAvailable:	false
+IsTextPattern2Available:	false
+IsTogglePatternAvailable:	false
+IsTransformPatternAvailable:	false
+IsTransform2PatternAvailable:	false
+IsValuePatternAvailable:	true
+IsVirtualizedItemPatternAvailable:	false
+IsWindowPatternAvailable:	false
+IsCustomNavigationPatternAvailable:	false
+IsSelectionPattern2Available:	false
+FirstChild:	[null]
+LastChild:	[null]
+Next:	"Add" 按钮
+Previous:	[null]
+Other Props:	Object has no additional properties
+Children:	Container has no children
+Ancestors:	"Add task" 组
+	"" 组
+	"ZenUI Todo" 窗口
+	"桌面 1" 窗格
+	[ No Parent ]
+
+UI Tree View
+
+UI Automation

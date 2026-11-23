@@ -19,6 +19,8 @@ pub enum NodeOperation {
     CompositionCommit,
     CompositionCancel,
     InsertText,
+    /// 整体替换文本输入的已提交值。
+    SetValue,
     Backspace,
     DeleteForward,
     SetCaret,
@@ -45,6 +47,7 @@ impl NodeOperation {
             Self::CompositionCommit => "composition commit",
             Self::CompositionCancel => "composition cancel",
             Self::InsertText => "insert text",
+            Self::SetValue => "set value",
             Self::Backspace => "backspace",
             Self::DeleteForward => "delete forward",
             Self::SetCaret => "set caret",

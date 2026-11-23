@@ -1,0 +1,108 @@
+scale=1.50
+
+initial
+control=50032 name="ZenUI Todo" id="" enabled=true focusable=false focused=false toggle="" value="" bounds=239,273,1350,1050
+ control=50037 name="" id="" enabled=true focusable=true focused=false toggle="" value="ZenUI Todo" bounds=263,231,1326,42
+  control=50010 name="系统" id="MenuBar" enabled=true focusable=true focused=false toggle="" value="" bounds=239,239,33,33
+   control=50011 name="系统" id="" enabled=true focusable=true focused=false toggle="" value="" bounds=239,239,33,33
+  control=50000 name="最小化" id="" enabled=true focusable=false focused=false toggle="" value="" bounds=1378,229,71,44
+  control=50000 name="最大化" id="" enabled=true focusable=false focused=false toggle="" value="" bounds=1449,229,70,44
+  control=50000 name="关闭" id="" enabled=true focusable=false focused=false toggle="" value="" bounds=1519,229,71,44
+ control=50026 name="" id="" enabled=true focusable=false focused=false toggle="" value="" bounds=239,273,1350,1050
+  control=50020 name="1 remaining" id="" enabled=true focusable=false focused=false toggle="" value="" bounds=263,297,1302,24
+  control=50026 name="Add task" id="" enabled=true focusable=false focused=false toggle="" value="" bounds=263,333,1302,55
+   control=50004 name="What needs to be done?" id="" enabled=true focusable=true focused=false toggle="" value="" bounds=263,339,1197,43
+   control=50000 name="Add" id="" enabled=true focusable=true focused=false toggle="" value="" bounds=1472,333,93,55
+  control=50026 name="Filter" id="" enabled=true focusable=false focused=false toggle="" value="" bounds=263,400,1302,43
+   control=50000 name="All" id="" enabled=true focusable=true focused=false toggle="" value="" bounds=263,400,63,43
+   control=50000 name="Active" id="" enabled=true focusable=true focused=false toggle="" value="" bounds=338,400,97,43
+   control=50000 name="Done" id="" enabled=true focusable=true focused=false toggle="" value="" bounds=447,400,90,43
+  control=50021 name="" id="" enabled=true focusable=false focused=false toggle="" value="" bounds=263,456,1302,43
+   control=50000 name="Reverse" id="" enabled=true focusable=true focused=false toggle="" value="" bounds=263,456,118,43
+   control=50000 name="Clear done" id="" enabled=true focusable=true focused=false toggle="" value="" bounds=399,456,142,43
+   control=50000 name="Load sample" id="" enabled=true focusable=true focused=false toggle="" value="" bounds=560,456,160,43
+   control=50000 name="Import file" id="" enabled=true focusable=true focused=false toggle="" value="" bounds=738,456,132,43
+   control=50000 name="Toggle theme" id="" enabled=true focusable=true focused=false toggle="" value="" bounds=888,456,105,43
+   control=50000 name="Open details" id="" enabled=true focusable=true focused=false toggle="" value="" bounds=1011,456,103,43
+  control=50021 name="" id="" enabled=true focusable=false focused=false toggle="" value="" bounds=263,511,1302,43
+   control=50000 name="Save tasks" id="" enabled=true focusable=true focused=false toggle="" value="" bounds=263,511,142,43
+   control=50000 name="Choose folder" id="" enabled=true focusable=true focused=false toggle="" value="" bounds=423,511,171,43
+  control=50026 name="" id="" enabled=true focusable=false focused=false toggle="" value="" bounds=263,567,1302,111
+   control=50026 name="" id="" enabled=true focusable=false focused=false toggle="" value="" bounds=263,567,1302,55
+    control=50007 name="" id="" enabled=true focusable=false focused=false toggle="" value="" bounds=263,567,1302,43
+     control=50002 name="Complete Write tests" id="" enabled=true focusable=true focused=false toggle="1" value="" bounds=263,576,24,24
+     control=50020 name="Write tests" id="" enabled=true focusable=false focused=false toggle="" value="" bounds=299,574,99,28
+     control=50004 name="Edit Write tests" id="" enabled=true focusable=true focused=false toggle="" value="Write tests" bounds=410,567,1054,43
+     control=50000 name="Delete Write tests" id="" enabled=true focusable=true focused=false toggle="" value="" bounds=1476,567,88,43
+   control=50026 name="" id="" enabled=true focusable=false focused=false toggle="" value="" bounds=263,622,1302,55
+    control=50007 name="" id="" enabled=true focusable=false focused=false toggle="" value="" bounds=263,622,1302,43
+     control=50002 name="Complete Read docs" id="" enabled=true focusable=true focused=false toggle="0" value="" bounds=263,631,24,24
+     control=50020 name="Read docs" id="" enabled=true focusable=false focused=false toggle="" value="" bounds=299,630,100,28
+     control=50004 name="Edit Read docs" id="" enabled=true focusable=true focused=false toggle="" value="Read docs" bounds=411,622,1053,43
+     control=50000 name="Delete Read docs" id="" enabled=true focusable=true focused=false toggle="" value="" bounds=1476,622,88,43
+
+patterns
+What needs to be done?: invoke=false toggle=false value=true
+Add: invoke=true toggle=false value=false
+Filter: invoke=false toggle=false value=false
+Reverse: invoke=true toggle=false value=false
+Complete Read docs: invoke=false toggle=true value=false
+Read docs: invoke=false toggle=false value=false
+
+set_focus has_keyboard_focus=true owner="What needs to be done?"
+value_before="" read_only=false
+value_after=true owner="What needs to be done?"
+
+invoke_add added=true matching_rows=1 remaining_2=true owner="Add"
+
+toggle before=0 after_on=true remaining_1=true owner="Complete Read docs"
+
+reverse before=["Write tests", "Read docs", "UIA action"]
+reverse after=["UIA action", "Read docs", "Write tests"] changed=true
+
+final
+control=50032 name="ZenUI Todo" id="" enabled=true focusable=false focused=false toggle="" value="" bounds=239,273,1350,1050
+ control=50037 name="" id="" enabled=true focusable=true focused=false toggle="" value="ZenUI Todo" bounds=263,231,1326,42
+  control=50010 name="系统" id="MenuBar" enabled=true focusable=true focused=false toggle="" value="" bounds=239,239,33,33
+   control=50011 name="系统" id="" enabled=true focusable=true focused=false toggle="" value="" bounds=239,239,33,33
+  control=50000 name="最小化" id="" enabled=true focusable=false focused=false toggle="" value="" bounds=1378,229,71,44
+  control=50000 name="最大化" id="" enabled=true focusable=false focused=false toggle="" value="" bounds=1449,229,70,44
+  control=50000 name="关闭" id="" enabled=true focusable=false focused=false toggle="" value="" bounds=1519,229,71,44
+ control=50026 name="" id="" enabled=true focusable=false focused=false toggle="" value="" bounds=239,273,1350,1050
+  control=50020 name="1 remaining" id="" enabled=true focusable=false focused=false toggle="" value="" bounds=263,297,1302,24
+  control=50026 name="Add task" id="" enabled=true focusable=false focused=false toggle="" value="" bounds=263,333,1302,55
+   control=50004 name="What needs to be done?" id="" enabled=true focusable=true focused=false toggle="" value="" bounds=263,339,1197,43
+   control=50000 name="Add" id="" enabled=true focusable=true focused=false toggle="" value="" bounds=1472,333,93,55
+  control=50026 name="Filter" id="" enabled=true focusable=false focused=false toggle="" value="" bounds=263,400,1302,43
+   control=50000 name="All" id="" enabled=true focusable=true focused=false toggle="" value="" bounds=263,400,63,43
+   control=50000 name="Active" id="" enabled=true focusable=true focused=false toggle="" value="" bounds=338,400,97,43
+   control=50000 name="Done" id="" enabled=true focusable=true focused=false toggle="" value="" bounds=447,400,90,43
+  control=50021 name="" id="" enabled=true focusable=false focused=false toggle="" value="" bounds=263,456,1302,43
+   control=50000 name="Reverse" id="" enabled=true focusable=true focused=true toggle="" value="" bounds=263,456,118,43
+   control=50000 name="Clear done" id="" enabled=true focusable=true focused=false toggle="" value="" bounds=399,456,142,43
+   control=50000 name="Load sample" id="" enabled=true focusable=true focused=false toggle="" value="" bounds=560,456,160,43
+   control=50000 name="Import file" id="" enabled=true focusable=true focused=false toggle="" value="" bounds=738,456,132,43
+   control=50000 name="Toggle theme" id="" enabled=true focusable=true focused=false toggle="" value="" bounds=888,456,105,43
+   control=50000 name="Open details" id="" enabled=true focusable=true focused=false toggle="" value="" bounds=1011,456,103,43
+  control=50021 name="" id="" enabled=true focusable=false focused=false toggle="" value="" bounds=263,511,1302,43
+   control=50000 name="Save tasks" id="" enabled=true focusable=true focused=false toggle="" value="" bounds=263,511,142,43
+   control=50000 name="Choose folder" id="" enabled=true focusable=true focused=false toggle="" value="" bounds=423,511,171,43
+  control=50026 name="" id="" enabled=true focusable=false focused=false toggle="" value="" bounds=263,567,1302,166
+   control=50026 name="" id="" enabled=true focusable=false focused=false toggle="" value="" bounds=263,567,1302,55
+    control=50007 name="" id="" enabled=true focusable=false focused=false toggle="" value="" bounds=263,567,1302,43
+     control=50002 name="Complete UIA action" id="" enabled=true focusable=true focused=false toggle="0" value="" bounds=263,576,24,24
+     control=50020 name="UIA action" id="" enabled=true focusable=false focused=false toggle="" value="" bounds=299,574,96,28
+     control=50004 name="Edit UIA action" id="" enabled=true focusable=true focused=false toggle="" value="" bounds=407,567,1057,43
+     control=50000 name="Delete UIA action" id="" enabled=true focusable=true focused=false toggle="" value="" bounds=1476,567,88,43
+   control=50026 name="" id="" enabled=true focusable=false focused=false toggle="" value="" bounds=263,622,1302,55
+    control=50007 name="" id="" enabled=true focusable=false focused=false toggle="" value="" bounds=263,622,1302,43
+     control=50002 name="Complete Read docs" id="" enabled=true focusable=true focused=false toggle="1" value="" bounds=263,631,24,24
+     control=50020 name="Read docs" id="" enabled=true focusable=false focused=false toggle="" value="" bounds=299,630,100,28
+     control=50004 name="Edit Read docs" id="" enabled=true focusable=true focused=false toggle="" value="Read docs" bounds=411,622,1053,43
+     control=50000 name="Delete Read docs" id="" enabled=true focusable=true focused=false toggle="" value="" bounds=1476,622,88,43
+   control=50026 name="" id="" enabled=true focusable=false focused=false toggle="" value="" bounds=263,678,1302,55
+    control=50007 name="" id="" enabled=true focusable=false focused=false toggle="" value="" bounds=263,678,1302,43
+     control=50002 name="Complete Write tests" id="" enabled=true focusable=true focused=false toggle="1" value="" bounds=263,687,24,24
+     control=50020 name="Write tests" id="" enabled=true focusable=false focused=false toggle="" value="" bounds=299,685,99,28
+     control=50004 name="Edit Write tests" id="" enabled=true focusable=true focused=false toggle="" value="Write tests" bounds=410,678,1054,43
+     control=50000 name="Delete Write tests" id="" enabled=true focusable=true focused=false toggle="" value="" bounds=1476,678,88,43

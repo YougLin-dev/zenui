@@ -3,10 +3,12 @@
 //! 输入是一次编辑前的字符偏移、本地 selection 与当前文本；输出是替换后的文本和
 //! 新的 caret。偏移始终以字符计并夹取到文本长度，因此不会切开 UTF-8 编码。
 
-/// 一次空编辑之外的三类文本修改。
+/// 一次空编辑之外的文本修改。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Edit<'a> {
     Insert(&'a str),
+    /// 整体替换已提交值；caret 落在新值末尾。
+    Replace(&'a str),
     Backspace,
     DeleteForward,
 }
@@ -89,6 +91,16 @@ pub(crate) fn apply(
             let (value, caret) = replace_range(value, start, end, insert);
             Some(EditOutcome { value, caret })
         }
+        Edit::Replace(replacement) => {
+            if value == replacement {
+                return None;
+            }
+            let caret = replacement.chars().count();
+            Some(EditOutcome {
+                value: replacement.to_owned(),
+                caret,
+            })
+        }
         Edit::Backspace => {
             let (start, end) = if start != end {
                 (start, end)
@@ -133,6 +145,18 @@ mod tests {
             })
         );
         assert_eq!(apply("abcd", 2, None, Edit::Insert("")), None);
+    }
+
+    #[test]
+    fn replace_ignores_the_selection_and_moves_the_caret_to_the_end() {
+        assert_eq!(
+            apply("abcd", 1, Some((2, 3)), Edit::Replace("新值")),
+            Some(EditOutcome {
+                value: String::from("新值"),
+                caret: 2
+            })
+        );
+        assert_eq!(apply("same", 4, None, Edit::Replace("same")), None);
     }
 
     #[test]

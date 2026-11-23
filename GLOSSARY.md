@@ -129,8 +129,12 @@ presentation snapshot 中用于命中测试与事件派发的稳定元素身份�
 _Avoid_: element index, view ID
 
 **Accessibility tree**:
-每个已提交窗口从 presentation snapshot 与同一份 `Scene` 派生的只读 UIA 树；发布时整体替换，节点身份沿用 Node ID，provider 解析当前发布而不是保留第二份界面。只覆盖读模型；UIA pattern、事件与动作不属于该术语。
+每个已提交窗口从 presentation snapshot 与同一份 `Scene` 派生的只读 UIA 树；发布时整体替换，节点身份沿用 Node ID，provider 解析当前发布而不是保留第二份界面。写 pattern 从这棵树派生动作并排给 UI 线程，不在 provider 线程修改 Runtime；UIA 事件不属于该术语。
 _Avoid_: a11y DOM, accessibility model (when meaning a separate retained tree)
+
+**Accessibility action**:
+provider 从当前 UIA 树派生、经窗口队列交给 UI 线程重验后执行的写操作（Invoke、Toggle、SetValue、SetFocus）；它最终调用 Runtime 的按 Node ID 命令，不保留第二份界面状态。
+_Avoid_: UIA command, native click
 
 **Text edit**:
 在 caret/selection 上执行的平台无关编辑操作，例如插入、退格、删除；每次编辑派发一次 `on:input`。
