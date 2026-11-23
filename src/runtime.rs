@@ -11,8 +11,9 @@ use crate::context::{self, ContextFault, DepKey, Phase, with_state};
 use crate::dispatch::{DispatchError, NodeOperation};
 use crate::menu::{CommandError, CommandEvent, CommandHandler, CommandSource};
 use crate::presentation::{
-    Appearance, NodeId, NodeStatus, PresentationSnapshot, SnapshotAttr, SnapshotElement,
-    SnapshotNode, SnapshotRowBand, SnapshotValue, TextEditState,
+    Appearance, NodeId, NodeStatus, PresentationSnapshot, SnapshotAction, SnapshotActions,
+    SnapshotAttr, SnapshotElement, SnapshotNode, SnapshotRowBand, SnapshotSemantics, SnapshotValue,
+    TextEditState,
 };
 use crate::signal::{Memo, MemoCell, SignalCell};
 use crate::store::{TodoId, WriteError};
@@ -995,10 +996,12 @@ impl State {
 
     /// 原生控件与显式挂接 focus/blur 的元素参与遍历；禁用元素不参与接任或 Tab 顺序。
     fn is_focusable(&self, element: usize) -> bool {
+        !self.elements[element].is_disabled() && self.element_is_inherently_focusable(element)
+    }
+
+    /// 元素本身的键盘可聚焦语义；`disabled` 与可见性由调用方另行组合。
+    fn element_is_inherently_focusable(&self, element: usize) -> bool {
         let element = &self.elements[element];
-        if element.is_disabled() {
-            return false;
-        }
         matches!(element.tag, "button" | "text-input" | "checkbox")
             || element.events.iter().any(|id| {
                 matches!(
@@ -4532,8 +4535,26 @@ fn collect_element(state: &State, id: usize, out: &mut Vec<SnapshotNode>) {
         attrs: snapshot_attrs(element),
         styles: snapshot_styles(element),
         edit: snapshot_edit(&element.local),
+        semantics: SnapshotSemantics::new(
+            state.element_is_inherently_focusable(id),
+            snapshot_actions(state, element),
+        ),
         children,
     }));
+}
+
+/// 已挂载的用户动作集合；焦点/组合等运行时事件不在此投影里。
+fn snapshot_actions(state: &State, element: &MountedElement) -> SnapshotActions {
+    let mut actions = SnapshotActions::default();
+    for id in &element.events {
+        match event_kind(&state.events[*id]) {
+            EventKind::Click => actions.insert(SnapshotAction::Click),
+            EventKind::Change => actions.insert(SnapshotAction::Change),
+            EventKind::Input => actions.insert(SnapshotAction::Input),
+            _ => {}
+        }
+    }
+    actions
 }
 
 /// 收集窗口化 For 的行带元数据；窗口外行没有节点，几何全靠这条记录定位。
