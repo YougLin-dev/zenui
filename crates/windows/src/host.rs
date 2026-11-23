@@ -1827,6 +1827,16 @@ impl Host {
                     }
                     ignore_expected_dispatch(self.runtime.replace_text_node(node, &value))
                 }
+                AccessibilityAction::SetSelection(_, start, end) => {
+                    let editable = element.semantics().has_action(SnapshotAction::Input)
+                        && element
+                            .edit()
+                            .is_some_and(|edit| edit.composition().is_none());
+                    if !editable {
+                        continue;
+                    }
+                    ignore_expected_dispatch(self.runtime.set_selection_node(node, start, end))
+                }
                 AccessibilityAction::SetFocus(_) => {
                     if !element.semantics().focusable()
                         || !accessibility::window_is_foreground(window.hwnd())
@@ -4066,17 +4076,26 @@ mod tests {
     use crate::accessibility::ControlType;
     use std::sync::Mutex;
     use std::sync::atomic::AtomicUsize;
-    use windows::Win32::System::Ole::{SafeArrayDestroy, SafeArrayGetElement};
-    use windows::Win32::UI::Accessibility::{
-        IInvokeProvider, IRawElementProviderFragment, IToggleProvider, IValueProvider,
-        NavigateDirection_FirstChild, NavigateDirection_NextSibling,
-        ProviderOptions_ServerSideProvider, ToggleState_Off, ToggleState_On,
-        UIA_E_ELEMENTNOTAVAILABLE, UIA_E_NOTSUPPORTED, UIA_InvokePatternId, UIA_NamePropertyId,
-        UIA_TogglePatternId, UIA_ValuePatternId, UiaAppendRuntimeId,
+    use windows::Win32::Graphics::Gdi::ClientToScreen;
+    use windows::Win32::System::Com::SAFEARRAY;
+    use windows::Win32::System::Ole::{
+        SafeArrayDestroy, SafeArrayGetElement, SafeArrayGetLBound, SafeArrayGetUBound,
     };
-    use windows::Win32::UI::Input::KeyboardAndMouse::{IsWindowEnabled, VK_A};
+    use windows::Win32::System::Variant::VARIANT;
+    use windows::Win32::UI::Accessibility::{
+        IInvokeProvider, IRawElementProviderFragment, ITextProvider, ITextRangeProvider,
+        IToggleProvider, IValueProvider, NavigateDirection_FirstChild,
+        NavigateDirection_NextSibling, ProviderOptions_ServerSideProvider,
+        SupportedTextSelection_Single, TextPatternRangeEndpoint_End,
+        TextPatternRangeEndpoint_Start, TextUnit_Character, ToggleState_Off, ToggleState_On,
+        UIA_E_ELEMENTNOTAVAILABLE, UIA_E_NOTSUPPORTED, UIA_FontNameAttributeId,
+        UIA_InvokePatternId, UIA_NamePropertyId, UIA_TextPatternId, UIA_TogglePatternId,
+        UIA_ValuePatternId, UiaAppendRuntimeId, UiaPoint,
+    };
+    use windows::Win32::UI::Input::KeyboardAndMouse::{IsWindowEnabled, VK_A, VK_NEXT};
     use windows::Win32::UI::WindowsAndMessaging::SendMessageW;
-    use windows::core::{HRESULT, Interface, w};
+    use windows::core::{BSTR, HRESULT, Interface, w};
+    use zenui_render::DecorationKind;
 
     const MAIN: &str = "main";
 
@@ -4809,6 +4828,392 @@ mod tests {
         let caption: IRawElementProviderFragment = caption.cast().expect("fragment");
         let error = unsafe { caption.SetFocus() }.expect_err("text is not focusable");
         assert_eq!(error.code(), HRESULT(UIA_E_NOTSUPPORTED as i32));
+    }
+
+    #[test]
+    fn text_pattern_reads_the_document_and_selection_in_utf16_offsets() {
+        let (mut host, _probe) = open_uia_probe();
+        let root = root_fragment(&mut host);
+        let field = provider_named(&root, "Field");
+        let text: ITextProvider = pattern(&field, UIA_TextPatternId);
+        assert_eq!(
+            unsafe { text.SupportedTextSelection() }.expect("supported selection"),
+            SupportedTextSelection_Single
+        );
+        let document = unsafe { text.DocumentRange() }.expect("document range");
+        assert_eq!(range_text(&document), "old");
+        let tree = host.accessibility_tree(MAIN).expect("tree");
+        let field_node = tree.find_name("Field").expect("the field");
+        assert_range_rectangles(&host, &document, &[tree.logical_rect(field_node)]);
+        assert_eq!(
+            unsafe { document.GetText(2) }.expect("prefix").to_string(),
+            "ol"
+        );
+        assert_eq!(
+            unsafe { document.GetText(0) }
+                .expect("empty prefix")
+                .to_string(),
+            ""
+        );
+        let visible = unsafe { text.GetVisibleRanges() }.expect("visible ranges");
+        assert_eq!(range_text(&text_range_at(visible, 0)), "old");
+        let ranges = unsafe { text.GetSelection() }.expect("selection");
+        let selection = text_range_at(ranges, 0);
+        assert_eq!(range_text(&selection), "");
+        assert!(
+            rect_values(&selection).is_empty(),
+            "an unfocused input has no caret geometry"
+        );
+
+        let value: IValueProvider = pattern(&field, UIA_ValuePatternId);
+        unsafe { value.SetValue(w!("a中🙂e\u{301}z")) }.expect("replace the value");
+        host.pump().expect("drain the replacement");
+        let document = unsafe { text.DocumentRange() }.expect("new document range");
+        assert_eq!(range_text(&document), "a中🙂e\u{301}z");
+        let node = host
+            .presentation(MAIN)
+            .expect("snapshot")
+            .find_label("Field")
+            .expect("the field")
+            .id();
+
+        host.runtime.focus_node(node).expect("focus the field");
+        host.render().expect("render the focus");
+        for (range, expected) in [
+            ((0usize, 1usize), "a"),
+            ((1, 2), "中"),
+            ((2, 3), "🙂"),
+            ((3, 5), "e\u{301}"),
+        ] {
+            host.runtime
+                .set_selection_node(node, range.0, range.1)
+                .expect("select a range");
+            host.render().expect("render the selection");
+            let snapshot = host.presentation(MAIN).expect("snapshot");
+            let edit = snapshot
+                .find_label("Field")
+                .expect("the field")
+                .edit()
+                .expect("edit state");
+            assert_eq!(edit.caret(), range.1);
+            assert_eq!(edit.selection(), Some(range));
+            let ranges = unsafe { text.GetSelection() }.expect("selection");
+            let selected = text_range_at(ranges, 0);
+            assert_eq!(
+                range_text(&selected),
+                expected,
+                "GetSelection matches TextEditState for {range:?}"
+            );
+            let selections: Vec<Rect> = host
+                .scene(MAIN)
+                .expect("scene")
+                .decorations()
+                .iter()
+                .filter(|decoration| {
+                    decoration.node() == node && decoration.kind() == DecorationKind::Selection
+                })
+                .map(|decoration| decoration.rect())
+                .collect();
+            assert!(
+                !selections.is_empty(),
+                "the selection has visible geometry for {range:?}"
+            );
+            assert_range_rectangles(&host, &selected, &selections);
+        }
+
+        host.runtime
+            .set_caret_node(node, 4)
+            .expect("place the caret");
+        host.render().expect("render the caret");
+        let snapshot = host.presentation(MAIN).expect("snapshot");
+        let edit = snapshot
+            .find_label("Field")
+            .expect("the field")
+            .edit()
+            .expect("edit state");
+        assert_eq!(edit.caret(), 4);
+        assert_eq!(
+            edit.selection(),
+            Some((4, 4)),
+            "set_caret stores a collapsed selection"
+        );
+        let ranges = unsafe { text.GetSelection() }.expect("selection");
+        let caret = text_range_at(ranges, 0);
+        assert_eq!(range_text(&caret), "");
+        let caret_rect = host
+            .scene(MAIN)
+            .expect("scene")
+            .caret(node)
+            .expect("caret geometry");
+        assert_range_rectangles(&host, &caret, &[caret_rect]);
+    }
+
+    #[test]
+    fn text_pattern_reports_no_visible_text_when_the_input_is_scrolled_out() {
+        let mut host = open_long_text_host();
+        let mut pages = 0;
+        while host.scene(MAIN).expect("scene").scroll_offset()
+            < host.scene(MAIN).expect("scene").max_scroll_offset()
+            && pages < 40
+        {
+            send_msg(
+                &mut host,
+                MSG {
+                    message: WM_KEYDOWN,
+                    wParam: WPARAM(VK_NEXT.0 as usize),
+                    ..Default::default()
+                },
+            );
+            pages += 1;
+        }
+        assert!(pages > 0, "the long host scrolls");
+        let tree = host.accessibility_tree(MAIN).expect("tree");
+        assert!(
+            tree.find_name("What needs to be done?")
+                .expect("the draft input")
+                .offscreen(),
+            "the draft is scrolled out of view"
+        );
+
+        let root = root_fragment(&mut host);
+        let field = provider_named(&root, "What needs to be done?");
+        let text: ITextProvider = pattern(&field, UIA_TextPatternId);
+        let visible = unsafe { text.GetVisibleRanges() }.expect("visible ranges");
+        let visible = text_range_at(visible, 0);
+        assert_eq!(
+            range_text(&visible),
+            "",
+            "no visible text returns a degenerate range"
+        );
+        assert!(
+            rect_values(&visible).is_empty(),
+            "a fully offscreen range has no rectangles"
+        );
+        let document = unsafe { text.DocumentRange() }.expect("document range");
+        assert!(
+            rect_values(&document).is_empty(),
+            "a fully offscreen document returns an empty array, not NULL"
+        );
+    }
+
+    #[test]
+    fn text_pattern_rejects_every_unsupported_range_operation() {
+        let (mut host, _probe) = open_uia_probe();
+        let root = root_fragment(&mut host);
+        let field = provider_named(&root, "Field");
+        let text: ITextProvider = pattern(&field, UIA_TextPatternId);
+        let document = unsafe { text.DocumentRange() }.expect("document range");
+        let other = unsafe { document.Clone() }.expect("cloned range");
+        assert_eq!(range_text(&other), "old");
+
+        let error = unsafe { text.RangeFromPoint(UiaPoint { x: 0.0, y: 0.0 }) }
+            .expect_err("RangeFromPoint is not part of this surface");
+        assert_not_supported(error);
+        let error = unsafe { text.RangeFromChild(None) }
+            .expect_err("RangeFromChild is not part of this surface");
+        assert_not_supported(error);
+        let error = unsafe { document.Move(TextUnit_Character, 1) }
+            .expect_err("Move is not part of this surface");
+        assert_not_supported(error);
+        let error = unsafe { document.ExpandToEnclosingUnit(TextUnit_Character) }
+            .expect_err("ExpandToEnclosingUnit is not part of this surface");
+        assert_not_supported(error);
+        let error =
+            unsafe { document.Compare(&other) }.expect_err("Compare is not part of this surface");
+        assert_not_supported(error);
+        let error = unsafe {
+            document.CompareEndpoints(
+                TextPatternRangeEndpoint_Start,
+                &other,
+                TextPatternRangeEndpoint_End,
+            )
+        }
+        .expect_err("CompareEndpoints is not part of this surface");
+        assert_not_supported(error);
+        let error = unsafe {
+            document.MoveEndpointByUnit(TextPatternRangeEndpoint_Start, TextUnit_Character, 1)
+        }
+        .expect_err("MoveEndpointByUnit is not part of this surface");
+        assert_not_supported(error);
+        let error = unsafe {
+            document.MoveEndpointByRange(
+                TextPatternRangeEndpoint_Start,
+                &other,
+                TextPatternRangeEndpoint_End,
+            )
+        }
+        .expect_err("MoveEndpointByRange is not part of this surface");
+        assert_not_supported(error);
+        let error =
+            unsafe { document.FindAttribute(UIA_FontNameAttributeId, &VARIANT::default(), false) }
+                .expect_err("FindAttribute is not part of this surface");
+        assert_not_supported(error);
+        let error = unsafe { document.FindText(&BSTR::from("old"), false, false) }
+            .expect_err("FindText is not part of this surface");
+        assert_not_supported(error);
+        let error = unsafe { document.GetAttributeValue(UIA_FontNameAttributeId) }
+            .expect_err("GetAttributeValue is not part of this surface");
+        assert_not_supported(error);
+        let error = unsafe { document.ScrollIntoView(false) }
+            .expect_err("ScrollIntoView is not part of this surface");
+        assert_not_supported(error);
+        let error = unsafe { document.AddToSelection() }
+            .expect_err("AddToSelection is not part of this surface");
+        assert_not_supported(error);
+        let error = unsafe { document.RemoveFromSelection() }
+            .expect_err("RemoveFromSelection is not part of this surface");
+        assert_not_supported(error);
+        let error =
+            unsafe { document.GetChildren() }.expect_err("GetChildren is not part of this surface");
+        assert_not_supported(error);
+
+        let enclosing = unsafe { document.GetEnclosingElement() }.expect("enclosing element");
+        assert_eq!(provider_name(&enclosing), "Field");
+    }
+
+    #[test]
+    fn text_pattern_select_moves_the_selection_without_dispatching_input() {
+        let (mut host, probe) = open_uia_probe();
+        let root = root_fragment(&mut host);
+        let field = provider_named(&root, "Field");
+        let text: ITextProvider = pattern(&field, UIA_TextPatternId);
+        let node = host
+            .presentation(MAIN)
+            .expect("snapshot")
+            .find_label("Field")
+            .expect("the field")
+            .id();
+        host.runtime.focus_node(node).expect("focus the field");
+        host.runtime
+            .set_selection_node(node, 1, 3)
+            .expect("select a range");
+        host.render().expect("render the selection");
+
+        let ranges = unsafe { text.GetSelection() }.expect("selection");
+        let selected = text_range_at(ranges, 0);
+        assert_eq!(range_text(&selected), "ld");
+        host.runtime
+            .set_caret_node(node, 0)
+            .expect("move the caret");
+        host.render().expect("render the caret");
+        unsafe { selected.Select() }.expect("queue the selection");
+        assert!(
+            probe.inputs.lock().expect("inputs").is_empty(),
+            "Select only queues a selection change"
+        );
+        host.pump().expect("drain the selection");
+        assert!(
+            probe.inputs.lock().expect("inputs").is_empty(),
+            "Select dispatches no on:input"
+        );
+        let snapshot = host.presentation(MAIN).expect("snapshot");
+        let edit = snapshot
+            .find_label("Field")
+            .expect("the field")
+            .edit()
+            .expect("edit state");
+        assert_eq!(edit.caret(), 3, "the caret moves to the range focus");
+        assert_eq!(edit.anchor(), 1);
+        assert_eq!(edit.selection(), Some((1, 3)));
+
+        let document = unsafe { text.DocumentRange() }.expect("document range");
+        unsafe { document.Select() }.expect("queue selecting the document");
+        host.pump().expect("drain the selection");
+        let snapshot = host.presentation(MAIN).expect("snapshot");
+        let edit = snapshot
+            .find_label("Field")
+            .expect("the field")
+            .edit()
+            .expect("edit state");
+        assert_eq!(edit.selection(), Some((0, 3)));
+        assert_eq!(edit.caret(), 3);
+        assert!(
+            probe.inputs.lock().expect("inputs").is_empty(),
+            "selecting the document keeps on:input silent"
+        );
+    }
+
+    #[test]
+    fn text_pattern_keeps_composing_disabled_and_static_inputs_read_only() {
+        let (mut host, probe) = open_uia_probe();
+        let node = host
+            .presentation(MAIN)
+            .expect("snapshot")
+            .find_label("Field")
+            .expect("the field")
+            .id();
+        host.runtime.focus_node(node).expect("focus the field");
+        host.runtime
+            .set_selection_node(node, 1, 3)
+            .expect("select before composing");
+        host.runtime
+            .compose_start_node(node)
+            .expect("start the composition");
+        host.runtime
+            .compose_update_node(node, "X")
+            .expect("update the preedit");
+        host.render().expect("render the composition");
+        let snapshot = host.presentation(MAIN).expect("snapshot");
+        let edit = snapshot
+            .find_label("Field")
+            .expect("the field")
+            .edit()
+            .expect("edit state");
+        assert_eq!(edit.caret(), 2, "the display caret follows the preedit");
+        assert_eq!(edit.composition(), Some((1, 3)));
+        assert_eq!(edit.selection(), None);
+        let tree = host.accessibility_tree(MAIN).expect("tree");
+        let geometry = tree
+            .find_name("Field")
+            .expect("the field")
+            .text_geometry()
+            .expect("text geometry");
+        assert_eq!(
+            geometry.caret(),
+            3,
+            "the document caret is the end of the replaced range, not the display offset"
+        );
+        assert_eq!(geometry.selection(), None);
+        let root = root_fragment(&mut host);
+        let field = provider_named(&root, "Field");
+        let text: ITextProvider = pattern(&field, UIA_TextPatternId);
+        let document = unsafe { text.DocumentRange() }.expect("document range");
+        assert_eq!(
+            range_text(&document),
+            "old",
+            "the document excludes the preedit"
+        );
+        let ranges = unsafe { text.GetSelection() }.expect("selection is readable");
+        let selection = text_range_at(ranges, 0);
+        assert_eq!(range_text(&selection), "");
+        let error = unsafe { document.Select() }.expect_err("a composing input is read-only");
+        assert_eq!(error.code(), HRESULT(UIA_E_ELEMENTNOTAVAILABLE as i32));
+        host.pump().expect("drain the rejected selection");
+        assert!(
+            probe.inputs.lock().expect("inputs").is_empty(),
+            "a rejected Select dispatches no on:input"
+        );
+
+        let mut disabled = open_disabled_probe();
+        let root = root_fragment(&mut disabled);
+        let locked = provider_named(&root, "Locked");
+        let text: ITextProvider = pattern(&locked, UIA_TextPatternId);
+        let document = unsafe { text.DocumentRange() }.expect("a disabled document is readable");
+        assert_eq!(range_text(&document), "frozen");
+        let error = unsafe { document.Select() }.expect_err("a disabled input is read-only");
+        assert_eq!(error.code(), HRESULT(UIA_E_ELEMENTNOTAVAILABLE as i32));
+        disabled.pump().expect("drain the rejected selection");
+
+        let mut read_only = open_read_only_probe();
+        let root = root_fragment(&mut read_only);
+        let field = provider_named(&root, "Static");
+        let text: ITextProvider = pattern(&field, UIA_TextPatternId);
+        let document = unsafe { text.DocumentRange() }.expect("a static document is readable");
+        assert_eq!(range_text(&document), "static text");
+        let error =
+            unsafe { document.Select() }.expect_err("an input without on:input is read-only");
+        assert_eq!(error.code(), HRESULT(UIA_E_ELEMENTNOTAVAILABLE as i32));
+        read_only.pump().expect("drain the rejected selection");
     }
 
     #[test]
@@ -5615,12 +6020,55 @@ mod tests {
         host
     }
 
+    /// 足够长的 Todo 列表：滚动到底部后草稿输入完全离开视口。
+    fn open_long_text_host() -> Host {
+        let mut runtime = Runtime::new();
+        zenui_demo::open_todo_window(&mut runtime).expect("open the todo window");
+        for index in 0..80 {
+            runtime
+                .input("What needs to be done?", &format!("Task {index}"))
+                .expect("fill the draft");
+            runtime.submit("Add task").expect("add a row");
+        }
+        let mut host = Host::open(runtime, HostConfig::hidden()).expect("open a long host");
+        host.render().expect("render the long host");
+        host
+    }
+
+    /// 没有 on:input 的静态文本输入：可读但不可选择。
+    fn open_read_only_probe() -> Host {
+        let mut runtime = Runtime::new();
+        runtime
+            .declare_windows(|catalog| {
+                catalog.window(WindowSpec::new(MAIN).primary().sized(320, 240), |_| {
+                    view! {
+                        <view>
+                            <text-input aria:label="Static" value="static text" />
+                        </view>
+                    }
+                })?;
+                Ok(())
+            })
+            .expect("declare the read-only probe window");
+        runtime.show(MAIN).expect("show the read-only probe window");
+        let mut host =
+            Host::open(runtime, HostConfig::hidden()).expect("open the read-only probe host");
+        host.render().expect("render the read-only probe window");
+        host
+    }
+
     fn root_fragment(host: &mut Host) -> IRawElementProviderFragment {
         let hwnd = host.hwnd(MAIN).expect("a live window");
         host.accessibility_provider(hwnd)
             .expect("a root provider")
             .cast()
             .expect("fragment root")
+    }
+
+    fn provider_name(simple: &IRawElementProviderSimple) -> String {
+        let variant = unsafe { simple.GetPropertyValue(UIA_NamePropertyId) }.expect("element name");
+        // 安全：provider 返回的 VT_BSTR 由这个 VARIANT 持有。
+        unsafe { &variant.Anonymous.Anonymous.Anonymous.bstrVal }.to_string()
     }
 
     /// 从根开始按 UIA 导航查找名称匹配的元素 provider。
@@ -5633,12 +6081,7 @@ mod tests {
             while let Some(child_fragment) = child {
                 let simple: IRawElementProviderSimple =
                     child_fragment.cast().expect("simple provider");
-                let variant =
-                    unsafe { simple.GetPropertyValue(UIA_NamePropertyId) }.expect("element name");
-                // 安全：provider 返回的 VT_BSTR 由这个 VARIANT 持有。
-                let child_name =
-                    unsafe { &variant.Anonymous.Anonymous.Anonymous.bstrVal }.to_string();
-                if child_name == name {
+                if provider_name(&simple) == name {
                     return Some(simple);
                 }
                 if let Some(found) = walk(&child_fragment, name) {
@@ -5649,6 +6092,79 @@ mod tests {
             None
         }
         walk(root, name).expect("a provider with the requested name")
+    }
+
+    /// 取出 VT_UNKNOWN SAFEARRAY 的一个元素并销毁数组。
+    ///
+    /// `SafeArrayGetElement` 对接口元素调用 AddRef，取出的范围持有自己的引用。
+    fn text_range_at(array: *mut SAFEARRAY, index: i32) -> ITextRangeProvider {
+        let mut raw: *mut c_void = std::ptr::null_mut();
+        // 安全：raw 是本地输出缓冲；数组由本次调用方的 provider 创建。
+        unsafe {
+            SafeArrayGetElement(array, &index, (&mut raw as *mut *mut c_void).cast())
+                .expect("a range element");
+            let range = ITextRangeProvider::from_raw(raw);
+            let _ = SafeArrayDestroy(array);
+            range
+        }
+    }
+
+    fn range_text(range: &ITextRangeProvider) -> String {
+        unsafe { range.GetText(-1) }
+            .expect("range text")
+            .to_string()
+    }
+
+    /// 复制 VT_R8 SAFEARRAY 的矩形值并销毁数组。
+    fn rect_values(range: &ITextRangeProvider) -> Vec<f64> {
+        let array = unsafe { range.GetBoundingRectangles() }.expect("rectangle array");
+        assert!(
+            !array.is_null(),
+            "GetBoundingRectangles returns an empty array, not NULL"
+        );
+        let lower = unsafe { SafeArrayGetLBound(array, 1) }.expect("lower bound");
+        let upper = unsafe { SafeArrayGetUBound(array, 1) }.expect("upper bound");
+        let mut values = Vec::with_capacity((upper - lower + 1).max(0) as usize);
+        for index in lower..=upper {
+            let mut value = 0.0f64;
+            // 安全：value 是本地输出缓冲；索引已由数组边界确定。
+            unsafe { SafeArrayGetElement(array, &index, (&mut value as *mut f64).cast()) }
+                .expect("a rectangle value");
+            values.push(value);
+        }
+        let _ = unsafe { SafeArrayDestroy(array) };
+        values
+    }
+
+    /// 范围矩形等于场景矩形按客户端原点和窗口 scale 翻译后的物理值。
+    fn assert_range_rectangles(host: &Host, range: &ITextRangeProvider, expected: &[Rect]) {
+        let values = rect_values(range);
+        assert_eq!(values.len(), expected.len() * 4, "one quad per rectangle");
+        let hwnd = host.hwnd(MAIN).expect("a live window");
+        let mut origin = POINT { x: 0, y: 0 };
+        // 安全：origin 是本地输出缓冲；句柄由测试宿主持有。
+        assert!(
+            unsafe { ClientToScreen(hwnd, &mut origin) }.as_bool(),
+            "client origin"
+        );
+        let scale = f64::from(host.accessibility_tree(MAIN).expect("tree").scale());
+        for (actual, rect) in values.chunks(4).zip(expected) {
+            assert_close(actual[0], f64::from(origin.x) + f64::from(rect.x) * scale);
+            assert_close(actual[1], f64::from(origin.y) + f64::from(rect.y) * scale);
+            assert_close(actual[2], f64::from(rect.width) * scale);
+            assert_close(actual[3], f64::from(rect.height) * scale);
+        }
+    }
+
+    fn assert_close(actual: f64, expected: f64) {
+        assert!(
+            (actual - expected).abs() < 1e-6,
+            "expected {expected}, got {actual}"
+        );
+    }
+
+    fn assert_not_supported(error: windows::core::Error) {
+        assert_eq!(error.code(), HRESULT(UIA_E_NOTSUPPORTED as i32));
     }
 
     fn pattern<T: Interface>(

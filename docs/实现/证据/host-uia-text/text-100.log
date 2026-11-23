@@ -1,0 +1,171 @@
+===== main: focus and initial read =====
+foreground=286460772 target=286460772
+ELEMENT What needs to be done?
+BOUNDS 64,115,782,29
+OFFSCREEN False
+VALUE ""
+READONLY False
+SUPPORTED Single
+DOCUMENT ""
+DOCUMENT_RECTS 0
+SELECTION_COUNT 1
+SELECTION_TEXT 0 ""
+SELECTION 0_RECTS 0
+===== main: set unicode value =====
+ELEMENT What needs to be done?
+BOUNDS 64,115,782,29
+OFFSCREEN False
+VALUE ""
+READONLY False
+SUPPORTED Single
+DOCUMENT ""
+DOCUMENT_RECTS 0
+SELECTION_COUNT 1
+SELECTION_TEXT 0 ""
+SELECTION 0_RECTS 0
+SET_VALUE "a中🙂éz"
+DOCUMENT_AFTER "a中🙂éz"
+SELECTION_COUNT 1
+SELECTION_TEXT 0 ""
+SELECTION 0_RECTS 1
+SELECTION 0_RECT 126,120,1,19
+ELEMENT What needs to be done?
+BOUNDS 64,115,782,29
+OFFSCREEN False
+VALUE "a中🙂éz"
+READONLY False
+SUPPORTED Single
+DOCUMENT "a中🙂éz"
+DOCUMENT_RECTS 1
+DOCUMENT_RECT 64,115,782,29
+SELECTION_COUNT 1
+SELECTION_TEXT 0 ""
+SELECTION 0_RECTS 1
+SELECTION 0_RECT 126,120,1,19
+===== main: Home caret =====
+ELEMENT What needs to be done?
+BOUNDS 64,115,782,29
+OFFSCREEN False
+VALUE "a中🙂éz"
+READONLY False
+SUPPORTED Single
+DOCUMENT "a中🙂éz"
+DOCUMENT_RECTS 1
+DOCUMENT_RECT 64,115,782,29
+SELECTION_COUNT 1
+SELECTION_TEXT 0 ""
+SELECTION 0_RECTS 1
+SELECTION 0_RECT 71,120,1,19
+===== main: Right caret =====
+ELEMENT What needs to be done?
+BOUNDS 64,115,782,29
+OFFSCREEN False
+VALUE "a中🙂éz"
+READONLY False
+SUPPORTED Single
+DOCUMENT "a中🙂éz"
+DOCUMENT_RECTS 1
+DOCUMENT_RECT 64,115,782,29
+SELECTION_COUNT 1
+SELECTION_TEXT 0 ""
+SELECTION 0_RECTS 1
+SELECTION 0_RECT 78,120,1,19
+===== main: select document =====
+ELEMENT What needs to be done?
+BOUNDS 64,115,782,29
+OFFSCREEN False
+VALUE "a中🙂éz"
+READONLY False
+SUPPORTED Single
+DOCUMENT "a中🙂éz"
+DOCUMENT_RECTS 1
+DOCUMENT_RECT 64,115,782,29
+SELECTION_COUNT 1
+SELECTION_TEXT 0 ""
+SELECTION 0_RECTS 1
+SELECTION 0_RECT 78,120,1,19
+SELECT_DOCUMENT queued
+SELECTION_COUNT 1
+SELECTION_TEXT 0 "a中🙂éz"
+SELECTION 0_RECTS 1
+SELECTION 0_RECT 71,120,55,19
+===== details: focus and set wrapped value =====
+foreground=222494874 target=222494874
+ELEMENT Details note
+BOUNDS 180,262,488,226
+OFFSCREEN False
+VALUE ""
+READONLY False
+SUPPORTED Single
+DOCUMENT ""
+DOCUMENT_RECTS 0
+SELECTION_COUNT 1
+SELECTION_TEXT 0 ""
+SELECTION 0_RECTS 0
+SET_VALUE "Details note with 中🙂 é wrapping across several visual lines to exercise multiple selection rectangles."
+DOCUMENT_AFTER "Details note with 中🙂 é wrapping across several visual lines to exercise multiple selection rectangles."
+SELECTION_COUNT 1
+SELECTION_TEXT 0 ""
+SELECTION 0_RECTS 1
+SELECTION 0_RECT 366,286,1,19
+ELEMENT Details note
+BOUNDS 180,262,488,226
+OFFSCREEN False
+VALUE "Details note with 中🙂 é wrapping across several visual lines to exercise multiple selection rectangles."
+READONLY False
+SUPPORTED Single
+DOCUMENT "Details note with 中🙂 é wrapping across several visual lines to exercise multiple selection rectangles."
+DOCUMENT_RECTS 1
+DOCUMENT_RECT 180,262,488,226
+SELECTION_COUNT 1
+SELECTION_TEXT 0 ""
+SELECTION 0_RECTS 1
+SELECTION 0_RECT 366,286,1,19
+===== details: Home caret =====
+ELEMENT Details note
+BOUNDS 180,262,488,226
+OFFSCREEN False
+VALUE "Details note with 中🙂 é wrapping across several visual lines to exercise multiple selection rectangles."
+READONLY False
+SUPPORTED Single
+DOCUMENT "Details note with 中🙂 é wrapping across several visual lines to exercise multiple selection rectangles."
+DOCUMENT_RECTS 1
+DOCUMENT_RECT 180,262,488,226
+SELECTION_COUNT 1
+SELECTION_TEXT 0 ""
+SELECTION 0_RECTS 1
+SELECTION 0_RECT 187,267,1,19
+===== details: End caret =====
+ELEMENT Details note
+BOUNDS 180,262,488,226
+OFFSCREEN False
+VALUE "Details note with 中🙂 é wrapping across several visual lines to exercise multiple selection rectangles."
+READONLY False
+SUPPORTED Single
+DOCUMENT "Details note with 中🙂 é wrapping across several visual lines to exercise multiple selection rectangles."
+DOCUMENT_RECTS 1
+DOCUMENT_RECT 180,262,488,226
+SELECTION_COUNT 1
+SELECTION_TEXT 0 ""
+SELECTION 0_RECTS 1
+SELECTION 0_RECT 366,286,1,19
+===== details: select document =====
+ELEMENT Details note
+BOUNDS 180,262,488,226
+OFFSCREEN False
+VALUE "Details note with 中🙂 é wrapping across several visual lines to exercise multiple selection rectangles."
+READONLY False
+SUPPORTED Single
+DOCUMENT "Details note with 中🙂 é wrapping across several visual lines to exercise multiple selection rectangles."
+DOCUMENT_RECTS 1
+DOCUMENT_RECT 180,262,488,226
+SELECTION_COUNT 1
+SELECTION_TEXT 0 ""
+SELECTION 0_RECTS 1
+SELECTION 0_RECT 366,286,1,19
+SELECT_DOCUMENT queued
+SELECTION_COUNT 1
+SELECTION_TEXT 0 "Details note with 中🙂 é wrapping across several visual lines to exercise multiple selection rectangles."
+SELECTION 0_RECTS 2
+SELECTION 0_RECT 187,267,454,19
+SELECTION 0_RECT 187,286,179,19
