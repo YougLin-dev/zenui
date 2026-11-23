@@ -2,6 +2,8 @@
 
 本页记录 #189 的 UIA 写动作：在 #188 的只读树之上增加 Invoke、Toggle、Value 与 SetFocus pattern。provider 线程只检查当前发布并排入类型化动作；UI 线程按入队顺序取走动作，用最新 presentation snapshot 重验后走与指针、键盘相同的 Runtime 命令路径。
 
+> 本页记录 #189 当时的验收范围。UIA 事件已由 [stage-three 辅助技术事件验收](stage-three-辅助技术事件-验收.md) 交付；本页“事件不在范围”的表述只描述 #189 的基线。
+
 **状态：可见验收完成（100% 与 150%）。** 证据来自进程外原生 `IUIAutomation` 客户端与 Inspect 的 UI Automation 模式；窗口是真实可见 HWND，动作由 UIA pattern 调用触发，场景、动作与树都走生产代码。
 
 验收日期：2026-11-23。功能基线为 `main` 的 `ede7513`。可见运行使用临时示例探针（未提交），它在本仓库的 Todo demo 上启动可见宿主；原生客户端与 Inspect 截图脚本也在提交前删除，仓库只保留本页与证据。
@@ -106,4 +108,4 @@ Inspect 截图使用 Kits 里同一份 `inspect.exe` 的临时副本，只把 ma
 
 ## 后续状态
 
-本页关闭 #189 的写 pattern 与可见证据；#190 的 UIA 事件、#191 的文本范围与 #192 的汇总契约仍由后续工单交付。
+本页关闭 #189 的写 pattern 与可见证据；#190 的 UIA 事件已由 [stage-three 辅助技术事件验收](stage-three-辅助技术事件-验收.md) 交付，#191 的文本范围与 #192 的汇总契约仍由后续工单交付。

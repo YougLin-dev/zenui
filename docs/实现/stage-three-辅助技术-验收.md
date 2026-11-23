@@ -4,7 +4,7 @@
 
 **状态：可见验收完成（100% 与 150%）。** 证据来自进程外的原生 `IUIAutomation` 客户端（Raw View）与 Inspect 的 UI Automation 模式；窗口是真实可见 HWND，滚轮由 OS 级 `SendInput` 注入，场景与树都走生产代码。
 
-> 本页记录 #188 当时的验收范围与读数。Invoke/Toggle/Value pattern 与 SetFocus 已由 [stage-three 辅助技术动作验收](stage-three-辅助技术动作-验收.md) 交付；本页“尚未实现 pattern”的表述只描述 #188 的基线，不代表当前构建。
+> 本页记录 #188 当时的验收范围与读数。Invoke/Toggle/Value pattern 与 SetFocus 已由 [stage-three 辅助技术动作验收](stage-three-辅助技术动作-验收.md) 交付，UIA 事件已由 [stage-three 辅助技术事件验收](stage-three-辅助技术事件-验收.md) 交付；本页“尚未实现 pattern / 事件”的表述只描述 #188 的基线，不代表当前构建。
 
 验收日期：2026-11-23。功能基线为 `main` 的 `aec5b9b`。可见运行使用临时示例探针（未提交），它在 `zenui_demo` 的 Todo 上启动可见宿主，并把已应用偏移、`max`、逻辑视口与发布树节点数写入状态文件。探针、UIA 客户端与截图/缩放脚本均在提交前删除，仓库只保留本页与证据。
 
@@ -117,4 +117,4 @@ UIA 客户端看到的 runtime ID 形如 `[42, hwnd, 4, 8]`；`42` 与窗口句�
 
 ## 后续状态
 
-本页关闭 #188 的只读树与可见证据；写 pattern 已由 [stage-three 辅助技术动作验收](stage-three-辅助技术动作-验收.md) 交付，UIA 事件、`TextPattern` 与 `ScrollPattern` 仍由后续工单交付。辅助技术决策仍由后续工单记录，本页不改变该范围。
+本页关闭 #188 的只读树与可见证据；写 pattern 已由 [stage-three 辅助技术动作验收](stage-three-辅助技术动作-验收.md) 交付，事件已由 [stage-three 辅助技术事件验收](stage-three-辅助技术事件-验收.md) 交付；`TextPattern` 与 `ScrollPattern` 仍由后续工单交付。辅助技术决策仍由后续工单记录，本页不改变该范围。

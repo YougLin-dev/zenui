@@ -13,6 +13,12 @@
 //! 检查当前树与启用状态后把 [`AccessibilityAction`] 入队并唤醒窗口，UI 线程
 //! 再按最新快照重验，最后走与指针、键盘相同的 Runtime 命令路径。provider 线程
 //! 从不直接修改 Runtime；`UIA_ACTION` 消息只负责唤醒，具体动作以队列顺序为准。
+//!
+//! 相邻两次发布还会按 runtime ID 比较：聚焦、启用、开关状态、值与子节点的
+//! 增删/重排各产生一条事件。事件在发布线程上、发布锁释放后投递；后台窗口的
+//! 焦点变化不投递聚焦事件，指针 hover/press 等呈现瞬态不改变树，因此不产生事件。
+
+mod events;
 
 use std::collections::{HashMap, VecDeque};
 use std::mem::ManuallyDrop;
@@ -356,12 +362,25 @@ impl WindowAccessibility {
         }
     }
 
-    pub(crate) fn publish(&self, tree: AccessibilityTree) {
-        let mut slot = self
-            .published
-            .write()
-            .unwrap_or_else(PoisonError::into_inner);
-        *slot = Some(Arc::new(tree));
+    /// 整体替换发布树，并按与上一棵树的差异投递 UIA 事件。
+    ///
+    /// 差异在发布锁释放后规划与投递：UIA 可能在事件回调中同步查询 provider，
+    /// 持锁投递会与属性读取互相等待。首次发布没有上一棵树，不产生事件。
+    pub(crate) fn publish(self: &Arc<Self>, tree: AccessibilityTree) {
+        let next = Arc::new(tree);
+        let previous = {
+            let mut slot = self
+                .published
+                .write()
+                .unwrap_or_else(PoisonError::into_inner);
+            slot.replace(Arc::clone(&next))
+        };
+        let plan = events::plan(
+            previous.as_deref(),
+            &next,
+            window_is_foreground(self.hwnd()),
+        );
+        events::raise(self, &next, &plan);
     }
 
     pub(crate) fn clear(&self) {
