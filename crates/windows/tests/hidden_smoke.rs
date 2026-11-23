@@ -2144,10 +2144,10 @@ fn paging_keys_leave_a_focused_editor_in_place() {
 
     post_key(&host, VK_HOME);
     host.pump().expect("Home while editing");
-    assert_eq!(
-        host.scene(MAIN).expect("scene").scroll_offset(),
-        page,
-        "Home edits the caret instead of scrolling"
+    let revealed = host.scene(MAIN).expect("scene").scroll_offset();
+    assert!(
+        revealed < page,
+        "Home edits the caret and reveals the focused input instead of paging"
     );
     assert_eq!(
         focused_id(&host),
@@ -2163,4 +2163,79 @@ fn paging_keys_leave_a_focused_editor_in_place() {
         Some(input),
         "PageUp keeps the same editor focused"
     );
+}
+
+#[test]
+fn tab_reveals_an_offscreen_focus_target_without_remounting() {
+    let mut host = open_tall_host(100);
+    host.render().expect("initial render");
+    let ids: Vec<NodeId> = host
+        .scene(MAIN)
+        .expect("scene")
+        .elements()
+        .iter()
+        .map(SceneElement::id)
+        .collect();
+
+    post_key(&host, VK_END);
+    host.pump().expect("scroll to the bottom");
+    let bottom = host.scene(MAIN).expect("scene").scroll_offset();
+    assert!(bottom > 0);
+
+    // 没有焦点时 Tab 聚焦第一个控件；它在视口顶部，当前已滚出视口。
+    post_key(&host, VK_TAB);
+    host.pump().expect("focus the first control");
+    let focused = focused_id(&host).expect("a focused control");
+    let scene = host.scene(MAIN).expect("scene");
+    let rect = scene.node(focused).expect("focused element").rect();
+    assert!(
+        rect.y >= 0.0 && rect.bottom() <= scene.viewport().height(),
+        "Tab reveals the focused control"
+    );
+    assert!(
+        scene.scroll_offset() < bottom,
+        "the reveal moves the offset back"
+    );
+    let after: Vec<NodeId> = scene.elements().iter().map(SceneElement::id).collect();
+    assert_eq!(ids, after, "reveal does not remount the rows");
+}
+
+#[test]
+fn an_edit_after_wheel_scrolling_reveals_the_focused_input() {
+    let mut host = open_tall_host(50);
+    host.render().expect("initial render");
+    let (_, point, scale) = center_label(&host, MAIN, "What needs to be done?");
+    post_click(&host, point, scale);
+    host.pump().expect("focus the draft input");
+    let input = focused_id(&host).expect("the draft has focus");
+    post_char(&host, 'a');
+    host.pump().expect("type into the draft");
+
+    post_wheel(&host, -600);
+    host.pump().expect("scroll the draft offscreen");
+    let scrolled = host.scene(MAIN).expect("scene").scroll_offset();
+    assert!(scrolled > 0);
+    assert_eq!(focused_id(&host), Some(input), "the wheel keeps focus");
+    let snapshot = host.presentation(MAIN).expect("snapshot");
+    let edit = snapshot
+        .node(input)
+        .expect("input")
+        .edit()
+        .expect("edit state");
+    assert_eq!(edit.caret(), 1, "the wheel keeps the caret");
+
+    post_char(&host, 'b');
+    host.pump().expect("type after scrolling");
+    let scene = host.scene(MAIN).expect("scene");
+    assert!(
+        scene.scroll_offset() < scrolled,
+        "the edit reveals the focused input"
+    );
+    let rect = scene.node(input).expect("input").rect();
+    assert!(
+        rect.y >= 0.0 && rect.bottom() <= scene.viewport().height(),
+        "the input is fully visible after the edit"
+    );
+    assert_eq!(glyphs(&host, input), 2, "the second character was inserted");
+    assert_eq!(focused_id(&host), Some(input), "the editor keeps focus");
 }
