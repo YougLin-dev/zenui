@@ -5,18 +5,21 @@
 //! 与状态来自快照，边界来自场景已经平移过的逻辑几何。它是派生的发布物，
 //! 不是第二棵保留树，也不新增 Node ID。
 //!
-//! 本模块只提供读模型的 fragment root 与元素 provider：`WM_GETOBJECT` 只应答
-//! `UiaRootObjectId`，不实现 UIA pattern、事件或 Invoke/Toggle/SetValue 动作。
 //! provider 持有窗口发布单元的弱引用，并在每次查询时解析当前发布，因此缓存的
 //! 旧 provider 能看到滚动后的边界；已卸载的 Node ID 返回
 //! `UIA_E_ELEMENTNOTAVAILABLE`。隐藏窗口与关闭中的窗口不发布树。
+//!
+//! 写操作只经排队通道：Invoke、Toggle、Value 与 SetFocus 在 provider 线程上
+//! 检查当前树与启用状态后把 [`AccessibilityAction`] 入队并唤醒窗口，UI 线程
+//! 再按最新快照重验，最后走与指针、键盘相同的 Runtime 命令路径。provider 线程
+//! 从不直接修改 Runtime；`UIA_ACTION` 消息只负责唤醒，具体动作以队列顺序为准。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::mem::ManuallyDrop;
-use std::sync::{Arc, PoisonError, RwLock, Weak};
+use std::sync::{Arc, Mutex, PoisonError, RwLock, Weak};
 
 use windows::Win32::Foundation::{
-    E_OUTOFMEMORY, HWND, POINT, VARIANT_BOOL, VARIANT_FALSE, VARIANT_TRUE,
+    E_INVALIDARG, E_OUTOFMEMORY, HWND, POINT, VARIANT_BOOL, VARIANT_FALSE, VARIANT_TRUE,
 };
 use windows::Win32::Graphics::Gdi::ClientToScreen;
 use windows::Win32::System::Com::SAFEARRAY;
@@ -26,27 +29,36 @@ use windows::Win32::System::Variant::{
     VT_BSTR, VT_I4,
 };
 use windows::Win32::UI::Accessibility::{
-    IRawElementProviderFragment, IRawElementProviderFragment_Impl, IRawElementProviderFragmentRoot,
+    IInvokeProvider, IInvokeProvider_Impl, IRawElementProviderFragment,
+    IRawElementProviderFragment_Impl, IRawElementProviderFragmentRoot,
     IRawElementProviderFragmentRoot_Impl, IRawElementProviderSimple,
-    IRawElementProviderSimple_Impl, NavigateDirection, NavigateDirection_FirstChild,
+    IRawElementProviderSimple_Impl, IToggleProvider, IToggleProvider_Impl, IValueProvider,
+    IValueProvider_Impl, NavigateDirection, NavigateDirection_FirstChild,
     NavigateDirection_LastChild, NavigateDirection_NextSibling, NavigateDirection_Parent,
     NavigateDirection_PreviousSibling, ProviderOptions, ProviderOptions_ServerSideProvider,
-    ToggleState_Off, ToggleState_On, UIA_AutomationIdPropertyId, UIA_BoundingRectanglePropertyId,
-    UIA_ButtonControlTypeId, UIA_CheckBoxControlTypeId, UIA_ClassNamePropertyId,
-    UIA_ControlTypePropertyId, UIA_CustomControlTypeId, UIA_E_ELEMENTNOTAVAILABLE,
-    UIA_E_NOTSUPPORTED, UIA_EditControlTypeId, UIA_FrameworkIdPropertyId, UIA_GroupControlTypeId,
-    UIA_HasKeyboardFocusPropertyId, UIA_IsContentElementPropertyId, UIA_IsControlElementPropertyId,
+    ToggleState, ToggleState_Off, ToggleState_On, UIA_AutomationIdPropertyId,
+    UIA_BoundingRectanglePropertyId, UIA_ButtonControlTypeId, UIA_CheckBoxControlTypeId,
+    UIA_ClassNamePropertyId, UIA_ControlTypePropertyId, UIA_CustomControlTypeId,
+    UIA_E_ELEMENTNOTAVAILABLE, UIA_E_NOTSUPPORTED, UIA_EditControlTypeId,
+    UIA_FrameworkIdPropertyId, UIA_GroupControlTypeId, UIA_HasKeyboardFocusPropertyId,
+    UIA_InvokePatternId, UIA_IsContentElementPropertyId, UIA_IsControlElementPropertyId,
     UIA_IsEnabledPropertyId, UIA_IsKeyboardFocusablePropertyId, UIA_IsOffscreenPropertyId,
     UIA_ListControlTypeId, UIA_ListItemControlTypeId, UIA_NamePropertyId,
     UIA_NativeWindowHandlePropertyId, UIA_ProcessIdPropertyId, UIA_ProviderDescriptionPropertyId,
-    UIA_TextControlTypeId, UIA_ToggleToggleStatePropertyId, UIA_ToolBarControlTypeId,
-    UIA_WindowControlTypeId, UiaAppendRuntimeId, UiaHostProviderFromHwnd, UiaRect,
+    UIA_TextControlTypeId, UIA_TogglePatternId, UIA_ToggleToggleStatePropertyId,
+    UIA_ToolBarControlTypeId, UIA_ValuePatternId, UIA_WindowControlTypeId, UiaAppendRuntimeId,
+    UiaHostProviderFromHwnd, UiaRect,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled;
 use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
-use windows::core::{BSTR, Error, HRESULT, Result as WinResult, implement};
-use zenui::{NodeId, PresentationSnapshot, SnapshotAttr, SnapshotElement, SnapshotNode};
+use windows::core::{BOOL, BSTR, Error, HRESULT, PCWSTR, Result as WinResult, implement};
+use zenui::{
+    NodeId, PresentationSnapshot, SnapshotAction, SnapshotActions, SnapshotAttr, SnapshotElement,
+    SnapshotNode,
+};
 use zenui_render::{Rect, Scene, Viewport};
+
+use crate::host::post_uia_action;
 
 /// 一个已提交窗口的只读辅助功能树。
 ///
@@ -76,6 +88,9 @@ pub struct AccessibleNode {
     focused: bool,
     offscreen: bool,
     toggle_state: Option<bool>,
+    actions: SnapshotActions,
+    value: Option<String>,
+    composing: bool,
     rect: Rect,
     parent: Option<usize>,
     children: Vec<usize>,
@@ -252,11 +267,23 @@ impl AccessibleNode {
     }
 
     /// `checked` 或 `aria:pressed` 的布尔状态；没有该状态时为 `None`。
-    ///
-    /// 这是只读树状态；本工单不暴露 TogglePattern，标准 UIA pattern 客户端
-    /// 不会通过 pattern 读取它。
     pub const fn toggle_state(&self) -> Option<bool> {
         self.toggle_state
+    }
+
+    /// 快照声明的用户动作；provider 据此决定 pattern 是否存在。
+    pub const fn has_action(&self, action: SnapshotAction) -> bool {
+        self.actions.contains(action)
+    }
+
+    /// 文本输入已提交的值；其它节点为 `None`。
+    pub fn value(&self) -> Option<&str> {
+        self.value.as_deref()
+    }
+
+    /// 文本输入当前是否处于 IME 组合中。
+    pub const fn composing(&self) -> bool {
+        self.composing
     }
 }
 
@@ -289,10 +316,35 @@ impl AccessibilityIds {
     }
 }
 
+/// provider 线程排入、UI 线程重验后执行的动作。
+pub(crate) enum AccessibilityAction {
+    Invoke(NodeId),
+    Toggle(NodeId),
+    SetValue(NodeId, String),
+    SetFocus(NodeId),
+}
+
+impl AccessibilityAction {
+    pub(crate) const fn node(&self) -> NodeId {
+        match self {
+            Self::Invoke(node)
+            | Self::Toggle(node)
+            | Self::SetValue(node, _)
+            | Self::SetFocus(node) => *node,
+        }
+    }
+}
+
+/// 单个窗口最多保留的待执行动作数。
+///
+/// provider 线程可能比 UI 线程快得多；达到上限后拒绝新动作，已排队的动作仍按序执行。
+pub(crate) const MAX_PENDING_ACTIONS: usize = 1024;
+
 /// 一个窗口的可访问性发布单元；provider 通过弱引用解析当前发布。
 pub(crate) struct WindowAccessibility {
     hwnd: WindowHandle,
     published: RwLock<Option<Arc<AccessibilityTree>>>,
+    actions: Mutex<VecDeque<AccessibilityAction>>,
 }
 
 impl WindowAccessibility {
@@ -300,6 +352,7 @@ impl WindowAccessibility {
         Self {
             hwnd: WindowHandle(hwnd),
             published: RwLock::new(None),
+            actions: Mutex::new(VecDeque::new()),
         }
     }
 
@@ -317,6 +370,10 @@ impl WindowAccessibility {
             .write()
             .unwrap_or_else(PoisonError::into_inner);
         *slot = None;
+        self.actions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
     }
 
     pub(crate) fn tree(&self) -> Option<Arc<AccessibilityTree>> {
@@ -324,6 +381,32 @@ impl WindowAccessibility {
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
+    }
+
+    /// 记录一次 provider 动作并唤醒 UI 线程；调用可能来自任意 COM 线程。
+    ///
+    /// 队列满或投递失败时返回 false，且不留下动作；调用方据此向 UIA 报告
+    /// 元素暂不可用。持锁调用 `PostMessageW` 只排队，不会回调本进程。
+    pub(crate) fn enqueue(&self, action: AccessibilityAction) -> bool {
+        let mut actions = self.actions.lock().unwrap_or_else(PoisonError::into_inner);
+        if actions.len() >= MAX_PENDING_ACTIONS {
+            return false;
+        }
+        actions.push_back(action);
+        if post_uia_action(self.hwnd()) {
+            return true;
+        }
+        actions.pop_back();
+        false
+    }
+
+    /// 按入队顺序取走动作；宿主在 UI 线程上调用。
+    pub(crate) fn take_actions(&self) -> Vec<AccessibilityAction> {
+        self.actions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .drain(..)
+            .collect()
     }
 
     fn hwnd(&self) -> HWND {
@@ -352,6 +435,137 @@ pub(crate) fn fragment_root(window: &Arc<WindowAccessibility>) -> IRawElementPro
     .into()
 }
 
+/// 在 provider 调用线程上解析当前发布中的节点；元素 provider 与模式 provider 共用。
+fn resolve_node(
+    window: &Weak<WindowAccessibility>,
+    node: NodeId,
+) -> WinResult<(Arc<WindowAccessibility>, Arc<AccessibilityTree>, usize)> {
+    let window = window.upgrade().ok_or_else(element_not_available)?;
+    let tree = window.tree().ok_or_else(element_not_available)?;
+    let index = tree.index_of(node).ok_or_else(element_not_available)?;
+    Ok((window, tree, index))
+}
+
+/// 发布时的启用状态与当前原生窗口启用状态都为真。
+fn node_enabled(window: &WindowAccessibility, node: &AccessibleNode) -> bool {
+    node.enabled && window_enabled(window.hwnd())
+}
+
+/// 解析当前发布中仍启用的节点；写 pattern 共用的身份、发布与启用检查。
+///
+/// 禁用目标按 UIA 契约报告元素不可用；只读查询不要使用这个入口，它们仍需
+/// 能读取禁用元素的名称、状态与边界。
+fn available_node(
+    window: &Weak<WindowAccessibility>,
+    node: NodeId,
+) -> WinResult<(Arc<WindowAccessibility>, Arc<AccessibilityTree>, usize)> {
+    let (window, tree, index) = resolve_node(window, node)?;
+    let published = tree.node_at(index).ok_or_else(element_not_available)?;
+    if !node_enabled(&window, published) {
+        return Err(element_not_available());
+    }
+    Ok((window, tree, index))
+}
+
+fn window_enabled(hwnd: HWND) -> bool {
+    // 安全：句柄只用于线程安全的启用状态查询；销毁后返回 false。
+    unsafe { IsWindowEnabled(hwnd) }.as_bool()
+}
+
+/// Invoke 模式：只把动作入队，由 UI 线程重验后执行。
+#[implement(IInvokeProvider)]
+struct InvokePattern {
+    window: Weak<WindowAccessibility>,
+    node: NodeId,
+}
+
+impl IInvokeProvider_Impl for InvokePattern_Impl {
+    fn Invoke(&self) -> WinResult<()> {
+        let (window, tree, index) = available_node(&self.window, self.node)?;
+        let node = tree.node_at(index).ok_or_else(element_not_available)?;
+        if !node.has_action(SnapshotAction::Click) {
+            return Err(not_supported());
+        }
+        if !window.enqueue(AccessibilityAction::Invoke(self.node)) {
+            return Err(element_not_available());
+        }
+        Ok(())
+    }
+}
+
+/// Toggle 模式：状态来自发布树，切换动作由 UI 线程读取最新状态后执行。
+#[implement(IToggleProvider)]
+struct TogglePattern {
+    window: Weak<WindowAccessibility>,
+    node: NodeId,
+}
+
+impl IToggleProvider_Impl for TogglePattern_Impl {
+    fn Toggle(&self) -> WinResult<()> {
+        let (window, tree, index) = available_node(&self.window, self.node)?;
+        let node = tree.node_at(index).ok_or_else(element_not_available)?;
+        if !node.has_action(SnapshotAction::Change) || node.toggle_state().is_none() {
+            return Err(not_supported());
+        }
+        if !window.enqueue(AccessibilityAction::Toggle(self.node)) {
+            return Err(element_not_available());
+        }
+        Ok(())
+    }
+
+    #[allow(non_snake_case)]
+    fn ToggleState(&self) -> WinResult<ToggleState> {
+        let (_, tree, index) = resolve_node(&self.window, self.node)?;
+        let node = tree.node_at(index).ok_or_else(element_not_available)?;
+        let state = node.toggle_state().ok_or_else(not_supported)?;
+        Ok(if state {
+            ToggleState_On
+        } else {
+            ToggleState_Off
+        })
+    }
+}
+
+/// Value 模式：返回值立即读取，写入排入队列。
+#[implement(IValueProvider)]
+struct ValuePattern {
+    window: Weak<WindowAccessibility>,
+    node: NodeId,
+}
+
+impl IValueProvider_Impl for ValuePattern_Impl {
+    fn SetValue(&self, val: &PCWSTR) -> WinResult<()> {
+        let (window, tree, index) = available_node(&self.window, self.node)?;
+        let node = tree.node_at(index).ok_or_else(element_not_available)?;
+        // 安全：val 由 UIA 传入，按契约是以 NUL 结尾的有效宽字符串。
+        let value = unsafe { val.to_string() }.map_err(|_| Error::from_hresult(E_INVALIDARG))?;
+        if node.has_action(SnapshotAction::Input)
+            && !node.composing
+            && window.enqueue(AccessibilityAction::SetValue(self.node, value))
+        {
+            return Ok(());
+        }
+        Err(element_not_available())
+    }
+
+    fn Value(&self) -> WinResult<BSTR> {
+        let (_, tree, index) = resolve_node(&self.window, self.node)?;
+        let node = tree.node_at(index).ok_or_else(element_not_available)?;
+        let value = node.value().ok_or_else(not_supported)?;
+        Ok(BSTR::from(value))
+    }
+
+    #[allow(non_snake_case)]
+    fn IsReadOnly(&self) -> WinResult<BOOL> {
+        let (window, tree, index) = resolve_node(&self.window, self.node)?;
+        let node = tree.node_at(index).ok_or_else(element_not_available)?;
+        let writable = node_enabled(&window, node)
+            && node.has_action(SnapshotAction::Input)
+            && !node.composing;
+        Ok(BOOL::from(!writable))
+    }
+}
+
 #[derive(Clone, Copy)]
 enum ProviderKey {
     Window,
@@ -370,13 +584,14 @@ struct ZenProvider {
 
 impl ZenProvider {
     fn resolve(&self) -> WinResult<(Arc<WindowAccessibility>, Arc<AccessibilityTree>, usize)> {
-        let window = self.window.upgrade().ok_or_else(element_not_available)?;
-        let tree = window.tree().ok_or_else(element_not_available)?;
-        let index = match self.key {
-            ProviderKey::Window => 0,
-            ProviderKey::Node(node) => tree.index_of(node).ok_or_else(element_not_available)?,
-        };
-        Ok((window, tree, index))
+        match self.key {
+            ProviderKey::Window => {
+                let window = self.window.upgrade().ok_or_else(element_not_available)?;
+                let tree = window.tree().ok_or_else(element_not_available)?;
+                Ok((window, tree, 0))
+            }
+            ProviderKey::Node(node) => resolve_node(&self.window, node),
+        }
     }
 
     fn provider_for(
@@ -409,8 +624,7 @@ impl ZenProvider {
     }
 
     fn live_enabled(&self, window: &WindowAccessibility) -> bool {
-        // 安全：句柄只用于线程安全的启用状态查询；销毁后返回 false。
-        unsafe { IsWindowEnabled(window.hwnd()) }.as_bool()
+        window_enabled(window.hwnd())
     }
 
     fn window_bounds(
@@ -432,9 +646,37 @@ impl IRawElementProviderSimple_Impl for ZenProvider_Impl {
     #[allow(non_snake_case)]
     fn GetPatternProvider(
         &self,
-        _patternid: windows::Win32::UI::Accessibility::UIA_PATTERN_ID,
+        patternid: windows::Win32::UI::Accessibility::UIA_PATTERN_ID,
     ) -> WinResult<windows::core::IUnknown> {
-        let _ = self.resolve()?;
+        let (_, tree, index) = self.resolve()?;
+        let node = tree.node_at(index).ok_or_else(element_not_available)?;
+        if patternid == UIA_InvokePatternId && node.has_action(SnapshotAction::Click) {
+            let id = node.node_id().ok_or_else(element_not_available)?;
+            return Ok(InvokePattern {
+                window: self.window.clone(),
+                node: id,
+            }
+            .into());
+        }
+        if patternid == UIA_TogglePatternId
+            && node.has_action(SnapshotAction::Change)
+            && node.toggle_state().is_some()
+        {
+            let id = node.node_id().ok_or_else(element_not_available)?;
+            return Ok(TogglePattern {
+                window: self.window.clone(),
+                node: id,
+            }
+            .into());
+        }
+        if patternid == UIA_ValuePatternId && node.value().is_some() {
+            let id = node.node_id().ok_or_else(element_not_available)?;
+            return Ok(ValuePattern {
+                window: self.window.clone(),
+                node: id,
+            }
+            .into());
+        }
         Err(Error::empty())
     }
 
@@ -584,8 +826,23 @@ impl IRawElementProviderFragment_Impl for ZenProvider_Impl {
     }
 
     fn SetFocus(&self) -> WinResult<()> {
-        let _ = self.resolve()?;
-        Err(not_supported())
+        let (window, tree, index) = self.resolve()?;
+        let node = tree.node_at(index).ok_or_else(element_not_available)?;
+        if index == 0 {
+            return Err(not_supported());
+        }
+        if !node_enabled(&window, node) {
+            return Err(element_not_available());
+        }
+        if !node.focusable {
+            return Err(not_supported());
+        }
+        let id = node.node_id().ok_or_else(element_not_available)?;
+        // 前台检查留给 UI 线程：从 provider 调用到执行之间窗口可能已经切到前台。
+        if !window.enqueue(AccessibilityAction::SetFocus(id)) {
+            return Err(element_not_available());
+        }
+        Ok(())
     }
 
     fn FragmentRoot(&self) -> WinResult<IRawElementProviderFragmentRoot> {
@@ -668,7 +925,7 @@ fn not_supported() -> Error {
     Error::from_hresult(HRESULT(UIA_E_NOTSUPPORTED as i32))
 }
 
-fn window_is_foreground(hwnd: HWND) -> bool {
+pub(crate) fn window_is_foreground(hwnd: HWND) -> bool {
     // 安全：只比较前台窗口句柄。
     unsafe { GetForegroundWindow() == hwnd }
 }
@@ -782,6 +1039,9 @@ pub(crate) fn build_tree(
         focused: false,
         offscreen: false,
         toggle_state: None,
+        actions: SnapshotActions::default(),
+        value: None,
+        composing: false,
         rect: Rect::new(0.0, 0.0, viewport.width(), viewport.height()),
         parent: None,
         children: Vec::new(),
@@ -829,6 +1089,11 @@ impl TreeBuilder<'_> {
         let role = element.attr("role").and_then(SnapshotAttr::as_text);
         let control_type = control_type(element.tag(), role);
         let rect = scene_element.rect();
+        let value = (control_type == ControlType::Edit)
+            .then(|| element.text_value().unwrap_or_default().to_owned());
+        let composing = element
+            .edit()
+            .is_some_and(|edit| edit.composition().is_some());
         let index = self.nodes.len();
         self.nodes.push(AccessibleNode {
             node_id: Some(id),
@@ -847,9 +1112,10 @@ impl TreeBuilder<'_> {
                 && self.window_enabled,
             focused: self.focus == Some(id),
             offscreen: self.offscreen(rect),
-            toggle_state: element
-                .checked()
-                .or_else(|| element.attr("aria:pressed").and_then(SnapshotAttr::as_bool)),
+            toggle_state: element.toggle_state(),
+            actions: element.semantics().actions(),
+            value,
+            composing,
             rect,
             parent: Some(parent),
             children: Vec::new(),

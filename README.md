@@ -6,7 +6,7 @@ ZenUI 使用 Rust 编写原生桌面界面。它保留控件及其编辑状态�
 
 ## 当前能力
 
-ZenUI 处在开发阶段。阶段一的 target API、阶段二的 Windows 原生切片，以及阶段三的多窗口、关闭确认、原生打开/保存/文件夹对话框、整页滚动、焦点显露、覆盖层滚动条、窗口化 `For` 与只读 UIA 树已可运行；菜单/托盘、UIA 动作与事件、跨平台支持仍在开发中。跨显示器混合 DPI 与实机 device loss 仍是 #63 的开放证据缺口。
+ZenUI 处在开发阶段。阶段一的 target API、阶段二的 Windows 原生切片，以及阶段三的多窗口、关闭确认、原生打开/保存/文件夹对话框、整页滚动、焦点显露、覆盖层滚动条、窗口化 `For`、只读 UIA 树与 UIA Invoke/Toggle/Value/SetFocus 动作已可运行；菜单/托盘、UIA 事件、文本与滚动 pattern、跨平台支持仍在开发中。跨显示器混合 DPI 与实机 device loss 仍是 #63 的开放证据缺口。
 
 仓库目前提供：
 
@@ -18,7 +18,7 @@ ZenUI 处在开发阶段。阶段一的 target API、阶段二的 Windows 原生
 - 原生打开/保存/文件夹对话框：窗口锚定、单选/多选、标题与类型过滤器、建议文件名与默认扩展名、取消/失败结果，以及显式的窗口或应用任务所有权；
 - 宿主任务：文件对话框结果与 worker 共用 Task/continuation 交付，但没有 worker 通道，也不会阻塞 `settle_tasks`；
 - 长列表场景构建：跨重建复用未变化的文本 layout 与测量结果，viewport 外的元素保留几何但跳过 glyph 与绘制；声明 `row-height` 的窗口化 `For` 只挂载可见行窗口，完整行范围由上下 spacer 保持（[ADR-0011](docs/adr/0011-windowed-for-mounting.md)）；变量行高仍不在本里程碑；
-- 只读 UIA 树：每个窗口从已提交快照与场景发布根、角色、名称、AutomationId、状态与物理边界，`WM_GETOBJECT` 交回 fragment-root provider；滚动只平移边界并保持 runtime ID，不实现 pattern、事件或 Invoke/Toggle/SetValue（[stage-three 辅助技术验收](docs/实现/stage-three-辅助技术-验收.md)）；
+- UIA：每个窗口从已提交快照与场景发布根、角色、名称、AutomationId、状态与物理边界，`WM_GETOBJECT` 交回 fragment-root provider；滚动只平移边界并保持 runtime ID。Invoke、Toggle、Value 与 SetFocus 把动作排队到 UI 线程，按最新快照重验后复用 Runtime 命令路径；UIA 事件、TextPattern 与 ScrollPattern 尚未实现（[只读树验收](docs/实现/stage-three-辅助技术-验收.md)、[动作验收](docs/实现/stage-three-辅助技术动作-验收.md)）；
 - 有界运行时存储：最近发布快照按固定窗口保留，释放的 Owner 节点回到存活规模，Todo 的列表 reconciliation 与行句柄查找使用索引而不是逐行扫描；
 - 可复现的 Todo 场景：插入、删除、筛选、重排、焦点与拒绝句柄后的恢复；
 - 独立的宏、文本、布局和 GPU 原型；

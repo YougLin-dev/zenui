@@ -247,6 +247,15 @@ impl SnapshotElement {
         self.attr("aria:pressed").and_then(SnapshotAttr::as_bool) == Some(true)
     }
 
+    /// `checked` 或 `aria:pressed` 的布尔状态；两者都缺失时为 `None`。
+    ///
+    /// 复选框的 `checked` 优先于 `aria:pressed`。UIA Toggle pattern 的存在性
+    /// 与切换目标都使用这一个定义。
+    pub fn toggle_state(&self) -> Option<bool> {
+        self.checked()
+            .or_else(|| self.attr("aria:pressed").and_then(SnapshotAttr::as_bool))
+    }
+
     /// 文本输入控件的本地编辑状态；其他元素为 `None`。
     pub const fn edit(&self) -> Option<&TextEditState> {
         self.edit.as_ref()
@@ -496,7 +505,10 @@ fn write_node(f: &mut fmt::Formatter<'_>, node: &SnapshotNode, depth: usize) -> 
 mod tests {
     use std::borrow::Cow;
 
-    use super::{NodeId, SnapshotAction, SnapshotActions, SnapshotElement, SnapshotSemantics};
+    use super::{
+        NodeId, SnapshotAction, SnapshotActions, SnapshotAttr, SnapshotElement, SnapshotSemantics,
+        SnapshotValue,
+    };
 
     fn element(semantics: SnapshotSemantics) -> SnapshotElement {
         SnapshotElement {
@@ -540,6 +552,26 @@ mod tests {
         assert_ne!(
             focusable, clickable,
             "mounted actions contribute to equality"
+        );
+    }
+
+    #[test]
+    fn toggle_state_prefers_checked_and_falls_back_to_pressed() {
+        let mut element = element(SnapshotSemantics::default());
+        assert_eq!(element.toggle_state(), None);
+        element.attrs.push(SnapshotAttr {
+            name: "aria:pressed",
+            value: SnapshotValue::Bool(true),
+        });
+        assert_eq!(element.toggle_state(), Some(true));
+        element.attrs.push(SnapshotAttr {
+            name: "checked",
+            value: SnapshotValue::Bool(false),
+        });
+        assert_eq!(
+            element.toggle_state(),
+            Some(false),
+            "checked wins over aria:pressed"
         );
     }
 }

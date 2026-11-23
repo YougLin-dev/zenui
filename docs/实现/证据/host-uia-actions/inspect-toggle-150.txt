@@ -1,0 +1,80 @@
+﻿How found:	Mouse move (1607,415)
+	hwnd=0x0000000008100AFA 64bit class="ZenUIHostWindow" style=0x14CF0000 ex=0x100
+Name:	"Complete Read docs"
+ControlType:	UIA_CheckBoxControlTypeId (0xC352)
+LocalizedControlType:	"复选框"
+BoundingRectangle:	{l:1595 t:403 r:1619 b:427}
+IsEnabled:	true
+IsOffscreen:	false
+IsKeyboardFocusable:	true
+HasKeyboardFocus:	false
+ProcessId:	52056
+RuntimeId:	[2A.8100AFA.4.1D]
+AutomationId:	""
+FrameworkId:	"ZenUI"
+ClassName:	"checkbox"
+IsControlElement:	true
+IsContentElement:	true
+ProviderDescription:	"[pid:52056,providerId:0x0 Main(parent link):ZenUI accessibility provider (unmanaged:uia_probe.exe)]"
+LegacyIAccessible.ChildId:	0
+LegacyIAccessible.DefaultAction:	"选定"
+LegacyIAccessible.Description:	""
+LegacyIAccessible.Help:	""
+LegacyIAccessible.KeyboardShortcut:	""
+LegacyIAccessible.Name:	"Complete Read docs"
+LegacyIAccessible.Role:	复选框 (0x2C)
+LegacyIAccessible.State:	可设定焦点 (0x100000)
+LegacyIAccessible.Value:	""
+Toggle.ToggleState:	Off (0)
+IsAnnotationPatternAvailable:	false
+IsDragPatternAvailable:	false
+IsDockPatternAvailable:	false
+IsDropTargetPatternAvailable:	false
+IsExpandCollapsePatternAvailable:	false
+IsGridItemPatternAvailable:	false
+IsGridPatternAvailable:	false
+IsInvokePatternAvailable:	false
+IsItemContainerPatternAvailable:	false
+IsLegacyIAccessiblePatternAvailable:	true
+IsMultipleViewPatternAvailable:	false
+IsObjectModelPatternAvailable:	false
+IsRangeValuePatternAvailable:	false
+IsScrollItemPatternAvailable:	false
+IsScrollPatternAvailable:	false
+IsSelectionItemPatternAvailable:	false
+IsSelectionPatternAvailable:	false
+IsSpreadsheetItemPatternAvailable:	false
+IsSpreadsheetPatternAvailable:	false
+IsStylesPatternAvailable:	false
+IsSynchronizedInputPatternAvailable:	false
+IsTableItemPatternAvailable:	false
+IsTablePatternAvailable:	false
+IsTextChildPatternAvailable:	false
+IsTextEditPatternAvailable:	false
+IsTextPatternAvailable:	false
+IsTextPattern2Available:	false
+IsTogglePatternAvailable:	true
+IsTransformPatternAvailable:	false
+IsTransform2PatternAvailable:	false
+IsValuePatternAvailable:	false
+IsVirtualizedItemPatternAvailable:	false
+IsWindowPatternAvailable:	false
+IsCustomNavigationPatternAvailable:	false
+IsSelectionPattern2Available:	false
+FirstChild:	[null]
+LastChild:	[null]
+Next:	"Read docs" 文本
+Previous:	[null]
+Other Props:	Object has no additional properties
+Children:	Container has no children
+Ancestors:	"" 列表项目
+	"" 组
+	"" 组
+	"" 组
+	"ZenUI Todo" 窗口
+	"桌面 1" 窗格
+	[ No Parent ]
+
+UI Tree View
+
+UI Automation

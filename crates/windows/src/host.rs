@@ -47,7 +47,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::{HSTRING, w};
 use zenui::prelude::*;
 
-use crate::accessibility::{self, AccessibilityIds, AccessibilityTree, WindowAccessibility};
+use crate::accessibility::{
+    self, AccessibilityAction, AccessibilityIds, AccessibilityTree, WindowAccessibility,
+};
 use crate::file_dialog::{FileDialogPresenter, NativeFileDialog};
 use crate::ole::{OleApartment, OleError};
 use crate::shortcuts::{EditorAction, editor_shortcut};
@@ -71,6 +73,14 @@ mod host_message {
 
     /// 注册表全集；`handle_message` 显式认领它们，保留值不会落入窗口路由。
     pub(super) const ALL: [u32; 4] = [WAKE, DEVICE_LOSS, UIA_ACTION, TRAY_CALLBACK];
+}
+
+/// 唤醒窗口的 UI 线程以执行排队的辅助技术动作。
+///
+/// provider 线程只入队；投递失败时入队方撤回动作并向 UIA 报告不可用。
+pub(crate) fn post_uia_action(hwnd: HWND) -> bool {
+    // 安全：HWND 由窗口条目持有；消息只排队，不跨线程解引用。
+    unsafe { PostMessageW(Some(hwnd), host_message::UIA_ACTION, WPARAM(0), LPARAM(0)).is_ok() }
 }
 
 /// `SPI_GETWHEELSCROLLLINES` 的哨兵值：一个 notch 滚动一页。
@@ -682,6 +692,10 @@ impl Host {
     /// 的：任一 HWND 收到唤醒都交付全部 worker 结果，再逐窗口比较快照重绘；
     /// 尚未实现的保留消息被显式忽略，不会落入窗口输入路由。
     fn handle_message(&mut self, hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) {
+        if message == host_message::UIA_ACTION {
+            self.run_queued_accessibility_actions(hwnd);
+            return;
+        }
         if host_message::ALL.contains(&message) {
             if message == host_message::WAKE
                 && let Err(error) = self.deliver_tasks()
@@ -1426,9 +1440,9 @@ impl Host {
 
         match visual {
             Visual::TextInput => {
-                pointer_dispatch(self.runtime.focus_node(node))?;
+                ignore_expected_dispatch(self.runtime.focus_node(node))?;
                 if let Some(offset) = caret {
-                    pointer_dispatch(self.runtime.set_caret_node(node, offset))?;
+                    ignore_expected_dispatch(self.runtime.set_caret_node(node, offset))?;
                 }
                 // 可见切片内的点击通常不需要移动；caret 落在视口外时由同一
                 // 显露规则拉回。
@@ -1672,9 +1686,11 @@ impl Host {
                 .and_then(|scene| scene.node(node))
                 .map(SceneElement::visual);
             match visual {
-                Some(Visual::Button { .. }) => pointer_dispatch(self.runtime.click_node(node))?,
+                Some(Visual::Button { .. }) => {
+                    ignore_expected_dispatch(self.runtime.click_node(node))?
+                }
                 Some(Visual::Checkbox { checked }) => {
-                    pointer_dispatch(self.runtime.change_node(node, !checked))?;
+                    ignore_expected_dispatch(self.runtime.change_node(node, !checked))?;
                 }
                 _ => {}
             }
@@ -1748,6 +1764,87 @@ impl Host {
         self.windows
             .get(key)
             .and_then(|window| window.accessibility.tree())
+    }
+
+    /// 在窗口对应的 UI 线程上执行 provider 排队的动作，再结算请求与重绘。
+    fn run_queued_accessibility_actions(&mut self, hwnd: HWND) {
+        let Some(key) = self.key_for(hwnd) else {
+            return;
+        };
+        let result = self.with_window(key, |host, window| host.run_accessibility_actions(window));
+        if let Err(error) = result {
+            self.deferred_error.get_or_insert(error);
+        }
+        if let Err(error) = self.settle_window_requests() {
+            self.deferred_error.get_or_insert(error);
+        }
+        if let Err(error) = self.repaint_changed_windows() {
+            self.deferred_error.get_or_insert(error);
+        }
+    }
+
+    /// 按入队顺序执行辅助技术动作；每条都按最新快照重验。
+    ///
+    /// provider 已按调用时的树过滤过一次；这里重新读取运行时快照，覆盖排队期间
+    /// 的卸载、禁用、隐藏与组合状态变化。被拒绝的动作是正常的竞态结果，不产生
+    /// 宿主错误；Runtime 的命令路径还会再验证 Node ID 与窗口状态。
+    fn run_accessibility_actions(&mut self, window: &mut WindowHost) -> Result<(), HostError> {
+        let mut failure = None;
+        for action in window.accessibility.take_actions() {
+            let node = action.node();
+            let Ok(snapshot) = self.runtime.presentation_of(window.ctx) else {
+                continue;
+            };
+            let Some(element) = snapshot.node(node) else {
+                continue;
+            };
+            if element.disabled() {
+                continue;
+            }
+            let dispatched = match action {
+                AccessibilityAction::Invoke(_) => {
+                    if !element.semantics().has_action(SnapshotAction::Click) {
+                        continue;
+                    }
+                    ignore_expected_dispatch(self.runtime.click_node(node))
+                }
+                AccessibilityAction::Toggle(_) => {
+                    let Some(checked) = element.toggle_state() else {
+                        continue;
+                    };
+                    if !element.semantics().has_action(SnapshotAction::Change) {
+                        continue;
+                    }
+                    ignore_expected_dispatch(self.runtime.change_node(node, !checked))
+                }
+                AccessibilityAction::SetValue(_, value) => {
+                    let editable = element.semantics().has_action(SnapshotAction::Input)
+                        && element
+                            .edit()
+                            .is_some_and(|edit| edit.composition().is_none());
+                    if !editable {
+                        continue;
+                    }
+                    ignore_expected_dispatch(self.runtime.replace_text_node(node, &value))
+                }
+                AccessibilityAction::SetFocus(_) => {
+                    if !element.semantics().focusable()
+                        || !accessibility::window_is_foreground(window.hwnd())
+                    {
+                        continue;
+                    }
+                    ignore_expected_dispatch(self.runtime.focus_node(node))
+                }
+            };
+            // 继续执行剩余动作；真正失败仍报告给宿主，但不丢弃已经应答的动作。
+            if let Err(error) = dispatched {
+                failure.get_or_insert(error);
+            }
+        }
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     /// `WM_GETOBJECT` 的 provider 交付；只有已发布树的窗口应答根对象。
@@ -1899,9 +1996,9 @@ impl Host {
         // 部分 IME 把候选确认作为 WM_CHAR 送达，而不是 GCS_RESULTSTR；
         // 组合中的字符必须走 commit，否则普通编辑会被 reducer 拒绝。
         if is_composing(&snapshot, focused) {
-            pointer_dispatch(self.runtime.compose_commit_node(focused, text))?;
+            ignore_expected_dispatch(self.runtime.compose_commit_node(focused, text))?;
         } else {
-            pointer_dispatch(self.runtime.insert_text_node(focused, text))?;
+            ignore_expected_dispatch(self.runtime.insert_text_node(focused, text))?;
         }
         window.reveal_requested = true;
         window.paint_requested = true;
@@ -1989,7 +2086,7 @@ impl Host {
         let composing = is_composing(&snapshot, focused);
         if key == VK_ESCAPE {
             // 运行时在组合中优先取消并恢复文本；否则派发给用户 keydown。
-            pointer_dispatch(self.runtime.keydown_node(focused, Key::Escape))?;
+            ignore_expected_dispatch(self.runtime.keydown_node(focused, Key::Escape))?;
             if composing {
                 self.notify_ime_cancel(window);
                 window.reveal_requested = true;
@@ -2005,7 +2102,7 @@ impl Host {
         if let Some(action) = editor_shortcut(key, control, true, composing) {
             match action {
                 EditorAction::SelectAll => {
-                    pointer_dispatch(self.runtime.select_all_node(focused))?;
+                    ignore_expected_dispatch(self.runtime.select_all_node(focused))?;
                     window.reveal_requested = true;
                     window.paint_requested = true;
                 }
@@ -2021,22 +2118,22 @@ impl Host {
         }
         if key == VK_RETURN {
             if !is_composing(&snapshot, focused) {
-                pointer_dispatch(self.runtime.keydown_node(focused, Key::Enter))?;
+                ignore_expected_dispatch(self.runtime.keydown_node(focused, Key::Enter))?;
                 if let Some(form) = ancestor_form(&snapshot, focused) {
-                    pointer_dispatch(self.runtime.submit_node(form))?;
+                    ignore_expected_dispatch(self.runtime.submit_node(form))?;
                 }
             }
             window.paint_requested = true;
             return Ok(());
         }
         if key == VK_BACK {
-            pointer_dispatch(self.runtime.backspace_node(focused))?;
+            ignore_expected_dispatch(self.runtime.backspace_node(focused))?;
             window.reveal_requested = true;
             window.paint_requested = true;
             return Ok(());
         }
         if key == VK_DELETE {
-            pointer_dispatch(self.runtime.delete_forward_node(focused))?;
+            ignore_expected_dispatch(self.runtime.delete_forward_node(focused))?;
             window.reveal_requested = true;
             window.paint_requested = true;
             return Ok(());
@@ -2047,10 +2144,10 @@ impl Host {
         };
         match command {
             CaretCommand::Caret(offset) => {
-                pointer_dispatch(self.runtime.set_caret_node(focused, offset))?;
+                ignore_expected_dispatch(self.runtime.set_caret_node(focused, offset))?;
             }
             CaretCommand::Selection(anchor, focus) => {
-                pointer_dispatch(self.runtime.set_selection_node(focused, anchor, focus))?;
+                ignore_expected_dispatch(self.runtime.set_selection_node(focused, anchor, focus))?;
             }
         }
         window.reveal_requested = true;
@@ -2068,7 +2165,7 @@ impl Host {
             return Ok(());
         };
         if !is_composing(&snapshot, node) {
-            pointer_dispatch(self.runtime.compose_start_node(node))?;
+            ignore_expected_dispatch(self.runtime.compose_start_node(node))?;
         }
         window.reveal_requested = true;
         window.paint_requested = true;
@@ -2122,12 +2219,12 @@ impl Host {
             match commit {
                 Some(text) => {
                     if !composing {
-                        pointer_dispatch(self.runtime.compose_start_node(node))?;
+                        ignore_expected_dispatch(self.runtime.compose_start_node(node))?;
                     }
-                    pointer_dispatch(self.runtime.compose_commit_node(node, &text))?;
+                    ignore_expected_dispatch(self.runtime.compose_commit_node(node, &text))?;
                 }
                 None if composing => {
-                    pointer_dispatch(self.runtime.compose_cancel_node(node))?;
+                    ignore_expected_dispatch(self.runtime.compose_cancel_node(node))?;
                 }
                 None => {}
             }
@@ -2136,9 +2233,9 @@ impl Host {
         if request.update {
             let text = update.unwrap_or_default();
             if !composing {
-                pointer_dispatch(self.runtime.compose_start_node(node))?;
+                ignore_expected_dispatch(self.runtime.compose_start_node(node))?;
             }
-            pointer_dispatch(self.runtime.compose_update_node(node, &text))?;
+            ignore_expected_dispatch(self.runtime.compose_update_node(node, &text))?;
         }
         Ok(())
     }
@@ -2160,7 +2257,7 @@ impl Host {
         for node in composing {
             match self.runtime.compose_cancel_node(node) {
                 Ok(()) => cancelled = true,
-                Err(error) => pointer_dispatch(Err(error))?,
+                Err(error) => ignore_expected_dispatch(Err(error))?,
             }
         }
         if cancelled {
@@ -3257,10 +3354,10 @@ fn validated_file_dialog_outcome(
     outcome
 }
 
-/// 命中元素可以没有对应 handler（例如静态按钮）、处于不可聚焦状态，
-/// 或在派发过程中被 handler 重挂载而失效；这些拒绝是正常交互结果，
-/// 不是宿主失败。
-fn pointer_dispatch(result: Result<(), DispatchError>) -> Result<(), HostError> {
+/// 命中元素可以没有对应 handler（例如静态按钮）、处于不可聚焦、挂起或已卸载
+/// 状态，或在派发过程中被 handler 重挂载而失效；这些拒绝是正常交互结果，
+/// 不是宿主失败。指针、键盘与 UIA 动作共用这一个判定。
+fn ignore_expected_dispatch(result: Result<(), DispatchError>) -> Result<(), HostError> {
     match result {
         Ok(())
         | Err(
@@ -3967,15 +4064,19 @@ mod tests {
 
     use super::*;
     use crate::accessibility::ControlType;
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicUsize;
     use windows::Win32::System::Ole::{SafeArrayDestroy, SafeArrayGetElement};
     use windows::Win32::UI::Accessibility::{
-        IRawElementProviderFragment, NavigateDirection_FirstChild,
-        ProviderOptions_ServerSideProvider, UIA_E_ELEMENTNOTAVAILABLE, UIA_NamePropertyId,
-        UiaAppendRuntimeId,
+        IInvokeProvider, IRawElementProviderFragment, IToggleProvider, IValueProvider,
+        NavigateDirection_FirstChild, NavigateDirection_NextSibling,
+        ProviderOptions_ServerSideProvider, ToggleState_Off, ToggleState_On,
+        UIA_E_ELEMENTNOTAVAILABLE, UIA_E_NOTSUPPORTED, UIA_InvokePatternId, UIA_NamePropertyId,
+        UIA_TogglePatternId, UIA_ValuePatternId, UiaAppendRuntimeId,
     };
     use windows::Win32::UI::Input::KeyboardAndMouse::{IsWindowEnabled, VK_A};
     use windows::Win32::UI::WindowsAndMessaging::SendMessageW;
-    use windows::core::{HRESULT, Interface};
+    use windows::core::{HRESULT, Interface, w};
 
     const MAIN: &str = "main";
 
@@ -4455,6 +4556,339 @@ mod tests {
         let error = unsafe { provider.GetPropertyValue(UIA_NamePropertyId) }
             .expect_err("a hidden window has no published tree");
         assert_eq!(error.code(), HRESULT(UIA_E_ELEMENTNOTAVAILABLE as i32));
+    }
+
+    #[test]
+    fn invoke_and_toggle_patterns_enqueue_one_command_each_in_order() {
+        let (mut host, probe) = open_uia_probe();
+        let root = root_fragment(&mut host);
+        let act = provider_named(&root, "Act");
+        let flag = provider_named(&root, "Flag");
+        let caption = provider_named(&root, "Caption");
+        let invoke: IInvokeProvider = pattern(&act, UIA_InvokePatternId);
+        let toggle: IToggleProvider = pattern(&flag, UIA_TogglePatternId);
+        assert!(
+            unsafe { caption.GetPatternProvider(UIA_InvokePatternId) }.is_err(),
+            "pattern presence comes from mounted actions, not the tag"
+        );
+        assert!(
+            unsafe { act.GetPatternProvider(UIA_TogglePatternId) }.is_err(),
+            "a button without a change handler has no toggle pattern"
+        );
+        assert_eq!(
+            unsafe { toggle.ToggleState() }.expect("initial state"),
+            ToggleState_Off
+        );
+
+        unsafe { invoke.Invoke() }.expect("queue invoke");
+        unsafe { toggle.Toggle() }.expect("queue toggle");
+        assert_eq!(
+            probe.clicks.load(Ordering::SeqCst),
+            0,
+            "provider calls only enqueue"
+        );
+        assert!(probe.changes.lock().expect("changes").is_empty());
+
+        host.pump().expect("drain the queued actions");
+        assert_eq!(
+            probe.clicks.load(Ordering::SeqCst),
+            1,
+            "Invoke runs the click handler once"
+        );
+        assert_eq!(
+            *probe.changes.lock().expect("changes"),
+            [true],
+            "Toggle runs one change"
+        );
+        assert_eq!(
+            *probe.events.lock().expect("events"),
+            ["click", "change"],
+            "actions drain in queue order"
+        );
+        assert_eq!(
+            host.accessibility_tree(MAIN)
+                .expect("published tree")
+                .find_name("Flag")
+                .and_then(|node| node.toggle_state()),
+            Some(true)
+        );
+        assert_eq!(
+            unsafe { toggle.ToggleState() }.expect("state after toggling"),
+            ToggleState_On
+        );
+
+        unsafe { toggle.Toggle() }.expect("queue the reverse toggle");
+        host.pump().expect("drain");
+        assert_eq!(*probe.changes.lock().expect("changes"), [true, false]);
+        assert_eq!(
+            unsafe { toggle.ToggleState() }.expect("state after the reverse toggle"),
+            ToggleState_Off
+        );
+    }
+
+    #[test]
+    fn actions_report_unavailable_for_disabled_stale_and_hidden_targets() {
+        // 静态禁用的控件：provider 在调用线程上直接报告不可用。
+        let mut disabled_host = open_disabled_probe();
+        let root = root_fragment(&mut disabled_host);
+        let dead = provider_named(&root, "Dead");
+        let invoke: IInvokeProvider = pattern(&dead, UIA_InvokePatternId);
+        let error = unsafe { invoke.Invoke() }.expect_err("disabled targets are unavailable");
+        assert_eq!(error.code(), HRESULT(UIA_E_ELEMENTNOTAVAILABLE as i32));
+        let locked = provider_named(&root, "Locked");
+        let value: IValueProvider = pattern(&locked, UIA_ValuePatternId);
+        assert_eq!(unsafe { value.IsReadOnly() }.expect("read-only").0, 1);
+        let error =
+            unsafe { value.SetValue(w!("blocked")) }.expect_err("disabled inputs are read-only");
+        assert_eq!(error.code(), HRESULT(UIA_E_ELEMENTNOTAVAILABLE as i32));
+        disabled_host.pump().expect("drain the rejected actions");
+
+        // 先取到 provider，再让目标卸载：旧 provider 必须报告不可用。
+        let (mut host, probe) = open_uia_probe();
+        let root = root_fragment(&mut host);
+        let ephemeral = provider_named(&root, "Ephemeral");
+        let ephemeral_invoke: IInvokeProvider = pattern(&ephemeral, UIA_InvokePatternId);
+        let hide = provider_named(&root, "Hide");
+        let hide_invoke: IInvokeProvider = pattern(&hide, UIA_InvokePatternId);
+        unsafe { hide_invoke.Invoke() }.expect("queue hiding the ephemeral button");
+        host.pump().expect("drain the hide");
+        assert!(
+            host.accessibility_tree(MAIN)
+                .expect("published tree")
+                .find_name("Ephemeral")
+                .is_none(),
+            "the gated button is unmounted"
+        );
+        let error =
+            unsafe { ephemeral_invoke.Invoke() }.expect_err("stale targets are unavailable");
+        assert_eq!(error.code(), HRESULT(UIA_E_ELEMENTNOTAVAILABLE as i32));
+
+        let act = provider_named(&root, "Act");
+        let act_invoke: IInvokeProvider = pattern(&act, UIA_InvokePatternId);
+        host.pump().expect("drain the rejected actions");
+        assert_eq!(
+            probe.clicks.load(Ordering::SeqCst),
+            0,
+            "rejected actions run no handler"
+        );
+
+        host.hide(MAIN).expect("hide the window");
+        let error = unsafe { act_invoke.Invoke() }.expect_err("hidden windows have no tree");
+        assert_eq!(error.code(), HRESULT(UIA_E_ELEMENTNOTAVAILABLE as i32));
+        host.pump().expect("drain after hiding");
+        assert_eq!(probe.clicks.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn queued_actions_are_revalidated_against_the_latest_snapshot() {
+        let (mut host, probe) = open_uia_probe();
+        let root = root_fragment(&mut host);
+        let act = provider_named(&root, "Act");
+        let disable = provider_named(&root, "Disable");
+        let act_invoke: IInvokeProvider = pattern(&act, UIA_InvokePatternId);
+        let disable_invoke: IInvokeProvider = pattern(&disable, UIA_InvokePatternId);
+
+        // provider 在入队时看到的目标仍然启用；中间的动作会禁用它。
+        unsafe { act_invoke.Invoke() }.expect("queue the first click");
+        unsafe { disable_invoke.Invoke() }.expect("queue disabling the button");
+        unsafe { act_invoke.Invoke() }.expect("queue a click that becomes invalid");
+        assert_eq!(probe.clicks.load(Ordering::SeqCst), 0);
+
+        host.pump().expect("drain in order");
+        assert_eq!(
+            probe.clicks.load(Ordering::SeqCst),
+            1,
+            "the UI thread drops the click queued before the disable"
+        );
+        assert_eq!(
+            *probe.events.lock().expect("events"),
+            ["click", "disable"],
+            "the disabled target runs no handler"
+        );
+        assert!(
+            !host
+                .accessibility_tree(MAIN)
+                .expect("published tree")
+                .find_name("Act")
+                .expect("the button")
+                .enabled(),
+            "the republished tree reports the disabled button"
+        );
+    }
+
+    #[test]
+    fn value_pattern_replaces_the_draft_once_and_records_one_undo() {
+        let (mut host, probe) = open_uia_probe();
+        let root = root_fragment(&mut host);
+        let field = provider_named(&root, "Field");
+        let value: IValueProvider = pattern(&field, UIA_ValuePatternId);
+        assert_eq!(unsafe { value.Value() }.expect("value").to_string(), "old");
+        assert_eq!(unsafe { value.IsReadOnly() }.expect("writable").0, 0);
+
+        unsafe { value.SetValue(w!("new value")) }.expect("queue the replacement");
+        assert!(probe.inputs.lock().expect("inputs").is_empty());
+        host.pump().expect("drain the replacement");
+        assert_eq!(
+            *probe.inputs.lock().expect("inputs"),
+            [String::from("new value")],
+            "SetValue dispatches exactly one input"
+        );
+
+        let snapshot = host.presentation(MAIN).expect("snapshot");
+        let input = snapshot.find_label("Field").expect("the draft input");
+        assert_eq!(input.text_value(), Some("new value"));
+        assert_eq!(input.edit().expect("text input").caret(), 9);
+        let node = input.id();
+
+        host.runtime.undo_node(node).expect("undo the replacement");
+        assert_eq!(
+            host.presentation(MAIN)
+                .expect("snapshot")
+                .node(node)
+                .expect("input")
+                .text_value(),
+            Some("old"),
+            "one undo restores the value before the replacement"
+        );
+        host.runtime
+            .undo_node(node)
+            .expect("a second undo is a no-op");
+        assert_eq!(
+            host.presentation(MAIN)
+                .expect("snapshot")
+                .node(node)
+                .expect("input")
+                .text_value(),
+            Some("old"),
+            "the replacement recorded exactly one undo entry"
+        );
+        assert_eq!(
+            *probe.inputs.lock().expect("inputs"),
+            [String::from("new value"), String::from("old")],
+            "the replacement and the undo each dispatch one input"
+        );
+
+        // 组合期间：provider 仍按旧树入队，UI 线程按最新快照拒绝。
+        host.runtime
+            .compose_start_node(node)
+            .expect("start composition");
+        host.runtime
+            .compose_update_node(node, "ka")
+            .expect("update the preedit");
+        unsafe { value.SetValue(w!("blocked")) }.expect("the stale tree looks writable");
+        host.pump().expect("drain the composing action");
+        assert_eq!(
+            probe.inputs.lock().expect("inputs").len(),
+            2,
+            "no input is dispatched while composing"
+        );
+
+        host.render().expect("republish the composition");
+        assert_eq!(unsafe { value.IsReadOnly() }.expect("read-only").0, 1);
+        let error =
+            unsafe { value.SetValue(w!("blocked")) }.expect_err("a composing input is read-only");
+        assert_eq!(error.code(), HRESULT(UIA_E_ELEMENTNOTAVAILABLE as i32));
+    }
+
+    #[test]
+    fn set_focus_only_queues_a_focusable_target_and_never_steals_foreground() {
+        let (mut host, _probe) = open_uia_probe();
+        let root = root_fragment(&mut host);
+        let field = provider_named(&root, "Field");
+        let fragment: IRawElementProviderFragment = field.cast().expect("fragment");
+        assert!(host.presentation(MAIN).expect("snapshot").focus().is_none());
+
+        unsafe { fragment.SetFocus() }.expect("queue focus for the focusable input");
+        host.pump().expect("drain");
+        assert!(
+            host.presentation(MAIN).expect("snapshot").focus().is_none(),
+            "a background window does not move runtime focus"
+        );
+
+        let caption = provider_named(&root, "Caption");
+        let caption: IRawElementProviderFragment = caption.cast().expect("fragment");
+        let error = unsafe { caption.SetFocus() }.expect_err("text is not focusable");
+        assert_eq!(error.code(), HRESULT(UIA_E_NOTSUPPORTED as i32));
+    }
+
+    #[test]
+    fn suspended_parent_targets_report_unavailable_and_keep_their_value() {
+        let mut host = open_confirm_host();
+        send_msg(
+            &mut host,
+            MSG {
+                message: WM_CLOSE,
+                ..Default::default()
+            },
+        );
+        assert!(!host.windows[MAIN].enabled, "the parent is close-suspended");
+
+        let root = root_fragment(&mut host);
+        let draft = provider_named(&root, "draft");
+        let value: IValueProvider = pattern(&draft, UIA_ValuePatternId);
+        let error = unsafe { value.SetValue(w!("blocked")) }
+            .expect_err("a suspended parent rejects writes");
+        assert_eq!(error.code(), HRESULT(UIA_E_ELEMENTNOTAVAILABLE as i32));
+
+        let fragment: IRawElementProviderFragment = draft.cast().expect("fragment");
+        let error = unsafe { fragment.SetFocus() }.expect_err("a suspended parent rejects focus");
+        assert_eq!(error.code(), HRESULT(UIA_E_ELEMENTNOTAVAILABLE as i32));
+
+        host.pump().expect("drain the rejected actions");
+        assert_eq!(
+            host.presentation(MAIN)
+                .expect("snapshot")
+                .find_label("draft")
+                .expect("the draft input")
+                .text_value(),
+            Some("")
+        );
+    }
+
+    #[test]
+    fn an_action_enqueued_from_another_thread_runs_only_after_pump() {
+        let (mut host, probe) = open_uia_probe();
+        let node = host
+            .accessibility_tree(MAIN)
+            .expect("published tree")
+            .find_name("Act")
+            .and_then(|node| node.node_id())
+            .expect("the action node");
+        let accessibility = Arc::clone(&host.windows[MAIN].accessibility);
+        std::thread::spawn(move || {
+            assert!(accessibility.enqueue(AccessibilityAction::Invoke(node)));
+        })
+        .join()
+        .expect("the provider thread enqueues");
+
+        assert_eq!(
+            probe.clicks.load(Ordering::SeqCst),
+            0,
+            "off-thread calls only change the queue"
+        );
+        host.pump().expect("the wake message drains the queue");
+        assert_eq!(probe.clicks.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn the_accessibility_action_queue_rejects_overflow() {
+        let (host, _probe) = open_uia_probe();
+        let node = host
+            .accessibility_tree(MAIN)
+            .expect("published tree")
+            .find_name("Act")
+            .and_then(|node| node.node_id())
+            .expect("the action node");
+        let accessibility = Arc::clone(&host.windows[MAIN].accessibility);
+        let limit = crate::accessibility::MAX_PENDING_ACTIONS;
+        for _ in 0..limit {
+            assert!(accessibility.enqueue(AccessibilityAction::Invoke(node)));
+        }
+        assert!(
+            !accessibility.enqueue(AccessibilityAction::Invoke(node)),
+            "a full queue rejects the next action instead of growing"
+        );
+        assert_eq!(accessibility.take_actions().len(), limit);
     }
 
     #[test]
@@ -5049,6 +5483,182 @@ mod tests {
         zenui_demo::open_todo_window(&mut runtime).expect("open the todo window");
         zenui_demo::seed(&mut runtime).expect("seed the todo rows");
         Host::open(runtime, HostConfig::hidden()).expect("open host")
+    }
+
+    /// 测试期记录器：`&'static` 是 Copy，事件闭包重复构造时不会把 view 的
+    /// factory 变成 `FnOnce`；每个探针实例各自泄漏一块极小的状态。
+    fn leak<T>(value: T) -> &'static T {
+        Box::leak(Box::new(value))
+    }
+
+    /// UIA 动作探针：每个 handler 记录自己的调用，便于断言恰好一次与顺序。
+    struct UiaProbe {
+        clicks: &'static AtomicUsize,
+        events: &'static Mutex<Vec<&'static str>>,
+        changes: &'static Mutex<Vec<bool>>,
+        inputs: &'static Mutex<Vec<String>>,
+    }
+
+    fn open_uia_probe() -> (Host, UiaProbe) {
+        let clicks = leak(AtomicUsize::new(0));
+        let events = leak(Mutex::new(Vec::new()));
+        let changes = leak(Mutex::new(Vec::new()));
+        let inputs = leak(Mutex::new(Vec::new()));
+
+        let mut runtime = Runtime::new();
+        runtime
+            .declare_windows(move |catalog| {
+                catalog.window(WindowSpec::new(MAIN).primary().sized(480, 360), move |_| {
+                    // 信号在挂载上下文中创建；测试通过快照与事件日志观察结果。
+                    let mounted = signal(true);
+                    let locked = signal(false);
+                    let checked = signal(false);
+                    let value = signal(String::from("old"));
+                    view! {
+                        <view>
+                            <button
+                                aria:label="Act"
+                                disabled={locked}
+                                on:click={move || {
+                                    clicks.fetch_add(1, Ordering::SeqCst);
+                                    events.lock().expect("events").push("click");
+                                }}
+                            >"Act"</button>
+                            <button
+                                aria:label="Disable"
+                                on:click={move || {
+                                    events.lock().expect("events").push("disable");
+                                    locked.set(true);
+                                }}
+                            >"Disable"</button>
+                            <button
+                                aria:label="Hide"
+                                on:click={move || mounted.set(false)}
+                            >"Hide"</button>
+                            <Show when={memo(move || mounted.get())}>
+                                <button
+                                    aria:label="Ephemeral"
+                                    on:click={move || {
+                                        clicks.fetch_add(1, Ordering::SeqCst);
+                                    }}
+                                >"Ephemeral"</button>
+                            </Show>
+                            <text aria:label="Caption">"Caption"</text>
+                            <checkbox
+                                aria:label="Flag"
+                                checked={checked}
+                                on:change={move |next: bool| {
+                                    events.lock().expect("events").push("change");
+                                    changes.lock().expect("changes").push(next);
+                                    checked.set(next);
+                                }}
+                            />
+                            <text-input
+                                aria:label="Field"
+                                value={value}
+                                on:input={move |next: String| {
+                                    events.lock().expect("events").push("input");
+                                    inputs.lock().expect("inputs").push(next.clone());
+                                    value.set(next);
+                                }}
+                            />
+                        </view>
+                    }
+                })?;
+                Ok(())
+            })
+            .expect("declare the probe window");
+        runtime.show(MAIN).expect("show the probe window");
+        let mut host = Host::open(runtime, HostConfig::hidden()).expect("open the probe host");
+        host.render().expect("render the probe window");
+        (
+            host,
+            UiaProbe {
+                clicks,
+                events,
+                changes,
+                inputs,
+            },
+        )
+    }
+
+    /// 静态禁用的按钮与输入：任何误派发的 handler 都会让测试失败。
+    fn open_disabled_probe() -> Host {
+        let mut runtime = Runtime::new();
+        runtime
+            .declare_windows(|catalog| {
+                catalog.window(WindowSpec::new(MAIN).primary().sized(320, 240), |_| {
+                    view! {
+                        <view>
+                            <button
+                                aria:label="Dead"
+                                disabled={true}
+                                on:click={move || panic!("a disabled Invoke ran its handler")}
+                            >"Dead"</button>
+                            <text-input
+                                aria:label="Locked"
+                                value="frozen"
+                                disabled={true}
+                                on:input={move |_value: String| {
+                                    panic!("a disabled SetValue ran its handler")
+                                }}
+                            />
+                        </view>
+                    }
+                })?;
+                Ok(())
+            })
+            .expect("declare the disabled probe window");
+        runtime.show(MAIN).expect("show the disabled probe window");
+        let mut host = Host::open(runtime, HostConfig::hidden()).expect("open the disabled host");
+        host.render().expect("render the disabled probe window");
+        host
+    }
+
+    fn root_fragment(host: &mut Host) -> IRawElementProviderFragment {
+        let hwnd = host.hwnd(MAIN).expect("a live window");
+        host.accessibility_provider(hwnd)
+            .expect("a root provider")
+            .cast()
+            .expect("fragment root")
+    }
+
+    /// 从根开始按 UIA 导航查找名称匹配的元素 provider。
+    fn provider_named(root: &IRawElementProviderFragment, name: &str) -> IRawElementProviderSimple {
+        fn walk(
+            fragment: &IRawElementProviderFragment,
+            name: &str,
+        ) -> Option<IRawElementProviderSimple> {
+            let mut child = unsafe { fragment.Navigate(NavigateDirection_FirstChild) }.ok();
+            while let Some(child_fragment) = child {
+                let simple: IRawElementProviderSimple =
+                    child_fragment.cast().expect("simple provider");
+                let variant =
+                    unsafe { simple.GetPropertyValue(UIA_NamePropertyId) }.expect("element name");
+                // 安全：provider 返回的 VT_BSTR 由这个 VARIANT 持有。
+                let child_name =
+                    unsafe { &variant.Anonymous.Anonymous.Anonymous.bstrVal }.to_string();
+                if child_name == name {
+                    return Some(simple);
+                }
+                if let Some(found) = walk(&child_fragment, name) {
+                    return Some(found);
+                }
+                child = unsafe { child_fragment.Navigate(NavigateDirection_NextSibling) }.ok();
+            }
+            None
+        }
+        walk(root, name).expect("a provider with the requested name")
+    }
+
+    fn pattern<T: Interface>(
+        simple: &IRawElementProviderSimple,
+        id: windows::Win32::UI::Accessibility::UIA_PATTERN_ID,
+    ) -> T {
+        unsafe { simple.GetPatternProvider(id) }
+            .expect("a pattern provider")
+            .cast()
+            .expect("the requested pattern interface")
     }
 
     /// 一个 Confirm 主窗口与它声明的确认窗口；确认窗口用按钮回复。
@@ -6212,7 +6822,7 @@ mod tests {
     }
 
     #[test]
-    fn pointer_dispatch_treats_a_rejected_blur_as_a_no_op() {
+    fn expected_dispatch_rejections_are_no_ops() {
         let mut app = Runtime::new();
         app.open_window("main", |_| {
             view! { <text-input value="x" aria:label="Input" /> }
@@ -6229,7 +6839,7 @@ mod tests {
             "an unfocused input rejects blur"
         );
         assert!(
-            pointer_dispatch(app.blur_node(id)).is_ok(),
+            ignore_expected_dispatch(app.blur_node(id)).is_ok(),
             "the host ignores the rejection"
         );
     }

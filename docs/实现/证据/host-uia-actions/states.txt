@@ -1,0 +1,23 @@
+# 100% (96 DPI) · ZenUI Todo · visible host, after the UIA action sequence
+# window: 900x700 client; native IUIAutomation client dump in 100-actions.txt
+scale=1.00
+set_focus=What needs to be done? has_keyboard_focus=true
+set_value=""->"UIA action" read_only=false
+invoke_add=one "Complete UIA action" row, "2 remaining"
+toggle=Complete Read docs Off->On, "1 remaining"
+reverse=[Write tests, Read docs, UIA action] -> [UIA action, Read docs, Write tests]
+
+# 150% (144 DPI) · ZenUI Todo · visible host, after the UIA action sequence
+# window: 900x700 logical client = 1350x1050 physical; dump in 150-actions.txt
+scale=1.50
+set_focus=What needs to be done? has_keyboard_focus=true
+set_value=""->"UIA action" read_only=false
+invoke_add=one "Complete UIA action" row, "2 remaining"
+toggle=Complete Read docs Off->On, "1 remaining"
+reverse=[Write tests, Read docs, UIA action] -> [UIA action, Read docs, Write tests]
+
+# Inspect UI Automation mode (same builds, separate session)
+# invoke: IsInvokePatternAvailable=true, IsToggle=false, IsValue=false
+# value:  IsValuePatternAvailable=true, Value.IsReadOnly=false, IsInvoke=false
+# toggle: IsTogglePatternAvailable=true, Toggle.ToggleState reflects the committed state
+# details text: inspect-invoke-{100,150}.txt, inspect-value-{100,150}.txt, inspect-toggle-{100,150}.txt
