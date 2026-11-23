@@ -32,16 +32,16 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow,
-    DispatchMessageW, GWLP_USERDATA, GetClientRect, GetForegroundWindow, GetMessageW,
+    DispatchMessageW, GWLP_USERDATA, GetClientRect, GetForegroundWindow, GetMenu, GetMessageW,
     GetWindowLongPtrW, IDC_ARROW, IsIconic, IsZoomed, KillTimer, LoadCursorW, MSG, PM_REMOVE,
     PeekMessageW, PostMessageW, RegisterClassExW, SPI_GETWHEELSCROLLLINES, SW_HIDE, SW_SHOW,
     SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
     SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
     SystemParametersInfoW, TranslateMessage, WINDOW_EX_STYLE, WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE,
-    WM_DESTROY, WM_DPICHANGED, WM_GETDPISCALEDSIZE, WM_GETOBJECT, WM_IME_CHAR, WM_IME_COMPOSITION,
-    WM_IME_ENDCOMPOSITION, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_SETTINGCHANGE, WM_SIZE,
-    WM_TIMER, WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
+    WM_COMMAND, WM_DESTROY, WM_DPICHANGED, WM_ENTERMENULOOP, WM_GETDPISCALEDSIZE, WM_GETOBJECT,
+    WM_IME_CHAR, WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_STARTCOMPOSITION, WM_KEYDOWN,
+    WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_PAINT, WM_SETTINGCHANGE, WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
 };
 
 use windows::core::{HSTRING, w};
@@ -52,6 +52,7 @@ use crate::accessibility::{
     WindowAccessibility,
 };
 use crate::file_dialog::{FileDialogPresenter, NativeFileDialog};
+use crate::menus::{MenuError, NativeMenu};
 use crate::ole::{OleApartment, OleError};
 use crate::shortcuts::{EditorAction, editor_shortcut};
 use zenui_render::{
@@ -334,6 +335,8 @@ struct WindowHost {
     surface: Option<wgpu::Surface<'static>>,
     surface_config: wgpu::SurfaceConfiguration,
     native: NativeWindow,
+    /// 命令 id 映射与菜单构建结果；菜单句柄由窗口拥有，`native` 的销毁负责注销。
+    menu: Option<NativeMenu>,
     ctx: WindowCtx,
     scene: Option<Scene>,
     pointer: Option<Point>,
@@ -481,7 +484,8 @@ impl Host {
                 HostError::Window(String::from("the primary window is not live after show"))
             })?;
 
-        let window = NativeWindow::new(primary_info.spec, hinstance)?;
+        let menu = build_window_menu(&runtime, primary_info.window)?;
+        let (window, menu) = NativeWindow::new(primary_info.spec, hinstance, menu)?;
         let hwnd = window.hwnd;
         // 安全：HWND 在窗口条目析构前有效；定时器随窗口销毁。
         let blink_timer = unsafe { SetTimer(Some(hwnd), CARET_BLINK_TIMER, CARET_BLINK_MS, None) };
@@ -566,6 +570,7 @@ impl Host {
         };
         host.insert_window(WindowHost::new(
             window,
+            menu,
             primary_info.window,
             primary_info.spec.title().to_owned(),
             surface,
@@ -945,6 +950,10 @@ impl Host {
             self.ime_cancel(window)
         } else if message == WM_KILLFOCUS {
             self.focus_lost(window)
+        } else if message == WM_COMMAND {
+            self.menu_command(window, wparam, lparam)
+        } else if message == WM_ENTERMENULOOP {
+            self.menu_loop_entered(window)
         } else if message == WM_TIMER && Some(wparam.0) == window.blink_timer {
             self.blink_caret(window)
         } else {
@@ -1058,12 +1067,15 @@ impl Host {
             right: (logical_width as f32 * scale) as i32,
             bottom: (logical_height as f32 * scale) as i32,
         };
-        // 安全：rect 由本地值初始化；按窗口 DPI 计算非客户区。
+        // 菜单栏属于非客户区；与 WM_GETDPISCALEDSIZE 使用同一个原生查询。
+        // 安全：hwnd 属于本窗口条目。
+        let has_menu = !unsafe { GetMenu(hwnd) }.is_invalid();
+        // 安全：rect 由本地值初始化；按窗口 DPI 计算含菜单栏的非客户区。
         unsafe {
             AdjustWindowRectExForDpi(
                 &mut rect,
                 WS_OVERLAPPEDWINDOW,
-                false,
+                has_menu,
                 WINDOW_EX_STYLE::default(),
                 dpi,
             )
@@ -1733,6 +1745,55 @@ impl Host {
         }
         let cancelled = self.cancel_compositions(window)?;
         if cancelled || was_pressed || was_dragging {
+            window.paint_requested = true;
+        }
+        Ok(())
+    }
+
+    /// `WM_COMMAND` 的菜单形式：HIWORD=0 且 lParam=0。
+    ///
+    /// 命令 id 必须是这个窗口菜单分配过的稳定项；隐藏、待决关闭与已关闭窗口已由
+    /// `handle_window_message` 拒绝，运行时命令路径还会再验证一次。窗口状态的
+    /// 竞态是正常交互结果，不升级为宿主错误。
+    fn menu_command(
+        &mut self,
+        window: &mut WindowHost,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> Result<(), HostError> {
+        if lparam.0 != 0 || (wparam.0 >> 16) & 0xFFFF != 0 {
+            return Ok(());
+        }
+        let id = (wparam.0 & 0xFFFF) as u16;
+        let Some(command) = window.menu.as_ref().and_then(|menu| menu.command(id)) else {
+            return Ok(());
+        };
+        match self
+            .runtime
+            .dispatch_command(window.ctx, command, CommandSource::MenuBar)
+        {
+            Ok(()) | Err(CommandError::Hidden | CommandError::Suspended | CommandError::Stale) => {
+                Ok(())
+            }
+            Err(error) => Err(HostError::Command(error)),
+        }
+    }
+
+    /// `WM_ENTERMENULOOP`：菜单接管鼠标与输入，取消组合并清除指针瞬态。
+    ///
+    /// 按住与 thumb 拖动持有的捕获在宿主借出结束后释放；菜单关闭后由下一次
+    /// 指针移动重新建立 hover。
+    fn menu_loop_entered(&mut self, window: &mut WindowHost) -> Result<(), HostError> {
+        let pressed = window.pressed.take().is_some();
+        let dragging = window.scrollbar_drag.take().is_some();
+        let hovered = window.hovered.take().is_some();
+        window.pointer = None;
+        window.tracking_leave = false;
+        if pressed || dragging {
+            window.release_capture = true;
+        }
+        let composing = self.cancel_compositions(window)?;
+        if pressed || dragging || hovered || composing {
             window.paint_requested = true;
         }
         Ok(())
@@ -2764,7 +2825,8 @@ impl Host {
     }
 
     fn add_window(&mut self, info: &WindowInfo) -> Result<(), HostError> {
-        let window = NativeWindow::new(info.spec, self.hinstance)?;
+        let menu = build_window_menu(&self.runtime, info.window)?;
+        let (window, menu) = NativeWindow::new(info.spec, self.hinstance, menu)?;
         let hwnd = window.hwnd;
         // 安全：HWND 在窗口条目析构前有效；定时器随窗口销毁。
         let blink_timer = unsafe { SetTimer(Some(hwnd), CARET_BLINK_TIMER, CARET_BLINK_MS, None) };
@@ -2774,6 +2836,7 @@ impl Host {
         surface.configure(&self.device, &config);
         self.insert_window(WindowHost::new(
             window,
+            menu,
             info.window,
             info.spec.title().to_owned(),
             surface,
@@ -3021,6 +3084,7 @@ impl Host {
 impl WindowHost {
     fn new(
         native: NativeWindow,
+        menu: Option<NativeMenu>,
         ctx: WindowCtx,
         title: String,
         surface: wgpu::Surface<'static>,
@@ -3032,6 +3096,7 @@ impl WindowHost {
             surface: Some(surface),
             surface_config,
             native,
+            menu,
             ctx,
             scene: None,
             pointer: None,
@@ -3237,6 +3302,10 @@ pub enum HostError {
     WindowState(WindowError),
     /// 宿主完成文件选择请求失败；stale 结果已在内部忽略。
     FileDialog(FileDialogRequestError),
+    /// 原生菜单构建失败。
+    Menu(MenuError),
+    /// 菜单命令在运行时命令路径上失败；窗口状态竞态已在调用方过滤。
+    Command(CommandError),
     /// 场景构建失败。
     Scene(zenui_render::SceneError),
     /// GPU 渲染失败。
@@ -3262,6 +3331,8 @@ impl fmt::Display for HostError {
             Self::Snapshot(error) => write!(f, "reading the window snapshot failed: {error}"),
             Self::WindowState(error) => write!(f, "window state change failed: {error}"),
             Self::FileDialog(error) => write!(f, "file dialog request failed: {error}"),
+            Self::Menu(error) => write!(f, "menu creation failed: {error}"),
+            Self::Command(error) => write!(f, "menu command failed: {error}"),
             Self::Scene(error) => write!(f, "scene failed: {error}"),
             Self::Render(error) => write!(f, "render failed: {error}"),
             Self::Input(error) => write!(f, "pointer dispatch failed: {error}"),
@@ -3272,6 +3343,19 @@ impl fmt::Display for HostError {
 
 impl Error for HostError {}
 
+/// 从目录声明构建窗口菜单；空声明不创建原生菜单栏，也不占非客户区。
+fn build_window_menu(
+    runtime: &Runtime,
+    window: WindowCtx,
+) -> Result<Option<NativeMenu>, HostError> {
+    runtime
+        .window_menu(window)
+        .filter(|menu| !menu.items().is_empty())
+        .map(|menu| NativeMenu::build(&menu))
+        .transpose()
+        .map_err(HostError::Menu)
+}
+
 struct NativeWindow {
     hwnd: HWND,
     /// 原生窗口当前是否由 `ShowWindow(SW_SHOW)` 显示；隐藏模式始终为 false。
@@ -3279,7 +3363,11 @@ struct NativeWindow {
 }
 
 impl NativeWindow {
-    fn new(spec: WindowSpec, hinstance: HINSTANCE) -> Result<Self, HostError> {
+    fn new(
+        spec: WindowSpec,
+        hinstance: HINSTANCE,
+        mut menu: Option<NativeMenu>,
+    ) -> Result<(Self, Option<NativeMenu>), HostError> {
         let title: HSTRING = spec.title().into();
         let style = WS_OVERLAPPEDWINDOW;
         let (width, height) = spec.size();
@@ -3293,18 +3381,18 @@ impl NativeWindow {
             right: (width as f32 * scale) as i32,
             bottom: (height as f32 * scale) as i32,
         };
-        // 安全：rect 与 style 来自本地值；bmenu=false。
+        // 安全：rect 与 style 来自本地值；菜单栏计入非客户区。
         unsafe {
             AdjustWindowRectExForDpi(
                 &mut rect,
                 style,
-                false,
+                menu.is_some(),
                 WINDOW_EX_STYLE::default(),
                 dpi.max(96),
             )
         }
         .map_err(|error| HostError::Window(error.to_string()))?;
-        // 安全：类名已在 register_class 注册；标题与实例句柄在调用期间有效。
+        // 安全：类名已在 register_class 注册；标题、菜单与实例句柄在调用期间有效。
         let hwnd = unsafe {
             CreateWindowExW(
                 WINDOW_EX_STYLE::default(),
@@ -3316,13 +3404,17 @@ impl NativeWindow {
                 rect.right - rect.left,
                 rect.bottom - rect.top,
                 None,
-                None,
+                menu.as_ref().map(NativeMenu::handle),
                 Some(hinstance),
                 None,
             )
         }
         .map_err(|error| HostError::Window(error.to_string()))?;
-        Ok(Self { hwnd, shown: false })
+        // 窗口创建成功后菜单归 Win32 所有；创建失败时菜单仍由局部值注销。
+        if let Some(menu) = menu.as_mut() {
+            menu.assigned_to_window();
+        }
+        Ok((Self { hwnd, shown: false }, menu))
     }
 }
 
@@ -4070,12 +4162,15 @@ unsafe extern "system" fn wndproc(
                 right: width,
                 bottom: height,
             };
+            // 菜单栏属于非客户区；直接查询 HWND 的菜单，避免在 DPI 计算里借出宿主。
+            // 安全：hwnd 来自系统回调。
+            let has_menu = !unsafe { GetMenu(hwnd) }.is_invalid();
             // 安全：outer 是本地值；样式与窗口创建时一致。
             if unsafe {
                 AdjustWindowRectExForDpi(
                     &mut outer,
                     WS_OVERLAPPEDWINDOW,
-                    false,
+                    has_menu,
                     WINDOW_EX_STYLE::default(),
                     new_dpi,
                 )
@@ -4148,6 +4243,8 @@ mod tests {
 
     use super::*;
     use crate::accessibility::ControlType;
+    use std::cell::Cell;
+    use std::rc::Rc;
     use std::sync::Mutex;
     use std::sync::atomic::AtomicUsize;
     use windows::Win32::Graphics::Gdi::ClientToScreen;
@@ -4169,7 +4266,10 @@ mod tests {
         UIA_TogglePatternId, UIA_ValuePatternId, UiaAppendRuntimeId, UiaPoint,
     };
     use windows::Win32::UI::Input::KeyboardAndMouse::{IsWindowEnabled, VK_A, VK_NEXT};
-    use windows::Win32::UI::WindowsAndMessaging::SendMessageW;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetMenuItemCount, GetMenuItemID, GetMenuState, GetMenuStringW, GetSubMenu, HMENU, IsMenu,
+        MENU_ITEM_FLAGS, MF_BYCOMMAND, MF_BYPOSITION, MF_CHECKED, MF_GRAYED, SendMessageW,
+    };
     use windows::core::{BSTR, HRESULT, Interface, w};
     use zenui_render::DecorationKind;
 
@@ -7853,6 +7953,431 @@ mod tests {
         assert!(
             ignore_expected_dispatch(app.blur_node(id)).is_ok(),
             "the host ignores the rejection"
+        );
+    }
+
+    fn menu_host() -> (Host, Rc<Cell<u32>>) {
+        let runs = Rc::new(Cell::new(0));
+        let handler_runs = runs.clone();
+        let mut runtime = Runtime::new();
+        runtime
+            .declare_windows(move |catalog| {
+                let handler_runs = handler_runs.clone();
+                catalog.window(
+                    WindowSpec::new(MAIN).primary().titled("ZenUI Menu"),
+                    move |window| {
+                        let handler_runs = handler_runs.clone();
+                        window
+                            .on_command("view.status", move |_| {
+                                handler_runs.set(handler_runs.get() + 1);
+                            })
+                            .expect("register view.status");
+                        window
+                            .on_command("file.close", |_| {})
+                            .expect("register file.close");
+                        window
+                            .on_command("file.quit", |_| {})
+                            .expect("register file.quit");
+                        view! {
+                            <view>
+                                <text aria:label="status">"Ready"</text>
+                                <text-input aria:label="edit" />
+                            </view>
+                        }
+                    },
+                )?;
+                catalog.menu(
+                    MAIN,
+                    MenuSpec::new()
+                        .submenu(
+                            "File",
+                            MenuSpec::new()
+                                .command("file.close", "Close")
+                                .separator()
+                                .item(MenuCommand::new("file.quit", "Quit").enabled(false)),
+                        )
+                        .submenu(
+                            "View",
+                            MenuSpec::new()
+                                .item(MenuCommand::new("view.status", "Show status").checked(true)),
+                        ),
+                )?;
+                Ok(())
+            })
+            .expect("declare the menu host");
+        (
+            Host::open(runtime, HostConfig::hidden()).expect("open the menu host"),
+            runs,
+        )
+    }
+
+    fn menu_confirm_host() -> (Host, Rc<Cell<u32>>) {
+        let runs = Rc::new(Cell::new(0));
+        let handler_runs = runs.clone();
+        let mut runtime = Runtime::new();
+        runtime
+            .declare_windows(move |catalog| {
+                let handler_runs = handler_runs.clone();
+                catalog.window(
+                    WindowSpec::new(MAIN)
+                        .primary()
+                        .close_policy(ClosePolicy::Confirm),
+                    move |window| {
+                        let handler_runs = handler_runs.clone();
+                        window
+                            .on_command("act", move |_| {
+                                handler_runs.set(handler_runs.get() + 1);
+                            })
+                            .expect("register act");
+                        window
+                            .on_close(move |_| {
+                                window
+                                    .request_show("confirm")
+                                    .expect("show the confirmation");
+                            })
+                            .expect("register the close handler");
+                        view! { <view /> }
+                    },
+                )?;
+                catalog.window(
+                    WindowSpec::new("confirm").confirmation_for(MAIN),
+                    |window| {
+                        window
+                            .close_request()
+                            .expect("read the pending request")
+                            .expect("a pending request exists");
+                        view! { <view /> }
+                    },
+                )?;
+                catalog.menu(MAIN, MenuSpec::new().command("act", "Act"))?;
+                Ok(())
+            })
+            .expect("declare the confirmation menu host");
+        (
+            Host::open(runtime, HostConfig::hidden()).expect("open the confirmation menu host"),
+            runs,
+        )
+    }
+
+    fn menu_label(menu: HMENU, item: u32, flags: MENU_ITEM_FLAGS) -> String {
+        let mut buffer = [0u16; 64];
+        let length = unsafe { GetMenuStringW(menu, item, Some(&mut buffer), flags) };
+        assert!(length > 0, "the menu item has a label");
+        String::from_utf16_lossy(&buffer[..length as usize])
+    }
+
+    #[test]
+    fn hidden_window_reports_the_declared_menu_bar() {
+        let (host, _runs) = menu_host();
+        let hwnd = host.hwnd(MAIN).expect("a live window");
+        let menu = unsafe { GetMenu(hwnd) };
+        assert!(!menu.is_invalid(), "the HWND owns a native menu");
+        assert_eq!(unsafe { GetMenuItemCount(Some(menu)) }, 2);
+
+        let file = unsafe { GetSubMenu(menu, 0) };
+        let view = unsafe { GetSubMenu(menu, 1) };
+        assert!(!file.is_invalid() && !view.is_invalid());
+        assert_eq!(menu_label(menu, 0, MF_BYPOSITION), "File");
+        assert_eq!(menu_label(menu, 1, MF_BYPOSITION), "View");
+        assert_eq!(unsafe { GetMenuItemCount(Some(file)) }, 3);
+        assert_eq!(menu_label(file, 0, MF_BYPOSITION), "Close");
+        assert_eq!(menu_label(file, 2, MF_BYPOSITION), "Quit");
+
+        assert_eq!(unsafe { GetMenuItemID(file, 0) }, 1);
+        assert_eq!(unsafe { GetMenuItemID(file, 1) }, 0, "a separator has id 0");
+        assert_eq!(unsafe { GetMenuItemID(file, 2) }, 2);
+        assert_eq!(unsafe { GetMenuItemID(view, 0) }, 3);
+        assert_eq!(menu_label(file, 1, MF_BYCOMMAND), "Close");
+        assert_eq!(menu_label(view, 3, MF_BYCOMMAND), "Show status");
+
+        let quit = unsafe { GetMenuState(file, 2, MF_BYCOMMAND) };
+        assert_ne!(quit & MF_GRAYED.0, 0, "the declared disabled state");
+        let status = unsafe { GetMenuState(view, 3, MF_BYCOMMAND) };
+        assert_ne!(status & MF_CHECKED.0, 0, "the declared checked state");
+    }
+
+    #[test]
+    fn menu_commands_dispatch_once_and_reject_non_menu_messages() {
+        let (mut host, runs) = menu_host();
+        send_msg(
+            &mut host,
+            MSG {
+                message: WM_COMMAND,
+                wParam: WPARAM(3),
+                ..Default::default()
+            },
+        );
+        assert_eq!(runs.get(), 1, "WM_COMMAND runs the declared handler once");
+
+        send_msg(
+            &mut host,
+            MSG {
+                message: WM_COMMAND,
+                wParam: WPARAM(3),
+                lParam: LPARAM(1),
+                ..Default::default()
+            },
+        );
+        assert_eq!(runs.get(), 1, "a control notification does not dispatch");
+
+        send_msg(
+            &mut host,
+            MSG {
+                message: WM_COMMAND,
+                wParam: WPARAM(3 | (1 << 16)),
+                ..Default::default()
+            },
+        );
+        assert_eq!(runs.get(), 1, "an accelerator-form command is deferred");
+
+        send_msg(
+            &mut host,
+            MSG {
+                message: WM_COMMAND,
+                wParam: WPARAM(9999),
+                ..Default::default()
+            },
+        );
+        assert_eq!(runs.get(), 1, "an unknown id does not dispatch");
+
+        send_msg(
+            &mut host,
+            MSG {
+                message: WM_COMMAND,
+                wParam: WPARAM(0),
+                ..Default::default()
+            },
+        );
+        assert_eq!(runs.get(), 1, "separator ids do not dispatch");
+    }
+
+    #[test]
+    fn menu_commands_are_ignored_while_hidden_or_closing() {
+        let (mut host, runs) = menu_host();
+        host.hide(MAIN).expect("hide the menu window");
+        send_msg(
+            &mut host,
+            MSG {
+                message: WM_COMMAND,
+                wParam: WPARAM(3),
+                ..Default::default()
+            },
+        );
+        assert_eq!(runs.get(), 0, "a hidden window runs nothing");
+        host.show(MAIN).expect("show the menu window");
+
+        let (mut closing, closing_runs) = menu_confirm_host();
+        send_msg(
+            &mut closing,
+            MSG {
+                message: WM_CLOSE,
+                ..Default::default()
+            },
+        );
+        assert!(closing.hwnd("confirm").is_some());
+        send_msg(
+            &mut closing,
+            MSG {
+                message: WM_COMMAND,
+                wParam: WPARAM(1),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            closing_runs.get(),
+            0,
+            "a parent awaiting close confirmation runs nothing"
+        );
+    }
+
+    #[test]
+    fn entering_the_menu_loop_cancels_composition_and_pointer_transients() {
+        let (mut host, _runs) = menu_host();
+        host.runtime.focus("edit").expect("focus the input");
+        let node = host
+            .runtime
+            .presentation()
+            .expect("snapshot")
+            .find_label("edit")
+            .expect("input")
+            .id();
+        send_msg(
+            &mut host,
+            MSG {
+                message: WM_IME_STARTCOMPOSITION,
+                ..Default::default()
+            },
+        );
+        assert!(
+            host.runtime
+                .presentation()
+                .expect("snapshot")
+                .node(node)
+                .expect("input")
+                .edit()
+                .expect("edit")
+                .composition()
+                .is_some(),
+            "the composition started"
+        );
+        let hwnd = host.hwnd(MAIN).expect("a live window");
+        with_main(&mut host, |_host, window| {
+            window.pointer = Some(Point::new(10.0, 10.0));
+            window.hovered = Some(node);
+            window.pressed = Some(node);
+            window.scrollbar_drag = Some(2.0);
+            window.tracking_leave = true;
+            // 安全：捕获属于这个测试窗口；松开或窗口销毁时清除。
+            unsafe {
+                SetCapture(window.hwnd());
+            }
+            Ok(())
+        });
+        assert_eq!(
+            // 安全：只查询当前线程的捕获窗口。
+            unsafe { GetCapture() },
+            hwnd,
+            "the simulated press holds the pointer capture"
+        );
+
+        send_msg(
+            &mut host,
+            MSG {
+                message: WM_ENTERMENULOOP,
+                ..Default::default()
+            },
+        );
+
+        assert!(
+            host.runtime
+                .presentation()
+                .expect("snapshot")
+                .node(node)
+                .expect("input")
+                .edit()
+                .expect("edit")
+                .composition()
+                .is_none(),
+            "the menu loop cancels the composition"
+        );
+        let window = &host.windows[MAIN];
+        assert!(window.pointer.is_none());
+        assert!(window.hovered.is_none());
+        assert!(window.pressed.is_none());
+        assert!(window.scrollbar_drag.is_none());
+        assert!(!window.tracking_leave);
+        assert_ne!(
+            // 安全：只查询当前线程的捕获窗口。
+            unsafe { GetCapture() },
+            hwnd,
+            "the menu loop releases the pointer capture"
+        );
+    }
+
+    #[test]
+    fn menu_bar_keeps_the_logical_client_size_at_96_and_144_dpi() {
+        let (mut host, _runs) = menu_host();
+        host.resize(MAIN, 640, 480).expect("resize the menu window");
+        let hwnd = host.hwnd(MAIN).expect("a live window");
+        let (client_width, client_height) = client_size(hwnd).expect("client size");
+        let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
+        let scale = dpi as f32 / 96.0;
+        assert_eq!(
+            (client_width, client_height),
+            ((640.0 * scale) as u32, (480.0 * scale) as u32),
+            "resize keeps the logical client size with a menu bar"
+        );
+
+        for new_dpi in [96, 144] {
+            let mut size = SIZE::default();
+            // 安全：hwnd 属于本线程；WM_GETDPISCALEDSIZE 的 lParam 是 SIZE 的 in/out 指针。
+            let result = unsafe {
+                SendMessageW(
+                    hwnd,
+                    WM_GETDPISCALEDSIZE,
+                    Some(WPARAM(new_dpi as usize)),
+                    Some(LPARAM(&mut size as *mut SIZE as isize)),
+                )
+            };
+            assert_eq!(result.0, 1, "the host computes the DPI-scaled size");
+            let (width, height) =
+                scaled_client_size(client_width as i32, client_height as i32, dpi, new_dpi);
+            let mut with_menu = RECT {
+                left: 0,
+                top: 0,
+                right: width,
+                bottom: height,
+            };
+            let mut without_menu = RECT {
+                left: 0,
+                top: 0,
+                right: width,
+                bottom: height,
+            };
+            // 安全：rect 是本地值；样式与窗口创建时一致。
+            unsafe {
+                AdjustWindowRectExForDpi(
+                    &mut with_menu,
+                    WS_OVERLAPPEDWINDOW,
+                    true,
+                    WINDOW_EX_STYLE::default(),
+                    new_dpi,
+                )
+                .expect("menu frame metrics");
+                AdjustWindowRectExForDpi(
+                    &mut without_menu,
+                    WS_OVERLAPPEDWINDOW,
+                    false,
+                    WINDOW_EX_STYLE::default(),
+                    new_dpi,
+                )
+                .expect("plain frame metrics");
+            }
+            assert_eq!(
+                (size.cx, size.cy),
+                (
+                    with_menu.right - with_menu.left,
+                    with_menu.bottom - with_menu.top
+                ),
+                "the candidate outer size at {new_dpi} DPI includes the menu bar"
+            );
+            assert!(
+                with_menu.bottom - with_menu.top > without_menu.bottom - without_menu.top,
+                "the menu adds non-client height at {new_dpi} DPI"
+            );
+        }
+    }
+
+    #[test]
+    fn menu_handle_dies_with_the_window() {
+        let (mut host, _runs) = menu_host();
+        let hwnd = host.hwnd(MAIN).expect("a live window");
+        let menu = unsafe { GetMenu(hwnd) };
+        assert!(!menu.is_invalid());
+        host.close(MAIN).expect("close the window");
+        assert!(
+            // 安全：只查询句柄是否仍是一个菜单；不访问已销毁窗口。
+            !unsafe { IsMenu(menu) }.as_bool(),
+            "the assigned menu dies with its window"
+        );
+    }
+
+    #[test]
+    fn an_empty_menu_declaration_creates_no_native_menu_bar() {
+        let mut runtime = Runtime::new();
+        runtime
+            .declare_windows(|catalog| {
+                catalog.window(WindowSpec::new(MAIN).primary(), |_| view! { <view /> })?;
+                catalog.menu(MAIN, MenuSpec::new())?;
+                Ok(())
+            })
+            .expect("declare the empty menu");
+        let host = Host::open(runtime, HostConfig::hidden()).expect("open the host");
+        let hwnd = host.hwnd(MAIN).expect("a live window");
+        assert!(
+            // 安全：只查询宿主持有的 HWND 的菜单。
+            unsafe { GetMenu(hwnd) }.is_invalid(),
+            "an empty declaration leaves the HWND without a native menu bar"
         );
     }
 }
