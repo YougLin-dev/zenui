@@ -17,6 +17,7 @@ use zenui_style::{Color, ColorRole};
 
 use crate::geometry::Rect;
 use crate::scene::{DecorationKind, ResolvedStyle, Scene, TextRun, Visual};
+use crate::scrollbar::{RADIUS, Scrollbar};
 
 /// GPU 层绘制内建视觉与 class 颜色角色时使用的调色板；各字段是 RGBA 字节，
 /// 按目标视图的转移函数解释。
@@ -60,6 +61,10 @@ pub struct RenderPalette {
     pub selection: [u8; 4],
     /// caret。
     pub caret: [u8; 4],
+    /// 滚动条轨道。
+    pub scrollbar_track: [u8; 4],
+    /// 滚动条 thumb。
+    pub scrollbar_thumb: [u8; 4],
 }
 
 impl RenderPalette {
@@ -83,6 +88,8 @@ impl RenderPalette {
             danger_hover: [185, 28, 28, 255],
             selection: [37, 99, 235, 80],
             caret: [24, 24, 27, 255],
+            scrollbar_track: [24, 24, 27, 28],
+            scrollbar_thumb: [82, 82, 91, 190],
         }
     }
 
@@ -106,6 +113,8 @@ impl RenderPalette {
             danger_hover: [239, 68, 68, 255],
             selection: [96, 165, 250, 80],
             caret: [250, 250, 250, 255],
+            scrollbar_track: [250, 250, 250, 32],
+            scrollbar_thumb: [161, 161, 170, 190],
         }
     }
 }
@@ -410,7 +419,25 @@ fn paint(
             }
         }
     }
+    if let Some(bar) = scene.scrollbar() {
+        paint_scrollbar(target, bar, scale, palette);
+    }
     Ok(())
+}
+
+/// 滚动条覆盖层画在内容与 caret 之上，轨道与 thumb 消费场景推导出的同一份几何。
+fn paint_scrollbar(
+    target: &mut vello_gpu::Scene,
+    bar: Scrollbar,
+    scale: f32,
+    palette: RenderPalette,
+) {
+    let track = physical_rect(bar.track(), scale);
+    target.set_paint(color(palette.scrollbar_track));
+    target.fill_path(&rounded_path(track, RADIUS, scale));
+    let thumb = physical_rect(bar.thumb(), scale);
+    target.set_paint(color(palette.scrollbar_thumb));
+    target.fill_path(&rounded_path(thumb, RADIUS, scale));
 }
 
 /// intrinsic 的背景先铺，class 的 `bg-*` 覆盖它；checkbox 的勾选块始终是强调色。

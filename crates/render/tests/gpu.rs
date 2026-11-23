@@ -26,6 +26,8 @@ const TEST_PALETTE: RenderPalette = RenderPalette {
     danger_hover: [128, 0, 0, 255],
     selection: [255, 0, 255, 255],
     caret: [255, 255, 255, 255],
+    scrollbar_track: [64, 32, 0, 255],
+    scrollbar_thumb: [0, 64, 32, 255],
 };
 
 // BGRA byte order.
@@ -638,6 +640,109 @@ fn window_scale_changes_physical_pixels_not_layout() {
     assert_eq!(one.at(4, 120), two.at(8, 240));
     assert_eq!(scaled.viewport().scale(), 2.0);
     assert_eq!(logical.viewport().scale(), 1.0);
+}
+
+/// TEST_PALETTE 的 scrollbar_thumb `[0, 64, 32]`。
+const SCROLLBAR_THUMB_BGRA: [u8; 4] = [32, 64, 0, 255];
+/// TEST_PALETTE 的 scrollbar_track `[64, 32, 0]`。
+const SCROLLBAR_TRACK_BGRA: [u8; 4] = [0, 32, 64, 255];
+
+fn tall_runtime(rows: usize) -> Runtime {
+    let mut app = runtime();
+    for index in 0..rows {
+        add(&mut app, &format!("Task {index}"));
+    }
+    app
+}
+
+#[test]
+fn the_scrollbar_thumb_paints_at_top_middle_and_bottom_at_both_scales() {
+    let Some(context) = context() else {
+        return;
+    };
+    let app = tall_runtime(500);
+    let snapshot = app.presentation().expect("snapshot");
+    for (scale, width, height) in [(1.0_f32, 900_u16, 700_u16), (1.5, 1350, 1050)] {
+        let viewport = Viewport::new(900.0, 700.0, scale).expect("viewport");
+        let top = Scene::build(&snapshot, viewport).expect("top scene");
+        let max = top.max_scroll_offset();
+        assert!(max > 0, "500 rows overflow the viewport");
+        for offset in [0, max / 2, max] {
+            let scene = Scene::build_with(
+                &snapshot,
+                viewport,
+                &SceneEnv::default().with_scroll_offset(offset),
+            )
+            .expect("scene");
+            let bar = scene.scrollbar().expect("scrollbar");
+            let pixels = render(
+                &context,
+                &scene,
+                wgpu::TextureFormat::Bgra8Unorm,
+                width,
+                height,
+            );
+            let thumb = bar.thumb();
+            let track = bar.track();
+            let center_x = ((thumb.x + thumb.width / 2.0) * scale).round() as u32;
+            let thumb_y = ((thumb.y + thumb.height / 2.0) * scale).round() as u32;
+            assert_eq!(
+                pixels.at(center_x, thumb_y),
+                SCROLLBAR_THUMB_BGRA,
+                "scale {scale} offset {offset}: the thumb center is painted"
+            );
+            let track_y = if thumb.y <= track.y + 0.5 {
+                (thumb.bottom() + 2.0) * scale
+            } else {
+                (track.y + 2.0) * scale
+            }
+            .round() as u32;
+            assert_eq!(
+                pixels.at(center_x, track_y),
+                SCROLLBAR_TRACK_BGRA,
+                "scale {scale} offset {offset}: the exposed track is painted"
+            );
+            if offset == 0 {
+                assert!(
+                    (thumb.y - track.y).abs() < 0.001,
+                    "the top offset pins the thumb to the track top"
+                );
+            } else if offset == max {
+                assert!(
+                    (thumb.bottom() - track.bottom()).abs() < 0.001,
+                    "the maximum offset pins the thumb to the track bottom"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn fitting_content_paints_no_scrollbar() {
+    let Some(context) = context() else {
+        return;
+    };
+    let mut app = Runtime::new();
+    app.mount(|| {
+        Ok(MountPlan::new(vec![zenui::view::element(
+            "view",
+            Vec::new(),
+            Vec::new(),
+        )]))
+    })
+    .expect("mount short content");
+    let snapshot = app.presentation().expect("snapshot");
+    let viewport = Viewport::new(900.0, 700.0, 1.0).expect("viewport");
+    let scene = Scene::build(&snapshot, viewport).expect("scene");
+    assert_eq!(scene.scrollbar(), None);
+    let pixels = render(&context, &scene, wgpu::TextureFormat::Bgra8Unorm, 900, 700);
+    assert!(
+        !pixels.any_in(
+            zenui_render::Rect::new(880.0, 0.0, 20.0, 700.0).into(),
+            |pixel| pixel == SCROLLBAR_THUMB_BGRA || pixel == SCROLLBAR_TRACK_BGRA
+        ),
+        "content that fits neither paints a thumb nor a track"
+    );
 }
 
 #[test]

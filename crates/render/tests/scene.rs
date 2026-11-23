@@ -1719,6 +1719,153 @@ fn scroll_clamps_requests_to_the_content_extent() {
 }
 
 #[test]
+fn the_scrollbar_track_and_thumb_follow_the_scroll_metrics() {
+    let app = tall_app(500);
+    let snapshot = app.presentation().expect("snapshot");
+    let viewport = Viewport::new(900.0, 700.0, 1.0).expect("viewport");
+    let top = Scene::build(&snapshot, viewport).expect("top scene");
+    let max = top.max_scroll_offset();
+    let content = top.content_extent().height;
+
+    let bar = top
+        .scrollbar()
+        .expect("overflowing content has a scrollbar");
+    assert_eq!(bar.track(), Rect::new(888.0, 4.0, 8.0, 692.0));
+    assert_eq!(bar.thumb().x, 888.0);
+    assert_eq!(bar.thumb().width, 8.0);
+    assert_eq!(
+        bar.thumb().y,
+        4.0,
+        "the top offset puts the thumb at the top"
+    );
+    let expected_thumb = 692.0 * 700.0 / content;
+    assert!(
+        (bar.thumb().height - expected_thumb).abs() < 0.001,
+        "the thumb is proportional to the viewport: {} vs {expected_thumb}",
+        bar.thumb().height
+    );
+    assert!(bar.thumb().bottom() < bar.track().bottom());
+    assert!(bar.hit(Point::new(892.0, 300.0)));
+    assert!(
+        !bar.hit(Point::new(880.0, 300.0)),
+        "the overlay is 8 points wide"
+    );
+    assert!(
+        !bar.hit(Point::new(892.0, 2.0)),
+        "the inset is not part of the track"
+    );
+
+    let middle = Scene::build_with(
+        &snapshot,
+        viewport,
+        &SceneEnv::default().with_scroll_offset(max / 2),
+    )
+    .expect("middle scene");
+    let middle_bar = middle.scrollbar().expect("middle scrollbar");
+    let travel = middle_bar.track().height - middle_bar.thumb().height;
+    let expected_y = 4.0 + travel * (max / 2) as f32 / max as f32;
+    assert!(
+        (middle_bar.thumb().y - expected_y).abs() < 0.001,
+        "the thumb position follows the applied offset: {} vs {expected_y}",
+        middle_bar.thumb().y
+    );
+
+    let bottom = Scene::build_with(
+        &snapshot,
+        viewport,
+        &SceneEnv::default().with_scroll_offset(max),
+    )
+    .expect("bottom scene");
+    let bottom_bar = bottom.scrollbar().expect("bottom scrollbar");
+    assert!(
+        (bottom_bar.thumb().bottom() - bottom_bar.track().bottom()).abs() < 0.001,
+        "the maximum offset puts the thumb at the bottom"
+    );
+    assert_eq!(bottom_bar.thumb().height, bar.thumb().height);
+}
+
+#[test]
+fn the_scrollbar_is_absent_when_content_fits_and_adds_no_element() {
+    let mut short = Runtime::new();
+    short
+        .mount(|| {
+            Ok(MountPlan::new(vec![zenui::view::element(
+                "view",
+                Vec::new(),
+                Vec::new(),
+            )]))
+        })
+        .expect("mount short content");
+    let short_snapshot = short.presentation().expect("snapshot");
+    let viewport = Viewport::new(900.0, 700.0, 1.0).expect("viewport");
+    let fits = Scene::build(&short_snapshot, viewport).expect("fitting scene");
+    assert_eq!(fits.scrollbar(), None);
+
+    let app = tall_app(500);
+    let snapshot = app.presentation().expect("snapshot");
+    let top = Scene::build(&snapshot, viewport).expect("top scene");
+    let scrolled = Scene::build_with(
+        &snapshot,
+        viewport,
+        &SceneEnv::default().with_scroll_offset(top.max_scroll_offset()),
+    )
+    .expect("scrolled scene");
+    assert_eq!(
+        top.elements().len(),
+        scrolled.elements().len(),
+        "the scrollbar adds no scene element"
+    );
+    let ids: Vec<NodeId> = top.elements().iter().map(SceneElement::id).collect();
+    let scrolled_ids: Vec<NodeId> = scrolled.elements().iter().map(SceneElement::id).collect();
+    assert_eq!(ids, scrolled_ids, "scrolling keeps every Node ID");
+    // 覆盖层不参与普通命中：bar 报告命中优先，而元素命中仍按场景解析。
+    let point = Point::new(892.0, 350.0);
+    let bar = top.scrollbar().expect("scrollbar");
+    assert!(bar.hit(point));
+    let hit = top
+        .hit_test(point)
+        .expect("the overlay does not mask element hits");
+    assert!(top.node(hit).expect("hit element").rect().contains(point));
+}
+
+#[test]
+fn the_scrollbar_thumb_has_a_documented_minimum() {
+    let app = tall_app(2000);
+    let snapshot = app.presentation().expect("snapshot");
+    let viewport = Viewport::new(900.0, 200.0, 1.0).expect("small viewport");
+    let scene = Scene::build(&snapshot, viewport).expect("scene");
+    assert!(scene.max_scroll_offset() > 0);
+    let bar = scene.scrollbar().expect("scrollbar");
+    assert_eq!(bar.thumb().height, 24.0, "the minimum thumb is 24 points");
+    assert!(bar.thumb().height <= bar.track().height);
+
+    let narrow = Viewport::new(10.0, 200.0, 1.0).expect("narrow viewport");
+    let narrow_scene = Scene::build_with(
+        &snapshot,
+        narrow,
+        &SceneEnv::default().with_scroll_offset(0),
+    )
+    .expect("narrow scene");
+    assert_eq!(
+        narrow_scene.scrollbar(),
+        None,
+        "a viewport narrower than the overlay has no scrollbar"
+    );
+
+    let short = Viewport::new(900.0, 30.0, 1.0).expect("short viewport");
+    let short_scene = Scene::build(&snapshot, short).expect("short scene");
+    assert!(
+        short_scene.max_scroll_offset() > 0,
+        "the short viewport still has scrollable content"
+    );
+    assert_eq!(
+        short_scene.scrollbar(),
+        None,
+        "a track shorter than the minimum thumb has no scrollbar"
+    );
+}
+
+#[test]
 fn a_zero_area_viewport_culls_everything_and_hit_tests_nothing() {
     let mut app = Runtime::new();
     app.mount(|| {
