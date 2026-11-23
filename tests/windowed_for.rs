@@ -196,6 +196,19 @@ fn tab_traverses_only_the_mounted_window_and_leaves_at_its_boundary() {
 }
 
 #[test]
+fn a_band_outside_the_tree_is_rejected_as_stale() {
+    let (mut app, window) = fixture();
+    let band = band(&app, window).key();
+    assert!(
+        matches!(
+            app.set_row_window(window, band.wrapping_add(1), 0, 10),
+            Err(WindowError::Stale)
+        ),
+        "an obsolete band key is rejected instead of mounting rows"
+    );
+}
+
+#[test]
 fn reordering_rows_rewindows_without_duplicating_keys() {
     let (mut app, window) = fixture();
     let band = band(&app, window);

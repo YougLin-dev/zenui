@@ -1181,12 +1181,16 @@ impl Host {
                 focus_cleared = true;
                 replaced = true;
             }
-            if self
+            match self
                 .runtime
                 .set_row_window(window.ctx, band.key(), first, count)
-                .map_err(HostError::WindowState)?
             {
-                replaced = true;
+                Ok(true) => replaced = true,
+                Ok(false) => {}
+                // 外层窗口的变化可能卸载了包含这个嵌套行带的行；该行带已经
+                // 不在新快照里，跳过即可（ADR-0011 的嵌套情况）。
+                Err(WindowError::Stale) => {}
+                Err(error) => return Err(HostError::WindowState(error)),
             }
         }
         if replaced {
