@@ -193,6 +193,7 @@ pub struct SnapshotElement {
     pub(crate) attrs: Vec<SnapshotAttr>,
     pub(crate) styles: Cow<'static, [StyleDeclaration]>,
     pub(crate) edit: Option<TextEditState>,
+    pub(crate) semantics: SnapshotSemantics,
     pub(crate) children: Vec<SnapshotNode>,
 }
 
@@ -265,6 +266,97 @@ impl SnapshotElement {
             }
         }
         text
+    }
+
+    /// 语义投影：键盘可聚焦性与已挂载的用户动作。
+    ///
+    /// `focusable` 不考虑 `disabled`，也不表达可见性；未挂载、被过滤或不在
+    /// 行窗口内的元素不出现在快照中。消费者把本值与 [`Self::disabled`]
+    /// 组合计算实际的可聚焦性。
+    pub const fn semantics(&self) -> SnapshotSemantics {
+        self.semantics
+    }
+}
+
+/// 一个已提交元素的语义投影：固有键盘可聚焦性与已挂载的用户动作。
+///
+/// 这是 UIA 需要的运行时时序投影，不包含平台 provider。`focusable` 只表示
+/// 元素的种类或 focus/blur 处理器允许键盘聚焦；`disabled` 与可见性仍是独立
+/// 状态，由消费者组合。新增动作扩展 [`SnapshotAction`]，不向
+/// [`SnapshotElement`] 逐项添加布尔字段。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SnapshotSemantics {
+    focusable: bool,
+    actions: SnapshotActions,
+}
+
+impl SnapshotSemantics {
+    pub(crate) const fn new(focusable: bool, actions: SnapshotActions) -> Self {
+        Self { focusable, actions }
+    }
+
+    /// 元素是否具有键盘可聚焦的固有语义，忽略 `disabled` 与可见性。
+    pub const fn focusable(&self) -> bool {
+        self.focusable
+    }
+
+    /// 已挂载的用户动作集合。
+    pub const fn actions(&self) -> SnapshotActions {
+        self.actions
+    }
+
+    /// 指定动作是否有已挂载的处理器。
+    pub const fn has_action(&self, action: SnapshotAction) -> bool {
+        self.actions.contains(action)
+    }
+}
+
+/// 快照可能报告的用户动作；新增动作扩展此枚举和 [`SnapshotActions`]。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SnapshotAction {
+    Click,
+    Change,
+    Input,
+}
+
+impl SnapshotAction {
+    const fn bit(self) -> u8 {
+        match self {
+            Self::Click => 1 << 0,
+            Self::Change => 1 << 1,
+            Self::Input => 1 << 2,
+        }
+    }
+}
+
+/// 一个元素上已挂载的用户动作集合。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SnapshotActions(u8);
+
+impl SnapshotActions {
+    pub(crate) fn insert(&mut self, action: SnapshotAction) {
+        self.0 |= action.bit();
+    }
+
+    /// 集合是否为空。
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// 指定动作是否在集合中。
+    pub const fn contains(self, action: SnapshotAction) -> bool {
+        self.0 & action.bit() != 0
+    }
+
+    /// 按固定顺序遍历已挂载的动作。
+    pub fn iter(self) -> impl Iterator<Item = SnapshotAction> {
+        [
+            SnapshotAction::Click,
+            SnapshotAction::Change,
+            SnapshotAction::Input,
+        ]
+        .into_iter()
+        .filter(move |action| self.contains(*action))
     }
 }
 
@@ -397,5 +489,57 @@ fn write_node(f: &mut fmt::Formatter<'_>, node: &SnapshotNode, depth: usize) -> 
             }
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::borrow::Cow;
+
+    use super::{NodeId, SnapshotAction, SnapshotActions, SnapshotElement, SnapshotSemantics};
+
+    fn element(semantics: SnapshotSemantics) -> SnapshotElement {
+        SnapshotElement {
+            id: NodeId::mint(1, 0, 0),
+            tag: "view",
+            attrs: Vec::new(),
+            styles: Cow::Borrowed(&[]),
+            edit: None,
+            semantics,
+            children: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn action_sets_compose_and_iterate_in_a_fixed_order() {
+        let mut actions = SnapshotActions::default();
+        assert!(actions.is_empty());
+        actions.insert(SnapshotAction::Input);
+        actions.insert(SnapshotAction::Click);
+        assert!(!actions.is_empty());
+        assert!(actions.contains(SnapshotAction::Click));
+        assert!(actions.contains(SnapshotAction::Input));
+        assert!(!actions.contains(SnapshotAction::Change));
+        assert_eq!(
+            actions.iter().collect::<Vec<_>>(),
+            vec![SnapshotAction::Click, SnapshotAction::Input]
+        );
+    }
+
+    #[test]
+    fn snapshot_equality_includes_the_semantic_projection() {
+        let plain = element(SnapshotSemantics::new(false, SnapshotActions::default()));
+        let same = element(SnapshotSemantics::new(false, SnapshotActions::default()));
+        let focusable = element(SnapshotSemantics::new(true, SnapshotActions::default()));
+        let mut actions = SnapshotActions::default();
+        actions.insert(SnapshotAction::Click);
+        let clickable = element(SnapshotSemantics::new(true, actions));
+
+        assert_eq!(plain, same, "identical projections stay equal");
+        assert_ne!(plain, focusable, "focusability contributes to equality");
+        assert_ne!(
+            focusable, clickable,
+            "mounted actions contribute to equality"
+        );
     }
 }

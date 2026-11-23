@@ -197,6 +197,15 @@ fn node_ids_survive_reorder_and_filtering_and_unmounted_ids_are_stale() {
 
     let before = app.presentation().expect("snapshot");
     let complete_a = before.find_label("Complete A").expect("A checkbox").id();
+    let complete_a_semantics = before
+        .find_label("Complete A")
+        .expect("A checkbox")
+        .semantics();
+    assert!(complete_a_semantics.focusable());
+    assert!(complete_a_semantics.has_action(SnapshotAction::Change));
+    assert!(!complete_a_semantics.has_action(SnapshotAction::Click));
+    let edit_a_semantics = before.find_label("Edit A").expect("A editor").semantics();
+    assert!(edit_a_semantics.has_action(SnapshotAction::Input));
     let edit_a = before.find_label("Edit A").expect("A editor").id();
     let complete_b = before.find_label("Complete B").expect("B checkbox").id();
     let unique: std::collections::BTreeSet<NodeId> =
@@ -217,6 +226,21 @@ fn node_ids_survive_reorder_and_filtering_and_unmounted_ids_are_stale() {
     assert_eq!(
         reordered.find_label("Edit A").map(SnapshotElement::id),
         Some(edit_a)
+    );
+    assert_eq!(
+        reordered
+            .find_label("Complete A")
+            .expect("A checkbox")
+            .semantics(),
+        complete_a_semantics,
+        "semantics follow the keyed row identity through reorder"
+    );
+    assert_eq!(
+        reordered
+            .find_label("Edit A")
+            .expect("A editor")
+            .semantics(),
+        edit_a_semantics
     );
     assert_eq!(
         label_order(&reordered, &["Complete A", "Complete B"]),
@@ -240,6 +264,14 @@ fn node_ids_survive_reorder_and_filtering_and_unmounted_ids_are_stale() {
         filtered.find_label("Complete A").map(SnapshotElement::id),
         Some(complete_a),
         "filtering another row keeps this row's identity"
+    );
+    assert_eq!(
+        filtered
+            .find_label("Complete A")
+            .expect("A checkbox")
+            .semantics(),
+        complete_a_semantics,
+        "filtering another row keeps this row's semantic projection"
     );
 
     app.click_text("All").expect("filter all");
@@ -343,6 +375,168 @@ fn BareCheckbox() -> MountResult<MountPlan> {
     view! {
         <checkbox aria:label="bare" on:change={move |_done: bool| {}} />
     }
+}
+
+#[component]
+fn SemanticProbe() -> MountResult<MountPlan> {
+    let value = signal(String::new());
+    view! {
+        <view>
+            <button aria:label="click" on:click={move || {}}>"click"</button>
+            <text-input
+                aria:label="input"
+                value={value}
+                on:input={move |text: String| value.set(text)}
+            />
+            <checkbox aria:label="change" on:change={move |_done: bool| {}} />
+            <button aria:label="disabled" disabled={true}>"disabled"</button>
+            <button
+                aria:label="disabled-click"
+                disabled={true}
+                on:click={move || {}}
+            >"disabled click"</button>
+            <view aria:label="plain" />
+            <view aria:label="click-view" on:click={move || {}} />
+            <view aria:label="focus" on:focus={move |_event: FocusEvent| {}} />
+            <view aria:label="blur" on:blur={move |_event: BlurEvent| {}} />
+        </view>
+    }
+}
+
+#[component]
+fn SemanticSwap() -> MountResult<MountPlan> {
+    let clickable = signal(true);
+    let when = memo(move || clickable.get());
+    view! {
+        <view>
+            <button aria:label="swap" on:click={move || clickable.set(!clickable.get())}>"swap"</button>
+            <Show
+                when={when}
+                fallback={move || view! { <view aria:label="probe" /> }}
+            >
+                <view aria:label="probe" on:click={move || {}} />
+            </Show>
+        </view>
+    }
+}
+
+#[test]
+fn snapshot_semantics_report_focusability_and_mounted_actions() {
+    let mut app = Runtime::new();
+    app.mount(|| view! { <SemanticProbe /> }).expect("mount");
+
+    let snapshot = app.presentation().expect("snapshot");
+    let click = snapshot.find_label("click").expect("click button");
+    assert!(click.semantics().focusable());
+    assert!(click.semantics().has_action(SnapshotAction::Click));
+    assert!(!click.semantics().has_action(SnapshotAction::Change));
+    assert!(!click.semantics().has_action(SnapshotAction::Input));
+    assert_eq!(
+        click.semantics().actions().iter().collect::<Vec<_>>(),
+        vec![SnapshotAction::Click]
+    );
+
+    let input = snapshot.find_label("input").expect("text input");
+    assert!(input.semantics().focusable());
+    assert!(input.semantics().has_action(SnapshotAction::Input));
+    assert!(!input.semantics().has_action(SnapshotAction::Click));
+
+    let change = snapshot.find_label("change").expect("checkbox");
+    assert!(change.semantics().focusable());
+    assert!(change.semantics().has_action(SnapshotAction::Change));
+    assert!(!change.semantics().has_action(SnapshotAction::Input));
+
+    let disabled = snapshot.find_label("disabled").expect("disabled button");
+    assert!(disabled.disabled());
+    assert!(
+        disabled.semantics().focusable(),
+        "focusability ignores the separate disabled state"
+    );
+    assert!(disabled.semantics().actions().is_empty());
+
+    let disabled_click = snapshot
+        .find_label("disabled-click")
+        .expect("disabled button with a handler");
+    assert!(disabled_click.disabled());
+    assert!(
+        disabled_click.semantics().has_action(SnapshotAction::Click),
+        "action presence is independent of disabled"
+    );
+
+    let plain = snapshot.find_label("plain").expect("plain view");
+    assert!(!plain.semantics().focusable());
+    assert!(plain.semantics().actions().is_empty());
+
+    let click_view = snapshot.find_label("click-view").expect("clickable view");
+    assert!(
+        !click_view.semantics().focusable(),
+        "a click handler alone does not make a view keyboard-focusable"
+    );
+    assert!(
+        click_view.semantics().has_action(SnapshotAction::Click),
+        "action presence is independent of inherent focusability"
+    );
+
+    let focus = snapshot.find_label("focus").expect("focusable view");
+    assert!(
+        focus.semantics().focusable(),
+        "a mounted focus handler makes a plain view keyboard-focusable"
+    );
+    assert!(
+        focus.semantics().actions().is_empty(),
+        "focus handlers are not user actions"
+    );
+
+    let blur = snapshot.find_label("blur").expect("blur-focusable view");
+    assert!(
+        blur.semantics().focusable(),
+        "a mounted blur handler makes a plain view keyboard-focusable"
+    );
+    assert!(blur.semantics().actions().is_empty());
+
+    let root = snapshot.roots()[0].as_element().expect("root view");
+    assert!(!root.semantics().focusable());
+    assert!(root.semantics().actions().is_empty());
+
+    app.focus("blur")
+        .expect("the runtime accepts a blur-only focus target");
+}
+
+#[test]
+fn semantic_changes_are_snapshot_visible_and_bump_the_revision() {
+    let mut app = Runtime::new();
+    app.mount(|| view! { <SemanticSwap /> }).expect("mount");
+
+    let before = app.presentation().expect("snapshot");
+    let before_revision = app.presentation_revision();
+    assert!(
+        before
+            .find_label("probe")
+            .expect("probe")
+            .semantics()
+            .has_action(SnapshotAction::Click),
+        "the then branch mounts a click handler"
+    );
+
+    app.click_label("swap").expect("swap the semantic branch");
+    let after = app.presentation().expect("snapshot");
+    assert_ne!(
+        app.presentation_revision(),
+        before_revision,
+        "a semantic change is a repaint-visible snapshot change"
+    );
+    assert!(
+        !after
+            .find_label("probe")
+            .expect("probe")
+            .semantics()
+            .has_action(SnapshotAction::Click),
+        "the fallback branch mounts no handler"
+    );
+    assert_ne!(
+        before, after,
+        "snapshots with different semantics are unequal"
+    );
 }
 
 #[test]
