@@ -67,6 +67,7 @@ target API 的公开行为测试位于根包 `tests/`，其中 `tests/tasks.rs` 
 - [Stage-three 文件对话框验收](docs/实现/stage-three-文件对话框-验收.md)：原生 `IFileOpenDialog`、取消、单选/多选、导入、错误与 Unicode 路径的可见证据。
 - [Stage-three 保存与文件夹验收](docs/实现/stage-three-保存与文件夹-验收.md)：原生 `IFileSaveDialog`、覆盖确认、过滤扩展名优先级、写入拒绝、Unicode 路径与文件夹选择的可见证据。
 - [Stage-three 宿主滚动验收](docs/实现/stage-three-宿主滚动-验收.md)：真实滚轮与翻页键、边界夹取、hover/press 复核、聚焦编辑器与缩放在 100%/150% 下的可见证据。
+- [Stage-three 焦点显露验收](docs/实现/stage-three-焦点显露-验收.md)：Tab/编辑后的焦点与 caret 显露、滚动不移动焦点、组合中滚动与候选窗锚点在 100%/150% 下的可见证据。
 
 ## 界面语法
 
