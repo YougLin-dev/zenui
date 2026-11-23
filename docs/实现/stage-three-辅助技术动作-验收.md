@@ -108,4 +108,4 @@ Inspect 截图使用 Kits 里同一份 `inspect.exe` 的临时副本，只把 ma
 
 ## 后续状态
 
-本页关闭 #189 的写 pattern 与可见证据；#190 的 UIA 事件已由 [stage-three 辅助技术事件验收](stage-three-辅助技术事件-验收.md) 交付，#191 的文本范围与 #192 的汇总契约仍由后续工单交付。
+本页关闭 #189 的写 pattern 与可见证据；#190 的 UIA 事件已由 [stage-three 辅助技术事件验收](stage-three-辅助技术事件-验收.md) 交付，#191 的文本范围已由 [stage-three 辅助技术文本验收](stage-three-辅助技术文本-验收.md) 交付，#192 的汇总契约已由 [ADR-0012](../adr/0012-uia-derived-tree-and-action-queue.md) 与 [stage-three 辅助技术合同与朗读验收](stage-three-辅助技术总验收.md) 记录。
