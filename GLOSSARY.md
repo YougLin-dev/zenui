@@ -164,6 +164,10 @@ _Avoid_: origin, base offset
 core 的一次事务提交单位；无修饰的 “frame” 不用于 presentation。
 _Avoid_: frame
 
+**Menu shortcut**:
+`MenuCommand` 声明的 Ctrl/Alt 组合与键位；目录拒绝同一窗口的重复归一化快捷键，宿主为每个 HWND 建 `HACCEL`，并在 `TranslateMessage` 之前翻译成 `CommandSource::Accelerator` 命令。聚焦文本输入的 IME 组合与保留编辑键优先，禁用命令不派发。
+_Avoid_: global hotkey, raw accelerator string
+
 **Menu command state**:
 窗口在菜单打开时通过 `WindowCtx::on_menu_state` 提交的只读 enabled/checked 结果；宿主在 `WM_INITMENU`/`WM_INITMENUPOPUP` 与派发前用 `Runtime::menu_state` 求值，没有回调时使用 `MenuCommand` 的声明默认值。回调内的 Signal 写与 Store 事务被拒绝为 typed error，模型保持已提交值。
 _Avoid_: menu flag, UI state snapshot

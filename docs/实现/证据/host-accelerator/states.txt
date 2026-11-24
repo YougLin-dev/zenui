@@ -1,0 +1,33 @@
+# #195 菜单快捷键可见证据
+日期: 2026-11-24
+示例: crates/windows/examples/menu_host.rs (ZenUI Menu)，debug 构建
+窗口: 560x320 逻辑像素；100% 位于屏幕 (52,52)，150% 位于 (190,190)
+
+缩放  DPI  外框      客户区    菜单栏项            快捷键项
+100%  96   576x379   560x320   File 33x19；View 41x19   File > Save    Ctrl+S
+150%  144  862x566   840x480   File 52x29；View 63x29   File > Save    Ctrl+S
+
+窗口几何来自 GetWindowRect / GetClientRect / GetWindowDpiForWindow；菜单栏项矩形来自
+GetMenuBarInfo(OBJID_MENU)。两个缩放都保持 560x320 逻辑客户区。
+
+采集方式:
+- *-initial.png / *-typed.png / *-accelerated.png:
+  PrintWindow(PW_RENDERFULLCONTENT) 读取完整窗口；右/下的黑色条是采集产物。
+- *-file-menu.png:
+  以 SendInput 点击 File 打开弹出菜单，用 DPI-aware CopyFromScreen 只裁剪菜单区域，
+  避免窗口圆角外的桌面像素。
+
+操作读数:
+- 初始：状态文本 Ready，note 输入为空；File > Save 显示右对齐的 Ctrl+S。
+- 点击 note 输入后键入 abc：输入显示 abc，caret 在末尾，状态仍为 Ready。
+- 重新确认窗口前台后按 Ctrl+S：状态文本变为 Saved，输入仍为 abc，选择/caret 未被改写。
+- 打开 File 菜单：Save 与 Ctrl+S 同项显示，Clear 可用，Close 可用。
+- 第一次 Ctrl+S 紧跟在 PowerShell 采集之后，前台被采集进程抢走，快捷键没有到达窗口；
+  重新 focus 窗口后同一次按键生效。两个缩放都记录了重新置前后的结果。
+
+隐藏测试补充:
+- 在测量线程用 SetKeyboardState 按下 Ctrl，向窗口队列投递 WM_KEYDOWN，pump 中的
+  TranslateAccelerator 恰好派发一次 CommandSource::Accelerator。
+- 同一队列中的 Ctrl+A 没有声明为快捷键，继续由编辑器全选。
+- 聚焦输入组合期间 Ctrl+S 不派发，组合保持。
+- 禁用命令在菜单与快捷键两个入口都不派发。

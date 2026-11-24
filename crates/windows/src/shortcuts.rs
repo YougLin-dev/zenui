@@ -26,6 +26,14 @@ pub(crate) enum EditorAction {
     SelectAll,
 }
 
+/// 聚焦输入的菜单快捷键遮蔽策略。
+///
+/// 调用方已确认存在聚焦输入或进行中的 IME 组合。组合消费所有按键；其余情况下，
+/// 聚焦输入的保留编辑键继续走编辑器路径，而不进入 `TranslateAccelerator`。
+pub(crate) fn accelerator_is_shadowed(key: VIRTUAL_KEY, control: bool, composing: bool) -> bool {
+    composing || editor_shortcut(key, control, true, false).is_some()
+}
+
 /// 决定一个按键是否属于聚焦编辑器的保留快捷键。
 ///
 /// 没有焦点、未按 Ctrl 或正在组合时返回 `None`，按键继续走原有路径：组合
@@ -58,7 +66,7 @@ pub(crate) fn editor_shortcut(
 
 #[cfg(test)]
 mod tests {
-    use windows::Win32::UI::Input::KeyboardAndMouse::VK_LEFT;
+    use windows::Win32::UI::Input::KeyboardAndMouse::{VK_LEFT, VK_S};
 
     use super::*;
 
@@ -97,5 +105,14 @@ mod tests {
     #[test]
     fn unrelated_keys_and_modified_navigation_are_not_shortcuts() {
         assert_eq!(editor_shortcut(VK_LEFT, true, true, false), None);
+    }
+
+    #[test]
+    fn accelerators_yield_to_a_composition_or_reserved_editor_key() {
+        assert!(accelerator_is_shadowed(VK_S, true, true));
+        assert!(accelerator_is_shadowed(VK_A, true, false));
+        assert!(accelerator_is_shadowed(VK_Z, true, false));
+        assert!(!accelerator_is_shadowed(VK_S, true, false));
+        assert!(!accelerator_is_shadowed(VK_A, false, false));
     }
 }

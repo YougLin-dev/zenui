@@ -34,16 +34,17 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CheckMenuItem, CreateWindowExW, DefWindowProcW,
     DestroyWindow, DispatchMessageW, EnableMenuItem, GWLP_USERDATA, GetClientRect,
     GetForegroundWindow, GetMenu, GetMenuItemCount, GetMenuItemID, GetMessageW, GetWindowLongPtrW,
-    HMENU, IDC_ARROW, IsIconic, IsZoomed, KillTimer, LoadCursorW, MF_BYCOMMAND, MF_CHECKED,
+    HACCEL, HMENU, IDC_ARROW, IsIconic, IsZoomed, KillTimer, LoadCursorW, MF_BYCOMMAND, MF_CHECKED,
     MF_ENABLED, MF_GRAYED, MF_UNCHECKED, MSG, PM_REMOVE, PeekMessageW, PostMessageW,
     RegisterClassExW, SPI_GETWHEELSCROLLLINES, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE,
     SWP_NOZORDER, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SetForegroundWindow, SetTimer,
-    SetWindowLongPtrW, SetWindowPos, ShowWindow, SystemParametersInfoW, TranslateMessage,
-    WINDOW_EX_STYLE, WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_DPICHANGED,
-    WM_ENTERMENULOOP, WM_GETDPISCALEDSIZE, WM_GETOBJECT, WM_IME_CHAR, WM_IME_COMPOSITION,
-    WM_IME_ENDCOMPOSITION, WM_IME_STARTCOMPOSITION, WM_INITMENU, WM_INITMENUPOPUP, WM_KEYDOWN,
-    WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_PAINT, WM_SETTINGCHANGE, WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
+    SetWindowLongPtrW, SetWindowPos, ShowWindow, SystemParametersInfoW, TranslateAcceleratorW,
+    TranslateMessage, WINDOW_EX_STYLE, WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE, WM_COMMAND,
+    WM_DESTROY, WM_DPICHANGED, WM_ENTERMENULOOP, WM_GETDPISCALEDSIZE, WM_GETOBJECT, WM_IME_CHAR,
+    WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_STARTCOMPOSITION, WM_INITMENU,
+    WM_INITMENUPOPUP, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEHWHEEL,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_SETTINGCHANGE, WM_SIZE, WM_SYSKEYDOWN, WM_TIMER,
+    WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
 };
 
 use windows::core::{HSTRING, w};
@@ -54,9 +55,9 @@ use crate::accessibility::{
     WindowAccessibility,
 };
 use crate::file_dialog::{FileDialogPresenter, NativeFileDialog};
-use crate::menus::{MenuError, NativeMenu};
+use crate::menus::{MenuError, NativeAccelerator, NativeMenu};
 use crate::ole::{OleApartment, OleError};
-use crate::shortcuts::{EditorAction, editor_shortcut};
+use crate::shortcuts::{EditorAction, accelerator_is_shadowed, editor_shortcut};
 use zenui_render::{
     GpuRenderer, Point, Rect, RenderPalette, RenderTargetConfig, Scene, SceneCache, SceneElement,
     SceneEnv, SceneRowBand, Scrollbar, Viewport, Visual, wgpu,
@@ -330,6 +331,30 @@ impl WakeState {
     }
 }
 
+/// 一个窗口的原生菜单栏与同一代快捷键表。
+///
+/// 两者共享命令 id 映射与 activation 生命周期：窗口关闭时一起释放，重新打开
+/// 必须从新的目录声明重建。
+struct WindowMenu {
+    menu: NativeMenu,
+    accelerator: Option<NativeAccelerator>,
+}
+
+impl WindowMenu {
+    fn build(menu: NativeMenu) -> Result<Self, MenuError> {
+        let accelerator = NativeAccelerator::build(&menu)?;
+        Ok(Self { menu, accelerator })
+    }
+
+    fn command(&self, id: u16) -> Option<&MenuCommand> {
+        self.menu.command(id)
+    }
+
+    fn accelerator(&self) -> Option<&NativeAccelerator> {
+        self.accelerator.as_ref()
+    }
+}
+
 /// 一个窗口的全部宿主状态；`Host` 为每个存活窗口持有一个条目。
 struct WindowHost {
     // 字段顺序是安全约束：surface 必须先于 HWND 释放，因为它的安全契约
@@ -337,8 +362,8 @@ struct WindowHost {
     surface: Option<wgpu::Surface<'static>>,
     surface_config: wgpu::SurfaceConfiguration,
     native: NativeWindow,
-    /// 命令 id 映射与菜单构建结果；菜单句柄由窗口拥有，`native` 的销毁负责注销。
-    menu: Option<NativeMenu>,
+    /// 命令 id 映射、菜单句柄与同一代快捷键表；随着窗口条目一起释放。
+    menu: Option<WindowMenu>,
     ctx: WindowCtx,
     scene: Option<Scene>,
     pointer: Option<Point>,
@@ -488,6 +513,7 @@ impl Host {
 
         let menu = build_window_menu(&runtime, primary_info.window)?;
         let (window, menu) = NativeWindow::new(primary_info.spec, hinstance, menu)?;
+        let menu = complete_window_menu(menu)?;
         let hwnd = window.hwnd;
         // 安全：HWND 在窗口条目析构前有效；定时器随窗口销毁。
         let blink_timer = unsafe { SetTimer(Some(hwnd), CARET_BLINK_TIMER, CARET_BLINK_MS, None) };
@@ -1757,7 +1783,40 @@ impl Host {
         Ok(())
     }
 
-    /// `WM_COMMAND` 的菜单形式：HIWORD=0 且 lParam=0。
+    /// 目标消息窗口的快捷键表，以及本次按键是否必须让给编辑器或 IME。
+    fn accelerator_for(&self, message: &MSG) -> Option<(HACCEL, bool)> {
+        let window = self
+            .windows
+            .values()
+            .find(|window| window.hwnd() == message.hwnd)?;
+        let accelerator = window.menu.as_ref()?.accelerator()?;
+        Some((
+            accelerator.handle(),
+            self.accelerator_shadowed(window, message),
+        ))
+    }
+
+    /// 进行中的 IME 组合、或聚焦输入的编辑保留键先于菜单快捷键。
+    ///
+    /// 组合可能比焦点活得更久，因此扫描全部文本输入；编辑保留键只在焦点仍是
+    /// 文本输入时生效。
+    fn accelerator_shadowed(&self, window: &WindowHost, message: &MSG) -> bool {
+        if message.message != WM_KEYDOWN && message.message != WM_SYSKEYDOWN {
+            return false;
+        }
+        let Ok(snapshot) = self.runtime.presentation_of(window.ctx) else {
+            return false;
+        };
+        let composing = any_composition(&snapshot);
+        if !composing && focused_input(&snapshot).is_none() {
+            return false;
+        }
+        // 安全：GetKeyState 只查询本线程最近一条键盘消息的修饰键状态。
+        let control = unsafe { GetKeyState(i32::from(VK_CONTROL.0)) } < 0;
+        accelerator_is_shadowed(VIRTUAL_KEY(message.wParam.0 as u16), control, composing)
+    }
+
+    /// `WM_COMMAND` 的菜单或快捷键形式：HIWORD=0/1 且 lParam=0。
     ///
     /// 命令 id 必须是这个窗口菜单分配过的稳定项；隐藏、待决关闭与已关闭窗口已由
     /// `handle_window_message` 拒绝，运行时命令路径还会再验证一次。状态回调在
@@ -1769,9 +1828,14 @@ impl Host {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> Result<(), HostError> {
-        if lparam.0 != 0 || (wparam.0 >> 16) & 0xFFFF != 0 {
+        if lparam.0 != 0 {
             return Ok(());
         }
+        let source = match (wparam.0 >> 16) & 0xFFFF {
+            0 => CommandSource::MenuBar,
+            1 => CommandSource::Accelerator,
+            _ => return Ok(()),
+        };
         let id = (wparam.0 & 0xFFFF) as u16;
         let Some(command) = window
             .menu
@@ -1791,7 +1855,7 @@ impl Host {
         }
         match self
             .runtime
-            .dispatch_command(window.ctx, command.id(), CommandSource::MenuBar)
+            .dispatch_command(window.ctx, command.id(), source)
         {
             Ok(()) | Err(CommandError::Hidden | CommandError::Suspended | CommandError::Stale) => {
                 Ok(())
@@ -2909,6 +2973,7 @@ impl Host {
     fn add_window(&mut self, info: &WindowInfo) -> Result<(), HostError> {
         let menu = build_window_menu(&self.runtime, info.window)?;
         let (window, menu) = NativeWindow::new(info.spec, self.hinstance, menu)?;
+        let menu = complete_window_menu(menu)?;
         let hwnd = window.hwnd;
         // 安全：HWND 在窗口条目析构前有效；定时器随窗口销毁。
         let blink_timer = unsafe { SetTimer(Some(hwnd), CARET_BLINK_TIMER, CARET_BLINK_MS, None) };
@@ -3166,7 +3231,7 @@ impl Host {
 impl WindowHost {
     fn new(
         native: NativeWindow,
-        menu: Option<NativeMenu>,
+        menu: Option<WindowMenu>,
         ctx: WindowCtx,
         title: String,
         surface: wgpu::Surface<'static>,
@@ -3386,6 +3451,8 @@ pub enum HostError {
     FileDialog(FileDialogRequestError),
     /// 原生菜单构建失败。
     Menu(MenuError),
+    /// 原生快捷键表构建失败。
+    Accelerator(MenuError),
     /// 菜单命令在运行时命令路径上失败；窗口状态竞态已在调用方过滤。
     Command(CommandError),
     /// 菜单状态回调失败；回调内的写入已被只读作用域拒绝。
@@ -3416,6 +3483,7 @@ impl fmt::Display for HostError {
             Self::WindowState(error) => write!(f, "window state change failed: {error}"),
             Self::FileDialog(error) => write!(f, "file dialog request failed: {error}"),
             Self::Menu(error) => write!(f, "menu creation failed: {error}"),
+            Self::Accelerator(error) => write!(f, "accelerator table creation failed: {error}"),
             Self::Command(error) => write!(f, "menu command failed: {error}"),
             Self::MenuState(error) => write!(f, "menu state query failed: {error}"),
             Self::Scene(error) => write!(f, "scene failed: {error}"),
@@ -3439,6 +3507,13 @@ fn build_window_menu(
         .map(|menu| NativeMenu::build(&menu))
         .transpose()
         .map_err(HostError::Menu)
+}
+
+/// 为已挂接 HWND 的菜单补上同一代的快捷键表；没有菜单时为 `None`。
+fn complete_window_menu(menu: Option<NativeMenu>) -> Result<Option<WindowMenu>, HostError> {
+    menu.map(WindowMenu::build)
+        .transpose()
+        .map_err(HostError::Accelerator)
 }
 
 struct NativeWindow {
@@ -3711,6 +3786,16 @@ fn is_composing(snapshot: &PresentationSnapshot, node: NodeId) -> bool {
 /// 聚焦输入是否仍在组合；没有聚焦输入时视为未组合。
 fn focused_composition(snapshot: &PresentationSnapshot) -> bool {
     focused_input(snapshot).is_some_and(|node| is_composing(snapshot, node))
+}
+
+/// 任意文本输入是否仍在组合；焦点移动不会结束组合。
+fn any_composition(snapshot: &PresentationSnapshot) -> bool {
+    snapshot.elements().any(|element| {
+        element.tag() == "text-input"
+            && element
+                .edit()
+                .is_some_and(|edit| edit.composition().is_some())
+    })
 }
 
 /// 快照里所有仍在组合的文本输入。
@@ -3990,13 +4075,40 @@ unsafe fn take_capture_release(hwnd: HWND) -> bool {
     host.take_release_capture(hwnd)
 }
 
-/// 翻译并派发一条消息；窗口过程负责处理。
-fn dispatch_message(message: &MSG) {
+/// 翻译并派发一条消息；快捷键先于字符翻译与窗口过程。
+///
+/// # Safety
+///
+/// `host` 指向在消息循环期间不会移动的 `Host`；调用时不持有它的引用。
+unsafe fn dispatch_message(host: *mut Host, message: &MSG) {
+    if unsafe { translate_accelerator(host, message) } {
+        return;
+    }
     // 安全：消息来自本线程队列，窗口由 Host 持有。
     unsafe {
         let _ = TranslateMessage(message);
         DispatchMessageW(message);
     }
+}
+
+/// 把一条键盘消息交给窗口的 `HACCEL`；匹配时 `TranslateAcceleratorW` 已经同步
+/// 派发过 `WM_COMMAND`，调用方不得再翻译或派发这条消息。
+///
+/// 组合中的聚焦输入与编辑保留键先于快捷键：这些键继续走正常输入路径。
+///
+/// # Safety
+///
+/// `host` 指向在消息循环期间不会移动的 `Host`；调用时不持有它的引用。
+unsafe fn translate_accelerator(host: *mut Host, message: &MSG) -> bool {
+    let Some((haccel, shadowed)) = unsafe { &*host }.accelerator_for(message) else {
+        return false;
+    };
+    if shadowed {
+        return false;
+    }
+    // 安全：haccel 属于这条消息的目标窗口；TranslateAcceleratorW 同步派发
+    // WM_COMMAND，窗口过程可以安全地重入宿主。
+    unsafe { TranslateAcceleratorW(message.hwnd, haccel, message) != 0 }
 }
 
 /// 在顶层消息回合之外服务文件选择请求。
@@ -4103,7 +4215,7 @@ unsafe fn run_loop(host: *mut Host) -> Result<(), HostError> {
         if result == 0 {
             return Ok(());
         }
-        dispatch_message(&message);
+        unsafe { dispatch_message(host, &message) };
         if unsafe { after_dispatch(host)? } {
             return Ok(());
         }
@@ -4126,7 +4238,7 @@ unsafe fn pump_loop(host: *mut Host) -> Result<bool, HostError> {
         if result.0 == 0 {
             return Ok(false);
         }
-        dispatch_message(&message);
+        unsafe { dispatch_message(host, &message) };
         if unsafe { after_dispatch(host)? } {
             return Ok(true);
         }
@@ -4328,7 +4440,7 @@ mod tests {
 
     use super::*;
     use crate::accessibility::ControlType;
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
     use std::rc::Rc;
     use std::sync::Mutex;
     use std::sync::atomic::AtomicUsize;
@@ -4350,10 +4462,13 @@ mod tests {
         UIA_ScrollItemPatternId, UIA_ScrollPatternId, UIA_ScrollPatternNoScroll, UIA_TextPatternId,
         UIA_TogglePatternId, UIA_ValuePatternId, UiaAppendRuntimeId, UiaPoint,
     };
-    use windows::Win32::UI::Input::KeyboardAndMouse::{IsWindowEnabled, VK_A, VK_NEXT};
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        GetKeyboardState, IsWindowEnabled, SetKeyboardState, VK_A, VK_NEXT, VK_S,
+    };
     use windows::Win32::UI::WindowsAndMessaging::{
-        GetMenuItemCount, GetMenuItemID, GetMenuState, GetMenuStringW, GetSubMenu, HMENU, IsMenu,
-        MENU_ITEM_FLAGS, MF_BYCOMMAND, MF_BYPOSITION, MF_CHECKED, MF_GRAYED, SendMessageW,
+        CopyAcceleratorTableW, GetMenuItemCount, GetMenuItemID, GetMenuState, GetMenuStringW,
+        GetSubMenu, HMENU, IsMenu, MENU_ITEM_FLAGS, MF_BYCOMMAND, MF_BYPOSITION, MF_CHECKED,
+        MF_GRAYED, SendMessageW,
     };
     use windows::core::{BSTR, HRESULT, Interface, w};
     use zenui_render::DecorationKind;
@@ -8083,8 +8198,11 @@ mod tests {
                         )
                         .submenu(
                             "View",
-                            MenuSpec::new()
-                                .item(MenuCommand::new("view.status", "Show status").checked(true)),
+                            MenuSpec::new().item(
+                                MenuCommand::new("view.status", "Show status")
+                                    .checked(true)
+                                    .bind_shortcut("Ctrl+S")?,
+                            ),
                         ),
                 )?;
                 Ok(())
@@ -8209,6 +8327,99 @@ mod tests {
         )
     }
 
+    fn accelerator_host() -> (Host, Rc<RefCell<Vec<CommandSource>>>) {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let mut runtime = Runtime::new();
+        let (enabled, draft) = runtime
+            .setup(|| (signal(true), signal(String::new())))
+            .expect("accelerator application setup");
+        let handler_events = events.clone();
+        runtime
+            .declare_windows(move |catalog| {
+                let handler_events = handler_events.clone();
+                catalog.window(WindowSpec::new(MAIN).primary(), move |window| {
+                    let handler_events = handler_events.clone();
+                    window
+                        .on_command("file.save", move |event| {
+                            handler_events.borrow_mut().push(event.source());
+                        })
+                        .expect("register file.save");
+                    window
+                        .on_command("state.toggle", move |_| enabled.set(!enabled.get()))
+                        .expect("register state.toggle");
+                    window
+                        .on_menu_state(move |command| match command.id() {
+                            "file.save" => MenuCommandState::new(enabled.get(), false),
+                            _ => command.default_state(),
+                        })
+                        .expect("register menu state");
+                    view! {
+                        <view>
+                            <text-input
+                                aria:label="edit"
+                                value={draft}
+                                on:input=move |value: String| draft.set(value)
+                            />
+                            <button aria:label="other">"Other"</button>
+                        </view>
+                    }
+                })?;
+                catalog.menu(
+                    MAIN,
+                    MenuSpec::new()
+                        .item(MenuCommand::new("file.save", "Save").bind_shortcut("Ctrl+S")?)
+                        .item(MenuCommand::new("state.toggle", "Toggle").bind_shortcut("Ctrl+T")?),
+                )?;
+                Ok(())
+            })
+            .expect("declare the accelerator host");
+        (
+            Host::open(runtime, HostConfig::hidden()).expect("open the accelerator host"),
+            events,
+        )
+    }
+
+    fn accelerator_entries(accelerator: &NativeAccelerator) -> i32 {
+        // 安全：句柄由宿主窗口持有；只查询表项数。
+        unsafe { CopyAcceleratorTableW(accelerator.handle(), None) }
+    }
+
+    fn send_command(host: &mut Host, wparam: u32) {
+        send_msg(
+            host,
+            MSG {
+                message: WM_COMMAND,
+                wParam: WPARAM(wparam as usize),
+                ..Default::default()
+            },
+        );
+    }
+
+    /// 测试线程按住 Ctrl，析构时恢复原来的键盘状态。
+    struct ControlPressed {
+        previous: [u8; 256],
+    }
+
+    impl ControlPressed {
+        fn press() -> Self {
+            let mut previous = [0u8; 256];
+            // 安全：缓冲区由本地数组提供。
+            unsafe { GetKeyboardState(&mut previous) }.expect("save the keyboard state");
+            let mut pressed = [0u8; 256];
+            pressed[VK_CONTROL.0 as usize] = 0x80;
+            // 安全：缓冲区由本地数组提供；测试线程与消息循环同一线程。
+            unsafe { SetKeyboardState(&pressed) }.expect("press Ctrl");
+            Self { previous }
+        }
+    }
+
+    impl Drop for ControlPressed {
+        fn drop(&mut self) {
+            // 安全：恢复测试线程自己的键盘状态。
+            let _ = unsafe { SetKeyboardState(&self.previous) };
+        }
+    }
+
     fn menu_label(menu: HMENU, item: u32, flags: MENU_ITEM_FLAGS) -> String {
         let mut buffer = [0u16; 64];
         let length = unsafe { GetMenuStringW(menu, item, Some(&mut buffer), flags) };
@@ -8238,7 +8449,7 @@ mod tests {
         assert_eq!(unsafe { GetMenuItemID(file, 2) }, 2);
         assert_eq!(unsafe { GetMenuItemID(view, 0) }, 3);
         assert_eq!(menu_label(file, 1, MF_BYCOMMAND), "Close");
-        assert_eq!(menu_label(view, 3, MF_BYCOMMAND), "Show status");
+        assert_eq!(menu_label(view, 3, MF_BYCOMMAND), "Show status\tCtrl+S");
 
         let quit = unsafe { GetMenuState(file, 2, MF_BYCOMMAND) };
         assert_ne!(quit & MF_GRAYED.0, 0, "the declared disabled state");
@@ -8278,7 +8489,21 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert_eq!(runs.get(), 1, "an accelerator-form command is deferred");
+        assert_eq!(
+            runs.get(),
+            2,
+            "an accelerator-form command dispatches through the same path"
+        );
+
+        send_msg(
+            &mut host,
+            MSG {
+                message: WM_COMMAND,
+                wParam: WPARAM(3 | (2 << 16)),
+                ..Default::default()
+            },
+        );
+        assert_eq!(runs.get(), 2, "an unknown command form does not dispatch");
 
         send_msg(
             &mut host,
@@ -8288,7 +8513,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert_eq!(runs.get(), 1, "an unknown id does not dispatch");
+        assert_eq!(runs.get(), 2, "an unknown id does not dispatch");
 
         send_msg(
             &mut host,
@@ -8298,7 +8523,212 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert_eq!(runs.get(), 1, "separator ids do not dispatch");
+        assert_eq!(runs.get(), 2, "separator ids do not dispatch");
+    }
+
+    #[test]
+    fn accelerator_commands_use_the_accelerator_source_and_refuse_disabled() {
+        let (mut host, events) = accelerator_host();
+        let hwnd = host.hwnd(MAIN).expect("a live window");
+        let menu = unsafe { GetMenu(hwnd) };
+        let save = unsafe { GetMenuItemID(menu, 0) };
+        let toggle = unsafe { GetMenuItemID(menu, 1) };
+        assert_eq!((save, toggle), (1, 2));
+        let accelerator = host.windows[MAIN]
+            .menu
+            .as_ref()
+            .and_then(WindowMenu::accelerator)
+            .expect("two shortcuts create a table");
+        assert_eq!(accelerator_entries(accelerator), 2);
+
+        for wparam in [save, save | (1 << 16)] {
+            send_command(&mut host, wparam);
+        }
+        assert_eq!(
+            *events.borrow(),
+            [CommandSource::MenuBar, CommandSource::Accelerator]
+        );
+
+        send_command(&mut host, toggle);
+        for wparam in [save, save | (1 << 16)] {
+            send_command(&mut host, wparam);
+        }
+        assert_eq!(
+            events.borrow().len(),
+            2,
+            "a disabled command refuses both entry points"
+        );
+
+        send_command(&mut host, toggle | (1 << 16));
+        send_command(&mut host, save | (1 << 16));
+        assert_eq!(
+            events.borrow().last(),
+            Some(&CommandSource::Accelerator),
+            "re-enabling restores the accelerator"
+        );
+        assert_eq!(events.borrow().len(), 3);
+    }
+
+    #[test]
+    fn keyboard_messages_translate_through_the_accelerator_table() {
+        let (mut host, events) = accelerator_host();
+        let hwnd = host.hwnd(MAIN).expect("a live window");
+        host.runtime.focus("edit").expect("focus the input");
+        let edit = host
+            .runtime
+            .presentation()
+            .expect("snapshot")
+            .find_label("edit")
+            .expect("input")
+            .id();
+        for character in ['a', 'b', 'c'] {
+            send_msg(
+                &mut host,
+                MSG {
+                    message: WM_CHAR,
+                    wParam: WPARAM(character as usize),
+                    ..Default::default()
+                },
+            );
+        }
+
+        let _control = ControlPressed::press();
+
+        // 未声明的 Ctrl+A 继续走编辑器路径，即使窗口有 HACCEL。
+        // 安全：消息目标是宿主持有的 HWND。
+        unsafe { PostMessageW(Some(hwnd), WM_KEYDOWN, WPARAM(VK_A.0 as usize), LPARAM(0)) }
+            .expect("post Ctrl+A");
+        host.pump().expect("pump Ctrl+A");
+        let selection = host
+            .runtime
+            .presentation()
+            .expect("snapshot")
+            .node(edit)
+            .and_then(|element| element.edit())
+            .and_then(|edit| edit.selection());
+        assert_eq!(selection, Some((0, 3)), "Ctrl+A selects all");
+
+        // 声明的 Ctrl+S 命中 HACCEL，只派发一次命令，不改文本或选择。
+        // 安全：同上。
+        unsafe { PostMessageW(Some(hwnd), WM_KEYDOWN, WPARAM(VK_S.0 as usize), LPARAM(0)) }
+            .expect("post Ctrl+S");
+        host.pump().expect("pump Ctrl+S");
+        assert_eq!(
+            *events.borrow(),
+            [CommandSource::Accelerator],
+            "one key message produces one accelerator command"
+        );
+        let selection = host
+            .runtime
+            .presentation()
+            .expect("snapshot")
+            .node(edit)
+            .and_then(|element| element.edit())
+            .and_then(|edit| edit.selection());
+        assert_eq!(selection, Some((0, 3)), "the shortcut does not edit");
+    }
+
+    #[test]
+    fn reopening_rebuilds_the_accelerator_table() {
+        let (mut host, _events) = accelerator_host();
+        let old_hwnd = host.hwnd(MAIN).expect("a live window");
+        let table = host.windows[MAIN]
+            .menu
+            .as_ref()
+            .and_then(WindowMenu::accelerator)
+            .expect("a table");
+        assert_eq!(accelerator_entries(table), 2);
+        host.close(MAIN).expect("close the window");
+        assert!(
+            !host.windows.contains_key(MAIN),
+            "the table dies with the window"
+        );
+
+        host.show(MAIN).expect("reopen the window");
+        let hwnd = host.hwnd(MAIN).expect("a live window");
+        assert_ne!(hwnd, old_hwnd);
+        let table = host.windows[MAIN]
+            .menu
+            .as_ref()
+            .and_then(WindowMenu::accelerator)
+            .expect("the new activation rebuilds the table");
+        assert_eq!(accelerator_entries(table), 2);
+    }
+
+    #[test]
+    fn an_active_composition_shadows_the_accelerator() {
+        let (mut host, events) = accelerator_host();
+        let hwnd = host.hwnd(MAIN).expect("a live window");
+        host.runtime.focus("edit").expect("focus the input");
+        let edit = host
+            .runtime
+            .presentation()
+            .expect("snapshot")
+            .find_label("edit")
+            .expect("input")
+            .id();
+        host.runtime
+            .compose_start_node(edit)
+            .expect("start the composition");
+        host.runtime
+            .compose_update_node(edit, "ni")
+            .expect("update the composition");
+
+        let _control = ControlPressed::press();
+        // 安全：消息目标是宿主持有的 HWND。
+        unsafe { PostMessageW(Some(hwnd), WM_KEYDOWN, WPARAM(VK_S.0 as usize), LPARAM(0)) }
+            .expect("post Ctrl+S");
+        host.pump().expect("pump Ctrl+S");
+        assert!(
+            events.borrow().is_empty(),
+            "the IME composition consumes the key"
+        );
+        let composition = host
+            .runtime
+            .presentation()
+            .expect("snapshot")
+            .node(edit)
+            .and_then(|element| element.edit())
+            .and_then(|edit| edit.composition());
+        assert!(composition.is_some(), "the composition survives");
+    }
+
+    #[test]
+    fn a_composition_that_outlives_focus_still_shadows_the_accelerator() {
+        let (mut host, events) = accelerator_host();
+        let hwnd = host.hwnd(MAIN).expect("a live window");
+        host.runtime.focus("edit").expect("focus the input");
+        let snapshot = host.runtime.presentation().expect("snapshot");
+        let edit = snapshot.find_label("edit").expect("input").id();
+        let other = snapshot.find_label("other").expect("button").id();
+        drop(snapshot);
+        host.runtime
+            .compose_start_node(edit)
+            .expect("start the composition");
+        host.runtime
+            .compose_update_node(edit, "ni")
+            .expect("update the composition");
+        host.runtime
+            .focus_node(other)
+            .expect("move focus away from the composing input");
+
+        let _control = ControlPressed::press();
+        // 安全：消息目标是宿主持有的 HWND。
+        unsafe { PostMessageW(Some(hwnd), WM_KEYDOWN, WPARAM(VK_S.0 as usize), LPARAM(0)) }
+            .expect("post Ctrl+S");
+        host.pump().expect("pump Ctrl+S");
+        assert!(
+            events.borrow().is_empty(),
+            "a composition outside focus still shadows the accelerator"
+        );
+        let composition = host
+            .runtime
+            .presentation()
+            .expect("snapshot")
+            .node(edit)
+            .and_then(|element| element.edit())
+            .and_then(|edit| edit.composition());
+        assert!(composition.is_some(), "the composition survives");
     }
 
     #[test]

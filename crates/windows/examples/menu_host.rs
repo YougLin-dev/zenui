@@ -1,12 +1,18 @@
-//! 可见的原生菜单栏示例：命令修改共享状态，菜单再按状态显示勾选与禁用。
+//! 可见的原生菜单栏与快捷键示例：命令修改共享状态，菜单再按状态显示勾选与禁用。
 
 #[cfg(windows)]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     use zenui::prelude::*;
 
     let mut runtime = Runtime::new();
-    let (status, shown, has_content) =
-        runtime.setup(|| (signal(String::from("Ready")), signal(true), signal(true)))?;
+    let (status, shown, has_content, draft) = runtime.setup(|| {
+        (
+            signal(String::from("Ready")),
+            signal(true),
+            signal(true),
+            signal(String::new()),
+        )
+    })?;
 
     runtime.declare_windows(move |catalog| {
         catalog.window(
@@ -15,6 +21,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .titled("ZenUI Menu")
                 .sized(560, 320),
             move |window| {
+                window
+                    .on_command("file.save", move |_| {
+                        status.set(String::from("Saved"));
+                    })
+                    .expect("the declared file.save registers");
                 window
                     .on_command("view.status", move |_| {
                         let next = !shown.get();
@@ -47,6 +58,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 view! {
                     <view>
                         <text aria:label="status">{status}</text>
+                        <text-input
+                            aria:label="note"
+                            value=draft
+                            on:input=move |value: String| draft.set(value)
+                        />
                     </view>
                 }
             },
@@ -57,6 +73,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .submenu(
                     "File",
                     MenuSpec::new()
+                        .item(MenuCommand::new("file.save", "Save").bind_shortcut("Ctrl+S")?)
                         .command("file.clear", "Clear")
                         .separator()
                         .command("file.close", "Close"),

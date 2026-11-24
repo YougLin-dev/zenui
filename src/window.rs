@@ -3,7 +3,10 @@ use std::fmt;
 use std::marker::PhantomData;
 use std::rc::Rc;
 
-use crate::menu::{CommandError, CommandEvent, MenuCommand, MenuCommandState, MenuSpec};
+use crate::menu::{
+    CommandError, CommandEvent, MenuCommand, MenuCommandState, MenuShortcut, MenuSpec,
+    ShortcutError,
+};
 use crate::presentation::Appearance;
 use crate::task::TaskScope;
 use crate::view::{MountError, MountPlan, MountResult};
@@ -451,6 +454,13 @@ impl WindowCatalog {
             if let Some(id) = menu.first_duplicate_command() {
                 return Err(CatalogError::DuplicateMenuCommand { window: key, id });
             }
+            if let Some((id, shortcut)) = menu.first_duplicate_shortcut() {
+                return Err(CatalogError::DuplicateMenuShortcut {
+                    window: key,
+                    id,
+                    shortcut,
+                });
+            }
             entry.menu = Some(menu);
         }
         let mut confirmation_parents = BTreeSet::new();
@@ -509,8 +519,22 @@ pub enum CatalogError {
         window: &'static str,
         id: &'static str,
     },
+    /// 菜单命令声明了无法解析的快捷键。
+    InvalidMenuShortcut(ShortcutError),
+    /// 一个窗口的菜单树里两个命令使用同一个归一化快捷键。
+    DuplicateMenuShortcut {
+        window: &'static str,
+        id: &'static str,
+        shortcut: MenuShortcut,
+    },
     /// 菜单树超过可表示的命令项上限。
     MenuTooLarge { window: &'static str, items: usize },
+}
+
+impl From<ShortcutError> for CatalogError {
+    fn from(error: ShortcutError) -> Self {
+        Self::InvalidMenuShortcut(error)
+    }
 }
 
 impl fmt::Display for CatalogError {
@@ -557,6 +581,15 @@ impl fmt::Display for CatalogError {
             Self::DuplicateMenuCommand { window, id } => {
                 write!(f, "window {window} declares command id {id} more than once")
             }
+            Self::InvalidMenuShortcut(error) => write!(f, "{error}"),
+            Self::DuplicateMenuShortcut {
+                window,
+                id,
+                shortcut,
+            } => write!(
+                f,
+                "window {window} declares shortcut {shortcut} for command {id} more than once"
+            ),
             Self::MenuTooLarge { window, items } => {
                 write!(
                     f,
