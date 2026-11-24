@@ -2021,6 +2021,17 @@ impl Runtime {
         self.open_window_at(key, move |window| factory(window))
     }
 
+    /// 该 activation 是否在 factory 中注册了 `on_drop` 处理器。
+    ///
+    /// 原生宿主只在窗口可见且这里返回 `true` 时注册 OLE drop target；已关闭、
+    /// 过期或外部 Runtime 的窗口返回 `false`。
+    pub fn window_has_drop_handler(&self, window: WindowCtx) -> bool {
+        let state = self.state.borrow();
+        window.runtime == state.id
+            && state.window_live_in_tree(window)
+            && state.drop_handlers.contains_key(window.key)
+    }
+
     /// 隐藏窗口：保留 activation、树、焦点与本地编辑状态，只停止输入与呈现。
     ///
     /// 参与待决关闭的窗口先按 Deny 结算：隐藏父窗口会恢复其输入与焦点后再隐藏；

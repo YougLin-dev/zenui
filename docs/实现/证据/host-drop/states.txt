@@ -1,0 +1,58 @@
+# #208 OLE 文件拖放可见证据
+
+日期: 2026-11-25
+基线: main 5b6970d（#207 运行时拖放事件）；本目录对应 #208 工作区
+示例: crates/windows/examples/todo_host.rs（ZenUI Todo），debug 构建
+拖放源: Windows 文件资源管理器，临时目录 zenui-drop-evidence
+
+## 环境与采集
+
+- 单屏 2560×1600。150% 是当前 144 DPI；100% 从 150% 临时切到 96 DPI，采集后恢复到 144 DPI。
+- 100%：主窗口 916×739 物理像素，放在 (1200,80)；资源管理器 1000×950，放在 (40,80)。
+- 150%：主窗口 1372×1106 物理像素，放在 (980,40)；资源管理器 900×1100，放在 (20,40)。
+- 应用启动后由 `zenui_demo::seed` 写入 `Write tests`（已完成）与 `Read docs` 两条任务。
+- 两个 ASCII/Unicode 文件由真实鼠标从资源管理器列表拖入应用内容区：
+  `drop-two.txt` 含 `Drop alpha`、`Drop beta`；`drop-unicode-你好-🙂.txt` 含 `Unicode drop`。
+- 资源管理器 Details 视图选中两行后，UIA SelectionItemPattern 读回 selected=2；
+  拖动前前台窗口是资源管理器。鼠标按下后先移出拖拽阈值，再分 30 步移到应用内。
+- 拖放中的截图在鼠标按钮仍按下时抓取，使用 BitBlt 的 SRCCOPY|CAPTUREBLT；
+  Windows 不把硬件光标写入位图，脚本按当前位置补画光标。Shell 的拖放 ghost
+  由合成器绘制，未进入这张截图；选中行、光标位置与落点后的应用状态共同构成本次证据。
+- 应用窗口图来自 PrintWindow(PW_RENDERFULLCONTENT)，整窗读取。
+- 资源管理器证据图只裁列表区，不含导航窗格、地址栏或窗口标题；不读取用户已有的
+  其它资源管理器窗口。临时目录只含上述两个文本文件。
+
+## 一次拖放的结果
+
+落点后应用显示 `Imported 3 tasks`，任务总数从 2 变 5，UIA CheckBox 名称顺序为
+`Write tests`、`Read docs`、`Drop alpha`、`Drop beta`、`Unicode drop`，
+说明路径按源顺序交付，Unicode 文件名与文件内容的非 ASCII 标题都保留。
+
+| 显示 | 落点 | 拖前 | 拖放中 | 拖后 |
+| --- | --- | --- | --- | --- |
+| 100% | (1680,560) | `100-01-before.png`：2 行，1 remaining | `100-02-drag.png`：两文件选中，光标在应用内 | `100-03-after.png`：Imported 3 tasks，4 remaining，5 行 |
+| 150% | (1550,650) | `150-01-before.png`：2 行，1 remaining | `150-02-drag.png`：两文件选中，光标在应用内 | `150-03-after.png`：Imported 3 tasks，4 remaining，5 行 |
+
+文件列表：`100-00-explorer.png`、`150-00-explorer.png`；两行选中状态见拖放中截图。
+
+## 隐藏测试
+
+- workspace 843 个测试通过；`cargo fmt --all -- --check` 与 workspace clippy
+  `-D warnings` 通过。
+- drag_drop 模块 7 个：Unicode/重复路径按序提取、未配对代理项原样保留、
+  缺失或空 CF_HDROP、COPY/启用/文件列表的 effect 判定、注册策略、medium 释放、
+  ChangedMode 映射。
+- Windows 宿主新增 1 个：隐藏宿主即使注册了 on_drop 也不创建 drop target，
+  且不初始化 OLE。
+- 运行时与 demo 的交付行为由 #207 的 10 个测试覆盖；本切片只增加 OLE 注册、
+  CF_HDROP 提取与宿主 drain。
+
+## 边界
+
+- 只在单屏 2560×1600 运行；100% 临时切换后恢复 150%，不声明混合 DPI 或多显示器。
+- 可见证据覆盖两个文件的成功拖放；非文件数据、空列表、启用窗口判定与
+  关闭确认挂起由单元测试和运行时测试覆盖。
+- 模态选择器依赖原生窗口禁用；关闭/重开时旧 target 队列随 registration
+  释放。这两条未在真机拖动中单独采集。
+- 没有覆盖其它拖放源（压缩工具、浏览器下载列表等）；它们同样通过 OLE
+  IDataObject 进入本切片，但没有真机证据。
