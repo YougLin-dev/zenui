@@ -1,0 +1,61 @@
+# #198 应用托盘可见证据
+日期: 2026-11-24
+示例: crates/windows/examples/tray_host.rs (ZenUI Tray)，debug 构建
+环境: 单屏 2560×1600，150% 缩放（144 DPI）；宿主进程 per-monitor v2
+窗口: 标题 ZenUI Tray；外框 862×566 物理像素，位于屏幕 (48,48)；客户区 840×480
+
+托盘窗口:
+- 可见主窗口与隐藏托盘窗口都使用 ZenUIHostWindow 类；托盘窗口标题同为 ZenUI Tray，
+  从不 ShowWindow，只承载通知区域回调与 TaskbarCreated 广播。
+- 图标 id 固定为 1；回调消息是宿主私有的 WM_APP + 4，与 worker 唤醒 WM_APP + 1 不同。
+
+Windows 11 溢出面板:
+- 新图标默认进入溢出面板，未修改系统的“始终显示”设置。
+- 面板收起时 Shell_NotifyIconGetRect 返回溢出按钮矩形 (2031,1528)-(2079,1600)；
+  这不代表图标位于任务栏可见区。
+- 点击溢出按钮后，同一查询返回图标矩形 (1906,1383)-(1966,1443)，
+  UIA NotifyItemIcon 的名称为 " ZenUI Tray"。
+- 展开/收起由系统任务栏控制；宿主不绘制、不移动也不固定图标。
+
+操作读数（150%）:
+- 初始：状态文本 Window visible，副文本 Hide the window, then click the tray icon。
+- 悬停图标：系统 tooltip 显示 ZenUI Tray（150-tooltip.png）。
+- 右键图标：原生菜单窗口类名 #32768，DPI-aware GetWindowRect 为
+  (1935,1291)-(2182,1413)，项为 Reset status、分隔线、Hide window、Close
+  （150-menu.png）。
+- 鼠标选择 Reset status：状态文本变为 Reset from the tray menu（150-reset.png）。
+- 鼠标选择 Hide window：主窗口隐藏（IsWindowVisible=false），runtime activation 与目录条目
+  保留；图标仍在溢出面板（150-hidden.png）。
+- 左键点击图标：主窗口重新显示且未最小化，状态仍为 Hidden to the tray（150-restored.png）。
+- 重启 Explorer（Stop-Process explorer，新 pid 22040）：TaskbarCreated 到达托盘 HWND，
+  图标重新添加；Shell_NotifyIconGetRect 再次有效，展开 overflow 后 tooltip 与图标正常
+  （150-after-explorer-restart.png）。
+- 鼠标选择 Close：唯一窗口关闭，进程退出，图标随最后一个窗口移除；
+  Shell_NotifyIconGetRect 返回 0x80004005，overflow 中不再出现该图标（150-closed.png）。
+
+回调布局读数:
+- NOTIFYICON_VERSION_4：事件在 lParam 低字，图标 id 在高字；鼠标物理坐标在 wParam。
+- 实测左键序列 wParam=0x0585078f（x=1935，y=1413），
+  lParam=0x00010201（WM_LBUTTONDOWN）、0x00010202（WM_LBUTTONUP）、
+  0x00010400（NIN_SELECT）。
+- 右键 WM_CONTEXTMENU 的事件同样是 0x007B；菜单位置等于 wParam 的屏幕坐标。
+- 早期按版本 3 读取（事件取自 wParam、坐标取自 lParam）时点击与右键都没有命中；
+  改为版本 4 布局后两条路径都恢复。
+
+实现读数:
+- 左键/键盘目标：目录中可见焦点窗口优先，其次 primary，其次任一存活窗口；
+  已经关闭的窗口不会因托盘点击重新打开。
+- 右键菜单在宿主借用之外展示，返回的命令以 CommandSource::Tray 派发恰好一次；
+  取消不派发。菜单项使用声明默认 enabled/checked，不进入窗口菜单状态回调。
+- 图标在最后一个窗口关闭时移除，窗口重新出现时再次添加；Host 析构与关闭路径
+  都幂等，不重复 NIM_DELETE。
+- HICON 来自 LoadIconW(None, IDI_APPLICATION) 的共享系统图标，宿主与 presenter
+  都不调用 DestroyIcon。
+- 隐藏宿主默认没有原生 presenter；fake 记录 add/update/menu/remove，CI 不触碰真实通知区域。
+
+键盘说明:
+- 原生菜单的键盘选择没有作为可见证据：Explorer 溢出面板持有前台时，合成的右键点击
+  虽能打开菜单，但 SendInput 键盘事件不保证进入应用菜单的模态循环。
+- 菜单命令的键盘无关路径（选中命令只派发一次、取消、panic 恢复、未声明 id 拒绝）
+  由 fake presenter 隐藏测试覆盖。
+- 系统 tooltip、NativeMenu 绘制与 Shell_NotifyIconW 的成功/失败路径只在可见运行中验证。

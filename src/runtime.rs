@@ -22,6 +22,7 @@ use crate::signal::{Memo, MemoCell, SignalCell};
 use crate::store::{TodoId, WriteError};
 use crate::task::{TaskRecord, WakeCallback};
 use crate::text_edit::{self, Edit, Movement};
+use crate::tray::{TrayError, TraySpec};
 use crate::view::{
     Attr, AttrValue, BlurEvent, ChildrenFactory, CompositionEvent, CompositionPhase, Event,
     FocusCause, FocusEvent, InlineStyle, Key, KeyEvent, MountError, MountPlan, MountResult,
@@ -111,6 +112,8 @@ pub(crate) struct State {
     command_handlers: BTreeMap<&'static str, BTreeMap<&'static str, CommandHandler>>,
     /// 应用级命令处理器；不随窗口关闭释放，运行时启动后拒绝注册。
     app_command_handlers: BTreeMap<&'static str, CommandHandler>,
+    /// 应用级托盘声明；由宿主在启动时读取。
+    tray: Option<TraySpec>,
     /// 每个 activation 的只读菜单状态回调，随窗口关闭释放。
     menu_state_handlers: BTreeMap<&'static str, MenuStateHandler>,
     /// 按父窗口键索引的待决关闭 epoch；存在即表示父窗口输入被挂起。
@@ -225,6 +228,7 @@ impl State {
             close_handlers: BTreeMap::new(),
             command_handlers: BTreeMap::new(),
             app_command_handlers: BTreeMap::new(),
+            tray: None,
             menu_state_handlers: BTreeMap::new(),
             close_epochs: BTreeMap::new(),
             close_replies: Vec::new(),
@@ -2121,6 +2125,41 @@ impl Runtime {
         }
         state.app_command_handlers.insert(id, Rc::new(handler));
         Ok(())
+    }
+
+    /// 声明应用托盘；每个 Runtime 一次，必须在运行时启动前调用。
+    ///
+    /// 菜单命令由应用级处理器承接；宿主启动时用
+    /// [`Runtime::missing_tray_handler`] 校验每个命令都有处理器。tooltip、
+    /// 重复命令 id、快捷键与菜单上限在这里校验，失败不保留声明。
+    pub fn declare_tray(&mut self, tray: TraySpec) -> Result<(), TrayError> {
+        let mut state = self.state.borrow_mut();
+        if state.tray.is_some() {
+            return Err(TrayError::AlreadyDeclared);
+        }
+        if state.runtime_started() {
+            return Err(TrayError::RegistrationClosed);
+        }
+        tray.validate()?;
+        state.tray = Some(tray);
+        Ok(())
+    }
+
+    /// 应用托盘声明；没有声明时为 `None`。宿主在启动时读取。
+    pub fn tray(&self) -> Option<TraySpec> {
+        self.state.borrow().tray.clone()
+    }
+
+    /// 托盘菜单声明但还没有应用级处理器的第一个命令 id。
+    ///
+    /// 宿主在创建图标前调用；没有托盘声明或全部命令都有处理器时返回
+    /// `None`。
+    pub fn missing_tray_handler(&self) -> Option<&'static str> {
+        let state = self.state.borrow();
+        state
+            .tray
+            .as_ref()?
+            .first_missing_handler(|id| state.app_command_handler(id).is_some())
     }
 
     /// 通过窗口的静态菜单派发一个命令。

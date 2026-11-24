@@ -27,6 +27,8 @@ pub mod menus;
 mod ole;
 #[cfg(windows)]
 mod shortcuts;
+#[cfg(windows)]
+mod tray;
 
 #[cfg(windows)]
 pub use context_menu::{ContextMenuPresenter, ContextMenuRequest};
@@ -34,3 +36,5 @@ pub use context_menu::{ContextMenuPresenter, ContextMenuRequest};
 pub use file_dialog::FileDialogPresenter;
 #[cfg(windows)]
 pub use host::{Frame, Host, HostConfig, HostError};
+#[cfg(windows)]
+pub use tray::{TrayIconRequest, TrayMenuRequest, TrayPresenter, TrayTooltipRequest};

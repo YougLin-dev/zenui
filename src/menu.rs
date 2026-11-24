@@ -485,6 +485,9 @@ impl MenuCommand {
     }
 }
 
+/// 菜单树的可表示上限；子菜单、分隔线与命令各计一项。
+pub(crate) const MENU_ITEM_LIMIT: usize = u16::MAX as usize;
+
 /// 菜单或子菜单中的一组声明项。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MenuSpec {
@@ -537,6 +540,12 @@ impl MenuSpec {
                 MenuItem::Command(_) | MenuItem::Separator => 1,
             })
             .sum()
+    }
+
+    /// 菜单树超过可表示上限时的项数；没有超过时为 `None`。
+    pub(crate) fn items_over_limit(&self) -> Option<usize> {
+        let items = self.item_count();
+        (items > MENU_ITEM_LIMIT).then_some(items)
     }
 
     /// 按声明顺序遍历全部命令 id。
