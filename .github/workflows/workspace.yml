@@ -44,6 +44,22 @@ jobs:
           sudo apt-get update
           sudo apt-get install --no-install-recommends --yes libfontconfig1-dev
 
+      # Blacksmith 的 Windows 镜像没有可用的 WARP 适配器，宿主测试会报
+      # NoAdapter。把 NuGet 版 WARP 放到测试可执行文件旁，D3D12 会优先加载它。
+      - name: Install WARP
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Get-Item "$env:SystemRoot\System32\d3d12.dll", "$env:SystemRoot\System32\d3d10warp.dll" -ErrorAction SilentlyContinue |
+            ForEach-Object { "$($_.FullName) $($_.VersionInfo.FileVersion)" }
+          $zip = Join-Path $env:RUNNER_TEMP warp.zip
+          $dir = Join-Path $env:RUNNER_TEMP warp
+          Invoke-WebRequest https://www.nuget.org/api/v2/package/Microsoft.Direct3D.WARP/1.0.22 -OutFile $zip
+          Expand-Archive $zip -DestinationPath $dir -Force
+          $deps = Join-Path $env:CARGO_TARGET_DIR debug\deps
+          New-Item -ItemType Directory -Force -Path $deps | Out-Null
+          Copy-Item "$dir\build\native\bin\x64\d3d10warp.dll" $deps
+
       - name: Format
         run: cargo fmt --all -- --check
 
