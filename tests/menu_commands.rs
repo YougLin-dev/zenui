@@ -808,7 +808,7 @@ fn dispatch_runs_the_handler_once_in_the_event_phase_and_settles_requests() {
 
     harness
         .app
-        .dispatch_command(main, "do.hide", CommandSource::Tray)
+        .dispatch_command(main, "do.hide", CommandSource::Accessibility)
         .expect("queue the hide");
     harness
         .app

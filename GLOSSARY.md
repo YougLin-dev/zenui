@@ -176,6 +176,10 @@ _Avoid_: menu flag, UI state snapshot
 窗口目录通过 `WindowCatalog::context_menu` 声明的窗口级菜单；与菜单栏共享命令处理器但命令 id 不能重复，也不声明快捷键。宿主从 `WM_CONTEXTMENU` 打开，presenter 在 `&mut Host` 借用之外用 `TrackPopupMenuEx(TPM_RETURNCMD)` 展示，返回命令以 `CommandSource::ContextMenu` 派发一次；右键与键盘（Apps/Shift+F10）命中同一份声明。
 _Avoid_: node menu, right-click handler, popup window state
 
+**Application command**:
+通过 `Runtime::on_app_command` 在首个窗口打开或根树挂载前注册的应用级处理器；没有窗口时也能运行，事件通过 `CommandEvent::window` 暴露可选的目标 activation。窗口菜单声明项可以由它承接，窗口目标派发只在窗口没有注册同一 id 时回退到它，`CommandSource::Tray` 从不运行窗口处理器。处理器在 `Phase::Event` 中可写应用 Signal/Store 并排队窗口请求；启动后注册、重复 id 与 panic 返回 typed error。
+_Avoid_: global command, background command
+
 **Window scale**:
 窗口逻辑坐标到物理像素的缩放；布局始终使用逻辑像素。
 _Avoid_: DPI factor, zoom
