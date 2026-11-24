@@ -34,6 +34,23 @@ fn editor() -> (Runtime, Rc<Cell<u32>>, NodeId) {
     (app, inputs, editor)
 }
 
+/// 空值、空历史且 caret 在 0 的编辑器；外部替换后计数清零。
+fn empty_editor() -> (Runtime, Rc<Cell<u32>>, NodeId) {
+    let (mut app, inputs, editor) = editor();
+    app.input("editor", "").expect("clear the value");
+    app.set_caret_node(editor, 0).expect("caret at the start");
+    inputs.set(0);
+    (app, inputs, editor)
+}
+
+/// 逐字符键入，模拟宿主的每次 `WM_CHAR`。
+fn type_scalars(app: &mut Runtime, editor: NodeId, text: &str) {
+    for scalar in text.chars() {
+        app.insert_text_node(editor, &scalar.to_string())
+            .expect("type one scalar");
+    }
+}
+
 fn node(app: &Runtime, label: &str) -> NodeId {
     app.presentation()
         .expect("snapshot")
@@ -186,6 +203,205 @@ fn a_new_edit_clears_redo() {
         .expect("redo after a new edit is a no-op");
     assert_eq!(value(&app, "editor"), "abYcd");
     assert_eq!(inputs.get(), before_redo, "the stale redo runs nothing");
+}
+
+#[test]
+fn a_typed_word_undoes_as_one_step_and_the_next_word_is_separate() {
+    let (mut app, inputs, editor) = empty_editor();
+    type_scalars(&mut app, editor, "hello world");
+    assert_eq!(value(&app, "editor"), "hello world");
+    assert_eq!(inputs.get(), 11);
+
+    app.undo_node(editor).expect("undo the second word");
+    assert_eq!(value(&app, "editor"), "hello ");
+    assert_eq!(
+        edit_state(&app, "editor"),
+        (6, 6, None, None),
+        "the run restores the state after the first word"
+    );
+
+    app.undo_node(editor)
+        .expect("undo the first word and its space");
+    assert_eq!(value(&app, "editor"), "");
+    assert_eq!(
+        edit_state(&app, "editor"),
+        (0, 0, Some((0, 0)), None),
+        "the run restores the state before typing started"
+    );
+    assert_eq!(inputs.get(), 13, "each undo dispatches exactly once");
+
+    app.redo_node(editor).expect("redo the first run");
+    assert_eq!(value(&app, "editor"), "hello ");
+    assert_eq!(inputs.get(), 14, "redo remains one step");
+    app.redo_node(editor).expect("redo the second run");
+    assert_eq!(value(&app, "editor"), "hello world");
+    assert_eq!(inputs.get(), 15);
+}
+
+#[test]
+fn movement_starts_a_new_run() {
+    let (mut app, _inputs, editor) = empty_editor();
+    type_scalars(&mut app, editor, "ab");
+    app.set_caret_node(editor, 0).expect("move the caret");
+    type_scalars(&mut app, editor, "cd");
+    assert_eq!(value(&app, "editor"), "cdab");
+
+    app.undo_node(editor).expect("undo after the movement");
+    assert_eq!(value(&app, "editor"), "ab");
+    app.undo_node(editor).expect("undo the first run");
+    assert_eq!(value(&app, "editor"), "");
+
+    let (mut app, _inputs, editor) = empty_editor();
+    type_scalars(&mut app, editor, "ab");
+    app.set_selection_node(editor, 0, 2)
+        .expect("select both characters");
+    type_scalars(&mut app, editor, "cd");
+    assert_eq!(value(&app, "editor"), "cd");
+    app.undo_node(editor)
+        .expect("undo the run that replaced the selection");
+    assert_eq!(value(&app, "editor"), "ab");
+    assert_eq!(
+        edit_state(&app, "editor"),
+        (2, 0, Some((0, 2)), None),
+        "undo restores the selection that existed before the run"
+    );
+    app.undo_node(editor).expect("undo the first run");
+    assert_eq!(value(&app, "editor"), "");
+}
+
+#[test]
+fn backspace_and_multi_scalar_inserts_start_new_runs() {
+    let (mut app, _inputs, editor) = empty_editor();
+    type_scalars(&mut app, editor, "ab");
+    app.backspace_node(editor).expect("delete the b");
+    type_scalars(&mut app, editor, "c");
+    assert_eq!(value(&app, "editor"), "ac");
+
+    app.undo_node(editor).expect("undo c");
+    assert_eq!(value(&app, "editor"), "a");
+    app.undo_node(editor).expect("undo the backspace");
+    assert_eq!(value(&app, "editor"), "ab");
+    app.undo_node(editor).expect("undo the typed run");
+    assert_eq!(value(&app, "editor"), "");
+
+    let (mut app, _inputs, editor) = empty_editor();
+    type_scalars(&mut app, editor, "ab");
+    app.insert_text_node(editor, "XY")
+        .expect("a paste-shaped insert");
+    type_scalars(&mut app, editor, "c");
+    assert_eq!(value(&app, "editor"), "abXYc");
+
+    app.undo_node(editor).expect("undo c");
+    assert_eq!(value(&app, "editor"), "abXY");
+    app.undo_node(editor).expect("undo the multi-scalar insert");
+    assert_eq!(value(&app, "editor"), "ab");
+    app.undo_node(editor).expect("undo the typed run");
+    assert_eq!(value(&app, "editor"), "");
+}
+
+#[test]
+fn whitespace_attaches_to_the_word_before_it() {
+    let (mut app, _inputs, editor) = empty_editor();
+    type_scalars(&mut app, editor, "a  b");
+    assert_eq!(value(&app, "editor"), "a  b");
+
+    app.undo_node(editor).expect("undo b");
+    assert_eq!(value(&app, "editor"), "a  ");
+    app.undo_node(editor).expect("undo a and the spaces");
+    assert_eq!(value(&app, "editor"), "");
+
+    app.redo_node(editor).expect("redo the first run");
+    assert_eq!(value(&app, "editor"), "a  ");
+    app.redo_node(editor).expect("redo b");
+    assert_eq!(value(&app, "editor"), "a  b");
+}
+
+#[test]
+fn leading_whitespace_is_its_own_run() {
+    let (mut app, _inputs, editor) = empty_editor();
+    type_scalars(&mut app, editor, "  a");
+    app.undo_node(editor).expect("undo a");
+    assert_eq!(value(&app, "editor"), "  ");
+    app.undo_node(editor).expect("undo the leading spaces");
+    assert_eq!(value(&app, "editor"), "");
+}
+
+#[test]
+fn a_run_stops_at_the_documented_scalar_bound() {
+    let (mut app, _inputs, editor) = empty_editor();
+    let typed = "x".repeat(65);
+    type_scalars(&mut app, editor, &typed);
+    assert_eq!(value(&app, "editor"), typed);
+
+    app.undo_node(editor).expect("undo the final scalar");
+    assert_eq!(value(&app, "editor"), "x".repeat(64));
+    app.undo_node(editor).expect("undo the bounded run");
+    assert_eq!(value(&app, "editor"), "");
+}
+
+#[test]
+fn cjk_and_emoji_typing_coalesce_by_scalar() {
+    let (mut app, _inputs, editor) = empty_editor();
+    type_scalars(&mut app, editor, "你好🙂世界");
+    assert_eq!(value(&app, "editor"), "你好🙂世界");
+
+    app.undo_node(editor).expect("undo the whole run");
+    assert_eq!(value(&app, "editor"), "");
+    assert_eq!(
+        edit_state(&app, "editor"),
+        (0, 0, Some((0, 0)), None),
+        "a non-BMP emoji is one scalar"
+    );
+    app.redo_node(editor).expect("redo the whole run");
+    assert_eq!(value(&app, "editor"), "你好🙂世界");
+    assert_eq!(edit_state(&app, "editor"), (5, 5, None, None));
+}
+
+#[test]
+fn composition_commit_and_focus_changes_start_new_runs() {
+    let (mut app, _inputs, editor) = empty_editor();
+    type_scalars(&mut app, editor, "ab");
+    app.compose_start_node(editor).expect("start");
+    app.compose_update_node(editor, "ni").expect("preedit");
+    app.compose_commit_node(editor, "你").expect("commit");
+    type_scalars(&mut app, editor, "c");
+    assert_eq!(value(&app, "editor"), "ab你c");
+
+    app.undo_node(editor).expect("undo c");
+    assert_eq!(value(&app, "editor"), "ab你");
+    app.undo_node(editor).expect("undo the composition commit");
+    assert_eq!(value(&app, "editor"), "ab");
+    app.undo_node(editor).expect("undo the typed run");
+    assert_eq!(value(&app, "editor"), "");
+
+    let (mut app, _inputs, editor) = empty_editor();
+    type_scalars(&mut app, editor, "ab");
+    app.focus_node(editor).expect("focus ends the run");
+    type_scalars(&mut app, editor, "cd");
+    assert_eq!(value(&app, "editor"), "abcd");
+    app.undo_node(editor).expect("undo after focus");
+    assert_eq!(value(&app, "editor"), "ab");
+    app.undo_node(editor).expect("undo before focus");
+    assert_eq!(value(&app, "editor"), "");
+}
+
+#[test]
+fn typing_after_undo_does_not_merge_into_the_older_run() {
+    let (mut app, _inputs, editor) = empty_editor();
+    type_scalars(&mut app, editor, "ab");
+    app.focus_node(editor).expect("focus ends the first run");
+    type_scalars(&mut app, editor, "cd");
+    app.undo_node(editor).expect("undo the second run");
+    assert_eq!(value(&app, "editor"), "ab");
+
+    type_scalars(&mut app, editor, "e");
+    assert_eq!(value(&app, "editor"), "abe");
+    app.undo_node(editor).expect("undo the new run only");
+    assert_eq!(
+        value(&app, "editor"),
+        "ab",
+        "typing after undo must not extend the older run"
+    );
 }
 
 #[test]
@@ -810,7 +1026,9 @@ fn the_entry_cap_evicts_the_oldest_history() {
     .expect("mount");
     let cap = node(&app, "cap");
 
-    for _ in 0..150 {
+    for index in 0..150 {
+        // 每次移动 caret 结束连续输入 run，让每个插入成为独立条目。
+        app.set_caret_node(cap, index).expect("caret at the end");
         app.insert_text_node(cap, "x").expect("insert at the end");
     }
     assert_eq!(value(&app, "cap").chars().count(), 150);

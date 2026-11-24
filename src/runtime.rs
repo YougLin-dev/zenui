@@ -415,6 +415,12 @@ impl State {
         {
             tree.focused = focused;
             self.bump_presentation();
+            // 焦点变化结束所有输入的连续输入 run。
+            for element in &mut self.elements {
+                if let LocalState::TextInput { history, .. } = &mut element.local {
+                    history.break_run();
+                }
+            }
         }
     }
 
@@ -1313,8 +1319,26 @@ impl TextEntry {
     }
 }
 
+/// 一次已提交编辑是否属于可合并的连续输入。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum EditKind {
+    /// 单字符插入；相邻同类插入可以合并为一个撤销步。
+    Typing(char),
+    /// 多字符插入、整体替换、删除或组合提交；结束当前输入 run。
+    Boundary,
+}
+
+/// 当前打开的连续输入 run；空白附在前一个词上，下一个非空白字符开启新步。
+#[derive(Clone, Copy, Debug)]
+struct InsertRun {
+    scalars: usize,
+    last: char,
+}
+
 const HISTORY_ENTRIES: usize = 100;
 const HISTORY_BYTES: usize = 256 * 1024;
+/// 一个连续输入 run 最多合并的单字符数；到界后下一次插入开启新步。
+const INSERT_RUN_SCALARS: usize = 64;
 
 /// 每个文本输入自己的有界编辑历史。
 ///
@@ -1329,6 +1353,7 @@ struct TextHistory {
     redo_bytes: usize,
     observed: Option<String>,
     settle_local: bool,
+    run: Option<InsertRun>,
 }
 
 impl TextHistory {
@@ -1348,6 +1373,12 @@ impl TextHistory {
         self.redo.clear();
         self.undo_bytes = 0;
         self.redo_bytes = 0;
+        self.run = None;
+    }
+
+    /// 结束当前连续输入；下一次单字符插入开启新的撤销步。
+    fn break_run(&mut self) {
+        self.run = None;
     }
 
     /// 元素卸载时释放历史与观察到的值，不在死槽位里保留文本。
@@ -1358,13 +1389,55 @@ impl TextHistory {
     }
 
     /// 记录一次已提交编辑；提交前后值相同则不记录，也不清空 redo。
-    fn record(&mut self, before: TextSnapshot, after: TextSnapshot) {
+    ///
+    /// 相邻单字符插入在同一个 run 内合并：保留最早的 `before`，只推进
+    /// `after`。空白并入前一个 run，下一个非空白字符、其它编辑种类、
+    /// 移动、焦点变化或撤销/重做都会结束 run。
+    fn record(&mut self, before: TextSnapshot, after: TextSnapshot, kind: EditKind) {
         if before.value == after.value {
             return;
         }
         self.redo.clear();
         self.redo_bytes = 0;
+        let EditKind::Typing(scalar) = kind else {
+            self.run = None;
+            self.push_undo(TextEntry { before, after });
+            return;
+        };
+        if self.can_extend_run(scalar, &before) {
+            let entry = self.undo.back_mut().expect("an open run has an entry");
+            self.undo_bytes = self.undo_bytes.saturating_sub(entry.bytes());
+            entry.after = after;
+            self.undo_bytes += entry.bytes();
+            let run = self.run.as_mut().expect("an open run has state");
+            run.scalars += 1;
+            run.last = scalar;
+            trim_history(&mut self.undo, &mut self.undo_bytes);
+            if self.undo.is_empty() {
+                self.run = None;
+            }
+            return;
+        }
+        self.run = Some(InsertRun {
+            scalars: 1,
+            last: scalar,
+        });
         self.push_undo(TextEntry { before, after });
+    }
+
+    fn can_extend_run(&self, scalar: char, before: &TextSnapshot) -> bool {
+        let Some(run) = self.run else {
+            return false;
+        };
+        if run.scalars >= INSERT_RUN_SCALARS {
+            return false;
+        }
+        // 空白附在前一个词上；下一个词的首字符开启新步。
+        if run.last.is_whitespace() && !scalar.is_whitespace() {
+            return false;
+        }
+        // run 必须仍指向栈顶，且这次插入紧接在它记录的状态之后。
+        self.undo.back().is_some_and(|entry| entry.after == *before)
     }
 
     fn push_undo(&mut self, entry: TextEntry) {
@@ -3611,6 +3684,8 @@ impl Runtime {
     }
 
     /// 在 caret/selection 处插入文本；一次编辑恰好派发一次 `on:input`。
+    ///
+    /// 连续的单字符插入合并为一个有界撤销步（ADR-0014）；多字符插入结束当前步。
     pub fn insert_text_node(&mut self, node: NodeId, text: &str) -> Result<(), DispatchError> {
         let state = self.state.clone();
         context::install(&state, || {
@@ -3698,6 +3773,9 @@ impl Runtime {
             Movement::SelectAll => (0, length),
         };
         set_local_selection(&mut state.elements[element].local, anchor, focus);
+        if let LocalState::TextInput { history, .. } = &mut state.elements[element].local {
+            history.break_run();
+        }
         state.bump_presentation();
         Ok(())
     }
@@ -3731,6 +3809,16 @@ impl Runtime {
             };
             Ok::<_, DispatchError>((before, *caret, *selection))
         })?;
+        let kind = match edit {
+            Edit::Insert(text) => {
+                let mut scalars = text.chars();
+                match (scalars.next(), scalars.next()) {
+                    (Some(scalar), None) => EditKind::Typing(scalar),
+                    _ => EditKind::Boundary,
+                }
+            }
+            Edit::Replace(_) | Edit::Backspace | Edit::DeleteForward => EditKind::Boundary,
+        };
         let Some(outcome) = text_edit::apply(&before.value, caret, selection, edit) else {
             return Ok(());
         };
@@ -3777,7 +3865,7 @@ impl Runtime {
             return Err(DispatchError::Command(error));
         }
         with_state(|state| clamp_local_edit(state, element));
-        self.record_text_edit(element, before);
+        self.record_text_edit(element, before, kind);
         Ok(())
     }
 
@@ -3785,7 +3873,7 @@ impl Runtime {
     ///
     /// 只记录仍然挂载的元素；处理器改写的值以刷新后的已提交值为准，
     /// 提交前后值相同的编辑不产生条目。
-    fn record_text_edit(&mut self, element: usize, before: TextSnapshot) {
+    fn record_text_edit(&mut self, element: usize, before: TextSnapshot, kind: EditKind) {
         with_state(|state| {
             if !state.element_is_mounted(element) {
                 return;
@@ -3796,21 +3884,23 @@ impl Runtime {
             let LocalState::TextInput { history, .. } = &mut state.elements[element].local else {
                 return;
             };
-            history.record(before, after);
+            history.record(before, after, kind);
         });
     }
 
-    /// 撤销该输入最近一次已提交编辑；空栈是静默无操作。
+    /// 撤销该输入最近一个撤销步；空栈是静默无操作。
     ///
-    /// 撤销通过一次 `on:input` 写回编辑前的值，应用模型仍是值的权威。
-    /// 精确恢复 caret/anchor/selection 只对原样提交值的处理器成立。
+    /// 连续单字符插入可能已合并为一个撤销步。撤销通过一次 `on:input` 写回该步
+    /// 开始前的值，应用模型仍是值的权威。精确恢复 caret/anchor/selection 只对
+    /// 原样提交值的处理器成立。
     pub fn undo_node(&mut self, node: NodeId) -> Result<(), DispatchError> {
         self.apply_history(node, NodeOperation::Undo, HistoryDirection::Undo)
     }
 
-    /// 重做该输入最近一次被撤销的编辑；空栈是静默无操作。
+    /// 重做该输入最近一个被撤销的撤销步；空栈是静默无操作。
     ///
-    /// 重做同样通过一次 `on:input` 写回，恢复的是那次编辑提交后的状态。
+    /// 重做同样通过一次 `on:input` 写回，恢复的是该步提交后的状态；合并 run
+    /// 的重做仍是一步。
     pub fn redo_node(&mut self, node: NodeId) -> Result<(), DispatchError> {
         self.apply_history(node, NodeOperation::Redo, HistoryDirection::Redo)
     }
@@ -3825,6 +3915,14 @@ impl Runtime {
         context::install(&state, || {
             let element = with_state(|state| state.element_for_node(node))?;
             with_state(|state| state.require_editable_text_input(node, element, operation))?;
+            // 撤销/重做后继续输入必须开启新的 run，不能并入更早的条目。
+            with_state(|state| {
+                let LocalState::TextInput { history, .. } = &mut state.elements[element].local
+                else {
+                    unreachable!("require_editable_text_input validated the input");
+                };
+                history.break_run();
+            });
             let entry = with_state(|state| {
                 let LocalState::TextInput { history, .. } = &state.elements[element].local else {
                     unreachable!("require_editable_text_input validated the input");
@@ -3932,6 +4030,7 @@ impl Runtime {
                     anchor,
                     selection,
                     composition,
+                    history,
                     ..
                 } = &mut state.elements[element].local
                 else {
@@ -3950,6 +4049,7 @@ impl Runtime {
                     base_selection: *selection,
                     preedit: String::new(),
                 });
+                history.break_run();
                 Ok((*caret, *selection))
             })?;
             with_state(State::bump_presentation);
@@ -4061,7 +4161,7 @@ impl Runtime {
             }
             with_state(|state| clamp_local_edit(state, element));
             if let Some(before) = before {
-                self.record_text_edit(element, before);
+                self.record_text_edit(element, before, EditKind::Boundary);
             }
             Ok(())
         })
