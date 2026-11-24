@@ -1,45 +1,91 @@
-# #201 剪贴板可见证据
+# #203 剪贴板可见证据
 
-日期: 2026-11-24
-基线: feat/201-clipboard-copy-paste
-示例: crates/windows/examples/todo_host.rs（ZenUI Todo），debug 构建
+日期: 2026-11-25
+基线: main ac58dcd（#201 复制/粘贴、#202 剪切）
+示例: crates/windows/examples/todo_host.rs（ZenUI Todo / ZenUI Details），debug 构建
 外部程序: Notepad 11.2609.11.0，RichEditD2DPT 文档区
 
 ## 环境与采集
 
-- 单屏 2560×1600，150%（144 DPI）。
-- ZenUI Todo 外框 1372×1106 物理像素，位于屏幕 (48,48)，客户区 1350×1050。
-- ZenUI 窗口图来自 PrintWindow(PW_RENDERFULLCONTENT)，整窗读取。
+- 单屏 2560×1600。150% 是当前 144 DPI；100% 从 150% 临时切到 96 DPI，采集后恢复到 144 DPI。
+- 100%：主窗口 916×739 物理像素，客户区 900×700；详情窗口 536×459。
+- 150%：主窗口 1372×1106 物理像素，客户区 1350×1050；详情窗口 802×686。
+- ZenUI 窗口图来自 PrintWindow(PW_RENDERFULLCONTENT)，整窗读取；详情窗口单独成图。
 - Notepad 文档图来自 CopyFromScreen，只取活动标签页文档区的屏幕矩形；不截标签栏，
   不读取或修改 Notepad 恢复的其它标签页。Notepad 在采集结束时保持打开。
 - 键盘与鼠标由仓库外的 PowerShell 脚本用 keybd_event / mouse_event 注入；每次输入前
   用 SetForegroundWindow 置前并确认 fg 与目标 HWND 相同。
-- 文本与选区来自仓库外的 UIA TextPattern 客户端；Notepad 活动标签页的文本同样由
-  TextPattern 读取。Notepad 的 UIA 偏移是 UTF-16 单元。
+- 文本与选区来自仓库外的 UIA TextPattern 客户端；Notepad 活动标签页同样由
+  TextPattern 读取，偏移是 UTF-16 单元。
+- 空剪贴板由 OpenClipboard/EmptyClipboard 清空；非文本剪贴板由 Windows.Forms
+  Clipboard.SetImage 写入 16×16 位图，两种状态都没有 CF_UNICODETEXT。
 
 ## 应用复制 -> Notepad 粘贴
 
-| 步骤 | 读数 | 证据 |
+草稿得到 `ZenUI clipboard`，Ctrl+A 后 selected=[ZenUI clipboard]，Ctrl+C；Notepad 清空后 Ctrl+V。
+
+| 显示 | Notepad 读数 | 证据 |
 | --- | --- | --- |
-| 草稿键入 `ZenUI clipboard`，Ctrl+A | text=[ZenUI clipboard]，selected=[ZenUI clipboard] | 无（复制前值由 UIA 记录） |
-| Ctrl+C | 草稿不变，无 `on:input` | 无 |
-| Notepad Ctrl+V | text=[ZenUI clipboard]，15 码元，`90,101,110,85,73,32,99,108,105,112,98,111,97,114,100` | `150-notepad-from-zenui.png` |
+| 100% | text=[ZenUI clipboard]，15 码元，`90,101,110,85,73,32,99,108,105,112,98,111,97,114,100` | `100-notepad-from-zenui.png` |
+| 150% | 同左 | `150-notepad-from-zenui.png` |
 
 ## Notepad 复制 -> 应用粘贴
 
-| 步骤 | 读数 | 证据 |
+外部系统剪贴板写入 `Notepad to ZenUI 你好 🙂`；Notepad 清空后 Ctrl+V，再 Ctrl+A/C；
+应用全选后 Ctrl+V。
+
+| 显示 | Notepad 读数 | 应用粘贴后 | 证据 |
+| --- | --- | --- | --- |
+| 100% | text=[Notepad to ZenUI 你好 🙂]，22 码元，`78,111,116,101,112,97,100,32,116,111,32,90,101,110,85,73,32,20320,22909,32,55357,56898` | 22 码元一致，选区折叠 | `100-notepad-external.png`、`100-zenui-from-notepad.png` |
+| 150% | 同左 | 同左；Ctrl+Z 恢复 `ZenUI clipboard` 与全选 | `150-notepad-external.png`、`150-zenui-from-notepad.png`、`150-zenui-paste-undo.png` |
+
+## 应用内剪切 -> Details 粘贴
+
+150%：主窗口粘贴 `cut me 你好 🙂`，Ctrl+A/X，主窗口空；Open details，Details note 粘贴。
+100%：主窗口已有 `Notepad to ZenUI 你好 🙂`，同样剪切后粘贴到 Details note。
+
+| 显示 | 剪切后主窗口 | Details note | 焦点读数 | 证据 |
+| --- | --- | --- | --- | --- |
+| 100% | `""`，caret 0 | `Notepad to ZenUI 你好 🙂`，22 码元 | Details note HasKeyboardFocus=True | `100-zenui-cut-main.png`、`100-zenui-cut-details.png` |
+| 150% | `""`，caret 0 | `cut me 你好 🙂`，12 码元 | 剪切后主窗口 focus=True；粘贴后 Details note focus=True | `150-zenui-cut-main.png`、`150-zenui-cut-details.png` |
+
+## 空剪贴板与非文本剪贴板
+
+草稿为 `abc`，Ctrl+A 全选；剪贴板置空或置为位图后 Ctrl+V。
+
+| 显示 | 场景 | 读数 | 证据 |
+| --- | --- | --- | --- |
+| 100% | 空 | text=[abc]，selected=[abc] | `100-zenui-empty-clipboard.png` |
+| 100% | 位图 | text=[abc]，selected=[abc] | `100-zenui-nontext-clipboard.png` |
+| 150% | 空 | text=[abc]，selected=[abc] | `150-zenui-empty-clipboard.png` |
+| 150% | 位图 | text=[abc]，selected=[abc] | `150-zenui-nontext-clipboard.png` |
+
+## 组合 no-op（150%）
+
+系统剪贴板哨兵为 `clipboard sentinel`；微软拼音键入 `nihao`，UIA 已提交文本为空，
+窗口显示组合串 `nǐhao`。组合中依次 Ctrl+C、Ctrl+X、Ctrl+V。
+
+| 读数 | 组合前 | 按键后 |
 | --- | --- | --- |
-| 外部系统剪贴板写入后，Notepad Ctrl+V | text=[Notepad to ZenUI 你好 🙂]，22 码元，`78,111,116,101,112,97,100,32,116,111,32,90,101,110,85,73,32,20320,22909,32,55357,56898` | `150-notepad-external.png` |
-| Notepad Ctrl+A、Ctrl+C | 选区为全部 22 码元 | 无 |
-| 应用草稿 `ZenUI clipboard` 全选，Ctrl+V | text=[Notepad to ZenUI 你好 🙂]，22 码元与 Notepad 一致，选区折叠 | `150-zenui-from-notepad.png` |
-| Ctrl+Z | text=[ZenUI clipboard]，selected=[ZenUI clipboard] | `150-zenui-paste-undo.png` |
+| UIA 已提交文本 | `""` | `""` |
+| 组合串 | `nǐhao`（下划线） | `nǐhao`（下划线） |
+| Get-Clipboard | `clipboard sentinel` | `clipboard sentinel` |
+
+证据：`150-zenui-composition-before.png`、`150-zenui-composition-after.png`。
+
+## 隐藏测试
+
+- 189→193 个 zenui-windows 库测试：13 个新增宿主测试与 2 个剪贴板模块测试。
+- workspace 825 个测试通过；fmt 与 clippy -D warnings 通过。
+- 复制/粘贴 9 个：精确复制、折叠/禁用/无焦点、代理对、caret 插入与一步撤销、
+  替换选区、过滤控制字符、空/非文本/读取失败、组合 no-op、隐藏无 provider、
+  AltGr、跨窗口。
+- 剪切 4 个：写入后删除、失败/缺少 provider、折叠/禁用/组合、跨窗口焦点保持。
 
 ## 边界
 
-- 只在单屏 150% 运行；100%、混合 DPI 与其它应用不在本工单证据范围。
-- 系统剪贴板原始字节没有直接读取；应用写入由 Notepad 粘贴结果观察，Notepad 写入由
-  应用粘贴后的 UIA 文本观察。
-- 隐藏测试使用内存 provider：189 个 `zenui-windows` 库测试包含 9 个新增宿主测试与
-  2 个剪贴板模块测试，不触碰系统剪贴板；AltGr、失败与跨窗口路径只由隐藏测试覆盖。
-- Notepad 恢复的其它标签页含本地文件；本目录截图不含其标题或内容。采集结束后 Notepad
-  与其它标签页保持原状，证据文本仍在系统剪贴板。
+- 只在单屏 2560×1600 运行；100% 临时切换后恢复 150%，不声明混合 DPI 或多显示器。
+- 组合 no-op 只在 150% 采集；100% 覆盖复制、剪切、粘贴、空/非文本与跨窗口。
+- 可见互操作只覆盖 Notepad；其它应用与富文本/HTML/图片粘贴不在本切片。
+- Notepad 恢复的其它标签页含本地文件；本目录截图不含其标题或内容，采集未修改它们。
+  证据文本仍留在系统剪贴板，Notepad 临时标签页未保存。
