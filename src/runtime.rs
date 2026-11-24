@@ -1894,6 +1894,7 @@ impl Runtime {
     /// factory 失败仍消耗这一代 activation；下一次成功打开使用新一代。
     /// 挂载或首帧刷新失败会释放新窗口并让它保持关闭。
     /// primary 窗口由 Host 首次显示；headless 调用方按目录键选择。
+    /// 显式退出之后返回 [`WindowError::State`]，不再打开窗口。
     pub fn show(&mut self, key: &'static str) -> Result<WindowCtx, WindowError> {
         if self.state.borrow().session.quitting {
             return Err(WindowError::State("the application session has ended"));
@@ -1969,6 +1970,9 @@ impl Runtime {
     ) -> Result<WindowCtx, WindowError> {
         {
             let state = self.state.borrow();
+            if state.session.quitting {
+                return Err(WindowError::State("the application session has ended"));
+            }
             if state.catalog_declared {
                 return Err(WindowError::State(
                     "open_window cannot be used after a catalog is declared",
@@ -2414,34 +2418,37 @@ impl Runtime {
     ///
     /// 原生宿主在窗口请求之后调用；headless 驱动在同一 turn 的
     /// [`Runtime::apply_window_requests`] 之后调用。`Show` 按目录键重新打开
-    /// 已关闭窗口；`Quit` 关闭全部 activation、丢弃同一 turn 尚未应用的窗口
-    /// 请求，并拒绝之后的窗口打开。显式退出不运行逐窗口的关闭确认。
+    /// 已关闭窗口；`Quit` 关闭全部 activation 并拒绝之后的窗口打开，排在同
+    /// 一批次 `Quit` 之后的动作随之丢弃。显式退出不运行逐窗口的关闭确认。
     ///
-    /// 动作按排队顺序应用；单个动作失败时继续应用后续动作，再返回第一个错误。
+    /// `Quit` 之前的动作按排队顺序应用；单个动作失败时继续应用后续动作，
+    /// 再返回第一个错误。
     pub fn apply_session_requests(&mut self) -> Result<usize, SessionError> {
         let requests = std::mem::take(&mut self.state.borrow_mut().session.requests);
         let mut applied = 0;
         let mut first_error = None;
         for action in requests {
+            if !self.session_alive() {
+                // quit 已在应用过程中结束会话；同一批次的后续动作不再有目标。
+                break;
+            }
             match action {
                 SessionAction::Show(key) => {
-                    if !self.session_alive() {
-                        first_error.get_or_insert(SessionError::Quit);
-                        continue;
-                    }
-                    match self.show(key) {
-                        Ok(_) => applied += 1,
-                        Err(error) => {
-                            first_error.get_or_insert(SessionError::Window(error));
-                        }
+                    if let Err(error) = self.show(key) {
+                        first_error.get_or_insert(SessionError::Window(error));
+                    } else {
+                        applied += 1;
                     }
                 }
-                SessionAction::Quit => match self.quit() {
-                    Ok(()) => applied += 1,
-                    Err(error) => {
-                        first_error.get_or_insert(error);
+                SessionAction::Quit => {
+                    match self.quit() {
+                        Ok(()) => applied += 1,
+                        Err(error) => {
+                            first_error.get_or_insert(error);
+                        }
                     }
-                },
+                    break;
+                }
             }
         }
         match first_error {
@@ -2467,8 +2474,16 @@ impl Runtime {
                 state.window_requests.clear();
                 state.session.requests.clear();
             }
-            let contexts: Vec<WindowCtx> =
-                self.windows().into_iter().map(|info| info.window).collect();
+            // 目录窗口与 stage-one 的 open_window 都登记在同一个激活表里；
+            // quit 不能只关闭目录条目，否则未声明的 activation 会在退出后保留。
+            let contexts: Vec<WindowCtx> = {
+                let state = self.state.borrow();
+                state
+                    .windows
+                    .keys()
+                    .filter_map(|key| state.window_ctx(key))
+                    .collect()
+            };
             let mut first_error = None;
             for window in contexts {
                 match self.close_window(window) {

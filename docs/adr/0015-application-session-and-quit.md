@@ -9,7 +9,7 @@
 - `QuitOnLastClose` 是默认值：最后一个窗口关闭后，原生宿主结束消息循环。Runtime 不被销毁，嵌入方仍可重新打开目录窗口并再次运行宿主。
 - `StayResident` 明确允许会话在零窗口时继续。原生宿主要求同时声明托盘；没有托盘时零窗口会话没有消息入口，也没有可达的退出动作，`Host::open` 返回 typed error，而不是挂起。
 - 应用通过 `Runtime::session()` 取得 Copy 的 `SessionCtx`，在命令处理器中捕获并排队 `request_show(key)` 或 `request_quit()`。会话动作只接受 `Event` / `Delivery` 阶段，在窗口请求之后结算；`request_show` 只打开目录中已声明的窗口，关闭后重新运行 factory，隐藏时恢复同一 activation。
-- `Runtime::quit` 是显式、不可撤销的会话动作：关闭全部 activation，释放待决 close epoch 与确认窗口，不调用新的关闭处理器；同一 turn 尚未结算的窗口请求和会话动作被丢弃；之后的 `show` 返回 `WindowError::State`。应用需要询问未保存内容时，先完成自己的确认再请求退出。
+- `Runtime::quit` 是显式、不可撤销的会话动作：关闭全部 activation（包括 stage-one `open_window` 创建的窗口），释放待决 close epoch 与确认窗口，不调用新的关闭处理器；直接调用时同一 turn 尚未结算的窗口请求被丢弃；之后的 `show` 返回 `WindowError::State`。排队结算的 `Quit` 在 `Show` 之后按批次顺序执行，排在它之后的动作随会话结束丢弃。应用需要询问未保存内容时，先完成自己的确认再请求退出。
 - 原生宿主在 `StayResident` 零窗口时保留托盘图标，把 worker 唤醒投递到托盘 HWND，并在左键点击时重新打开 primary；托盘菜单可以通过 `SessionCtx::request_show` 恢复已关闭的窗口，通过 `SessionCtx::request_quit` 结束会话。会话结束后宿主同步移除托盘图标并返回消息循环。
 - headless Runtime 只维护策略与请求队列，不规定驱动循环。调用方在同一 turn 先结算窗口请求、再结算会话请求；不声明 `StayResident` 也可以显式退出。
 

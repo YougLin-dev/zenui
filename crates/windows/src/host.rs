@@ -40,7 +40,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     HACCEL, HICON, HMENU, IDC_ARROW, IDI_APPLICATION, IsIconic, IsZoomed, KillTimer, LoadCursorW,
     LoadIconW, MF_BYCOMMAND, MF_CHECKED, MF_ENABLED, MF_GRAYED, MF_UNCHECKED, MSG, PM_REMOVE,
     PeekMessageW, PostMessageW, RegisterClassExW, RegisterWindowMessageW, SPI_GETWHEELSCROLLLINES,
-    SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER,
+    SW_HIDE, SW_RESTORE, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER,
     SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SetForegroundWindow, SetTimer, SetWindowLongPtrW,
     SetWindowPos, ShowWindow, SystemParametersInfoW, TranslateAcceleratorW, TranslateMessage,
     WINDOW_EX_STYLE, WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY,
@@ -509,6 +509,10 @@ impl Host {
     ///
     /// 每个存活窗口创建一个 HWND 与 DX12 surface；device、queue 与 renderer
     /// 在窗口之间共享。优先硬件适配器，失败时回退 WARP。
+    ///
+    /// `StayResident` 会话必须同时声明托盘，否则返回
+    /// [`HostError::Session`] 的 [`SessionError::TrayRequired`]；托盘命令缺少
+    /// 应用级处理器时返回 [`HostError::Tray`]。
     pub fn open(mut runtime: Runtime, config: HostConfig) -> Result<Self, HostError> {
         // 安全：进程级 DPI 设置；重复设置失败时保持已有策略。
         unsafe {
@@ -910,6 +914,16 @@ impl Host {
             return Ok(());
         };
         self.runtime.show(key).map_err(HostError::Open)?;
+        // runtime 的 show 对已打开窗口只更新焦点；用户最小化的原生窗口要先
+        // 恢复图标状态，否则点击托盘只会让一个仍最小化的窗口“获得焦点”。
+        if let Some(window) = self.windows.get(key) {
+            let hwnd = window.hwnd();
+            self.without_routing(None, |_| unsafe {
+                if IsIconic(hwnd).as_bool() {
+                    let _ = ShowWindow(hwnd, SW_RESTORE);
+                }
+            });
+        }
         self.focus_after_sync = true;
         Ok(())
     }
@@ -1172,6 +1186,10 @@ impl Host {
         }
         let hwnd = window.hwnd();
         self.without_routing(None, |_| unsafe {
+            // 托盘激活可能指向用户最小化的窗口；先恢复图标状态，再抢前台。
+            if IsIconic(hwnd).as_bool() {
+                let _ = ShowWindow(hwnd, SW_RESTORE);
+            }
             let _ = SetForegroundWindow(hwnd);
         });
         if previous == hwnd {

@@ -13,7 +13,7 @@ _Avoid_: window instance, window generation
 _Avoid_: global state, app singleton
 
 **Application session**:
-一个 Runtime 拥有的应用级生命周期与最后窗口策略。默认 `QuitOnLastClose` 在最后一个窗口关闭后结束宿主消息循环；`StayResident` 显式允许零窗口会话继续，原生宿主要求同时声明托盘。`Runtime::session()` 返回的 Copy `SessionCtx` 在命令处理器中排队 `request_show` 与 `request_quit`；显式退出关闭全部 activation、释放待决关闭确认并丢弃同一 turn 尚未结算的窗口请求。
+一个 Runtime 拥有的应用级生命周期与最后窗口策略。默认 `QuitOnLastClose` 在最后一个窗口关闭后结束宿主消息循环；`StayResident` 显式允许零窗口会话继续，原生宿主要求同时声明托盘。`Runtime::session()` 返回的 Copy `SessionCtx` 在命令处理器中排队 `request_show` 与 `request_quit`；显式退出关闭全部 activation、释放待决关闭确认并让之后的 show 返回 `State`。直接调用 `Runtime::quit` 时同一 turn 尚未结算的窗口请求被丢弃；排队的 `request_quit` 在窗口请求之后结算。
 _Avoid_: process lifetime, app loop
 
 **Window catalog**:

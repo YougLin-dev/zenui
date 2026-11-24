@@ -143,6 +143,83 @@ fn a_session_show_rejects_an_unknown_key_at_queue_time() {
 }
 
 #[test]
+fn quit_closes_a_stage_one_window_and_rejects_later_opens() {
+    let mut app = Runtime::new();
+    let window = app
+        .open_window("main", |_| view! { <view /> })
+        .expect("open the stage-one window");
+    assert!(app.window_alive(window));
+
+    app.quit().expect("quit the session");
+    assert!(!app.window_alive(window));
+    assert!(!app.session_alive());
+    assert!(matches!(
+        app.open_window("again", |_| view! { <view /> }),
+        Err(WindowError::State("the application session has ended"))
+    ));
+}
+
+#[test]
+fn a_show_queued_after_quit_is_discarded_by_settlement() {
+    let mut app = Runtime::new();
+    let session = app.session();
+    app.on_app_command("app.quit_then_show", move |_| {
+        session.request_quit().expect("queue the quit");
+        session.request_show("main").expect("queue the show");
+    })
+    .expect("register the command");
+    app.declare_windows(|catalog| {
+        catalog.window(WindowSpec::new("main").primary(), |_| view! { <view /> })?;
+        Ok(())
+    })
+    .expect("declare the window");
+
+    app.dispatch_app_command("app.quit_then_show", CommandSource::Tray, None)
+        .expect("run the command");
+    assert_eq!(
+        app.apply_session_requests()
+            .expect("quit settles without an error"),
+        1
+    );
+    assert!(app.windows().is_empty());
+    assert!(!app.session_alive());
+}
+
+#[test]
+fn direct_quit_discards_queued_window_requests() {
+    let opened = Rc::new(Cell::new(0));
+    let other_opens = opened.clone();
+    let mut app = Runtime::new();
+    app.on_app_command("app.open_other", |event| {
+        if let Some(window) = event.window() {
+            window.request_show("other").expect("queue the show");
+        }
+    })
+    .expect("register the open command");
+    app.declare_windows(move |catalog| {
+        catalog.window(WindowSpec::new("main").primary(), |_| view! { <view /> })?;
+        catalog.window(WindowSpec::new("other"), move |_| {
+            other_opens.set(other_opens.get() + 1);
+            view! { <view /> }
+        })?;
+        Ok(())
+    })
+    .expect("declare the windows");
+    let main = app.show("main").expect("open main");
+
+    app.dispatch_app_command("app.open_other", CommandSource::Tray, Some(main))
+        .expect("queue the show request");
+    app.quit().expect("quit before settlement");
+    assert_eq!(
+        app.apply_window_requests()
+            .expect("discarded requests settle cleanly"),
+        0
+    );
+    assert!(app.windows().is_empty());
+    assert_eq!(opened.get(), 0, "the queued window never mounts");
+}
+
+#[test]
 fn explicit_quit_releases_a_pending_close_confirmation() {
     let close_runs = Rc::new(Cell::new(0));
     let handler_runs = close_runs.clone();
