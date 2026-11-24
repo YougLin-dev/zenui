@@ -1,5 +1,6 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
@@ -31,8 +32,8 @@ use crate::view::{
 };
 use crate::window::{
     CatalogEntry, CatalogError, CloseError, CloseHandler, ClosePolicy, CloseReply, CloseRequest,
-    WindowAction, WindowCatalog, WindowCtx, WindowError, WindowInfo, WindowRecord, WindowRequest,
-    WindowRole,
+    DropError, DropEvent, DropHandler, WindowAction, WindowCatalog, WindowCtx, WindowError,
+    WindowInfo, WindowRecord, WindowRequest, WindowRole,
 };
 
 const HIDDEN_TARGET: &str = "target window is hidden";
@@ -121,6 +122,8 @@ pub(crate) struct State {
     window_requests: Vec<WindowRequest>,
     /// 每个 activation 在 factory 中注册的关闭处理器，随窗口关闭释放。
     close_handlers: BTreeMap<&'static str, CloseHandler>,
+    /// 每个 activation 在 factory 中注册的文件拖放处理器，随窗口关闭释放。
+    drop_handlers: BTreeMap<&'static str, DropHandler>,
     /// 每个 activation 在 factory 中注册的命令处理器，随窗口关闭释放。
     command_handlers: BTreeMap<&'static str, BTreeMap<&'static str, CommandHandler>>,
     /// 应用级命令处理器；不随窗口关闭释放，运行时启动后拒绝注册。
@@ -241,6 +244,7 @@ impl State {
             windows: BTreeMap::new(),
             window_requests: Vec::new(),
             close_handlers: BTreeMap::new(),
+            drop_handlers: BTreeMap::new(),
             command_handlers: BTreeMap::new(),
             app_command_handlers: BTreeMap::new(),
             tray: None,
@@ -590,6 +594,7 @@ impl State {
     pub(crate) fn begin_window(&mut self, key: &'static str) -> (u32, u32) {
         self.window_factory_ran = true;
         // 旧 activation 的处理器不能进入新 factory；正常关闭已经清理过。
+        self.drop_handlers.remove(key);
         self.command_handlers.remove(key);
         self.menu_state_handlers.remove(key);
         let activation = self
@@ -612,6 +617,7 @@ impl State {
 
     pub(crate) fn mark_window_closed(&mut self, key: &'static str) {
         self.close_handlers.remove(key);
+        self.drop_handlers.remove(key);
         self.command_handlers.remove(key);
         self.menu_state_handlers.remove(key);
         let Some(record) = self.windows.get_mut(key) else {
@@ -699,6 +705,25 @@ impl State {
             ));
         }
         self.close_handlers.insert(window.key, handler);
+        Ok(())
+    }
+
+    /// 在窗口 factory 中登记文件拖放处理器；必须是该 activation 自己的 Setup。
+    pub(crate) fn register_drop_handler(
+        &mut self,
+        window: WindowCtx,
+        handler: DropHandler,
+    ) -> Result<(), WindowError> {
+        self.ensure_factory_registration(
+            window,
+            "drop handlers must be registered during the window factory",
+        )?;
+        if self.drop_handlers.contains_key(window.key) {
+            return Err(WindowError::State(
+                "a drop handler is already registered for this activation",
+            ));
+        }
+        self.drop_handlers.insert(window.key, handler);
         Ok(())
     }
 
@@ -2028,6 +2053,57 @@ impl Runtime {
             }
             drop(state);
             Ok(())
+        })
+    }
+
+    /// 向窗口投递一次已接受的文件拖放。
+    ///
+    /// 路径按给定顺序交给该 activation 在 factory 中注册的 `on_drop` 处理器；
+    /// 处理器在 `Phase::Event` 中运行一次，可以写 Store/Signal、排队窗口请求与
+    /// 启动任务。重复路径与 Unicode 原样保留，不做去重或规范化。
+    ///
+    /// 外部 Runtime 的窗口、已关闭/过期的 activation、隐藏窗口、等待关闭确认的
+    /// 窗口、空路径与没有处理器的窗口都在进入事件阶段前拒绝。
+    pub fn drop_files(&mut self, window: WindowCtx, paths: Vec<PathBuf>) -> Result<(), DropError> {
+        let state = self.state.clone();
+        if window.runtime != state.borrow().id {
+            return Err(DropError::WrongRuntime);
+        }
+        context::install(&state, || {
+            if !with_state(|state| state.window_live_in_tree(window)) {
+                return Err(DropError::Stale);
+            }
+            if paths.is_empty() {
+                return Err(DropError::Empty);
+            }
+            if !with_state(|state| state.window_is_visible(window.key)) {
+                return Err(DropError::Hidden);
+            }
+            if with_state(|state| {
+                state.close_epochs.contains_key(window.key)
+                    || state.pending_parent_for_confirmation(window.key).is_some()
+            }) {
+                return Err(DropError::Suspended);
+            }
+            let Some(handler) = with_state(|state| state.drop_handlers.get(window.key).cloned())
+            else {
+                return Err(DropError::NoHandler);
+            };
+            let previous = with_state(|state| {
+                let previous = state.phase;
+                state.phase = Phase::Event;
+                state.fault = None;
+                state.write_error = None;
+                previous
+            });
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                handler(DropEvent::new(window, paths));
+            }));
+            with_state(|state| state.phase = previous);
+            if outcome.is_err() {
+                return Err(DropError::HandlerPanicked);
+            }
+            self.finish_command().map_err(DropError::Command)
         })
     }
 

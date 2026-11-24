@@ -122,6 +122,94 @@ fn picked_files_add_one_title_per_non_empty_line_in_order() {
 }
 
 #[test]
+fn dropped_files_add_one_title_per_line_in_source_order() {
+    let temp = TempDir::new("dropped");
+    let first = temp.file("first.txt", b"\n  First task  \n\nSecond task\n");
+    let second = temp.file("second.txt", b"Third task\r\n\r\n");
+    let (mut app, main) = open();
+
+    app.drop_files(main, vec![first, second])
+        .expect("deliver the dropped files");
+    app.settle_tasks().expect("settle the import tasks");
+
+    assert_eq!(
+        row_titles(&app),
+        [
+            "Write tests",
+            "Read docs",
+            "First task",
+            "Second task",
+            "Third task"
+        ],
+        "drops use the same parser and keep the file and line order"
+    );
+    assert!(has_text(&app, "Imported 3 tasks"));
+}
+
+#[test]
+fn a_dropped_import_can_finish_after_the_main_window_closes() {
+    let temp = TempDir::new("dropped-late");
+    let late = temp.file("late.txt", b"Late task\n");
+    let (mut app, main) = open();
+
+    app.drop_files(main, vec![late])
+        .expect("deliver the dropped file");
+    app.close_window(main).expect("close the main window");
+    app.settle_tasks().expect("settle the app-owned import");
+
+    let reopened = app.show("main").expect("reopen the main window");
+    assert_ne!(reopened.activation(), main.activation());
+    assert_eq!(
+        row_titles(&app),
+        ["Write tests", "Read docs", "Late task"],
+        "the drop worker belongs to the application and commits after close"
+    );
+    assert!(has_text(&app, "Imported 1 task"));
+}
+
+#[test]
+fn an_unreadable_dropped_file_reports_the_import_error() {
+    let (mut app, main) = open();
+
+    app.drop_files(main, vec![missing_file("unreadable-drop.txt")])
+        .expect("deliver the dropped file");
+    app.settle_tasks().expect("settle the failed import");
+
+    assert_eq!(row_titles(&app), ["Write tests", "Read docs"]);
+    assert!(has_text(&app, "Import failed: Could not read"));
+}
+
+#[test]
+fn the_details_window_imports_drops_into_the_shared_model() {
+    let temp = TempDir::new("dropped-details");
+    let file = temp.file("details.txt", b"From details\n");
+    let (mut app, main) = open();
+    app.click_label("Open details").expect("open details");
+    app.apply_window_requests()
+        .expect("settle the open request");
+    let details = app
+        .windows()
+        .into_iter()
+        .find(|info| info.spec.key() == "details")
+        .expect("the details window is live")
+        .window;
+
+    app.drop_files(details, vec![file])
+        .expect("deliver a drop to details");
+    app.settle_tasks().expect("settle the import");
+
+    let titles: Vec<String> = app
+        .presentation_of(main)
+        .expect("main snapshot")
+        .elements()
+        .filter_map(SnapshotElement::label)
+        .filter_map(|label| label.strip_prefix("Edit ").map(str::to_owned))
+        .collect();
+    assert_eq!(titles, ["Write tests", "Read docs", "From details"]);
+    assert!(has_text(&app, "Imported 1 task"));
+}
+
+#[test]
 fn cancelling_the_chooser_leaves_the_list_unchanged() {
     let (mut app, _main) = open();
     let request = import_request(&mut app);
