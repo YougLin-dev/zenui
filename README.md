@@ -6,7 +6,7 @@ ZenUI 使用 Rust 编写原生桌面界面。它保留控件及其编辑状态�
 
 ## 当前能力
 
-ZenUI 处在开发阶段。阶段一的 target API、阶段二的 Windows 原生切片，以及阶段三的多窗口、关闭确认、应用会话策略与显式退出、原生打开/保存/文件夹对话框、整页滚动、焦点显露、覆盖层滚动条、窗口化 `For`、只读 UIA 树、UIA Invoke/Toggle/Value/SetFocus 动作、UIA 焦点/状态/结构事件、UIA TextPattern 与窗口根 ScrollPattern、原生菜单栏/快捷键/窗口级上下文菜单与应用托盘已可运行；节点级上下文菜单、拖放与跨平台支持仍在开发中。跨显示器混合 DPI 与实机 device loss 仍是 #63 的开放证据缺口。
+ZenUI 处在开发阶段。阶段一的 target API、阶段二的 Windows 原生切片，以及阶段三的多窗口、关闭确认、应用会话策略与显式退出、原生打开/保存/文件夹对话框、整页滚动、焦点显露、覆盖层滚动条、窗口化 `For`、只读 UIA 树、UIA Invoke/Toggle/Value/SetFocus 动作、UIA 焦点/状态/结构事件、UIA TextPattern 与窗口根 ScrollPattern、原生菜单栏/快捷键/窗口级上下文菜单、应用托盘与文件拖放已可运行；节点级上下文菜单与跨平台支持仍在开发中。跨显示器混合 DPI 与实机 device loss 仍是 #63 的开放证据缺口。
 
 仓库目前提供：
 
@@ -18,6 +18,7 @@ ZenUI 处在开发阶段。阶段一的 target API、阶段二的 Windows 原生
 - 应用会话：启动前声明 `QuitOnLastClose`（默认）或 `StayResident`；`SessionCtx` 在命令处理器中排队恢复窗口与显式退出。常驻会话允许零窗口消息循环，原生宿主要求声明托盘，托盘恢复 primary 或已关闭窗口，Quit 关闭全部 activation 并释放待决关闭确认；
 - 原生打开/保存/文件夹对话框：窗口锚定、单选/多选、标题与类型过滤器、建议文件名与默认扩展名、取消/失败结果，以及显式的窗口或应用任务所有权；
 - 宿主任务：文件对话框结果与 worker 共用 Task/continuation 交付，但没有 worker 通道，也不会阻塞 `settle_tasks`；
+- 文件拖放：每个可见且注册 `on_drop` 的窗口拥有 OLE `IDropTarget`，只接受启用窗口、COPY 与 `CF_HDROP`。路径按源顺序以 `DropEvent` 在 `Phase::Event` 交付，保留重复、Unicode、非 BMP 与长路径；隐藏、模态选择器、关闭确认与非文件数据在处理器前拒绝。拖放事件本身不创建任务，读取工作由应用显式选择 window/app scope（[ADR-0016](docs/adr/0016-ole-file-drop-target.md)、[stage-three 文件拖放验收](docs/实现/stage-three-文件拖放-验收.md)）；
 - 长列表场景构建：跨重建复用未变化的文本 layout 与测量结果，viewport 外的元素保留几何但跳过 glyph 与绘制；声明 `row-height` 的窗口化 `For` 只挂载可见行窗口，完整行范围由上下 spacer 保持（[ADR-0011](docs/adr/0011-windowed-for-mounting.md)）；变量行高仍不在本里程碑；
 - UIA：每个窗口从已提交快照与场景发布根、角色、名称、AutomationId、状态与物理边界，`WM_GETOBJECT` 交回 fragment-root provider；滚动只平移边界并保持 runtime ID。Invoke、Toggle、Value 与 SetFocus 把动作排队到 UI 线程，按最新快照重验后复用 Runtime 命令路径。相邻两次发布按 runtime ID 比较，聚焦、启用、ToggleState、Value 与子节点增删/重排各投递一次事件；后台窗口不投递聚焦事件，指针 hover/press 瞬态不产生事件（[只读树验收](docs/实现/stage-three-辅助技术-验收.md)、[动作验收](docs/实现/stage-three-辅助技术动作-验收.md)、[事件验收](docs/实现/stage-three-辅助技术事件-验收.md)、[合同与朗读验收](docs/实现/stage-three-辅助技术总验收.md)）；
 - UIA 文本：`text-input` 的 Edit 节点暴露最小 `ITextProvider`/`ITextRangeProvider`。文档取已提交值并排除 preedit，对外偏移是 UTF-16 code unit，运行时仍用字符偏移；GetText、GetSelection、GetVisibleRanges、GetBoundingRectangles 与 Select 可用，Select 经动作队列调用 `set_selection_node` 且不派发 `on:input`；查找、移动、扩展、比较、多选与滚动等 range 方法返回 `UIA_E_NOTSUPPORTED`，组合中、禁用或无 `on:input` 的输入保持只读（[文本验收](docs/实现/stage-three-辅助技术文本-验收.md)）；
@@ -37,7 +38,7 @@ cargo run -p zenui --example minimal_todo --locked
 cargo run -p zenui-windows --example todo_host --locked
 ```
 
-原生示例的主窗口工具栏可以打开共享模型的详情窗口；隐藏会保留详情窗口的本地编辑状态，关闭后可以重新打开。`Import file` 打开锚定到主窗口的原生打开文件对话框，把每个选中 UTF-8 文本文件的非空行提交为任务，并在主窗口关闭后仍由应用所有权任务完成导入。主窗口有非空草稿时，关闭按钮会显示 Continue editing / Discard draft 确认窗口。
+原生示例的主窗口工具栏可以打开共享模型的详情窗口；隐藏会保留详情窗口的本地编辑状态，关闭后可以重新打开。`Import file` 打开锚定到主窗口的原生打开文件对话框，把每个选中 UTF-8 文本文件的非空行提交为任务，并在主窗口关闭后仍由应用所有权任务完成导入；把文本文件拖入主窗口或 Details 会走同一条应用所有权导入。主窗口有非空草稿时，关闭按钮会显示 Continue editing / Discard draft 确认窗口。
 
 target API 的公开行为测试位于根包 `tests/`，其中 `tests/tasks.rs` 覆盖窗口关闭、重开代际、过期交付与 app 所有权模型提交，`tests/ime.rs` 覆盖 headless composition 的 preedit、候选确认与取消；这些测试不代替原生窗口或真实 IME 验收，原生路径由 `crates/windows` 的隐藏 smoke 与可见窗口验收覆盖。
 
@@ -88,6 +89,7 @@ target API 的公开行为测试位于根包 `tests/`，其中 `tests/tasks.rs` 
 - [Stage-three 托盘验收](docs/实现/stage-three-托盘-验收.md)：系统托盘图标、tooltip、点击恢复、右键应用命令、`TaskbarCreated` 与 Windows 11 溢出的可见证据。
 - [Stage-three 文本编辑历史验收](docs/实现/stage-three-文本编辑历史-验收.md)：按输入的撤销/重做、Ctrl+Z/Y、连续输入合并、选择替换、Backspace/Delete、中文组合提交、两窗口隔离与 150% 可见证据。
 - [Stage-three 剪贴板验收](docs/实现/stage-three-剪贴板-验收.md)：Ctrl+C/X/V、Notepad 双向互操作、应用内剪切与跨窗口粘贴、空/非文本剪贴板、组合 no-op、焦点保持与 100%/150% 可见证据。
+- [Stage-three 文件拖放验收](docs/实现/stage-three-文件拖放-验收.md)：真实资源管理器拖放的单文件/多文件、Unicode/非 BMP/长路径、文件夹、非文件、无处理器、关闭提示、模态选择器与关闭重开的 100%/150% 可见证据与边界。
 
 ## 界面语法
 

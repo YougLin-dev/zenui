@@ -50,11 +50,15 @@ _Avoid_: dialog, modal (when meaning the catalog role)
 
 **File dialog**:
 一个由应用从 `WindowCtx::request_file_dialog` 请求、由宿主后端呈现的原生打开、保存或选择文件夹对话框；按 kind 携带标题、类型过滤器、建议文件名、默认扩展名与单选/多选选项，返回 `Picked`、`Cancelled` 或 `Failed`。保存与文件夹都是单路径契约；文件夹忽略过滤器、建议文件名与默认扩展名。它不是窗口目录条目，也不等于关闭确认窗口。
-_Avoid_: file dialog window, file picker window, import dialog
+_Avoid_: file dialog window, file picker window, file drop, import dialog
+
+**File drop**:
+通过 OLE `IDropTarget` 从资源管理器或其它 OLE 拖放源送到一个可见窗口的一组有序路径。只有可见且在 factory 注册了 `on_drop` 的窗口拥有 target；源必须提供 `CF_HDROP` 并允许 COPY，窗口被禁用（例如模态对话框的 owner 或等待关闭确认）时返回 NONE。宿主在 UI 线程 drain 后以 `DropEvent` 运行一次处理器；它不是文件对话框，也不创建任务或 pending 状态，处理器自行选择 window/app task scope。路径保留顺序、重复、Unicode、非 BMP 与长路径；文件夹也是路径，非文件数据在处理器前拒绝。
+_Avoid_: file picker, host task, drag event (when meaning the SDK event), drop task
 
 **Host task**:
 由后端服务而不是 worker 线程完成的任务；任务记录没有结果通道，只能经 `Runtime` 的宿主完成入口以恰好一次的方式完成，并在 `Delivery` turn 交付。文件对话框是当前的宿主任务；它与 worker 共享 Task 句柄和 continuation，但不被 `settle_tasks` 等待。
-_Avoid_: host worker, UI task, dialog task
+_Avoid_: host worker, UI task, dialog task, file drop
 
 **Host**:
 拥有原生窗口、事件循环、DPI 与 surface，并驱动 target runtime 的平台层。
