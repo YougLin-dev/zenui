@@ -203,6 +203,166 @@ impl MenuCommandState {
 
 pub(crate) type MenuStateHandler = Rc<dyn Fn(&MenuCommand) -> MenuCommandState>;
 
+/// 菜单快捷键里的非修饰键。
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ShortcutKey {
+    /// ASCII 字母或数字；解析时统一为大写。
+    Character(char),
+    /// F1 到 F24。
+    Function(u8),
+}
+
+/// 一个菜单命令的快捷键。
+///
+/// 至少包含 Ctrl 或 Alt，避免把普通输入或只带 Shift 的编辑键声明成快捷键。
+/// 解析接受大小写不敏感的 `Ctrl`/`Control`、`Alt`、`Shift` 修饰键，以及
+/// ASCII 字母、数字或 `F1`..`F24`；展示文本按 Ctrl、Alt、Shift、键位归一化。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct MenuShortcut {
+    key: ShortcutKey,
+    control: bool,
+    alt: bool,
+    shift: bool,
+}
+
+impl MenuShortcut {
+    /// 解析声明文本；失败时保留原文与原因。
+    pub fn parse(text: &'static str) -> Result<Self, ShortcutError> {
+        if text.trim().is_empty() {
+            return Err(ShortcutError::new(text, "the shortcut is empty"));
+        }
+        let mut control = false;
+        let mut alt = false;
+        let mut shift = false;
+        let mut parts = text.split('+');
+        let Some(key_text) = parts.next_back() else {
+            return Err(ShortcutError::new(text, "the shortcut is empty"));
+        };
+        for modifier in parts {
+            let modifier = modifier.trim();
+            if modifier.eq_ignore_ascii_case("ctrl") || modifier.eq_ignore_ascii_case("control") {
+                if control {
+                    return Err(ShortcutError::new(text, "Ctrl is repeated"));
+                }
+                control = true;
+            } else if modifier.eq_ignore_ascii_case("alt") {
+                if alt {
+                    return Err(ShortcutError::new(text, "Alt is repeated"));
+                }
+                alt = true;
+            } else if modifier.eq_ignore_ascii_case("shift") {
+                if shift {
+                    return Err(ShortcutError::new(text, "Shift is repeated"));
+                }
+                shift = true;
+            } else {
+                return Err(ShortcutError::new(text, "unknown modifier"));
+            }
+        }
+        let key = parse_shortcut_key(key_text.trim()).ok_or_else(|| {
+            ShortcutError::new(text, "the key must be an ASCII letter, digit, or F1-F24")
+        })?;
+        if !control && !alt {
+            return Err(ShortcutError::new(text, "the shortcut needs Ctrl or Alt"));
+        }
+        Ok(Self {
+            key,
+            control,
+            alt,
+            shift,
+        })
+    }
+
+    /// 非修饰键。
+    pub const fn key(self) -> ShortcutKey {
+        self.key
+    }
+
+    /// 是否要求按住 Ctrl。
+    pub const fn control(self) -> bool {
+        self.control
+    }
+
+    /// 是否要求按住 Alt。
+    pub const fn alt(self) -> bool {
+        self.alt
+    }
+
+    /// 是否要求按住 Shift。
+    pub const fn shift(self) -> bool {
+        self.shift
+    }
+}
+
+impl fmt::Display for MenuShortcut {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.control {
+            f.write_str("Ctrl+")?;
+        }
+        if self.alt {
+            f.write_str("Alt+")?;
+        }
+        if self.shift {
+            f.write_str("Shift+")?;
+        }
+        match self.key {
+            ShortcutKey::Character(character) => write!(f, "{character}"),
+            ShortcutKey::Function(number) => write!(f, "F{number}"),
+        }
+    }
+}
+
+/// 菜单快捷键声明无效的原因。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ShortcutError {
+    text: &'static str,
+    reason: &'static str,
+}
+
+impl ShortcutError {
+    const fn new(text: &'static str, reason: &'static str) -> Self {
+        Self { text, reason }
+    }
+
+    /// 原始声明文本。
+    pub const fn text(self) -> &'static str {
+        self.text
+    }
+
+    /// 可读的失败原因。
+    pub const fn reason(self) -> &'static str {
+        self.reason
+    }
+}
+
+impl fmt::Display for ShortcutError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "invalid menu shortcut `{}`: {}", self.text, self.reason)
+    }
+}
+
+impl std::error::Error for ShortcutError {}
+
+fn parse_shortcut_key(text: &str) -> Option<ShortcutKey> {
+    let mut characters = text.chars();
+    let first = characters.next()?;
+    let rest = characters.as_str();
+    if rest.is_empty() {
+        return first
+            .is_ascii_alphanumeric()
+            .then(|| ShortcutKey::Character(first.to_ascii_uppercase()));
+    }
+    if !first.eq_ignore_ascii_case(&'f') {
+        return None;
+    }
+    let number = rest
+        .parse::<u8>()
+        .ok()
+        .filter(|number| (1..=24).contains(number))?;
+    Some(ShortcutKey::Function(number))
+}
+
 /// 一个菜单项。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MenuItem {
@@ -224,24 +384,34 @@ impl MenuItem {
     }
 }
 
-/// 一个命令项的静态描述：稳定 id、标签与打开时的默认 enabled/checked 状态。
+/// 一个命令项的静态描述：稳定 id、标签、快捷键与打开时的默认 enabled/checked 状态。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MenuCommand {
     id: &'static str,
     label: &'static str,
+    shortcut: Option<MenuShortcut>,
     enabled: bool,
     checked: bool,
 }
 
 impl MenuCommand {
-    /// 一个默认可用、未勾选的命令。
+    /// 一个默认可用、未勾选且没有快捷键的命令。
     pub const fn new(id: &'static str, label: &'static str) -> Self {
         Self {
             id,
             label,
+            shortcut: None,
             enabled: true,
             checked: false,
         }
+    }
+
+    /// 声明快捷键；解析失败时在窗口目录声明期返回错误。
+    ///
+    /// 同一个窗口的菜单树里两个命令不能使用同一个归一化快捷键。
+    pub fn bind_shortcut(mut self, shortcut: &'static str) -> Result<Self, ShortcutError> {
+        self.shortcut = Some(MenuShortcut::parse(shortcut)?);
+        Ok(self)
     }
 
     /// 覆盖打开时的默认可用状态。
@@ -264,6 +434,11 @@ impl MenuCommand {
     /// 展示给用户的标签。
     pub const fn label(&self) -> &'static str {
         self.label
+    }
+
+    /// 声明的快捷键；没有时返回 `None`。
+    pub const fn shortcut(&self) -> Option<MenuShortcut> {
+        self.shortcut
     }
 
     /// 打开菜单时的默认可用状态；这不是运行时状态。
@@ -345,26 +520,19 @@ impl MenuSpec {
 
     /// 第一个在树中重复出现的命令 id；没有重复时为 `None`。
     pub(crate) fn first_duplicate_command(&self) -> Option<&'static str> {
-        fn visit(items: &[MenuItem], seen: &mut BTreeSet<&'static str>) -> Option<&'static str> {
-            for item in items {
-                match item {
-                    MenuItem::Command(command) => {
-                        if !seen.insert(command.id) {
-                            return Some(command.id);
-                        }
-                    }
-                    MenuItem::Separator => {}
-                    MenuItem::Submenu(submenu) => {
-                        if let Some(duplicate) = visit(&submenu.spec.items, seen) {
-                            return Some(duplicate);
-                        }
-                    }
-                }
-            }
-            None
-        }
+        let mut seen = BTreeSet::new();
+        find_command(&self.items, &mut |command| {
+            (!seen.insert(command.id)).then_some(command.id)
+        })
+    }
 
-        visit(&self.items, &mut BTreeSet::new())
+    /// 第一个与其他命令重复的归一化快捷键；没有重复时为 `None`。
+    pub(crate) fn first_duplicate_shortcut(&self) -> Option<(&'static str, MenuShortcut)> {
+        let mut seen = BTreeSet::new();
+        find_command(&self.items, &mut |command| {
+            let shortcut = command.shortcut?;
+            (!seen.insert(shortcut)).then_some((command.id, shortcut))
+        })
     }
 
     /// 这棵树是否声明了该命令 id。
@@ -385,6 +553,29 @@ impl MenuSpec {
             }
         }
     }
+}
+
+/// 按声明顺序访问命令，直到 `visit` 返回第一个结果。
+fn find_command<R>(
+    items: &[MenuItem],
+    visit: &mut impl FnMut(&MenuCommand) -> Option<R>,
+) -> Option<R> {
+    for item in items {
+        match item {
+            MenuItem::Command(command) => {
+                if let Some(result) = visit(command) {
+                    return Some(result);
+                }
+            }
+            MenuItem::Separator => {}
+            MenuItem::Submenu(submenu) => {
+                if let Some(result) = find_command(&submenu.spec.items, visit) {
+                    return Some(result);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// 子菜单：一个标签与它自己的声明项。

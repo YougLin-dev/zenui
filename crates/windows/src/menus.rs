@@ -11,13 +11,14 @@ use std::error::Error;
 use std::fmt;
 
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreateMenu, CreatePopupMenu, DestroyMenu, HMENU, MF_CHECKED, MF_GRAYED, MF_POPUP,
-    MF_SEPARATOR, MF_STRING,
+    ACCEL, ACCEL_VIRT_FLAGS, AppendMenuW, CreateAcceleratorTableW, CreateMenu, CreatePopupMenu,
+    DestroyAcceleratorTable, DestroyMenu, FALT, FCONTROL, FSHIFT, FVIRTKEY, HACCEL, HMENU,
+    MF_CHECKED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING,
 };
 use windows::core::{HSTRING, PCWSTR};
-use zenui::{MenuCommand, MenuItem, MenuSpec, Submenu};
+use zenui::{MenuCommand, MenuItem, MenuShortcut, MenuSpec, ShortcutKey, Submenu};
 
-/// 构建窗口菜单时保留的 Win32 失败。
+/// 构建窗口菜单或快捷键表时保留的 Win32 失败。
 #[derive(Debug)]
 pub struct MenuError(String);
 
@@ -37,7 +38,13 @@ impl Error for MenuError {}
 pub(crate) struct NativeMenu {
     handle: HMENU,
     owns_handle: bool,
-    commands: Vec<MenuCommand>,
+    commands: Vec<NativeCommand>,
+}
+
+/// 一个命令与它在原生菜单里的数字 id。
+struct NativeCommand {
+    id: u16,
+    command: MenuCommand,
 }
 
 impl NativeMenu {
@@ -71,7 +78,11 @@ impl NativeMenu {
 
     /// 命令 id 对应的稳定声明 id；0、分隔线位置与悬空 id 返回 `None`。
     pub(crate) fn command(&self, id: u16) -> Option<&MenuCommand> {
-        self.commands.get(usize::from(id).checked_sub(1)?)
+        let index = usize::from(id).checked_sub(1)?;
+        self.commands
+            .get(index)
+            .filter(|entry| entry.id == id)
+            .map(|entry| &entry.command)
     }
 }
 
@@ -86,6 +97,82 @@ impl Drop for NativeMenu {
     }
 }
 
+/// 一个窗口的快捷键表；没有快捷键的菜单不创建 `HACCEL`。
+///
+/// 表项的命令 id 与 `NativeMenu` 的前序编号一致。表由窗口条目独占，窗口关闭
+/// 或创建失败时在这里注销，不跨 activation 复用。
+pub(crate) struct NativeAccelerator {
+    handle: HACCEL,
+}
+
+impl NativeAccelerator {
+    /// 从菜单命令的声明快捷键构建；全部命令都没有快捷键时返回 `None`。
+    pub(crate) fn build(menu: &NativeMenu) -> Result<Option<Self>, MenuError> {
+        let mut entries = Vec::new();
+        for entry in &menu.commands {
+            let Some(shortcut) = entry.command.shortcut() else {
+                continue;
+            };
+            let key = accelerator_key(shortcut.key()).ok_or_else(|| {
+                MenuError(String::from("a menu shortcut has no Windows virtual key"))
+            })?;
+            entries.push(ACCEL {
+                fVirt: accelerator_flags(shortcut),
+                key,
+                cmd: entry.id,
+            });
+        }
+        if entries.is_empty() {
+            return Ok(None);
+        }
+        // 安全：表项在调用期间有效；成功返回的 HACCEL 由本结构注销。
+        let handle = unsafe { CreateAcceleratorTableW(&entries) }.map_err(menu_error)?;
+        Ok(Some(Self { handle }))
+    }
+
+    /// 交给 `TranslateAcceleratorW` 的句柄。
+    pub(crate) const fn handle(&self) -> HACCEL {
+        self.handle
+    }
+}
+
+impl Drop for NativeAccelerator {
+    fn drop(&mut self) {
+        // 安全：句柄由本结构创建，只注销一次。
+        unsafe {
+            let _ = DestroyAcceleratorTable(self.handle);
+        }
+    }
+}
+
+fn accelerator_flags(shortcut: MenuShortcut) -> ACCEL_VIRT_FLAGS {
+    let mut flags = FVIRTKEY;
+    if shortcut.control() {
+        flags |= FCONTROL;
+    }
+    if shortcut.alt() {
+        flags |= FALT;
+    }
+    if shortcut.shift() {
+        flags |= FSHIFT;
+    }
+    flags
+}
+
+fn accelerator_key(key: ShortcutKey) -> Option<u16> {
+    /// `VK_F1`；F24 紧随其后。
+    const VK_F1: u16 = 0x70;
+    match key {
+        ShortcutKey::Character(character) if character.is_ascii_alphanumeric() => {
+            Some(u16::from(character as u8))
+        }
+        ShortcutKey::Function(number) if (1..=24).contains(&number) => {
+            Some(VK_F1 + u16::from(number - 1))
+        }
+        _ => None,
+    }
+}
+
 fn menu_error(error: windows::core::Error) -> MenuError {
     MenuError(error.to_string())
 }
@@ -94,7 +181,7 @@ fn menu_error(error: windows::core::Error) -> MenuError {
 fn append_items(
     menu: HMENU,
     items: &[MenuItem],
-    commands: &mut Vec<MenuCommand>,
+    commands: &mut Vec<NativeCommand>,
 ) -> Result<(), MenuError> {
     for item in items {
         match item {
@@ -115,10 +202,17 @@ fn append_items(
                 if command.is_checked() {
                     flags |= MF_CHECKED;
                 }
-                let label = HSTRING::from(command.label());
+                let label = match command.shortcut() {
+                    // 制表符让 Windows 把快捷键文本右对齐；它仍是同一个菜单项。
+                    Some(shortcut) => HSTRING::from(format!("{}\t{shortcut}", command.label())),
+                    None => HSTRING::from(command.label()),
+                };
                 // 安全：label 在调用期间有效，命令 id 落在 u16 范围。
                 unsafe { AppendMenuW(menu, flags, usize::from(id), &label) }.map_err(menu_error)?;
-                commands.push(command.clone());
+                commands.push(NativeCommand {
+                    id,
+                    command: command.clone(),
+                });
             }
             MenuItem::Separator => {
                 // 安全：分隔线不读取 `lpNewItem`。
@@ -134,7 +228,7 @@ fn append_items(
 fn append_submenu(
     menu: HMENU,
     submenu: &Submenu,
-    commands: &mut Vec<MenuCommand>,
+    commands: &mut Vec<NativeCommand>,
 ) -> Result<(), MenuError> {
     // 安全：弹出菜单由本函数创建；挂接前失败时显式销毁，挂接后归父菜单所有。
     unsafe {
@@ -157,6 +251,72 @@ mod tests {
     use windows::Win32::UI::WindowsAndMessaging::IsMenu;
 
     use super::*;
+
+    #[test]
+    fn an_accelerator_table_is_built_only_for_declared_shortcuts() {
+        let menu =
+            NativeMenu::build(&MenuSpec::new().command("file.new", "New")).expect("build the menu");
+        assert!(
+            NativeAccelerator::build(&menu)
+                .expect("build the empty accelerator table")
+                .is_none()
+        );
+
+        let menu = NativeMenu::build(
+            &MenuSpec::new()
+                .item(
+                    MenuCommand::new("file.save", "Save")
+                        .bind_shortcut("Ctrl+S")
+                        .expect("bind save"),
+                )
+                .command("file.open", "Open")
+                .item(
+                    MenuCommand::new("view.refresh", "Refresh")
+                        .bind_shortcut("Alt+F5")
+                        .expect("bind refresh"),
+                ),
+        )
+        .expect("build the menu with shortcuts");
+        let accelerator = NativeAccelerator::build(&menu)
+            .expect("build the accelerator table")
+            .expect("two commands declare shortcuts");
+
+        use windows::Win32::UI::WindowsAndMessaging::CopyAcceleratorTableW;
+        let mut entries = [ACCEL::default(); 2];
+        // 安全：表由本测试构建；缓冲长度与表项数一致。
+        let copied = unsafe { CopyAcceleratorTableW(accelerator.handle(), Some(&mut entries)) };
+        assert_eq!(copied, 2);
+        assert_eq!(entries[0].key, u16::from(b'S'));
+        assert_eq!(entries[0].cmd, 1);
+        assert!(entries[0].fVirt.contains(FVIRTKEY | FCONTROL));
+        assert_eq!(entries[1].key, 0x74, "F5");
+        assert_eq!(entries[1].cmd, 3, "the unshortcuted command keeps its id");
+        assert!(entries[1].fVirt.contains(FVIRTKEY | FALT));
+    }
+
+    #[test]
+    fn a_dropped_accelerator_table_is_destroyed() {
+        use windows::Win32::UI::WindowsAndMessaging::CopyAcceleratorTableW;
+
+        let menu = NativeMenu::build(
+            &MenuSpec::new().item(
+                MenuCommand::new("file.save", "Save")
+                    .bind_shortcut("Ctrl+S")
+                    .expect("bind save"),
+            ),
+        )
+        .expect("build the menu");
+        let accelerator = NativeAccelerator::build(&menu)
+            .expect("build the accelerator table")
+            .expect("one declared shortcut");
+        let handle = accelerator.handle();
+        // 安全：句柄由本测试创建；只查询表项数。
+        assert_eq!(unsafe { CopyAcceleratorTableW(handle, None) }, 1);
+        drop(accelerator);
+        // 安全：句柄已被本测试的结构注销；API 用返回值报告不可用，不解引用。
+        let after = unsafe { CopyAcceleratorTableW(handle, None) };
+        assert_ne!(after, 1, "the destroyed table exposes no entries");
+    }
 
     #[test]
     fn an_unassigned_menu_is_destroyed_on_drop() {

@@ -34,7 +34,7 @@
 `zenui-windows` 的 140 个库测试包含：
 
 - `hidden_window_reports_the_declared_menu_bar`：`GetMenu` 非空；三级标签、分隔线、命令 id 1/2/3、`MF_GRAYED` 与 `MF_CHECKED` 默认状态来自声明。
-- `menu_commands_dispatch_once_and_reject_non_menu_messages`：`HIWORD=0` 的命令恰好运行一次；`lParam!=0`、`HIWORD=1`、未知 id 与分隔线 id 0 都不派发。
+- `menu_commands_dispatch_once_and_reject_non_menu_messages`：`HIWORD=0` 的命令恰好运行一次；`lParam!=0`、未知 id 与分隔线 id 0 都不派发。`HIWORD=1` 的快捷键形式由 [快捷键验收](stage-three-快捷键-验收.md) 覆盖。
 - `menu_commands_are_ignored_while_hidden_or_closing`：隐藏窗口与等待关闭确认的父窗口不运行命令。
 - `entering_the_menu_loop_cancels_composition_and_pointer_transients`：`WM_ENTERMENULOOP` 取消 IME 组合，清除 pointer/hover/pressed/thumb 拖动与 leave 跟踪，并释放延迟的捕获。
 - `menu_bar_keeps_the_logical_client_size_at_96_and_144_dpi`：`resize` 在运行机实际 DPI 下保持精确逻辑客户区；`WM_GETDPISCALEDSIZE` 在 96/144 下返回含菜单栏的外框，且高于无菜单外框。
@@ -72,7 +72,7 @@
 | #193：`WM_COMMAND`（`HIWORD=0`）恰好派发一次；`lParam!=0` 与未知 id 不派发 | 通过 | `menu_commands_dispatch_once_and_reject_non_menu_messages` |
 | #193：过期、隐藏与待决关闭窗口不运行 | 通过 | `menu_commands_are_ignored_while_hidden_or_closing`；运行时的 stale 测试 |
 | #193：`WM_ENTERMENULOOP` 取消 IME 组合与指针瞬态 | 通过 | `entering_the_menu_loop_cancels_composition_and_pointer_transients` |
-| #193：`HMENU` 句柄随窗口释放；本工单未创建 `HACCEL` | 通过 | `menu_handle_dies_with_the_window`；`reopening_rebuilds_the_menu_and_reregisters_state` |
+| #193：`HMENU` 句柄随窗口释放；本工单未创建 `HACCEL`（#195 已接入） | 通过 | `menu_handle_dies_with_the_window`；`reopening_rebuilds_the_menu_and_reregisters_state` |
 | #194：enabled/checked 跟随共享状态，并在两种 init 消息上重新查询 | 通过 | `menu_init_messages_reapply_committed_state`；六组可见图 |
 | #194：状态在两次弹出菜单之间改变可被观察 | 通过 | 同上测试；View 勾选与 File 禁用图 |
 | #194：回调写 Signal/Store 得到 typed error 且状态不变 | 通过 | `menu_state_reads_committed_state_and_rejects_writes`；`menu_state_errors_leave_the_menu_unchanged` |
@@ -86,7 +86,7 @@
 - **采集：** 完整窗口图来自 `PrintWindow(PW_RENDERFULLCONTENT)`；它不绘制外框的缩放宽边，图片右/下的黑色条是采集产物。打开中的弹出菜单由图外的 DPI-aware 屏幕读取获得，图片左/下的黑色条是窗口不可见缩放宽边的采集产物；两者都不证明 DWM 合成时序或被其它窗口遮挡时的表现。
 - **菜单状态时机：** 状态只在菜单即将打开时查询并写入原生项；菜单保持打开时不会轮询共享状态。Windows 菜单是模态循环，这一时机与系统行为一致，本页不声明打开中的实时刷新。
 - **失败处理：** 状态回调的 Signal 写、Store 事务或 panic 在宿主中升级为 `HostError::MenuState`；返回错误时该次菜单初始化保持原状。运行时 API 本身只返回 typed error，调用方可以自行决定是否继续。
-- **尚未交付：** 快捷键表与 `HACCEL`（#195）、上下文菜单（#196）、应用级命令（#197）、托盘（#198）不在本工单。本工单没有创建 `HACCEL`，`HIWORD=1` 的命令路径仍不派发。
+- **后续交付：** 快捷键表与 `HACCEL` 已由 #195 接入，`HIWORD=1` 的快捷键路径与快捷键验收见 [stage-three 快捷键验收](stage-three-快捷键-验收.md)；上下文菜单（#196）、应用级命令（#197）与托盘（#198）仍不在本工单。
 - **菜单结构：** 可见示例与隐藏测试覆盖一层子菜单；`NativeMenu` 的命令映射支持更深层，但多层弹出菜单的系统消息顺序没有可见证据。
 - **菜单栏高度：** 尺寸计算使用 `AdjustWindowRectExForDpi` 的单行菜单栏高度；标签换行成多行菜单栏时系统实际高度可能更大，本页不覆盖该情形。
 - **系统菜单：** `WM_INITMENUPOPUP` 的高字标记系统菜单时宿主跳过状态应用；应用声明中不存在系统菜单项。
