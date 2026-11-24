@@ -16,9 +16,10 @@ Windows 11 溢出面板:
   （150-initial.png）。
 - 点击 Hide to tray：窗口隐藏，activation 保留；展开 overflow 后左键点击图标，
   窗口恢复且状态仍为 Hidden to the tray（150-hidden-restored.png）。
-- 原生最小化窗口后左键点击托盘图标：宿主先 ShowWindow(SW_RESTORE) 再聚焦，
-  IsIconic 从 True 变为 False，窗口恢复为 Window visible
-  （150-minimized-restored.png）。原生最小化按钮本身不会自动隐藏到托盘。
+- 用 ShowWindow(SW_MINIMIZE) 最小化窗口后，展开 overflow 并左键点击托盘图标：
+  宿主先 ShowWindow(SW_RESTORE) 再聚焦，IsIconic 从 True 变为 False，窗口恢复
+  为 Window visible（150-minimized-restored.png）。原生最小化按钮本身不会自动
+  隐藏到托盘。
 - 点击 Close to tray：唯一窗口关闭，进程与托盘继续运行；Shell_NotifyIconGetRect
   仍返回图标矩形，overflow 中图标仍在（150-resident-closed.png）。
 - 零窗口时左键点击图标：runtime 重新运行 primary 的 factory，窗口重新出现，
@@ -51,9 +52,10 @@ Windows 11 溢出面板:
   原生窗口”，修复后左键恢复通过。
 
 隐藏测试:
-- 6 个 session 集成测试：默认策略与声明边界、命令处理器显式退出并关闭多窗口、
+- 9 个 session 集成测试：默认策略与声明边界、命令处理器显式退出并关闭多窗口、
   会话 show 重开最后窗口、隐藏窗口 show 保留 activation、未知 key、退出释放
-  待决关闭确认且只运行一次关闭处理器。
+  待决关闭确认且只运行一次关闭处理器、quit 关闭 stage-one 窗口并拒绝之后的
+  open_window、同批 Quit 之后的 show 被丢弃、直接 quit 丢弃待决窗口请求。
 - 4 个宿主测试：常驻会话最后关闭保留图标且左键重开、菜单 show 在零窗口重开、
   菜单 Quit 结束会话并只移除一次图标、无托盘的常驻宿主被拒绝。
 - 既有 close confirmation、多窗口、托盘与 worker 测试保持不变并通过。
