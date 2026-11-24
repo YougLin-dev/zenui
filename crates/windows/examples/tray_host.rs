@@ -1,20 +1,27 @@
-//! 可见的托盘示例：左键恢复隐藏窗口，右键菜单运行应用级命令。
+//! 可见的常驻托盘示例：隐藏或关闭最后一个窗口后会话继续，托盘恢复窗口，
+//! 菜单里的 Quit 显式结束会话。
 //!
-//! `Close` 结束唯一窗口后托盘图标随最后一个窗口移除；托盘独存与最小化到
-//! 托盘属于后续会话工单。
+//! 关闭按钮只释放 activation；tray 的 Show window 或左键点击重新运行 factory。
+//! 托盘图标在会话结束后移除。
 
 #[cfg(windows)]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     use zenui::prelude::*;
 
     let mut runtime = Runtime::new();
+    runtime.declare_session(SessionPolicy::StayResident)?;
+    let session = runtime.session();
     let (status, detail) = runtime.setup(|| {
         (
             signal(String::from("Window visible")),
-            signal(String::from("Hide the window, then click the tray icon")),
+            signal(String::from("Hide or close the window, then use the tray")),
         )
     })?;
 
+    runtime.on_app_command("tray.show", move |_| {
+        status.set(String::from("Restored from the tray"));
+        session.request_show("main").expect("queue the show");
+    })?;
     runtime.on_app_command("tray.reset", move |_| {
         status.set(String::from("Reset from the tray menu"))
     })?;
@@ -25,19 +32,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         status.set(String::from("Hidden to the tray"));
         window.request_hide().expect("queue the hide request");
     })?;
-    runtime.on_app_command("tray.close", |event| {
-        if let Some(window) = event.window() {
-            window.request_close().expect("queue the close request");
-        }
+    runtime.on_app_command("tray.close", move |event| {
+        let Some(window) = event.window() else {
+            return;
+        };
+        status.set(String::from("Closed to the tray"));
+        window.request_close().expect("queue the close request");
+    })?;
+    runtime.on_app_command("tray.quit", move |_| {
+        session.request_quit().expect("queue the quit");
     })?;
 
     runtime.declare_tray(
         TraySpec::new("ZenUI Tray").with_menu(
             MenuSpec::new()
+                .command("tray.show", "Show window")
                 .command("tray.reset", "Reset status")
                 .separator()
                 .command("tray.hide", "Hide window")
-                .command("tray.close", "Close"),
+                .command("tray.close", "Close window")
+                .separator()
+                .command("tray.quit", "Quit"),
         ),
     )?;
 
@@ -60,6 +75,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 hide.request_hide().expect("queue the hide request");
                             }}
                         >"Hide to tray"</button>
+                        <button
+                            aria:label="Close to tray"
+                            on:click={move || {
+                                status.set(String::from("Closed to the tray"));
+                                window.request_close().expect("queue the close request");
+                            }}
+                        >"Close to tray"</button>
                     </view>
                 }
             },

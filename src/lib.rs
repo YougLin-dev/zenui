@@ -13,6 +13,7 @@ pub mod file_dialog;
 pub mod menu;
 pub mod presentation;
 pub mod runtime;
+pub mod session;
 pub mod signal;
 pub mod store;
 pub mod task;
@@ -37,6 +38,7 @@ pub use presentation::{
     TextEditState,
 };
 pub use runtime::{FocusInfo, Runtime};
+pub use session::{SessionCtx, SessionError, SessionPolicy};
 pub use signal::{Memo, Once, Signal, memo, once, signal};
 pub use store::{Field, FieldError, Store, TodoId, Transaction, WriteError, WriteOp};
 pub use task::{DeliveryReport, Task, TaskError, TaskScope, TaskStatus, TaskToken};
@@ -66,12 +68,13 @@ pub mod prelude {
         Key, KeyEvent, Length, LengthUnit, Memo, MenuCommand, MenuCommandState, MenuItem,
         MenuShortcut, MenuSpec, MenuStateError, MountError, MountPlan, MountResult, NodeId,
         NodeOperation, NodeStatus, Once, Opacity, PresentationSnapshot, Property, Runtime,
-        ShortcutError, ShortcutKey, Signal, SnapshotAction, SnapshotActions, SnapshotAttr,
-        SnapshotElement, SnapshotNode, SnapshotRowBand, SnapshotSemantics, SnapshotValue, Store,
-        StyleDeclaration, StyleOrigin, StyleValue, Submenu, SubmitEvent, Task, TaskError,
-        TaskScope, TaskStatus, TaskToken, TextEditState, TodoId, Transaction, TrayError, TraySpec,
-        WindowCatalog, WindowCtx, WindowError, WindowInfo, WindowRole, WindowSpec, WriteError,
-        WriteOp, component, em, memo, once, px, signal, view,
+        SessionCtx, SessionError, SessionPolicy, ShortcutError, ShortcutKey, Signal,
+        SnapshotAction, SnapshotActions, SnapshotAttr, SnapshotElement, SnapshotNode,
+        SnapshotRowBand, SnapshotSemantics, SnapshotValue, Store, StyleDeclaration, StyleOrigin,
+        StyleValue, Submenu, SubmitEvent, Task, TaskError, TaskScope, TaskStatus, TaskToken,
+        TextEditState, TodoId, Transaction, TrayError, TraySpec, WindowCatalog, WindowCtx,
+        WindowError, WindowInfo, WindowRole, WindowSpec, WriteError, WriteOp, component, em, memo,
+        once, px, signal, view,
     };
     pub use zenui_core::Filter;
 }

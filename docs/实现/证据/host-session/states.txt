@@ -1,0 +1,66 @@
+# #199 应用会话与显式退出可见证据
+日期: 2026-11-24
+示例: crates/windows/examples/tray_host.rs (ZenUI Tray)，debug 构建
+环境: 单屏 2560×1600，150% 缩放（144 DPI）
+窗口: 标题 ZenUI Tray，外框 862×566 物理像素，客户区 840×480
+会话策略: SessionPolicy::StayResident；托盘菜单 Show window / Reset status /
+Hide window / Close window / Quit
+
+Windows 11 溢出面板:
+- 图标仍在溢出面板；收起时 Shell_NotifyIconGetRect 返回溢出按钮矩形
+  (2031,1528)-(2079,1600)，展开后返回 (1906,1383)-(1966,1443)。
+- 未修改系统“始终显示”设置。
+
+操作读数（150%）:
+- 初始：状态文本 Window visible；两个按钮 Hide to tray、Close to tray
+  （150-initial.png）。
+- 点击 Hide to tray：窗口隐藏，activation 保留；展开 overflow 后左键点击图标，
+  窗口恢复且状态仍为 Hidden to the tray（150-hidden-restored.png）。
+- 用 ShowWindow(SW_MINIMIZE) 最小化窗口后，展开 overflow 并左键点击托盘图标：
+  宿主先 ShowWindow(SW_RESTORE) 再聚焦，IsIconic 从 True 变为 False，窗口恢复
+  为 Window visible（150-minimized-restored.png）。原生最小化按钮本身不会自动
+  隐藏到托盘。
+- 点击 Close to tray：唯一窗口关闭，进程与托盘继续运行；Shell_NotifyIconGetRect
+  仍返回图标矩形，overflow 中图标仍在（150-resident-closed.png）。
+- 零窗口时左键点击图标：runtime 重新运行 primary 的 factory，窗口重新出现，
+  状态仍为 Closed to the tray（150-click-reopened.png）；会话未结束。
+- 零窗口时右键图标：菜单显示 Show window / Reset status / Hide window /
+  Close window / Quit（150-menu.png）。
+- 选择 Show window：通过 SessionCtx::request_show("main") 重新打开窗口，
+  状态文本变为 Restored from the tray（150-menu-show.png）。
+- 再关闭窗口并从菜单选择 Quit：进程退出，Shell_NotifyIconGetRect 返回
+  0x80004005，overflow 中不再有该图标（150-quit.png）。
+
+实现读数:
+- 默认策略 QuitOnLastClose 保持之前的最后窗口退出时机，但现在由会话状态驱动；
+  StayResident 零窗口时宿主继续消息循环，托盘图标保留。
+- 原生宿主拒绝没有托盘的 StayResident；零窗口时 worker 唤醒改投托盘 HWND。
+- 左键恢复目标：可见焦点窗口、primary、任一存活窗口；零窗口的常驻会话回退
+  primary 并重新运行 factory。托盘菜单的 Show window 使用会话级 show，不依赖
+  目标 activation。激活原生最小化的窗口时先 ShowWindow(SW_RESTORE) 再聚焦；
+  原生最小化按钮本身不会自动隐藏到托盘，进入托盘由应用 hide/close 请求驱动。
+- 显式退出关闭全部 activation、释放待决 close epoch 与确认窗口，不运行新的
+  关闭处理器；之后的 show 返回 WindowError::State。
+- 窗口请求先结算，会话动作后结算。直接调用 Runtime::quit 时丢弃同一 turn
+  尚未结算的窗口请求；排队的 request_quit 在窗口请求之后结算，批次中排在
+  Quit 之后的会话动作随会话结束丢弃。
+- Runtime::quit 关闭激活表中的全部窗口，包括 stage-one open_window；退出后
+  的 show 与 open_window 都返回 WindowError::State。
+- shell 可能用 SendMessage 投递托盘回调，外层消息循环收不到可结算的消息。
+  宿主在每次托盘回调后向托盘 HWND 投递 WM_NULL，保证零窗口恢复后的 HWND
+  同步与首次呈现发生；该问题在可见运行中曾表现为“runtime 已打开窗口但没有
+  原生窗口”，修复后左键恢复通过。
+
+隐藏测试:
+- 9 个 session 集成测试：默认策略与声明边界、命令处理器显式退出并关闭多窗口、
+  会话 show 重开最后窗口、隐藏窗口 show 保留 activation、未知 key、退出释放
+  待决关闭确认且只运行一次关闭处理器、quit 关闭 stage-one 窗口并拒绝之后的
+  open_window、同批 Quit 之后的 show 被丢弃、直接 quit 丢弃待决窗口请求。
+- 4 个宿主测试：常驻会话最后关闭保留图标且左键重开、菜单 show 在零窗口重开、
+  菜单 Quit 结束会话并只移除一次图标、无托盘的常驻宿主被拒绝。
+- 既有 close confirmation、多窗口、托盘与 worker 测试保持不变并通过。
+
+说明:
+- 本页只运行 150%；100%、混合 DPI、多显示器和平台 session end 不在证据范围。
+- 窗口图来自 PrintWindow(PW_RENDERFULLCONTENT)；托盘/菜单图来自 DPI-aware
+  屏幕裁剪。菜单截图前最小化其它窗口，背景只有桌面壁纸。

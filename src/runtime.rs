@@ -18,6 +18,7 @@ use crate::presentation::{
     SnapshotAttr, SnapshotElement, SnapshotNode, SnapshotRowBand, SnapshotSemantics, SnapshotValue,
     TextEditState,
 };
+use crate::session::{SessionAction, SessionCtx, SessionError, SessionPolicy};
 use crate::signal::{Memo, MemoCell, SignalCell};
 use crate::store::{TodoId, WriteError};
 use crate::task::{TaskRecord, WakeCallback};
@@ -77,6 +78,18 @@ struct RowWindow {
 /// 没有宿主窗口时的默认挂载行数；ADR-0011 要求它远大于常见视口行数。
 const DEFAULT_WINDOW_ROWS: usize = 32;
 
+/// 一个 Runtime 的应用会话状态。
+#[derive(Default)]
+struct SessionState {
+    /// 未声明时使用 `QuitOnLastClose`。
+    policy: SessionPolicy,
+    declared: bool,
+    /// 显式退出已开始；之后的窗口打开与会话动作被拒绝。
+    quitting: bool,
+    /// UI 处理期排队、在窗口请求之后结算的会话动作。
+    requests: Vec<SessionAction>,
+}
+
 pub(crate) struct State {
     pub(crate) id: u32,
     pub(crate) read_only: u32,
@@ -114,6 +127,8 @@ pub(crate) struct State {
     app_command_handlers: BTreeMap<&'static str, CommandHandler>,
     /// 应用级托盘声明；由宿主在启动时读取。
     tray: Option<TraySpec>,
+    /// 应用会话的最后窗口策略与显式退出状态。
+    session: SessionState,
     /// 每个 activation 的只读菜单状态回调，随窗口关闭释放。
     menu_state_handlers: BTreeMap<&'static str, MenuStateHandler>,
     /// 按父窗口键索引的待决关闭 epoch；存在即表示父窗口输入被挂起。
@@ -229,6 +244,7 @@ impl State {
             command_handlers: BTreeMap::new(),
             app_command_handlers: BTreeMap::new(),
             tray: None,
+            session: SessionState::default(),
             menu_state_handlers: BTreeMap::new(),
             close_epochs: BTreeMap::new(),
             close_replies: Vec::new(),
@@ -621,6 +637,28 @@ impl State {
             return Err(WindowError::UnknownWindow(key));
         }
         self.window_requests.push(request);
+        Ok(())
+    }
+
+    /// 会话动作与窗口请求共用 Event/Delivery 阶段门，但只按目录键打开窗口。
+    pub(crate) fn queue_session_request(
+        &mut self,
+        action: SessionAction,
+    ) -> Result<(), SessionError> {
+        if !matches!(self.phase, Phase::Event | Phase::Delivery) {
+            return Err(SessionError::State(
+                "session requests are only available during event or delivery handlers",
+            ));
+        }
+        if self.session.quitting {
+            return Err(SessionError::Ended);
+        }
+        if let SessionAction::Show(key) = action
+            && !self.catalog.contains_key(key)
+        {
+            return Err(SessionError::UnknownWindow(key));
+        }
+        self.session.requests.push(action);
         Ok(())
     }
 
@@ -1856,7 +1894,11 @@ impl Runtime {
     /// factory 失败仍消耗这一代 activation；下一次成功打开使用新一代。
     /// 挂载或首帧刷新失败会释放新窗口并让它保持关闭。
     /// primary 窗口由 Host 首次显示；headless 调用方按目录键选择。
+    /// 显式退出之后返回 [`WindowError::State`]，不再打开窗口。
     pub fn show(&mut self, key: &'static str) -> Result<WindowCtx, WindowError> {
+        if self.state.borrow().session.quitting {
+            return Err(WindowError::State("the application session has ended"));
+        }
         let factory = {
             let state = self.state.borrow();
             let entry = state
@@ -1928,6 +1970,9 @@ impl Runtime {
     ) -> Result<WindowCtx, WindowError> {
         {
             let state = self.state.borrow();
+            if state.session.quitting {
+                return Err(WindowError::State("the application session has ended"));
+            }
             if state.catalog_declared {
                 return Err(WindowError::State(
                     "open_window cannot be used after a catalog is declared",
@@ -2162,6 +2207,42 @@ impl Runtime {
             .first_missing_handler(|id| state.app_command_handler(id).is_some())
     }
 
+    /// 声明最后一个窗口关闭后的会话策略；每个 Runtime 一次。
+    ///
+    /// 必须在首个窗口打开或根树挂载之前调用。未声明时使用
+    /// [`SessionPolicy::QuitOnLastClose`]；`StayResident` 的原生宿主要求同时
+    /// 声明托盘，否则 `zenui-windows` 的 `Host::open` 拒绝启动。
+    pub fn declare_session(&mut self, policy: SessionPolicy) -> Result<(), SessionError> {
+        let mut state = self.state.borrow_mut();
+        if state.session.declared {
+            return Err(SessionError::AlreadyDeclared);
+        }
+        if state.runtime_started() {
+            return Err(SessionError::RegistrationClosed);
+        }
+        state.session.policy = policy;
+        state.session.declared = true;
+        Ok(())
+    }
+
+    /// 当前应用会话策略；未声明时为 [`SessionPolicy::QuitOnLastClose`]。
+    pub fn session_policy(&self) -> SessionPolicy {
+        self.state.borrow().session.policy
+    }
+
+    /// 应用会话的 Copy handle；可在命令处理器中捕获并排队 show/quit。
+    pub fn session(&self) -> SessionCtx {
+        SessionCtx::new(self.state.borrow().id)
+    }
+
+    /// 应用会话是否仍在运行；显式退出后为 `false`。
+    ///
+    /// 关闭最后一个窗口是否结束宿主会话由 [`Runtime::session_policy`] 决定；
+    /// Runtime 本身仍可由嵌入方重新打开窗口，除非已经显式退出。
+    pub fn session_alive(&self) -> bool {
+        !self.state.borrow().session.quitting
+    }
+
     /// 通过窗口的静态菜单派发一个命令。
     ///
     /// 菜单栏、快捷键、上下文菜单与辅助技术共用这条路径。处理器在
@@ -2331,6 +2412,92 @@ impl Runtime {
             Some(error) => Err(error),
             None => Ok(applied),
         }
+    }
+
+    /// 结算 UI 处理器排队的会话动作，返回已应用的数量。
+    ///
+    /// 原生宿主在窗口请求之后调用；headless 驱动在同一 turn 的
+    /// [`Runtime::apply_window_requests`] 之后调用。`Show` 按目录键重新打开
+    /// 已关闭窗口；`Quit` 关闭全部 activation 并拒绝之后的窗口打开，排在同
+    /// 一批次 `Quit` 之后的动作随之丢弃。显式退出不运行逐窗口的关闭确认。
+    ///
+    /// `Quit` 之前的动作按排队顺序应用；单个动作失败时继续应用后续动作，
+    /// 再返回第一个错误。
+    pub fn apply_session_requests(&mut self) -> Result<usize, SessionError> {
+        let requests = std::mem::take(&mut self.state.borrow_mut().session.requests);
+        let mut applied = 0;
+        let mut first_error = None;
+        for action in requests {
+            if !self.session_alive() {
+                // quit 已在应用过程中结束会话；同一批次的后续动作不再有目标。
+                break;
+            }
+            match action {
+                SessionAction::Show(key) => {
+                    if let Err(error) = self.show(key) {
+                        first_error.get_or_insert(SessionError::Window(error));
+                    } else {
+                        applied += 1;
+                    }
+                }
+                SessionAction::Quit => {
+                    match self.quit() {
+                        Ok(()) => applied += 1,
+                        Err(error) => {
+                            first_error.get_or_insert(error);
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(applied),
+        }
+    }
+
+    /// 显式结束应用会话：关闭全部窗口并拒绝之后的窗口打开。
+    ///
+    /// 这是不可撤销的会话动作；应用需要确认时应在调用前完成。待决关闭 epoch
+    /// 与关闭确认窗口随所属窗口一起释放，不调用新的关闭处理器。窗口请求与
+    /// 尚未结算的会话动作被丢弃，模型与外观保留在 Runtime 中。
+    pub fn quit(&mut self) -> Result<(), SessionError> {
+        let state = self.state.clone();
+        context::install(&state, || {
+            if with_state(|state| state.session.quitting) {
+                return Ok(());
+            }
+            with_state(|state| state.session.quitting = true);
+            {
+                let mut state = self.state.borrow_mut();
+                state.window_requests.clear();
+                state.session.requests.clear();
+            }
+            // 目录窗口与 stage-one 的 open_window 都登记在同一个激活表里；
+            // quit 不能只关闭目录条目，否则未声明的 activation 会在退出后保留。
+            let contexts: Vec<WindowCtx> = {
+                let state = self.state.borrow();
+                state
+                    .windows
+                    .keys()
+                    .filter_map(|key| state.window_ctx(key))
+                    .collect()
+            };
+            let mut first_error = None;
+            for window in contexts {
+                match self.close_window(window) {
+                    Ok(()) | Err(WindowError::Stale) => {}
+                    Err(error) => {
+                        first_error.get_or_insert(SessionError::Window(error));
+                    }
+                }
+            }
+            match first_error {
+                Some(error) => Err(error),
+                None => Ok(()),
+            }
+        })
     }
 
     fn apply_close_reply(&mut self, reply: CloseReplyRequest) -> Result<(), WindowError> {
