@@ -3,7 +3,7 @@ use std::fmt;
 use std::marker::PhantomData;
 use std::rc::Rc;
 
-use crate::menu::{CommandError, CommandEvent, MenuSpec};
+use crate::menu::{CommandError, CommandEvent, MenuCommand, MenuCommandState, MenuSpec};
 use crate::presentation::Appearance;
 use crate::task::TaskScope;
 use crate::view::{MountError, MountPlan, MountResult};
@@ -124,6 +124,21 @@ impl WindowCtx {
     ) -> Result<(), WindowError> {
         crate::context::with_state_of(self.runtime, |state| {
             state.register_command_handler(self, id, Rc::new(handler))
+        })
+    }
+
+    /// 在窗口 factory 中注册只读菜单状态回调；每个 activation 只能注册一次。
+    ///
+    /// 宿主在菜单打开前按命令调用它，用返回值设置 enabled/checked。回调运行在
+    /// 只读作用域：Signal 写与 Store 事务被拒绝并返回 typed error，模型不变。
+    /// 没有注册回调时宿主使用命令声明的默认状态。关闭窗口释放回调，重新打开
+    /// 必须在新的 factory 中重新注册。
+    pub fn on_menu_state(
+        self,
+        handler: impl Fn(&MenuCommand) -> MenuCommandState + 'static,
+    ) -> Result<(), WindowError> {
+        crate::context::with_state_of(self.runtime, |state| {
+            state.register_menu_state_handler(self, Rc::new(handler))
         })
     }
 

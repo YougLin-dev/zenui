@@ -15,7 +15,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     MF_SEPARATOR, MF_STRING,
 };
 use windows::core::{HSTRING, PCWSTR};
-use zenui::{MenuItem, MenuSpec, Submenu};
+use zenui::{MenuCommand, MenuItem, MenuSpec, Submenu};
 
 /// 构建窗口菜单时保留的 Win32 失败。
 #[derive(Debug)]
@@ -37,7 +37,7 @@ impl Error for MenuError {}
 pub(crate) struct NativeMenu {
     handle: HMENU,
     owns_handle: bool,
-    commands: Vec<&'static str>,
+    commands: Vec<MenuCommand>,
 }
 
 impl NativeMenu {
@@ -70,8 +70,8 @@ impl NativeMenu {
     }
 
     /// 命令 id 对应的稳定声明 id；0、分隔线位置与悬空 id 返回 `None`。
-    pub(crate) fn command(&self, id: u16) -> Option<&'static str> {
-        self.commands.get(usize::from(id).checked_sub(1)?).copied()
+    pub(crate) fn command(&self, id: u16) -> Option<&MenuCommand> {
+        self.commands.get(usize::from(id).checked_sub(1)?)
     }
 }
 
@@ -94,7 +94,7 @@ fn menu_error(error: windows::core::Error) -> MenuError {
 fn append_items(
     menu: HMENU,
     items: &[MenuItem],
-    commands: &mut Vec<&'static str>,
+    commands: &mut Vec<MenuCommand>,
 ) -> Result<(), MenuError> {
     for item in items {
         match item {
@@ -118,7 +118,7 @@ fn append_items(
                 let label = HSTRING::from(command.label());
                 // 安全：label 在调用期间有效，命令 id 落在 u16 范围。
                 unsafe { AppendMenuW(menu, flags, usize::from(id), &label) }.map_err(menu_error)?;
-                commands.push(command.id());
+                commands.push(command.clone());
             }
             MenuItem::Separator => {
                 // 安全：分隔线不读取 `lpNewItem`。
@@ -134,7 +134,7 @@ fn append_items(
 fn append_submenu(
     menu: HMENU,
     submenu: &Submenu,
-    commands: &mut Vec<&'static str>,
+    commands: &mut Vec<MenuCommand>,
 ) -> Result<(), MenuError> {
     // 安全：弹出菜单由本函数创建；挂接前失败时显式销毁，挂接后归父菜单所有。
     unsafe {
