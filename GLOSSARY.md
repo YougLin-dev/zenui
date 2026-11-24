@@ -185,7 +185,7 @@ _Avoid_: node menu, right-click handler, popup window state
 _Avoid_: global command, background command
 
 **Tray icon**:
-应用级托盘声明 `TraySpec`：一个 tooltip 与一份右键 `MenuSpec`，在首个窗口打开或根树挂载前通过 `Runtime::declare_tray` 注册，全部菜单命令必须有应用级处理器。宿主用一个从不显示的顶层托盘 HWND 接住自己的回调消息与 Explorer 的 `TaskbarCreated` 广播；左键或键盘激活恢复可见焦点窗口，没有可见焦点时恢复 primary，primary 不在时选择任一存活窗口；右键在宿主借用之外展示菜单并以 `CommandSource::Tray` 派发恰好一次。默认会话策略下图标随最后一个窗口关闭移除；`StayResident` 会话保留图标并可在零窗口时恢复 primary。`TaskbarCreated` 后重新添加。第一切片使用共享系统图标，不承诺自定义图标资产；托盘独存与最小化到托盘由应用会话策略决定，不是隐式默认。
+应用级托盘声明 `TraySpec`：一个 tooltip 与一份右键 `MenuSpec`，在首个窗口打开或根树挂载前通过 `Runtime::declare_tray` 注册，全部菜单命令必须有应用级处理器。宿主用一个从不显示的顶层托盘 HWND 接住自己的回调消息与 Explorer 的 `TaskbarCreated` 广播；左键或键盘激活恢复可见焦点窗口，没有可见焦点时恢复 primary，primary 不在时选择任一存活窗口；右键在宿主借用之外展示菜单并以 `CommandSource::Tray` 派发恰好一次。默认会话策略下图标随最后一个窗口关闭移除；`StayResident` 会话保留图标并可在零窗口时恢复 primary。`TaskbarCreated` 后重新添加。第一切片使用共享系统图标，不承诺自定义图标资产；零窗口的托盘独存由应用会话策略显式决定，不是隐式默认，隐藏到托盘由应用的 hide 请求进入。
 _Avoid_: notification area widget, tray window, background app icon
 
 **Tray presenter**:

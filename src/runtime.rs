@@ -651,7 +651,7 @@ impl State {
             ));
         }
         if self.session.quitting {
-            return Err(SessionError::Quit);
+            return Err(SessionError::Ended);
         }
         if let SessionAction::Show(key) = action
             && !self.catalog.contains_key(key)
