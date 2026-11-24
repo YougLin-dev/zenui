@@ -1,6 +1,6 @@
 # Stage-three 应用会话与显式退出验收（实机）
 
-本页记录 #199：应用在运行时启动前声明最后一个窗口关闭后的会话策略，通过 `SessionCtx` 排队窗口恢复与显式退出。默认策略保持“最后窗口关闭即结束宿主会话”，`StayResident` 明确允许零窗口会话继续运行并保留托盘。产品决策见 [ADR-0016](../adr/0016-application-session-and-quit.md)。
+本页记录 #199：应用在运行时启动前声明最后一个窗口关闭后的会话策略，通过 `SessionCtx` 排队窗口恢复与显式退出。默认策略保持“最后窗口关闭即结束宿主会话”，`StayResident` 明确允许零窗口会话继续运行并保留托盘。产品决策见 [ADR-0018](../adr/0018-application-session-and-quit.md)。
 
 **状态：可见自动驱动完成（Windows 11 单屏 150%）；隐藏会话测试只是部分证据，零窗口消息循环与托盘恢复以可见运行为准。**
 
@@ -58,7 +58,7 @@
 
 | #199 要求 | 状态 | 证据 |
 | --- | --- | --- |
-| 退出显式且确定；最后窗口关闭遵循文档化策略而不是隐式循环退出 | 通过 | `SessionPolicy` 默认 `QuitOnLastClose`；`Runtime::quit` / `SessionCtx::request_quit`；ADR-0016；根包与宿主测试 |
+| 退出显式且确定；最后窗口关闭遵循文档化策略而不是隐式循环退出 | 通过 | `SessionPolicy` 默认 `QuitOnLastClose`；`Runtime::quit` / `SessionCtx::request_quit`；ADR-0018；根包与宿主测试 |
 | 隐藏/最小化到托盘保留会话与图标，托盘恢复隐藏窗口 | 通过（隐藏路径） | 应用 hide 请求进入托盘；可见隐藏→左键恢复；原生最小化→托盘激活恢复（`IsIconic` True→False）；`a_resident_session_keeps_the_tray_and_click_reopens_the_last_window` |
 | 既有 close confirmation 与多窗口验收不变 | 通过 | 全部 796 个 workspace 测试；退出测试覆盖待决确认清理 |
 | 隐藏与可见证据遵循 ADR-0005；primary 不变量保留 | 通过 | 隐藏测试为部分证据，150% 可见运行；无托盘常驻宿主被拒绝 |
