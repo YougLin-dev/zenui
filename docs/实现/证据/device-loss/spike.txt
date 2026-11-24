@@ -1,0 +1,54 @@
+# 设备丢失 spike 原始读数（#210）
+
+日期: 2026-11-25
+环境: Windows 11 Pro 10.0.26300，单屏 2560×1600，150%（144 DPI），
+NVIDIA GeForce RTX 4060 Laptop GPU，驱动 32.0.15.7283，DX12，debug todo_host。
+方法: 临时在宿主打印 adapter、device-lost 回调、surface 状态、WM_PAINT 与
+present；脚本用 Win32 注入 Win+Ctrl+Shift+B 两次（轻按与按住 4 秒），并用
+Win+D 验证 Win 键注入；采样桌面像素；最后运行临时 Device::destroy 探针。
+临时探针与打印已删除，不进入提交。只尝试 Win+Ctrl+Shift+B；GPU 禁用/驱动
+重启/RDP 未尝试（当前会话无管理员权限，也没有第二个会话）。只覆盖单屏，
+不声明混合 DPI 或多显示器。
+结论: 未观察到真实设备丢失；没有回调、Lost、Validation 或重建，恢复未发生。
+合成 Device::destroy 在 poll 时回调 Destroyed，属于合成证据。
+----
+[2026-11-25 06:28:58.830] started pid=36936 exe=E:\code\mine\zenui\target\debug\examples\todo_host.exe
+[2026-11-25 06:29:01.176] hwnd=0x6C00F7E dpi=144 visible=True enabled=True
+[2026-11-25 06:29:01.424] before remaining=1 remaining notice=False error=False titles=[Write tests | Read docs]
+[2026-11-25 06:29:01.425] run A: tap Win+Ctrl+Shift+B
+[2026-11-25 06:29:02.795] run A brightness before=79 min=79 max=79 samples=79,79,79,79,79,79,79,79,79,79,79,79,79,79,79,79,79,79,79,79
+[2026-11-25 06:29:05.789] run A after alive=True visible=True enabled=True remaining=1 remaining notice=False error=False titles=[Write tests | Read docs]
+[2026-11-25 06:29:05.790] run B: hold Win+Ctrl+Shift+B for 4s
+[2026-11-25 06:29:10.195] run B brightness before=79 min=79 max=79 samples=79,79,79,79,79,79,79,79,79,79,79,79,79,79,79,79,79,79,79,79,79,79,79,79,79,79,79,79,79,79,79,79,79,79,79,79,79,79,79,79
+[2026-11-25 06:29:13.047] run B after alive=True visible=True enabled=True remaining=1 remaining notice=False error=False titles=[Write tests | Read docs]
+[2026-11-25 06:29:13.049] injection check: Win+D twice
+[2026-11-25 06:29:14.181] after first Win+D iconic=True
+[2026-11-25 06:29:15.000] after second Win+D iconic=False alive=True
+[2026-11-25 06:29:16.268] after Reverse clicked=True remaining=1 remaining notice=False error=False titles=[Read docs | Write tests]
+[2026-11-25 06:29:16.272] processExited=False
+[2026-11-25 06:29:17.342] --- app stderr log (E:\code\mine\zenui\target\device-loss-probe\final\app-20261125-062858.log) ---
+[probe] adapter name=NVIDIA GeForce RTX 4060 Laptop GPU backend=Dx12 device_type=DiscreteGpu driver=32.0.15.7283 driver_info= fallback=false
+[probe] present ok
+[probe] present ok
+[probe] present ok
+[probe] WM_PAINT
+[probe] present ok
+[probe] WM_PAINT
+[probe] present ok
+[probe] WM_PAINT
+[probe] present ok
+[probe] WM_PAINT
+[probe] present ok
+[probe] present ok
+[probe] present ok
+[probe] present ok
+[2026-11-25 06:29:17.367] --- app log end ---
+[2026-11-25 06:29:47.793] System Display/TDR events since 06:09:47: 0
+--- synthetic Device::destroy + poll(wait_indefinitely()) ---
+adapter name=NVIDIA GeForce RTX 4060 Laptop GPU backend=Vulkan type=DiscreteGpu driver=NVIDIA driver_info=572.83
+before destroy
+after destroy
+callback reason=Destroyed message=
+after poll
+after drop device
+exit
