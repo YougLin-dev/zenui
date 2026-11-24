@@ -22,7 +22,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [blacksmith-4vcpu-ubuntu-2604, blacksmith-6vcpu-macos-15, blacksmith-4vcpu-windows-2025]
     env:
       CARGO_TERM_COLOR: always
       # 模板是独立 workspace，但 Windows leg 与根 workspace 共享 target，
@@ -78,7 +78,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [blacksmith-4vcpu-ubuntu-2604, blacksmith-6vcpu-macos-15, blacksmith-4vcpu-windows-2025]
         example:
           - examples/macro_poc
           - examples/native_poc
