@@ -897,7 +897,9 @@ impl Host {
     /// 左键或键盘激活托盘：恢复焦点窗口；全部隐藏时恢复 primary。
     ///
     /// 只在 runtime 的窗口目录里选择目标，不重新打开已经关闭的窗口。原生显示
-    /// 留给随后的同步阶段，避免在窗口过程里同步派发 `WM_SHOWWINDOW` 的重入。
+    /// 留给随后的同步阶段，避免在窗口过程里同步派发 `WM_SHOWWINDOW` 的重入；
+    /// 已最小化的目标窗口是例外，恢复图标状态需要在同步前完成，且只在可见
+    /// 宿主执行。
     fn restore_from_tray(&mut self) -> Result<(), HostError> {
         if !self.session_running() {
             return Ok(());
@@ -916,7 +918,9 @@ impl Host {
         self.runtime.show(key).map_err(HostError::Open)?;
         // runtime 的 show 对已打开窗口只更新焦点；用户最小化的原生窗口要先
         // 恢复图标状态，否则点击托盘只会让一个仍最小化的窗口“获得焦点”。
-        if let Some(window) = self.windows.get(key) {
+        if self.show_windows
+            && let Some(window) = self.windows.get(key)
+        {
             let hwnd = window.hwnd();
             self.without_routing(None, |_| unsafe {
                 if IsIconic(hwnd).as_bool() {
@@ -1186,10 +1190,6 @@ impl Host {
         }
         let hwnd = window.hwnd();
         self.without_routing(None, |_| unsafe {
-            // 托盘激活可能指向用户最小化的窗口；先恢复图标状态，再抢前台。
-            if IsIconic(hwnd).as_bool() {
-                let _ = ShowWindow(hwnd, SW_RESTORE);
-            }
             let _ = SetForegroundWindow(hwnd);
         });
         if previous == hwnd {
