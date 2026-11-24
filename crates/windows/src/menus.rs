@@ -51,19 +51,35 @@ impl NativeMenu {
     /// 按键声明构建顶级菜单；任何一步失败都销毁已创建的部分。
     pub(crate) fn build(spec: &MenuSpec) -> Result<Self, MenuError> {
         // 安全：句柄由本函数创建；失败路径不把未挂接的句柄留给调用方。
-        unsafe {
-            let handle = CreateMenu().map_err(menu_error)?;
-            let mut commands = Vec::new();
-            if let Err(error) = append_items(handle, spec.items(), &mut commands) {
+        let handle = unsafe { CreateMenu() }.map_err(menu_error)?;
+        Self::populate(handle, spec)
+    }
+
+    /// 按声明构建一个由 `TrackPopupMenuEx` 展示的弹出菜单。
+    ///
+    /// `CreateMenu` 的句柄是菜单栏；`TrackPopupMenuEx` 收到它时系统只建立菜单栏
+    /// 形态的窗口，不排版命令标签。弹出展示必须使用 `CreatePopupMenu`。
+    pub(crate) fn build_popup(spec: &MenuSpec) -> Result<Self, MenuError> {
+        // 安全：句柄由本函数创建；失败路径不把未挂接的句柄留给调用方。
+        let handle = unsafe { CreatePopupMenu() }.map_err(menu_error)?;
+        Self::populate(handle, spec)
+    }
+
+    /// 把声明项追加到刚创建的句柄；失败时注销尚未挂接的句柄。
+    fn populate(handle: HMENU, spec: &MenuSpec) -> Result<Self, MenuError> {
+        let mut commands = Vec::new();
+        if let Err(error) = append_items(handle, spec.items(), &mut commands) {
+            // 安全：句柄由调用方刚创建，尚未交给窗口或父菜单。
+            unsafe {
                 let _ = DestroyMenu(handle);
-                return Err(error);
             }
-            Ok(Self {
-                handle,
-                owns_handle: true,
-                commands,
-            })
+            return Err(error);
         }
+        Ok(Self {
+            handle,
+            owns_handle: true,
+            commands,
+        })
     }
 
     /// 交给 `CreateWindowExW` 的菜单句柄。
@@ -248,7 +264,7 @@ fn append_submenu(
 
 #[cfg(test)]
 mod tests {
-    use windows::Win32::UI::WindowsAndMessaging::IsMenu;
+    use windows::Win32::UI::WindowsAndMessaging::{GetMenuItemCount, IsMenu};
 
     use super::*;
 
@@ -316,6 +332,30 @@ mod tests {
         // 安全：句柄已被本测试的结构注销；API 用返回值报告不可用，不解引用。
         let after = unsafe { CopyAcceleratorTableW(handle, None) };
         assert_ne!(after, 1, "the destroyed table exposes no entries");
+    }
+
+    #[test]
+    fn a_popup_menu_keeps_declared_items_and_command_ids() {
+        let menu = NativeMenu::build_popup(
+            &MenuSpec::new()
+                .command("edit.copy", "Copy")
+                .separator()
+                .submenu("More", MenuSpec::new().command("edit.paste", "Paste")),
+        )
+        .expect("build the popup menu");
+
+        // 安全：句柄由本测试持有；只查询项数。
+        assert_eq!(
+            unsafe { GetMenuItemCount(Some(menu.handle())) },
+            3,
+            "commands, separators and submenus stay in the popup menu"
+        );
+        assert_eq!(menu.command(1).map(MenuCommand::id), Some("edit.copy"));
+        assert_eq!(menu.command(2).map(MenuCommand::id), Some("edit.paste"));
+        let handle = menu.handle();
+        drop(menu);
+        // 安全：句柄已被本测试的结构注销；API 只报告它不再是菜单。
+        assert!(!unsafe { IsMenu(handle) }.as_bool());
     }
 
     #[test]

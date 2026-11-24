@@ -526,6 +526,13 @@ impl MenuSpec {
         })
     }
 
+    /// 第一个声明了快捷键的命令 id；上下文菜单不接受快捷键。
+    pub(crate) fn first_shortcut_command(&self) -> Option<&'static str> {
+        find_command(&self.items, &mut |command| {
+            command.shortcut.map(|_| command.id)
+        })
+    }
+
     /// 第一个与其他命令重复的归一化快捷键；没有重复时为 `None`。
     pub(crate) fn first_duplicate_shortcut(&self) -> Option<(&'static str, MenuShortcut)> {
         let mut seen = BTreeSet::new();

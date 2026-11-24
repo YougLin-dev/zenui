@@ -1,4 +1,5 @@
-//! 可见的原生菜单栏与快捷键示例：命令修改共享状态，菜单再按状态显示勾选与禁用。
+//! 可见的原生菜单栏、快捷键与上下文菜单示例：命令修改共享状态，菜单再按状态
+//! 显示勾选与禁用；窗口级上下文菜单与菜单栏共享命令处理器。
 
 #[cfg(windows)]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -49,6 +50,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     })
                     .expect("the declared file.close registers");
                 window
+                    .on_command("edit.copy", move |_| {
+                        status.set(String::from("Copied"));
+                    })
+                    .expect("the declared edit.copy registers");
+                window
+                    .on_command("edit.paste", move |_| {
+                        status.set(String::from("Pasted"));
+                    })
+                    .expect("the declared edit.paste registers");
+                window
+                    .on_command("edit.clear", move |_| {
+                        draft.set(String::new());
+                        status.set(String::from("Note cleared"));
+                    })
+                    .expect("the declared edit.clear registers");
+                window
                     .on_menu_state(move |command| match command.id() {
                         "view.status" => MenuCommandState::new(true, shown.get()),
                         "file.clear" => MenuCommandState::new(has_content.get(), false),
@@ -82,6 +99,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "View",
                     MenuSpec::new().command("view.status", "Show status"),
                 ),
+        )?;
+        catalog.context_menu(
+            "main",
+            MenuSpec::new()
+                .command("edit.copy", "Copy")
+                .command("edit.paste", "Paste")
+                .separator()
+                .command("edit.clear", "Clear note"),
         )?;
         Ok(())
     })?;
