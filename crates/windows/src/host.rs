@@ -2762,8 +2762,7 @@ impl Host {
                 }
                 EditorAction::Copy => self.copy_selection(&snapshot, focused),
                 EditorAction::Paste => self.paste_text(window, focused)?,
-                // Cut 仍由后续工单保留；在接线前消费按键。
-                EditorAction::Cut => {}
+                EditorAction::Cut => self.cut_selection(window, &snapshot, focused)?,
             }
             return Ok(());
         }
@@ -2807,32 +2806,60 @@ impl Host {
     }
 
     /// 把聚焦输入的已提交选区写入剪贴板；不派发 `on:input`。
-    ///
-    /// 折叠 selection、没有 provider、provider 失败或 panic 都是静默无操作。
     fn copy_selection(&mut self, snapshot: &PresentationSnapshot, focused: NodeId) {
+        let _ = self.write_selection(snapshot, focused);
+    }
+
+    /// 写入聚焦输入的已提交选区；provider 确认成功时返回 `true`。
+    ///
+    /// 折叠 selection、没有 provider、provider 失败或 panic 都返回 `false`，
+    /// 且不派发 `on:input`。
+    fn write_selection(&mut self, snapshot: &PresentationSnapshot, focused: NodeId) -> bool {
         let Some(element) = snapshot.node(focused) else {
-            return;
+            return false;
         };
         let Some((start, end)) = element.edit().and_then(|edit| edit.selection()) else {
-            return;
+            return false;
         };
         if start >= end {
-            return;
+            return false;
         }
         let Some(value) = element.text_value() else {
-            return;
+            return false;
         };
         let selected: String = value.chars().skip(start).take(end - start).collect();
         if selected.is_empty() {
-            return;
+            return false;
         }
         let Some(provider) = self.clipboard.as_mut() else {
-            return;
+            return false;
         };
         // provider 属于嵌入方；panic 与失败一样按无操作处理。
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            provider.write_text(&selected)
-        }));
+        matches!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                provider.write_text(&selected)
+            })),
+            Ok(Ok(()))
+        )
+    }
+
+    /// 先写入选区，成功后再用 Backspace 语义删除它；写入失败不改模型。
+    ///
+    /// 删除只在 provider 确认后发生，因此剪贴板失败不会丢失文本。成功时
+    /// 恰好一次 `on:input`，caret 落在原选区的起点。
+    fn cut_selection(
+        &mut self,
+        window: &mut WindowHost,
+        snapshot: &PresentationSnapshot,
+        focused: NodeId,
+    ) -> Result<(), HostError> {
+        if !self.write_selection(snapshot, focused) {
+            return Ok(());
+        }
+        ignore_expected_dispatch(self.runtime.backspace_node(focused))?;
+        window.reveal_requested = true;
+        window.paint_requested = true;
+        Ok(())
     }
 
     /// 读取剪贴板文本，过滤单行输入不接受的控制字符后插入聚焦输入。
@@ -5140,7 +5167,7 @@ mod tests {
     };
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         GetKeyboardState, IsWindowEnabled, SetKeyboardState, VK_A, VK_C, VK_MENU, VK_NEXT, VK_S,
-        VK_V, VK_Y, VK_Z,
+        VK_V, VK_X, VK_Y, VK_Z,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         CopyAcceleratorTableW, GetMenuItemCount, GetMenuItemID, GetMenuState, GetMenuStringW,
@@ -8595,6 +8622,7 @@ mod tests {
         reads: usize,
         writes: Vec<String>,
         fail_read: bool,
+        fail_write: bool,
     }
 
     impl ClipboardProbe {
@@ -8623,6 +8651,10 @@ mod tests {
         fn fail_reads(&self) {
             self.0.borrow_mut().fail_read = true;
         }
+
+        fn fail_writes(&self) {
+            self.0.borrow_mut().fail_write = true;
+        }
     }
 
     struct MemoryClipboard(ClipboardProbe);
@@ -8640,6 +8672,9 @@ mod tests {
         fn write_text(&mut self, text: &str) -> Result<(), ClipboardError> {
             let mut state = self.0.0.borrow_mut();
             state.writes.push(text.to_owned());
+            if state.fail_write {
+                return Err(ClipboardError::new("clipboard write failed"));
+            }
             state.text = Some(text.to_owned());
             Ok(())
         }
@@ -9047,6 +9082,229 @@ mod tests {
         );
         assert_eq!(*inputs.lock().expect("inputs"), ["abcdd"]);
         assert_eq!(clipboard.reads(), 4);
+    }
+
+    #[test]
+    fn ctrl_x_writes_then_deletes_the_selection_once() {
+        let (mut host, inputs) = open_history_probe();
+        let clipboard = ClipboardProbe::install(&mut host);
+        host.runtime.focus("Field").expect("focus");
+        let node = history_node(&host);
+        host.runtime
+            .set_selection_node(node, 1, 3)
+            .expect("select the suffix");
+        with_main(&mut host, |host, window| {
+            host.key_down_with(window, VK_X, false, true)
+        });
+        assert_eq!(clipboard.writes(), ["ld"]);
+        assert_eq!(clipboard.text().as_deref(), Some("ld"));
+        {
+            let snapshot = host.runtime.presentation().expect("snapshot");
+            let element = snapshot.node(node).expect("field");
+            assert_eq!(element.text_value(), Some("o"));
+            let edit = element.edit().expect("edit");
+            assert_eq!((edit.anchor(), edit.caret()), (1, 1));
+            assert_eq!(edit.selection(), None);
+            assert_eq!(snapshot.focus(), Some(node), "cut keeps focus");
+        }
+        assert_eq!(*inputs.lock().expect("inputs"), ["o"]);
+
+        with_main(&mut host, |host, window| {
+            host.key_down_with(window, VK_Z, false, true)
+        });
+        let snapshot = host.runtime.presentation().expect("snapshot");
+        let element = snapshot.node(node).expect("field");
+        assert_eq!(element.text_value(), Some("old"));
+        let edit = element.edit().expect("edit");
+        assert_eq!((edit.anchor(), edit.caret()), (1, 3));
+        assert_eq!(edit.selection(), Some((1, 3)));
+    }
+
+    #[test]
+    fn ctrl_x_keeps_text_when_the_write_fails_or_no_provider_exists() {
+        let (mut host, inputs) = open_history_probe();
+        let clipboard = ClipboardProbe::install(&mut host);
+        clipboard.fail_writes();
+        host.runtime.focus("Field").expect("focus");
+        let node = history_node(&host);
+        host.runtime
+            .set_selection_node(node, 1, 3)
+            .expect("select the suffix");
+        with_main(&mut host, |host, window| {
+            host.key_down_with(window, VK_X, false, true)
+        });
+        assert_eq!(clipboard.writes(), ["ld"], "the write was attempted");
+        assert_eq!(clipboard.text(), None, "the failed write changed nothing");
+        assert!(inputs.lock().expect("inputs").is_empty());
+        {
+            let snapshot = host.runtime.presentation().expect("snapshot");
+            let element = snapshot.node(node).expect("field");
+            assert_eq!(element.text_value(), Some("old"));
+            let edit = element.edit().expect("edit");
+            assert_eq!((edit.anchor(), edit.caret()), (1, 3));
+            assert_eq!(edit.selection(), Some((1, 3)));
+            assert_eq!(snapshot.focus(), Some(node));
+        }
+
+        let (mut host, inputs) = open_history_probe();
+        host.runtime.focus("Field").expect("focus");
+        let node = history_node(&host);
+        host.runtime
+            .set_selection_node(node, 0, 2)
+            .expect("select the prefix");
+        with_main(&mut host, |host, window| {
+            host.key_down_with(window, VK_X, false, true)
+        });
+        let snapshot = host.runtime.presentation().expect("snapshot");
+        let element = snapshot.node(node).expect("field");
+        assert_eq!(element.text_value(), Some("old"));
+        assert_eq!(
+            element.edit().expect("edit").selection(),
+            Some((0, 2)),
+            "a missing provider leaves the selection intact"
+        );
+        assert!(inputs.lock().expect("inputs").is_empty());
+    }
+
+    #[test]
+    fn ctrl_x_is_a_no_op_without_a_selection_or_while_composing_or_disabled() {
+        let (mut host, inputs) = open_history_probe();
+        let clipboard = ClipboardProbe::install(&mut host);
+        host.runtime.focus("Field").expect("focus");
+        let node = history_node(&host);
+        host.runtime.set_caret_node(node, 1).expect("collapse");
+        with_main(&mut host, |host, window| {
+            host.key_down_with(window, VK_X, false, true)
+        });
+        assert!(clipboard.writes().is_empty());
+
+        host.runtime
+            .set_selection_node(node, 0, 2)
+            .expect("select the prefix");
+        let lock = host
+            .runtime
+            .presentation()
+            .expect("snapshot")
+            .find_label("Lock")
+            .expect("lock")
+            .id();
+        host.runtime.click_node(lock).expect("disable the field");
+        with_main(&mut host, |host, window| {
+            host.key_down_with(window, VK_X, false, true)
+        });
+        assert!(clipboard.writes().is_empty(), "disabled input cuts nothing");
+        assert!(inputs.lock().expect("inputs").is_empty());
+
+        let (mut host, inputs) = open_history_probe();
+        let clipboard = ClipboardProbe::install(&mut host);
+        host.runtime.focus("Field").expect("focus");
+        let node = history_node(&host);
+        host.runtime
+            .set_selection_node(node, 0, 2)
+            .expect("select the prefix");
+        host.runtime.compose_start_node(node).expect("start");
+        host.runtime
+            .compose_update_node(node, "ni")
+            .expect("update");
+        with_main(&mut host, |host, window| {
+            host.key_down_with(window, VK_X, false, true)
+        });
+        assert!(clipboard.writes().is_empty(), "composition cuts nothing");
+        let snapshot = host.runtime.presentation().expect("snapshot");
+        let element = snapshot.node(node).expect("field");
+        assert_eq!(element.text_value(), Some("old"));
+        assert_eq!(element.edit().expect("edit").preedit(), Some("ni"));
+        assert!(inputs.lock().expect("inputs").is_empty());
+    }
+
+    #[test]
+    fn cut_and_paste_route_between_windows_without_moving_focus() {
+        let mut host = open_host();
+        host.render().expect("render the primary window");
+        let clipboard = ClipboardProbe::install(&mut host);
+        host.runtime
+            .focus("What needs to be done?")
+            .expect("focus the draft");
+        let draft = host
+            .runtime
+            .presentation()
+            .expect("snapshot")
+            .find_label("What needs to be done?")
+            .expect("draft")
+            .id();
+        host.runtime
+            .insert_text_node(draft, "shared")
+            .expect("type the draft");
+        host.runtime
+            .set_selection_node(draft, 0, 6)
+            .expect("select the draft");
+        with_main(&mut host, |host, window| {
+            host.key_down_with(window, VK_X, false, true)
+        });
+        assert_eq!(clipboard.writes(), ["shared"]);
+        {
+            let snapshot = host.presentation(MAIN).expect("main snapshot");
+            let element = snapshot.node(draft).expect("draft");
+            assert_eq!(element.text_value(), Some(""));
+            let edit = element.edit().expect("edit");
+            assert_eq!((edit.anchor(), edit.caret()), (0, 0));
+            assert_eq!(snapshot.focus(), Some(draft), "cut keeps focus");
+        }
+
+        host.show(zenui_demo::DETAILS_WINDOW)
+            .expect("show the details window");
+        host.runtime
+            .focus("Details note")
+            .expect("focus the details note");
+        let note = host
+            .presentation(zenui_demo::DETAILS_WINDOW)
+            .expect("details snapshot")
+            .find_label("Details note")
+            .expect("note")
+            .id();
+        host.with_window(zenui_demo::DETAILS_WINDOW, |host, window| {
+            host.key_down_with(window, VK_V, false, true)
+        })
+        .expect("paste into the details note");
+        {
+            let snapshot = host
+                .presentation(zenui_demo::DETAILS_WINDOW)
+                .expect("details snapshot");
+            let element = snapshot.node(note).expect("note");
+            assert_eq!(element.text_value(), Some("shared"));
+            assert_eq!(element.edit().expect("edit").caret(), 6);
+            assert_eq!(snapshot.focus(), Some(note), "paste keeps focus");
+        }
+
+        host.runtime
+            .set_selection_node(note, 0, 6)
+            .expect("select the note");
+        host.with_window(zenui_demo::DETAILS_WINDOW, |host, window| {
+            host.key_down_with(window, VK_X, false, true)
+        })
+        .expect("cut from the details note");
+        assert_eq!(clipboard.writes(), ["shared", "shared"]);
+        {
+            let snapshot = host
+                .presentation(zenui_demo::DETAILS_WINDOW)
+                .expect("details snapshot");
+            let element = snapshot.node(note).expect("note");
+            assert_eq!(element.text_value(), Some(""));
+            assert_eq!(snapshot.focus(), Some(note), "cut keeps focus");
+        }
+        host.runtime
+            .focus("What needs to be done?")
+            .expect("focus the draft");
+        with_main(&mut host, |host, window| {
+            host.key_down_with(window, VK_V, false, true)
+        });
+        {
+            let snapshot = host.presentation(MAIN).expect("main snapshot");
+            let element = snapshot.node(draft).expect("draft");
+            assert_eq!(element.text_value(), Some("shared"));
+            assert_eq!(element.edit().expect("edit").caret(), 6);
+            assert_eq!(snapshot.focus(), Some(draft), "paste keeps focus");
+        }
     }
 
     #[test]

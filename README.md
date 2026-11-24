@@ -23,7 +23,7 @@ ZenUI 处在开发阶段。阶段一的 target API、阶段二的 Windows 原生
 - UIA 文本：`text-input` 的 Edit 节点暴露最小 `ITextProvider`/`ITextRangeProvider`。文档取已提交值并排除 preedit，对外偏移是 UTF-16 code unit，运行时仍用字符偏移；GetText、GetSelection、GetVisibleRanges、GetBoundingRectangles 与 Select 可用，Select 经动作队列调用 `set_selection_node` 且不派发 `on:input`；查找、移动、扩展、比较、多选与滚动等 range 方法返回 `UIA_E_NOTSUPPORTED`，组合中、禁用或无 `on:input` 的输入保持只读（[文本验收](docs/实现/stage-three-辅助技术文本-验收.md)）；
 - UIA 滚动：可滚动窗口的根暴露垂直 `IScrollProvider`。`VerticallyScrollable` 取 `max_scroll_offset > 0`，垂直 view size 为 viewport/content 百分比，垂直百分比由已应用偏移换算；水平属性固定为 `NoScroll`。`Scroll` 的大小步长复用键盘翻页与滚轮行步长，`SetScrollPercent` 把 0..100 四舍五入到最近的整数逻辑像素后夹取。provider 只入队，UI 线程按当前场景重验；隐藏、禁用、零最大偏移与关闭中的窗口拒绝写入。滚动只改宿主偏移，Node ID、焦点、caret、selection、draft、组合、快照相等性与运行时计数不变（[滚动验收](docs/实现/stage-three-辅助技术滚动-验收.md)）。
 - 文本编辑历史：每个 `text-input` 在运行时保存有界 undo/redo；Windows 宿主把 Ctrl+Z/Y 接到聚焦启用输入，连续单字符输入合并为至多 64 个字符的撤销步（空白并入前一个 run），移动、焦点、删除、多字符插入、整体替换、组合、撤销/重做与外部替换开启新步；撤销/重做各恰好一次 `on:input`，模型仍是值的权威（[ADR-0014](docs/adr/0014-text-edit-history.md)）。
-- 剪贴板复制与粘贴：Windows 宿主把 Ctrl+C/V 接到可注入的 `ClipboardProvider`；可见宿主读写 `CF_UNICODETEXT`，隐藏宿主默认不触碰系统剪贴板。复制精确写出已提交选区且不派发 `on:input`，粘贴过滤控制字符后通过同一插入 reducer 替换选区或插入 caret，一次粘贴恰好一次 `on:input`；AltGr 组合不触发快捷键（[stage-three 剪贴板验收](docs/实现/stage-three-剪贴板-验收.md)）。
+- 剪贴板复制、剪切与粘贴：Windows 宿主把 Ctrl+C/X/V 接到可注入的 `ClipboardProvider`；可见宿主读写 `CF_UNICODETEXT`，隐藏宿主默认不触碰系统剪贴板。复制精确写出已提交选区且不派发 `on:input`，剪切只在写入成功后删除选区，粘贴过滤控制字符后通过同一插入 reducer 替换选区或插入 caret；复制/剪切/粘贴各至多一次 `on:input`，AltGr 组合不触发快捷键（[stage-three 剪贴板验收](docs/实现/stage-three-剪贴板-验收.md)）。
 - 有界运行时存储：最近发布快照按固定窗口保留，释放的 Owner 节点回到存活规模，Todo 的列表 reconciliation 与行句柄查找使用索引而不是逐行扫描；
 - 可复现的 Todo 场景：插入、删除、筛选、重排、焦点与拒绝句柄后的恢复；
 - 独立的宏、文本、布局和 GPU 原型；
