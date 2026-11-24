@@ -52,14 +52,24 @@ fn begin_import(
     task_error: Signal<String>,
     outcome: FileDialogOutcome,
 ) -> Result<(), MountError> {
-    let paths = match outcome {
-        FileDialogOutcome::Picked(paths) => paths,
-        FileDialogOutcome::Cancelled => return Ok(()),
+    match outcome {
+        FileDialogOutcome::Picked(paths) => start_import(window, todos, notice, task_error, paths),
+        FileDialogOutcome::Cancelled => Ok(()),
         FileDialogOutcome::Failed(error) => {
             fail(notice, task_error, error.to_string());
-            return Ok(());
+            Ok(())
         }
-    };
+    }
+}
+
+/// 选择器与文件拖放共用的导入 worker；任务属于应用，窗口关闭后仍可提交。
+fn start_import(
+    window: WindowCtx,
+    todos: Store,
+    notice: Signal<String>,
+    task_error: Signal<String>,
+    paths: Vec<PathBuf>,
+) -> Result<(), MountError> {
     let task = window
         .app_task_scope()
         .spawn(move |_| read_import(&paths))
@@ -386,6 +396,20 @@ pub fn open_todo_window(runtime: &mut Runtime) -> Result<WindowCtx, WindowError>
                         }
                     })
                     .map_err(|_| MountError::Component("register the todo close handler"))?;
+                window
+                    .on_drop(move |drop| {
+                        report(
+                            start_import(
+                                window,
+                                state.todos,
+                                state.notice,
+                                state.task_error,
+                                drop.into_paths(),
+                            ),
+                            state.task_error,
+                        );
+                    })
+                    .map_err(|_| MountError::Component("register the todo drop handler"))?;
                 view! { <TodoApp window=window state=state /> }
             },
         )?;
@@ -393,7 +417,23 @@ pub fn open_todo_window(runtime: &mut Runtime) -> Result<WindowCtx, WindowError>
             WindowSpec::new(DETAILS_WINDOW)
                 .titled("ZenUI Details")
                 .sized(520, 420),
-            move |window| view! { <TodoDetails window=window state=state /> },
+            move |window| {
+                window
+                    .on_drop(move |drop| {
+                        report(
+                            start_import(
+                                window,
+                                state.todos,
+                                state.notice,
+                                state.task_error,
+                                drop.into_paths(),
+                            ),
+                            state.task_error,
+                        );
+                    })
+                    .map_err(|_| MountError::Component("register the details drop handler"))?;
+                view! { <TodoDetails window=window state=state /> }
+            },
         )?;
         catalog.window(
             WindowSpec::new(CLOSE_CONFIRMATION_WINDOW)

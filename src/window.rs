@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::marker::PhantomData;
+use std::path::PathBuf;
 use std::rc::Rc;
 
 use crate::menu::{
@@ -112,6 +113,17 @@ impl WindowCtx {
         })
     }
 
+    /// 在窗口 factory 中注册文件拖放处理器；每个 activation 只能注册一次。
+    ///
+    /// 处理器由 [`crate::Runtime::drop_files`] 在 `Phase::Event` 中调用，可以写
+    /// Store/Signal、排队窗口请求并启动窗口或应用所有权任务。没有注册处理器的
+    /// 窗口拒绝拖放；关闭窗口释放处理器，重新打开必须重新注册。
+    pub fn on_drop(self, handler: impl Fn(DropEvent) + 'static) -> Result<(), WindowError> {
+        crate::context::with_state_of(self.runtime, |state| {
+            state.register_drop_handler(self, Rc::new(handler))
+        })
+    }
+
     /// 在窗口 factory 中为菜单命令注册处理器；每个 activation、每个 id 一次。
     ///
     /// 菜单栏与上下文菜单声明的每个命令都必须有窗口或应用级处理器，否则这次
@@ -208,6 +220,89 @@ pub(crate) enum CloseReply {
 }
 
 pub(crate) type CloseHandler = Rc<dyn Fn(CloseRequest)>;
+
+/// 一次已接受的窗口文件拖放。
+///
+/// 只在 `on_drop` 处理器调用期间存在。路径保持源顺序、重复项与 Unicode；
+/// 宿主不规范化、不去重，也不把文件夹展开成子项。
+#[derive(Debug)]
+pub struct DropEvent {
+    window: WindowCtx,
+    paths: Vec<PathBuf>,
+}
+
+impl DropEvent {
+    pub(crate) fn new(window: WindowCtx, paths: Vec<PathBuf>) -> Self {
+        Self { window, paths }
+    }
+
+    /// 接收这次拖放的窗口 activation。
+    pub const fn window(&self) -> WindowCtx {
+        self.window
+    }
+
+    /// 按源顺序读取路径；处理器可以检查后克隆需要保留的部分。
+    pub fn paths(&self) -> &[PathBuf] {
+        &self.paths
+    }
+
+    /// 取走有序路径，通常交给应用所有权 worker。
+    pub fn into_paths(self) -> Vec<PathBuf> {
+        self.paths
+    }
+}
+
+pub(crate) type DropHandler = Rc<dyn Fn(DropEvent)>;
+
+/// 文件拖放被拒绝的原因。
+///
+/// 验证发生在用户处理器运行之前；被拒绝的拖放不写模型、不启动任务，也不
+/// 进入 `Phase::Event`。
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum DropError {
+    /// `WindowCtx` 属于另一个 Runtime。
+    WrongRuntime,
+    /// 该 activation 已关闭或被新的一代取代。
+    Stale,
+    /// 窗口仍然存活但处于隐藏状态。
+    Hidden,
+    /// 窗口正在等待关闭确认；父窗口与确认窗口都拒绝拖放。
+    Suspended,
+    /// 路径列表为空。
+    Empty,
+    /// 窗口没有在 factory 中注册 `on_drop` 处理器。
+    NoHandler,
+    /// 处理器 panic；容器被捕获，运行时保持可用。
+    HandlerPanicked,
+    /// 处理器或其后的界面刷新失败。
+    Command(MountError),
+}
+
+impl fmt::Display for DropError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::WrongRuntime => {
+                f.write_str("a WindowCtx from another ZenUI Runtime cannot receive this drop")
+            }
+            Self::Stale => f.write_str("the window activation is no longer live"),
+            Self::Hidden => f.write_str("the window is hidden"),
+            Self::Suspended => f.write_str("the window is awaiting close confirmation"),
+            Self::Empty => f.write_str("a file drop needs at least one path"),
+            Self::NoHandler => f.write_str("the window has no on_drop handler"),
+            Self::HandlerPanicked => f.write_str("the on_drop handler panicked"),
+            Self::Command(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for DropError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Command(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 /// 关闭确认协议本身失败；父窗口保持打开，绝不回退为 Allow。
 #[derive(Clone, PartialEq, Eq, Debug)]

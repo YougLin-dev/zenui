@@ -48,8 +48,8 @@ pub use view::{
     FocusEvent, Key, KeyEvent, MountError, MountPlan, MountResult, SubmitEvent,
 };
 pub use window::{
-    CatalogError, CloseError, ClosePolicy, CloseRequest, WindowCatalog, WindowCtx, WindowError,
-    WindowInfo, WindowRole, WindowSpec,
+    CatalogError, CloseError, ClosePolicy, CloseRequest, DropError, DropEvent, WindowCatalog,
+    WindowCtx, WindowError, WindowInfo, WindowRole, WindowSpec,
 };
 pub use zenui_macro::{component, view};
 pub use zenui_style as style;
@@ -62,14 +62,14 @@ pub mod prelude {
     pub use crate::{
         Appearance, BlurEvent, CatalogError, Children, ChildrenFactory, CloseError, ClosePolicy,
         CloseRequest, Color, ColorRole, CommandError, CommandEvent, CommandSource,
-        CompositionEvent, CompositionPhase, Condition, DeliveryReport, DispatchError, Field,
-        FieldError, FileDialogError, FileDialogKind, FileDialogOptions, FileDialogOutcome,
-        FileDialogRequest, FileDialogRequestError, FileFilter, FocusCause, FocusEvent, FocusInfo,
-        Key, KeyEvent, Length, LengthUnit, Memo, MenuCommand, MenuCommandState, MenuItem,
-        MenuShortcut, MenuSpec, MenuStateError, MountError, MountPlan, MountResult, NodeId,
-        NodeOperation, NodeStatus, Once, Opacity, PresentationSnapshot, Property, Runtime,
-        SessionCtx, SessionError, SessionPolicy, ShortcutError, ShortcutKey, Signal,
-        SnapshotAction, SnapshotActions, SnapshotAttr, SnapshotElement, SnapshotNode,
+        CompositionEvent, CompositionPhase, Condition, DeliveryReport, DispatchError, DropError,
+        DropEvent, Field, FieldError, FileDialogError, FileDialogKind, FileDialogOptions,
+        FileDialogOutcome, FileDialogRequest, FileDialogRequestError, FileFilter, FocusCause,
+        FocusEvent, FocusInfo, Key, KeyEvent, Length, LengthUnit, Memo, MenuCommand,
+        MenuCommandState, MenuItem, MenuShortcut, MenuSpec, MenuStateError, MountError, MountPlan,
+        MountResult, NodeId, NodeOperation, NodeStatus, Once, Opacity, PresentationSnapshot,
+        Property, Runtime, SessionCtx, SessionError, SessionPolicy, ShortcutError, ShortcutKey,
+        Signal, SnapshotAction, SnapshotActions, SnapshotAttr, SnapshotElement, SnapshotNode,
         SnapshotRowBand, SnapshotSemantics, SnapshotValue, Store, StyleDeclaration, StyleOrigin,
         StyleValue, Submenu, SubmitEvent, Task, TaskError, TaskScope, TaskStatus, TaskToken,
         TextEditState, TodoId, Transaction, TrayError, TraySpec, WindowCatalog, WindowCtx,
