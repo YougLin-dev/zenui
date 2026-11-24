@@ -12,6 +12,10 @@ _Avoid_: window instance, window generation
 归属应用而不是某个窗口的 owner 0；`Runtime::setup` 创建的 Signal、Memo 与 Store 在窗口关闭后仍保留。
 _Avoid_: global state, app singleton
 
+**Application session**:
+一个 Runtime 拥有的应用级生命周期与最后窗口策略。默认 `QuitOnLastClose` 在最后一个窗口关闭后结束宿主消息循环；`StayResident` 显式允许零窗口会话继续，原生宿主要求同时声明托盘。`Runtime::session()` 返回的 Copy `SessionCtx` 在命令处理器中排队 `request_show` 与 `request_quit`；显式退出关闭全部 activation、释放待决关闭确认并丢弃同一 turn 尚未结算的窗口请求。
+_Avoid_: process lifetime, app loop
+
 **Window catalog**:
 启动时声明的静态窗口集合；每个窗口有稳定键、原生标题、初始逻辑尺寸、primary 标记、ClosePolicy、WindowRole 与可重复执行的 factory。声明本身不挂载界面，并拒绝重复键、缺失或多个 primary 以及无效的关闭确认绑定。
 _Avoid_: window list, registry
@@ -181,7 +185,7 @@ _Avoid_: node menu, right-click handler, popup window state
 _Avoid_: global command, background command
 
 **Tray icon**:
-应用级托盘声明 `TraySpec`：一个 tooltip 与一份右键 `MenuSpec`，在首个窗口打开或根树挂载前通过 `Runtime::declare_tray` 注册，全部菜单命令必须有应用级处理器。宿主用一个从不显示的顶层托盘 HWND 接住自己的回调消息与 Explorer 的 `TaskbarCreated` 广播；左键或键盘激活恢复可见焦点窗口，没有可见焦点时恢复 primary，primary 不在时选择任一存活窗口；右键在宿主借用之外展示菜单并以 `CommandSource::Tray` 派发恰好一次。图标随最后一个窗口关闭移除，窗口重新出现时再次添加；`TaskbarCreated` 后重新添加。第一切片使用共享系统图标，不承诺自定义图标资产，也不包含托盘独存或最小化到托盘。
+应用级托盘声明 `TraySpec`：一个 tooltip 与一份右键 `MenuSpec`，在首个窗口打开或根树挂载前通过 `Runtime::declare_tray` 注册，全部菜单命令必须有应用级处理器。宿主用一个从不显示的顶层托盘 HWND 接住自己的回调消息与 Explorer 的 `TaskbarCreated` 广播；左键或键盘激活恢复可见焦点窗口，没有可见焦点时恢复 primary，primary 不在时选择任一存活窗口；右键在宿主借用之外展示菜单并以 `CommandSource::Tray` 派发恰好一次。默认会话策略下图标随最后一个窗口关闭移除；`StayResident` 会话保留图标并可在零窗口时恢复 primary。`TaskbarCreated` 后重新添加。第一切片使用共享系统图标，不承诺自定义图标资产；托盘独存与最小化到托盘由应用会话策略决定，不是隐式默认。
 _Avoid_: notification area widget, tray window, background app icon
 
 **Tray presenter**:

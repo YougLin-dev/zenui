@@ -6,7 +6,7 @@ ZenUI 使用 Rust 编写原生桌面界面。它保留控件及其编辑状态�
 
 ## 当前能力
 
-ZenUI 处在开发阶段。阶段一的 target API、阶段二的 Windows 原生切片，以及阶段三的多窗口、关闭确认、原生打开/保存/文件夹对话框、整页滚动、焦点显露、覆盖层滚动条、窗口化 `For`、只读 UIA 树、UIA Invoke/Toggle/Value/SetFocus 动作、UIA 焦点/状态/结构事件、UIA TextPattern 与窗口根 ScrollPattern 已可运行；菜单/托盘、跨平台支持仍在开发中。跨显示器混合 DPI 与实机 device loss 仍是 #63 的开放证据缺口。
+ZenUI 处在开发阶段。阶段一的 target API、阶段二的 Windows 原生切片，以及阶段三的多窗口、关闭确认、应用会话策略与显式退出、原生打开/保存/文件夹对话框、整页滚动、焦点显露、覆盖层滚动条、窗口化 `For`、只读 UIA 树、UIA Invoke/Toggle/Value/SetFocus 动作、UIA 焦点/状态/结构事件、UIA TextPattern 与窗口根 ScrollPattern、原生菜单栏/快捷键/窗口级上下文菜单与应用托盘已可运行；节点级上下文菜单、拖放与跨平台支持仍在开发中。跨显示器混合 DPI 与实机 device loss 仍是 #63 的开放证据缺口。
 
 仓库目前提供：
 
@@ -15,6 +15,7 @@ ZenUI 处在开发阶段。阶段一的 target API、阶段二的 Windows 原生
 - headless 与原生窗口的 activation 和任务交付边界：app/window 所有权、Send worker、代际检查后的 UI continuation；窗口关闭取消其交付，共享模型仍可由 app 所有权任务提交；
 - Windows 宿主：每个存活窗口一个 HWND、Scene 与 DX12 surface，共享 device 和模型；原生输入、IME、DPI 与隐藏窗口 smoke（CI 回退 WARP）；
 - 多窗口窗口目录：show/hide/close/reopen、关闭确认 epoch、父窗口输入挂起与声明的确认窗口；
+- 应用会话：启动前声明 `QuitOnLastClose`（默认）或 `StayResident`；`SessionCtx` 在命令处理器中排队恢复窗口与显式退出。常驻会话允许零窗口消息循环，原生宿主要求声明托盘，托盘恢复 primary 或已关闭窗口，Quit 关闭全部 activation 并释放待决关闭确认；
 - 原生打开/保存/文件夹对话框：窗口锚定、单选/多选、标题与类型过滤器、建议文件名与默认扩展名、取消/失败结果，以及显式的窗口或应用任务所有权；
 - 宿主任务：文件对话框结果与 worker 共用 Task/continuation 交付，但没有 worker 通道，也不会阻塞 `settle_tasks`；
 - 长列表场景构建：跨重建复用未变化的文本 layout 与测量结果，viewport 外的元素保留几何但跳过 glyph 与绘制；声明 `row-height` 的窗口化 `For` 只挂载可见行窗口，完整行范围由上下 spacer 保持（[ADR-0011](docs/adr/0011-windowed-for-mounting.md)）；变量行高仍不在本里程碑；

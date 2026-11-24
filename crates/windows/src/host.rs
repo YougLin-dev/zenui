@@ -47,8 +47,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_DPICHANGED, WM_ENTERMENULOOP, WM_GETDPISCALEDSIZE, WM_GETOBJECT, WM_IME_CHAR,
     WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_STARTCOMPOSITION, WM_INITMENU,
     WM_INITMENUPOPUP, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEHWHEEL,
-    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_SETTINGCHANGE, WM_SIZE, WM_SYSKEYDOWN, WM_TIMER,
-    WNDCLASSEXW, WS_OVERLAPPEDWINDOW, WS_POPUP,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NULL, WM_PAINT, WM_SETTINGCHANGE, WM_SIZE, WM_SYSKEYDOWN,
+    WM_TIMER, WNDCLASSEXW, WS_OVERLAPPEDWINDOW, WS_POPUP,
 };
 
 use windows::core::{HSTRING, w};
@@ -517,6 +517,9 @@ impl Host {
         let primary = runtime
             .primary_key()
             .ok_or_else(|| HostError::Window(String::from("the window catalog is not declared")))?;
+        if runtime.session_policy() == SessionPolicy::StayResident && runtime.tray().is_none() {
+            return Err(HostError::Session(SessionError::TrayRequired));
+        }
         if let Some(id) = runtime.missing_tray_handler() {
             return Err(HostError::Tray(format!(
                 "tray command {id} has no application-level handler"
@@ -844,12 +847,12 @@ impl Host {
         }
     }
 
-    /// 最后一个窗口关闭时移除图标；窗口重新出现时再次添加。
+    /// 会话结束时移除图标；常驻会话保留图标，并可在零窗口时恢复 primary。
     fn sync_tray(&mut self) -> Result<(), HostError> {
         if self.tray.is_none() {
             return Ok(());
         }
-        if self.windows.is_empty() {
+        if !self.session_running() {
             self.remove_tray_icon();
         } else if !self.tray.as_ref().is_some_and(|tray| tray.added) {
             self.present_tray_add()?;
@@ -892,7 +895,18 @@ impl Host {
     /// 只在 runtime 的窗口目录里选择目标，不重新打开已经关闭的窗口。原生显示
     /// 留给随后的同步阶段，避免在窗口过程里同步派发 `WM_SHOWWINDOW` 的重入。
     fn restore_from_tray(&mut self) -> Result<(), HostError> {
-        let Some(key) = self.tray_target_window().map(|window| window.key()) else {
+        if !self.session_running() {
+            return Ok(());
+        }
+        let key = self
+            .tray_target_window()
+            .map(|window| window.key())
+            .or_else(|| {
+                (self.runtime.session_policy() == SessionPolicy::StayResident)
+                    .then(|| self.runtime.primary_key())
+                    .flatten()
+            });
+        let Some(key) = key else {
             return Ok(());
         };
         self.runtime.show(key).map_err(HostError::Open)?;
@@ -930,13 +944,19 @@ impl Host {
         }
     }
 
-    /// 显示所有打开的窗口（若配置为可见）并进入消息循环，直到最后一个窗口关闭。
+    /// 显示所有打开的窗口（若配置为可见）并进入消息循环。
+    ///
+    /// 默认策略在最后一个窗口关闭后返回；`StayResident` 在零窗口时继续接收
+    /// 托盘与 worker 消息，直到应用显式退出。没有声明托盘的常驻会话在
+    /// [`Host::open`] 被拒绝。
     pub fn run(&mut self) -> Result<(), HostError> {
         self.sync_windows()?;
-        if self.runtime.windows().is_empty() {
+        if !self.session_running() {
             return Ok(());
         }
-        self.render()?;
+        if !self.runtime.windows().is_empty() {
+            self.render()?;
+        }
         // 窗口过程要能在系统自己的拖动/缩放循环里重绘；指针只在循环期间安装。
         let host = self as *mut Self;
         let _pointer = HostPointer::install(host);
@@ -945,9 +965,11 @@ impl Host {
         unsafe { run_loop(host) }
     }
 
-    /// 处理所有已排队的窗口消息后立即返回；返回是否已没有存活窗口。
+    /// 处理所有已排队的窗口消息后立即返回；返回宿主会话是否已结束。
     ///
-    /// 把宿主嵌进别的消息循环，或在测试里驱动一次输入而不阻塞时使用。
+    /// 默认策略下会话在最后一个窗口关闭后结束；`StayResident` 的零窗口会话
+    /// 返回 `false`，直到显式退出。把宿主嵌进别的消息循环，或在测试里驱动
+    /// 一次输入而不阻塞时使用。
     pub fn pump(&mut self) -> Result<bool, HostError> {
         self.sync_windows()?;
         let host = self as *mut Self;
@@ -994,7 +1016,7 @@ impl Host {
         if let Err(error) = result {
             self.deferred_error.get_or_insert(error);
         }
-        if let Err(error) = self.settle_window_requests() {
+        if let Err(error) = self.settle_requests() {
             self.deferred_error.get_or_insert(error);
         }
         if let Err(error) = self.repaint_changed_windows() {
@@ -1002,20 +1024,44 @@ impl Host {
         }
     }
 
-    /// 结算运行时队列里的窗口请求；有动作生效时把原生前台切到焦点窗口。
+    /// 结算运行时队列里的窗口与会话请求；有动作生效时重定向前台。
     ///
-    /// 隐藏模式从不显示原生窗口，不抢前台；系统前台策略拒绝时忽略错误，
-    /// 运行时焦点与输入路由不受影响。
-    fn settle_window_requests(&mut self) -> Result<(), HostError> {
+    /// 窗口请求先于会话动作结算；`StayResident` 的零窗口会话可以继续接收
+    /// 托盘与 worker 消息。隐藏模式从不显示原生窗口，不抢前台；系统前台策略
+    /// 拒绝时忽略错误，运行时焦点与输入路由不受影响。
+    fn settle_requests(&mut self) -> Result<(), HostError> {
+        let mut applied = 0;
+        let mut first_error = None;
         match self.runtime.apply_window_requests() {
-            Ok(0) => Ok(()),
-            Ok(_) => {
-                // 启用/禁用与焦点恢复要等消息循环同步 HWND 之后再执行。
-                self.focus_after_sync = true;
-                Ok(())
+            Ok(count) => applied += count,
+            Err(error) => {
+                first_error.get_or_insert(HostError::WindowState(error));
             }
-            Err(error) => Err(HostError::WindowState(error)),
         }
+        match self.runtime.apply_session_requests() {
+            Ok(count) => applied += count,
+            Err(error) => {
+                first_error.get_or_insert(HostError::Session(error));
+            }
+        }
+        if applied > 0 {
+            // 启用/禁用与焦点恢复要等消息循环同步 HWND 之后再执行。
+            self.focus_after_sync = true;
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    /// 宿主是否继续消息循环。
+    ///
+    /// 默认策略在最后一个窗口关闭后结束；`StayResident` 在零窗口时继续运行，
+    /// 由显式退出或 [`Host::drop`] 结束。
+    fn session_running(&self) -> bool {
+        self.runtime.session_alive()
+            && (self.runtime.session_policy() == SessionPolicy::StayResident
+                || !self.runtime.windows().is_empty())
     }
 
     /// 第一次需要 OLE 时初始化 UI 线程的 STA；失败原因被缓存。
@@ -1092,7 +1138,7 @@ impl Host {
             Err(error) => return Err(HostError::FileDialog(error)),
         }
         self.runtime.drive_tasks().map_err(HostError::Runtime)?;
-        self.settle_window_requests()?;
+        self.settle_requests()?;
         self.sync_windows()?;
         if std::mem::take(&mut self.focus_after_sync) {
             self.focus_native_focused_window()?;
@@ -1291,7 +1337,7 @@ impl Host {
         self.wake.observed();
         let report = self.runtime.drive_tasks().map_err(HostError::Runtime)?;
         // 交付期的 continuation 也可以打开、隐藏或关闭窗口。
-        self.settle_window_requests()?;
+        self.settle_requests()?;
         if report.delivered == 0 {
             return Ok(());
         }
@@ -2294,7 +2340,7 @@ impl Host {
         if let Err(error) = result {
             self.deferred_error.get_or_insert(error);
         }
-        if let Err(error) = self.settle_window_requests() {
+        if let Err(error) = self.settle_requests() {
             self.deferred_error.get_or_insert(error);
         }
         if let Err(error) = self.repaint_changed_windows() {
@@ -3480,7 +3526,13 @@ impl Host {
     }
 
     fn update_wake_target(&self) {
-        let target = self.windows.values().next().map(WindowHost::hwnd);
+        let target = self
+            .windows
+            .values()
+            .next()
+            .map(WindowHost::hwnd)
+            // 常驻会话在零窗口时仍要交付应用任务；托盘 HWND 是唯一的消息入口。
+            .or_else(|| self.tray.as_ref().map(|tray| tray.window.hwnd));
         let changed = self.wake.set_target(target);
         // 有唤醒在途而目标被销毁时，把那条唤醒转投到仍存活的窗口；
         // 否则 pending 会永远为 true，后续完成不再投递。
@@ -3769,6 +3821,8 @@ pub enum HostError {
     TrayMenu(MenuError),
     /// 托盘 presenter 失败；panic 不能穿过窗口过程的系统边界。
     TrayPresenter(String),
+    /// 应用会话策略、显式退出或会话动作失败。
+    Session(SessionError),
     /// 菜单命令在运行时命令路径上失败；窗口状态竞态已在调用方过滤。
     Command(CommandError),
     /// 菜单状态回调失败；回调内的写入已被只读作用域拒绝。
@@ -3809,6 +3863,7 @@ impl fmt::Display for HostError {
             Self::TrayPresenter(message) => {
                 write!(f, "tray presentation failed: {message}")
             }
+            Self::Session(error) => write!(f, "application session failed: {error}"),
             Self::Command(error) => write!(f, "menu command failed: {error}"),
             Self::MenuState(error) => write!(f, "menu state query failed: {error}"),
             Self::Scene(error) => write!(f, "scene failed: {error}"),
@@ -4538,7 +4593,7 @@ unsafe fn handle_tray_callback(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
             // 安全：菜单已关闭且没有其它引用；重新借出宿主结算这次打开。
             let host = unsafe { &mut *pointer };
             let mut error = host.finish_tray_menu(presenter, target, result).err();
-            if let Err(failure) = host.settle_window_requests() {
+            if let Err(failure) = host.settle_requests() {
                 error.get_or_insert(failure);
             }
             if let Err(failure) = host.repaint_changed_windows() {
@@ -4633,7 +4688,7 @@ unsafe fn service_file_dialogs(host: *mut Host) -> Result<bool, HostError> {
     }
 }
 
-/// 派发一条消息后的统一结算；返回是否已经没有存活窗口。
+/// 派发一条消息后的统一结算；返回宿主会话是否已结束。
 ///
 /// 同步窗口、恢复前台焦点、重绘变化窗口、取出延迟错误、结算文件对话框；
 /// `run_loop` 与 `pump_loop` 共用这一条路径。
@@ -4653,27 +4708,27 @@ unsafe fn after_dispatch(host: *mut Host) -> Result<bool, HostError> {
         if let Some(error) = host.deferred_error.take() {
             return Err(error);
         }
-        if host.runtime.windows().is_empty() {
+        if !host.session_running() {
             return Ok(true);
         }
     }
     unsafe { service_file_dialogs(host)? };
-    Ok(unsafe { &*host }.runtime.windows().is_empty())
+    Ok(!unsafe { &*host }.session_running())
 }
 
-/// 没有消息可派发时的结算；返回是否已经没有存活窗口。
+/// 没有消息可派发时的结算；返回宿主会话是否已结束。
 ///
 /// # Safety
 ///
 /// 与 [`run_loop`] 相同。
 unsafe fn settle_idle(host: *mut Host) -> Result<bool, HostError> {
-    if unsafe { &*host }.runtime.windows().is_empty() {
+    if !unsafe { &*host }.session_running() {
         // 确保关闭时排队的请求不会留下 Running 任务。
         let _ = unsafe { &mut *host }.runtime.take_file_dialog_requests();
         return Ok(true);
     }
     unsafe { service_file_dialogs(host)? };
-    Ok(unsafe { &*host }.runtime.windows().is_empty())
+    Ok(!unsafe { &*host }.session_running())
 }
 
 /// `run` 的消息循环；返回关闭或处理错误。
@@ -4699,7 +4754,7 @@ unsafe fn run_loop(host: *mut Host) -> Result<(), HostError> {
     }
 }
 
-/// `pump` 的消息循环；返回是否已没有存活窗口。
+/// `pump` 的消息循环；返回宿主会话是否已结束。
 ///
 /// # Safety
 ///
@@ -4732,6 +4787,12 @@ unsafe extern "system" fn wndproc(
         // 托盘菜单自己的模态循环在窗口过程内运行；展示期间不持有宿主引用，
         // 与上下文菜单走同一条重入安全路径。
         unsafe { handle_tray_callback(hwnd, wparam, lparam) };
+        // shell 可能用 SendMessage 投递托盘回调，外层消息循环因此收不到一次
+        // 可结算的消息。排队的空消息保证恢复/退出后的窗口同步与重绘发生。
+        // 安全：hwnd 是宿主自己的托盘窗口，消息只排队。
+        unsafe {
+            let _ = PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0));
+        }
         return LRESULT(0);
     }
     match message {
@@ -4809,7 +4870,7 @@ unsafe extern "system" fn wndproc(
                 // 安全：菜单已关闭且没有其它引用；重新借出宿主结算这次打开。
                 let host = unsafe { &mut *pointer };
                 let mut error = host.finish_context_menu(presenter, window, result).err();
-                if let Err(failure) = host.settle_window_requests() {
+                if let Err(failure) = host.settle_requests() {
                     error.get_or_insert(failure);
                 }
                 if let Err(failure) = host.repaint_changed_windows() {
@@ -5560,6 +5621,173 @@ mod tests {
             1,
             "Host drop does not delete the icon a second time"
         );
+    }
+
+    struct SessionTrayHarness {
+        host: Host,
+        calls: Rc<RefCell<TrayCalls>>,
+        runs: Rc<Cell<u32>>,
+    }
+
+    /// 常驻会话 + 托盘的隐藏宿主；菜单选中 app.show 或 app.quit。
+    fn session_tray_host(result: Option<&'static str>) -> SessionTrayHarness {
+        let runs = Rc::new(Cell::new(0));
+        let show_runs = runs.clone();
+        let quit_runs = runs.clone();
+        let mut runtime = Runtime::new();
+        let session = runtime.session();
+        runtime
+            .on_app_command("app.show", move |_| {
+                show_runs.set(show_runs.get() + 1);
+                session.request_show(MAIN).expect("queue the show");
+            })
+            .expect("register the show command");
+        runtime
+            .on_app_command("app.quit", move |_| {
+                quit_runs.set(quit_runs.get() + 1);
+                session.request_quit().expect("queue the quit");
+            })
+            .expect("register the quit command");
+        runtime
+            .declare_session(SessionPolicy::StayResident)
+            .expect("declare the resident session");
+        runtime
+            .declare_tray(
+                TraySpec::new("ZenUI Tray").with_menu(
+                    MenuSpec::new()
+                        .command("app.show", "Show window")
+                        .command("app.quit", "Quit"),
+                ),
+            )
+            .expect("declare the tray");
+        runtime
+            .declare_windows(|catalog| {
+                catalog.window(WindowSpec::new(MAIN).primary(), |_| {
+                    view! {
+                        <view>
+                            <text aria:label="status">"Ready"</text>
+                        </view>
+                    }
+                })?;
+                Ok(())
+            })
+            .expect("declare the window");
+        let mut host = Host::open(runtime, HostConfig::hidden()).expect("open the resident host");
+        let calls = Rc::new(RefCell::new(TrayCalls::default()));
+        host.set_tray_presenter(FakeTrayPresenter {
+            calls: calls.clone(),
+            result,
+            panic_first: Rc::new(Cell::new(false)),
+        })
+        .expect("install the fake tray presenter");
+        SessionTrayHarness { host, calls, runs }
+    }
+
+    #[test]
+    fn a_resident_session_keeps_the_tray_and_click_reopens_the_last_window() {
+        let SessionTrayHarness {
+            mut host,
+            calls,
+            runs,
+        } = session_tray_host(None);
+        let hwnd = tray_hwnd(&host);
+        let first = host.windows[MAIN].ctx;
+        host.close(MAIN).expect("close the last window");
+        assert!(host.runtime.windows().is_empty());
+        assert!(host.hwnd(MAIN).is_none());
+        assert_eq!(
+            calls.borrow().removes,
+            [],
+            "a resident session keeps the icon after the last close"
+        );
+
+        assert!(send_tray_callback(&mut host, NIN_SELECT, (0, 0)).is_none());
+        assert_eq!(
+            host.runtime.windows().len(),
+            1,
+            "a tray click reopens the primary window"
+        );
+        assert!(host.hwnd(MAIN).is_some());
+        assert_ne!(
+            host.windows[MAIN].ctx, first,
+            "reopening is a new activation"
+        );
+        assert_eq!(
+            calls.borrow().adds.len(),
+            1,
+            "the kept icon is not re-added"
+        );
+        assert_eq!(calls.borrow().removes, []);
+        assert_eq!(runs.get(), 0, "reopening is not a command");
+        drop(host);
+        assert_eq!(calls.borrow().removes, [hwnd], "drop removes the kept icon");
+    }
+
+    #[test]
+    fn a_resident_session_show_command_reopens_zero_windows() {
+        let SessionTrayHarness {
+            mut host,
+            calls,
+            runs,
+        } = session_tray_host(Some("app.show"));
+        host.close(MAIN).expect("close the last window");
+        assert!(host.runtime.windows().is_empty());
+
+        assert!(send_tray_callback(&mut host, WM_CONTEXTMENU, (10, 20)).is_none());
+        assert_eq!(runs.get(), 1);
+        assert_eq!(host.runtime.windows().len(), 1);
+        assert!(host.hwnd(MAIN).is_some());
+        assert_eq!(calls.borrow().adds.len(), 1, "the resident icon stays");
+        assert_eq!(calls.borrow().removes, []);
+    }
+
+    #[test]
+    fn a_tray_quit_ends_the_resident_session_and_removes_the_icon_once() {
+        let SessionTrayHarness {
+            mut host,
+            calls,
+            runs,
+        } = session_tray_host(Some("app.quit"));
+        let hwnd = tray_hwnd(&host);
+        assert!(!host.runtime.windows().is_empty());
+
+        assert!(send_tray_callback(&mut host, WM_CONTEXTMENU, (10, 20)).is_none());
+        assert_eq!(runs.get(), 1);
+        assert!(
+            host.runtime.windows().is_empty(),
+            "quit closes every window"
+        );
+        assert!(!host.runtime.session_alive());
+        assert_eq!(calls.borrow().removes, [hwnd], "the icon is removed once");
+        assert!(host.pump().expect("settle the ended session"));
+        drop(host);
+        assert_eq!(
+            calls.borrow().removes.len(),
+            1,
+            "drop does not delete the icon twice"
+        );
+    }
+
+    #[test]
+    fn a_resident_session_requires_a_declared_tray() {
+        let mut runtime = Runtime::new();
+        runtime
+            .declare_session(SessionPolicy::StayResident)
+            .expect("declare the resident policy");
+        runtime
+            .declare_windows(|catalog| {
+                catalog.window(WindowSpec::new(MAIN).primary(), |_| view! { <view /> })?;
+                Ok(())
+            })
+            .expect("declare the window");
+        let error = match Host::open(runtime, HostConfig::hidden()) {
+            Ok(_) => panic!("a resident host without a tray must be rejected"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            HostError::Session(SessionError::TrayRequired)
+        ));
     }
 
     #[test]
