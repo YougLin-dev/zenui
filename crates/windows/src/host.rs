@@ -31,15 +31,17 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_LEFT, VK_NEXT, VK_PRIOR, VK_PROCESSKEY, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_TAB,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow,
-    DispatchMessageW, GWLP_USERDATA, GetClientRect, GetForegroundWindow, GetMenu, GetMessageW,
-    GetWindowLongPtrW, IDC_ARROW, IsIconic, IsZoomed, KillTimer, LoadCursorW, MSG, PM_REMOVE,
-    PeekMessageW, PostMessageW, RegisterClassExW, SPI_GETWHEELSCROLLLINES, SW_HIDE, SW_SHOW,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
-    SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-    SystemParametersInfoW, TranslateMessage, WINDOW_EX_STYLE, WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE,
-    WM_COMMAND, WM_DESTROY, WM_DPICHANGED, WM_ENTERMENULOOP, WM_GETDPISCALEDSIZE, WM_GETOBJECT,
-    WM_IME_CHAR, WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_STARTCOMPOSITION, WM_KEYDOWN,
+    CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CheckMenuItem, CreateWindowExW, DefWindowProcW,
+    DestroyWindow, DispatchMessageW, EnableMenuItem, GWLP_USERDATA, GetClientRect,
+    GetForegroundWindow, GetMenu, GetMenuItemCount, GetMenuItemID, GetMessageW, GetWindowLongPtrW,
+    HMENU, IDC_ARROW, IsIconic, IsZoomed, KillTimer, LoadCursorW, MF_BYCOMMAND, MF_CHECKED,
+    MF_ENABLED, MF_GRAYED, MF_UNCHECKED, MSG, PM_REMOVE, PeekMessageW, PostMessageW,
+    RegisterClassExW, SPI_GETWHEELSCROLLLINES, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOZORDER, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SetForegroundWindow, SetTimer,
+    SetWindowLongPtrW, SetWindowPos, ShowWindow, SystemParametersInfoW, TranslateMessage,
+    WINDOW_EX_STYLE, WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_DPICHANGED,
+    WM_ENTERMENULOOP, WM_GETDPISCALEDSIZE, WM_GETOBJECT, WM_IME_CHAR, WM_IME_COMPOSITION,
+    WM_IME_ENDCOMPOSITION, WM_IME_STARTCOMPOSITION, WM_INITMENU, WM_INITMENUPOPUP, WM_KEYDOWN,
     WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL,
     WM_PAINT, WM_SETTINGCHANGE, WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
 };
@@ -950,6 +952,11 @@ impl Host {
             self.ime_cancel(window)
         } else if message == WM_KILLFOCUS {
             self.focus_lost(window)
+        } else if message == WM_INITMENU {
+            self.apply_menu_state(window, HMENU(wparam.0 as *mut c_void), false)
+        } else if message == WM_INITMENUPOPUP {
+            let system_menu = (lparam.0 >> 16) & 0xFFFF != 0;
+            self.apply_menu_state(window, HMENU(wparam.0 as *mut c_void), system_menu)
         } else if message == WM_COMMAND {
             self.menu_command(window, wparam, lparam)
         } else if message == WM_ENTERMENULOOP {
@@ -1753,8 +1760,9 @@ impl Host {
     /// `WM_COMMAND` 的菜单形式：HIWORD=0 且 lParam=0。
     ///
     /// 命令 id 必须是这个窗口菜单分配过的稳定项；隐藏、待决关闭与已关闭窗口已由
-    /// `handle_window_message` 拒绝，运行时命令路径还会再验证一次。窗口状态的
-    /// 竞态是正常交互结果，不升级为宿主错误。
+    /// `handle_window_message` 拒绝，运行时命令路径还会再验证一次。状态回调在
+    /// 派发前再次求值，禁用项不运行 handler；窗口状态的竞态是正常交互结果，不
+    /// 升级为宿主错误。
     fn menu_command(
         &mut self,
         window: &mut WindowHost,
@@ -1765,18 +1773,92 @@ impl Host {
             return Ok(());
         }
         let id = (wparam.0 & 0xFFFF) as u16;
-        let Some(command) = window.menu.as_ref().and_then(|menu| menu.command(id)) else {
+        let Some(command) = window
+            .menu
+            .as_ref()
+            .and_then(|menu| menu.command(id))
+            .cloned()
+        else {
             return Ok(());
         };
+        let state = self
+            .runtime
+            .menu_state(window.ctx, &command)
+            .map_err(HostError::MenuState)?
+            .unwrap_or_else(|| command.default_state());
+        if !state.enabled() {
+            return Ok(());
+        }
         match self
             .runtime
-            .dispatch_command(window.ctx, command, CommandSource::MenuBar)
+            .dispatch_command(window.ctx, command.id(), CommandSource::MenuBar)
         {
             Ok(()) | Err(CommandError::Hidden | CommandError::Suspended | CommandError::Stale) => {
                 Ok(())
             }
             Err(error) => Err(HostError::Command(error)),
         }
+    }
+
+    /// `WM_INITMENU`/`WM_INITMENUPOPUP`：按只读状态回调设置 enabled/checked。
+    ///
+    /// 先求值菜单中的全部命令，再统一应用；任一回调失败时菜单保持原状，错误交给
+    /// 消息循环。系统菜单不属于应用声明，直接跳过。
+    fn apply_menu_state(
+        &mut self,
+        window: &mut WindowHost,
+        menu: HMENU,
+        system_menu: bool,
+    ) -> Result<(), HostError> {
+        if system_menu || menu.is_invalid() {
+            return Ok(());
+        }
+        let Some(native_menu) = window.menu.as_ref() else {
+            return Ok(());
+        };
+        // 安全：menu 由宿主持有的 HWND 拥有。
+        let count = unsafe { GetMenuItemCount(Some(menu)) };
+        if count <= 0 {
+            return Ok(());
+        }
+        let mut states = Vec::with_capacity(count as usize);
+        for position in 0..count {
+            // 安全：position 在菜单项范围内；分隔线返回 0，子菜单返回 u32::MAX。
+            let id = unsafe { GetMenuItemID(menu, position) };
+            if id == 0 || id == u32::MAX {
+                continue;
+            }
+            let Ok(id) = u16::try_from(id) else {
+                continue;
+            };
+            let Some(command) = native_menu.command(id) else {
+                continue;
+            };
+            let state = self
+                .runtime
+                .menu_state(window.ctx, command)
+                .map_err(HostError::MenuState)?
+                .unwrap_or_else(|| command.default_state());
+            states.push((id, state));
+        }
+        for (id, state) in states {
+            let enable = if state.enabled() {
+                MF_ENABLED
+            } else {
+                MF_GRAYED
+            };
+            let check = if state.checked() {
+                MF_CHECKED.0
+            } else {
+                MF_UNCHECKED.0
+            };
+            // 安全：菜单由窗口拥有；命令 id 来自它的原生项。
+            unsafe {
+                let _ = EnableMenuItem(menu, u32::from(id), MF_BYCOMMAND | enable);
+                let _ = CheckMenuItem(menu, u32::from(id), MF_BYCOMMAND.0 | check);
+            }
+        }
+        Ok(())
     }
 
     /// `WM_ENTERMENULOOP`：菜单接管鼠标与输入，取消组合并清除指针瞬态。
@@ -3306,6 +3388,8 @@ pub enum HostError {
     Menu(MenuError),
     /// 菜单命令在运行时命令路径上失败；窗口状态竞态已在调用方过滤。
     Command(CommandError),
+    /// 菜单状态回调失败；回调内的写入已被只读作用域拒绝。
+    MenuState(MenuStateError),
     /// 场景构建失败。
     Scene(zenui_render::SceneError),
     /// GPU 渲染失败。
@@ -3333,6 +3417,7 @@ impl fmt::Display for HostError {
             Self::FileDialog(error) => write!(f, "file dialog request failed: {error}"),
             Self::Menu(error) => write!(f, "menu creation failed: {error}"),
             Self::Command(error) => write!(f, "menu command failed: {error}"),
+            Self::MenuState(error) => write!(f, "menu state query failed: {error}"),
             Self::Scene(error) => write!(f, "scene failed: {error}"),
             Self::Render(error) => write!(f, "render failed: {error}"),
             Self::Input(error) => write!(f, "pointer dispatch failed: {error}"),
@@ -8059,6 +8144,71 @@ mod tests {
         )
     }
 
+    fn menu_state_host() -> (Host, Rc<Cell<u32>>) {
+        let runs = Rc::new(Cell::new(0));
+        let mut runtime = Runtime::new();
+        let checked = runtime
+            .setup(|| signal(true))
+            .expect("menu state application setup");
+        let handler_runs = runs.clone();
+        runtime
+            .declare_windows(move |catalog| {
+                let handler_runs = handler_runs.clone();
+                catalog.window(
+                    WindowSpec::new(MAIN).primary().titled("ZenUI Menu State"),
+                    move |window| {
+                        let handler_runs = handler_runs.clone();
+                        window
+                            .on_command("file.clear", move |_| {
+                                handler_runs.set(handler_runs.get() + 1);
+                            })
+                            .expect("register file.clear");
+                        window
+                            .on_command("view.status", |_| {})
+                            .expect("register view.status");
+                        window
+                            .on_command("state.toggle", move |_| checked.set(!checked.get()))
+                            .expect("register state.toggle");
+                        window
+                            .on_command("app.about", |_| {})
+                            .expect("register app.about");
+                        window
+                            .on_menu_state(move |command| match command.id() {
+                                "file.clear" | "app.about" => {
+                                    MenuCommandState::new(checked.get(), false)
+                                }
+                                "view.status" => MenuCommandState::new(true, checked.get()),
+                                _ => command.default_state(),
+                            })
+                            .expect("register menu state");
+                        view! {
+                            <view>
+                                <text aria:label="status">"Ready"</text>
+                            </view>
+                        }
+                    },
+                )?;
+                catalog.menu(
+                    MAIN,
+                    MenuSpec::new()
+                        .submenu("File", MenuSpec::new().command("file.clear", "Clear"))
+                        .submenu(
+                            "View",
+                            MenuSpec::new()
+                                .command("view.status", "Show status")
+                                .command("state.toggle", "Toggle"),
+                        )
+                        .command("app.about", "About"),
+                )?;
+                Ok(())
+            })
+            .expect("declare the menu state host");
+        (
+            Host::open(runtime, HostConfig::hidden()).expect("open the menu state host"),
+            runs,
+        )
+    }
+
     fn menu_label(menu: HMENU, item: u32, flags: MENU_ITEM_FLAGS) -> String {
         let mut buffer = [0u16; 64];
         let length = unsafe { GetMenuStringW(menu, item, Some(&mut buffer), flags) };
@@ -8360,6 +8510,354 @@ mod tests {
             !unsafe { IsMenu(menu) }.as_bool(),
             "the assigned menu dies with its window"
         );
+    }
+
+    fn menu_state_at(menu: HMENU, id: u32) -> u32 {
+        // 安全：id 来自同一窗口拥有的菜单。
+        unsafe { GetMenuState(menu, id, MF_BYCOMMAND) }
+    }
+
+    fn assert_menu_enabled(menu: HMENU, id: u32, expected: bool) {
+        let state = menu_state_at(menu, id);
+        assert_eq!(
+            state & MF_GRAYED.0 == 0,
+            expected,
+            "menu item {id} enabled state: {state:#x}"
+        );
+    }
+
+    fn assert_menu_checked(menu: HMENU, id: u32, expected: bool) {
+        let state = menu_state_at(menu, id);
+        assert_eq!(
+            state & MF_CHECKED.0 != 0,
+            expected,
+            "menu item {id} checked state: {state:#x}"
+        );
+    }
+
+    #[test]
+    fn menu_init_messages_reapply_committed_state() {
+        let (mut host, runs) = menu_state_host();
+        let hwnd = host.hwnd(MAIN).expect("a live window");
+        let menu = unsafe { GetMenu(hwnd) };
+        let file = unsafe { GetSubMenu(menu, 0) };
+        let view = unsafe { GetSubMenu(menu, 1) };
+        // 安全：位置在菜单项范围内。
+        let clear = unsafe { GetMenuItemID(file, 0) };
+        let status = unsafe { GetMenuItemID(view, 0) };
+        let toggle = unsafe { GetMenuItemID(view, 1) };
+        let about = unsafe { GetMenuItemID(menu, 2) };
+        assert_eq!((clear, status, toggle, about), (1, 2, 3, 4));
+
+        send_msg(
+            &mut host,
+            MSG {
+                message: WM_INITMENU,
+                wParam: WPARAM(menu.0 as usize),
+                ..Default::default()
+            },
+        );
+        assert_menu_enabled(menu, about, true);
+        send_msg(
+            &mut host,
+            MSG {
+                message: WM_INITMENUPOPUP,
+                wParam: WPARAM(file.0 as usize),
+                ..Default::default()
+            },
+        );
+        assert_menu_enabled(file, clear, true);
+        send_msg(
+            &mut host,
+            MSG {
+                message: WM_INITMENUPOPUP,
+                wParam: WPARAM(view.0 as usize),
+                ..Default::default()
+            },
+        );
+        assert_menu_checked(view, status, true);
+        assert_menu_enabled(view, toggle, true);
+
+        send_msg(
+            &mut host,
+            MSG {
+                message: WM_COMMAND,
+                wParam: WPARAM(toggle as usize),
+                ..Default::default()
+            },
+        );
+        send_msg(
+            &mut host,
+            MSG {
+                message: WM_INITMENU,
+                wParam: WPARAM(menu.0 as usize),
+                ..Default::default()
+            },
+        );
+        assert_menu_enabled(menu, about, false);
+        send_msg(
+            &mut host,
+            MSG {
+                message: WM_INITMENUPOPUP,
+                wParam: WPARAM(file.0 as usize),
+                ..Default::default()
+            },
+        );
+        assert_menu_enabled(file, clear, false);
+        send_msg(
+            &mut host,
+            MSG {
+                message: WM_INITMENUPOPUP,
+                wParam: WPARAM(view.0 as usize),
+                ..Default::default()
+            },
+        );
+        assert_menu_checked(view, status, false);
+        assert_menu_enabled(view, toggle, true);
+
+        send_msg(
+            &mut host,
+            MSG {
+                message: WM_COMMAND,
+                wParam: WPARAM(clear as usize),
+                ..Default::default()
+            },
+        );
+        assert_eq!(runs.get(), 0, "a disabled item cannot dispatch");
+
+        send_msg(
+            &mut host,
+            MSG {
+                message: WM_COMMAND,
+                wParam: WPARAM(toggle as usize),
+                ..Default::default()
+            },
+        );
+        send_msg(
+            &mut host,
+            MSG {
+                message: WM_INITMENU,
+                wParam: WPARAM(menu.0 as usize),
+                ..Default::default()
+            },
+        );
+        assert_menu_enabled(menu, about, true);
+        send_msg(
+            &mut host,
+            MSG {
+                message: WM_INITMENUPOPUP,
+                wParam: WPARAM(file.0 as usize),
+                ..Default::default()
+            },
+        );
+        assert_menu_enabled(file, clear, true);
+        send_msg(
+            &mut host,
+            MSG {
+                message: WM_COMMAND,
+                wParam: WPARAM(clear as usize),
+                ..Default::default()
+            },
+        );
+        assert_eq!(runs.get(), 1, "an enabled item dispatches");
+    }
+
+    #[test]
+    fn hidden_windows_leave_menu_items_unchanged() {
+        let (mut host, _runs) = menu_state_host();
+        let hwnd = host.hwnd(MAIN).expect("a live window");
+        let menu = unsafe { GetMenu(hwnd) };
+        let view = unsafe { GetSubMenu(menu, 1) };
+        let status = unsafe { GetMenuItemID(view, 0) };
+        let toggle = unsafe { GetMenuItemID(view, 1) };
+        let about = unsafe { GetMenuItemID(menu, 2) };
+
+        send_msg(
+            &mut host,
+            MSG {
+                message: WM_INITMENU,
+                wParam: WPARAM(menu.0 as usize),
+                ..Default::default()
+            },
+        );
+        send_msg(
+            &mut host,
+            MSG {
+                message: WM_INITMENUPOPUP,
+                wParam: WPARAM(view.0 as usize),
+                ..Default::default()
+            },
+        );
+        assert_menu_enabled(menu, about, true);
+        assert_menu_checked(view, status, true);
+
+        send_msg(
+            &mut host,
+            MSG {
+                message: WM_COMMAND,
+                wParam: WPARAM(toggle as usize),
+                ..Default::default()
+            },
+        );
+        host.hide(MAIN).expect("hide the menu window");
+        send_msg(
+            &mut host,
+            MSG {
+                message: WM_INITMENU,
+                wParam: WPARAM(menu.0 as usize),
+                ..Default::default()
+            },
+        );
+        send_msg(
+            &mut host,
+            MSG {
+                message: WM_INITMENUPOPUP,
+                wParam: WPARAM(view.0 as usize),
+                ..Default::default()
+            },
+        );
+        assert_menu_enabled(menu, about, true);
+        assert_menu_checked(view, status, true);
+
+        host.show(MAIN).expect("show the menu window");
+        send_msg(
+            &mut host,
+            MSG {
+                message: WM_INITMENU,
+                wParam: WPARAM(menu.0 as usize),
+                ..Default::default()
+            },
+        );
+        send_msg(
+            &mut host,
+            MSG {
+                message: WM_INITMENUPOPUP,
+                wParam: WPARAM(view.0 as usize),
+                ..Default::default()
+            },
+        );
+        assert_menu_enabled(menu, about, false);
+        assert_menu_checked(view, status, false);
+    }
+
+    #[test]
+    fn menu_state_errors_leave_the_menu_unchanged() {
+        let mut runtime = Runtime::new();
+        let checked = runtime
+            .setup(|| signal(true))
+            .expect("menu state error setup");
+        runtime
+            .declare_windows(move |catalog| {
+                catalog.window(WindowSpec::new(MAIN).primary(), move |window| {
+                    window
+                        .on_command("file.clear", |_| {})
+                        .expect("register file.clear");
+                    window
+                        .on_menu_state(move |command| {
+                            checked.set(false);
+                            command.default_state()
+                        })
+                        .expect("register menu state");
+                    view! { <view /> }
+                })?;
+                catalog.menu(
+                    MAIN,
+                    MenuSpec::new().submenu(
+                        "File",
+                        MenuSpec::new().item(
+                            MenuCommand::new("file.clear", "Clear")
+                                .enabled(false)
+                                .checked(true),
+                        ),
+                    ),
+                )?;
+                Ok(())
+            })
+            .expect("declare the menu state error host");
+        let mut host = Host::open(runtime, HostConfig::hidden()).expect("open the host");
+        let hwnd = host.hwnd(MAIN).expect("a live window");
+        let menu = unsafe { GetMenu(hwnd) };
+        let file = unsafe { GetSubMenu(menu, 0) };
+        let clear = unsafe { GetMenuItemID(file, 0) };
+        let before = menu_state_at(file, clear);
+        assert_ne!(before & MF_GRAYED.0, 0, "the declared disabled state");
+        assert_ne!(before & MF_CHECKED.0, 0, "the declared checked state");
+
+        host.handle_message(hwnd, WM_INITMENUPOPUP, WPARAM(file.0 as usize), LPARAM(0));
+        match host.deferred_error.take() {
+            Some(HostError::MenuState(MenuStateError::Context {
+                operation: "Signal::set",
+                ..
+            })) => {}
+            other => panic!("the state error must surface typed: {other:?}"),
+        }
+        assert_eq!(
+            menu_state_at(file, clear),
+            before,
+            "a failed callback leaves the native menu unchanged"
+        );
+    }
+
+    #[test]
+    fn reopening_rebuilds_the_menu_and_reregisters_state() {
+        let (mut host, _runs) = menu_state_host();
+        let old_hwnd = host.hwnd(MAIN).expect("a live window");
+        let old_menu = unsafe { GetMenu(old_hwnd) };
+        assert!(!old_menu.is_invalid());
+        host.close(MAIN).expect("close the window");
+        assert!(
+            // 安全：只查询旧菜单句柄。
+            !unsafe { IsMenu(old_menu) }.as_bool(),
+            "the old menu dies with its window"
+        );
+
+        host.show(MAIN).expect("reopen the window");
+        let hwnd = host.hwnd(MAIN).expect("a live window");
+        assert_ne!(hwnd, old_hwnd, "reopening creates a new native window");
+        let menu = unsafe { GetMenu(hwnd) };
+        let file = unsafe { GetSubMenu(menu, 0) };
+        let view = unsafe { GetSubMenu(menu, 1) };
+        let clear = unsafe { GetMenuItemID(file, 0) };
+        let status = unsafe { GetMenuItemID(view, 0) };
+        let toggle = unsafe { GetMenuItemID(view, 1) };
+
+        send_msg(
+            &mut host,
+            MSG {
+                message: WM_INITMENUPOPUP,
+                wParam: WPARAM(view.0 as usize),
+                ..Default::default()
+            },
+        );
+        assert_menu_checked(view, status, true);
+        assert_menu_enabled(view, toggle, true);
+
+        send_msg(
+            &mut host,
+            MSG {
+                message: WM_COMMAND,
+                wParam: WPARAM(toggle as usize),
+                ..Default::default()
+            },
+        );
+        send_msg(
+            &mut host,
+            MSG {
+                message: WM_INITMENUPOPUP,
+                wParam: WPARAM(file.0 as usize),
+                ..Default::default()
+            },
+        );
+        assert_menu_enabled(file, clear, false);
+        send_msg(
+            &mut host,
+            MSG {
+                message: WM_INITMENUPOPUP,
+                wParam: WPARAM(view.0 as usize),
+                ..Default::default()
+            },
+        );
+        assert_menu_checked(view, status, false);
     }
 
     #[test]

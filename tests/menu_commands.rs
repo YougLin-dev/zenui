@@ -3,6 +3,7 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
+use zenui::Phase;
 use zenui::prelude::*;
 
 #[test]
@@ -229,6 +230,255 @@ fn an_empty_menu_needs_no_handlers() {
         .show("main")
         .expect("an empty menu opens without handlers");
     assert!(app.window_alive(main));
+}
+
+fn command_by_id(menu: &MenuSpec, id: &str) -> MenuCommand {
+    menu.items()
+        .iter()
+        .find_map(|item| match item {
+            MenuItem::Command(command) if command.id() == id => Some(command.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no command {id}"))
+}
+
+#[test]
+fn menu_state_reads_committed_state_and_rejects_writes() {
+    let mut app = Runtime::new();
+    let (checked, store) = app
+        .setup(|| (signal(true), Store::new()))
+        .expect("application setup");
+    let menu = MenuSpec::new()
+        .command("state.toggle", "Toggle")
+        .command("state.signal-write", "Signal write")
+        .command("state.txn-write", "Store write")
+        .command("state.panic", "Panic")
+        .command("state.on", "On")
+        .command("state.off", "Off")
+        .command("state.commit", "Commit")
+        .command("state.rows", "Rows");
+    let declaration = menu.clone();
+    app.declare_windows(move |catalog| {
+        catalog.window(WindowSpec::new("main").primary(), move |window| {
+            window
+                .on_command("state.toggle", move |_| checked.set(!checked.get()))
+                .expect("register toggle");
+            window
+                .on_command("state.on", move |_| checked.set(true))
+                .expect("register on");
+            window
+                .on_command("state.off", move |_| checked.set(false))
+                .expect("register off");
+            window
+                .on_command("state.commit", move |_| {
+                    let mut transaction = Transaction::new();
+                    transaction = transaction.write(store.insert("row"));
+                    transaction.finish().expect("commit the row");
+                })
+                .expect("register commit");
+            for id in [
+                "state.signal-write",
+                "state.txn-write",
+                "state.panic",
+                "state.rows",
+            ] {
+                window.on_command(id, |_| {}).expect("register inert");
+            }
+            window
+                .on_menu_state(move |command| match command.id() {
+                    "state.toggle" => MenuCommandState::new(true, checked.get()),
+                    "state.signal-write" => {
+                        checked.set(false);
+                        command.default_state()
+                    }
+                    "state.txn-write" => {
+                        let mut transaction = Transaction::new();
+                        transaction = transaction.write(store.insert("bad"));
+                        let _ = transaction.finish();
+                        command.default_state()
+                    }
+                    "state.panic" => panic!("the menu state callback failed"),
+                    "state.rows" => MenuCommandState::new(true, store.rows(Filter::All).is_empty()),
+                    _ => command.default_state(),
+                })
+                .expect("register menu state");
+            view! { <view /> }
+        })?;
+        catalog.menu("main", declaration)?;
+        Ok(())
+    })
+    .expect("catalog");
+    let main = app.show("main").expect("show main");
+
+    let toggle = command_by_id(&menu, "state.toggle");
+    assert_eq!(
+        app.menu_state(main, &toggle),
+        Ok(Some(MenuCommandState::new(true, true)))
+    );
+
+    let error = app
+        .menu_state(main, &command_by_id(&menu, "state.signal-write"))
+        .expect_err("a Signal write is rejected");
+    assert!(
+        matches!(
+            error,
+            MenuStateError::Context {
+                operation: "Signal::set",
+                phase: Phase::Idle
+            }
+        ),
+        "{error:?}"
+    );
+    assert_eq!(
+        app.menu_state(main, &toggle),
+        Ok(Some(MenuCommandState::new(true, true))),
+        "the rejected write leaves the Signal unchanged"
+    );
+
+    let error = app
+        .menu_state(main, &command_by_id(&menu, "state.txn-write"))
+        .expect_err("a Store transaction is rejected");
+    assert!(
+        matches!(
+            error,
+            MenuStateError::Write(WriteError::Context {
+                operation: "Transaction::finish",
+                phase: Phase::Idle
+            })
+        ),
+        "{error:?}"
+    );
+    let rows = command_by_id(&menu, "state.rows");
+    assert_eq!(
+        app.menu_state(main, &rows),
+        Ok(Some(MenuCommandState::new(true, true))),
+        "the rejected transaction leaves the Store unchanged"
+    );
+
+    let error = app
+        .menu_state(main, &command_by_id(&menu, "state.panic"))
+        .expect_err("a panicking callback is contained");
+    assert_eq!(error, MenuStateError::HandlerPanicked);
+    assert_eq!(
+        app.menu_state(main, &toggle),
+        Ok(Some(MenuCommandState::new(true, true))),
+        "the runtime is still usable after a contained panic"
+    );
+
+    app.dispatch_command(main, "state.off", CommandSource::MenuBar)
+        .expect("commit the off state");
+    assert_eq!(
+        app.menu_state(main, &toggle),
+        Ok(Some(MenuCommandState::new(true, false))),
+        "the callback sees the committed Signal"
+    );
+    app.dispatch_command(main, "state.on", CommandSource::MenuBar)
+        .expect("commit the on state");
+    assert_eq!(
+        app.menu_state(main, &toggle),
+        Ok(Some(MenuCommandState::new(true, true)))
+    );
+    app.dispatch_command(main, "state.commit", CommandSource::MenuBar)
+        .expect("commit a row");
+    assert_eq!(
+        app.menu_state(main, &rows),
+        Ok(Some(MenuCommandState::new(true, false))),
+        "the callback reads the committed Store"
+    );
+}
+
+#[test]
+fn menu_state_registration_is_per_activation_and_readable() {
+    let attempts = Rc::new(Cell::new(0));
+    let attempts_factory = attempts.clone();
+    let duplicate: Rc<RefCell<Option<Result<(), WindowError>>>> = Rc::new(RefCell::new(None));
+    let duplicate_factory = duplicate.clone();
+    let checked = Rc::new(Cell::new(true));
+    let checked_factory = checked.clone();
+    let menu = MenuSpec::new().command("act", "Act");
+    let declaration = menu.clone();
+
+    let mut app = Runtime::new();
+    app.declare_windows(move |catalog| {
+        catalog.window(WindowSpec::new("main").primary(), move |window| {
+            attempts_factory.set(attempts_factory.get() + 1);
+            window.on_command("act", |_| {}).expect("register act");
+            match attempts_factory.get() {
+                1 => {
+                    let checked = checked_factory.clone();
+                    window
+                        .on_menu_state(move |command| {
+                            MenuCommandState::new(true, checked.get() && command.id() == "act")
+                        })
+                        .expect("register the first state handler");
+                    let checked = checked_factory.clone();
+                    *duplicate_factory.borrow_mut() = Some(window.on_menu_state(move |command| {
+                        MenuCommandState::new(false, checked.get() && command.id() == "act")
+                    }));
+                }
+                3 => {
+                    let checked = checked_factory.clone();
+                    window
+                        .on_menu_state(move |command| {
+                            MenuCommandState::new(true, checked.get() && command.id() == "act")
+                        })
+                        .expect("register the new state handler");
+                }
+                _ => {}
+            }
+            view! { <view /> }
+        })?;
+        catalog.menu("main", declaration.clone())?;
+        Ok(())
+    })
+    .expect("catalog");
+
+    let main = app.show("main").expect("show the first activation");
+    assert!(
+        matches!(
+            duplicate.borrow().as_ref(),
+            Some(Err(WindowError::State(_)))
+        ),
+        "a second state handler is rejected: {:?}",
+        duplicate.borrow()
+    );
+    let act = command_by_id(&menu, "act");
+    assert_eq!(
+        app.menu_state(main, &act),
+        Ok(Some(MenuCommandState::new(true, true)))
+    );
+
+    app.close_window(main).expect("close the first activation");
+    assert_eq!(
+        app.menu_state(main, &act),
+        Err(MenuStateError::Stale),
+        "a closed activation cannot query state"
+    );
+    let reopened = app
+        .show("main")
+        .expect("the second activation opens without a state handler");
+    assert_eq!(
+        app.menu_state(reopened, &act),
+        Ok(None),
+        "the old handler does not leak into the new activation"
+    );
+
+    app.close_window(reopened)
+        .expect("close the second activation");
+    let registered = app.show("main").expect("the third activation registers");
+    assert_eq!(
+        app.menu_state(registered, &act),
+        Ok(Some(MenuCommandState::new(true, true)))
+    );
+
+    let mut other = Runtime::new();
+    let foreign = other
+        .open_window("foreign", |_| view! { <view /> })
+        .expect("foreign window");
+    assert_eq!(
+        app.menu_state(foreign, &act),
+        Err(MenuStateError::WrongRuntime)
+    );
 }
 
 fn source_name(source: CommandSource) -> &'static str {

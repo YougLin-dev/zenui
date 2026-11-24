@@ -1,23 +1,30 @@
-#193 原生菜单栏可见证据
+# Stage-three 原生菜单栏与动态状态可见证据（#193、#194）
 日期: 2026-11-24
-示例: crates/windows/examples/menu_host.rs (ZenUI Menu)
-窗口位置: 屏幕 (300,150)；外框尺寸随 DPI；目录尺寸 560x320 逻辑像素
+示例: crates/windows/examples/menu_host.rs (ZenUI Menu)，debug 构建
+窗口: 560x320 逻辑像素；100% 位于屏幕 (208,208)，150% 位于 (114,114)
 
-缩放  DPI  外框      客户区    菜单栏        命令
-100%  96   576x379   560x320   File / View   View > Show status：Ready -> Command ran
-150%  144  862x566   840x480   File / View   View > Show status：Ready -> Command ran
+缩放  DPI  外框      客户区    菜单栏高度  菜单项矩形（屏幕物理像素）
+100%  96   576x379   560x320  19          File 33x19 @ (122,145)；View 41x19 @ (155,145)
+150%  144  862x566   840x480  29          File 52x29 @ (125,159)；View 63x29 @ (177,159)
+
+窗口几何来自 GetWindowRect / GetClientRect / GetWindowDpiForWindow；菜单栏与菜单项
+矩形来自 GetMenuBarInfo(OBJID_MENU)。两个缩放都保持 560x320 逻辑客户区，菜单栏
+计入非客户区（100% 外框减客户区 16x59；150% 为 22x86）。
 
 采集方式:
-- 100-window.png / 100-command.png / 150-window.png / 150-command.png:
+- *-window.png / *-cleared.png:
   PrintWindow(PW_RENDERFULLCONTENT) 读取完整窗口；包含标题栏、菜单栏与客户区。
-  PrintWindow 不绘制窗口外框的缩放宽边，图片边缘的黑色条是该采集产物，不是应用绘制。
-- 100-view-menu.png / 150-view-menu.png:
-  View 菜单由 SendInput 注入 Alt+V 打开；用 DPI-aware 的屏幕读取窗口可见区域
-  (100%: 300,158 起 560x355；150%: 311,161 起 840x545)，不包含窗口外的桌面内容。
-- 命令由菜单循环执行：打开 View 后按 Enter，随后再采集完整窗口。
+  PrintWindow 不绘制窗口外框的缩放宽边，图片右/下边缘的黑色条是采集产物。
+- *-view-checked.png / *-view-unchecked.png / *-file-enabled.png / *-file-disabled.png:
+  以 SendInput 鼠标点击菜单栏打开弹出菜单，用 DPI-aware CopyFromScreen 采集窗口
+  外框区域；弹出菜单是独立窗口，因此屏幕读取包含菜单。图片左/下的黑色条是窗口
+  不可见缩放宽边的采集产物，不是应用绘制。
+- 菜单项选择由 SendInput 发送 Down、Enter；disabled 项的拒绝由鼠标点击其位置后
+  再次采集确认。
 
 读数:
-- 100%: GetWindowRect 576x379, GetClientRect 560x320, 外框减客户区 16x59。
-- 150%: GetWindowRect 862x566, GetClientRect 840x480, 外框减客户区 22x86。
-- 两个缩放都保持 560x320 逻辑客户区；菜单栏高度包含在非客户区。
-- 菜单标签 File / View；子项 Close / Show status；命令执行后 status 文本由 Ready 变为 Command ran。
+- 初始：客户区文本 Ready；View > Show status 显示勾选；File > Clear 可用（黑色）。
+- 选择 View > Show status 后：文本变为 Status hidden；再次打开 View 时勾选消失。
+- 选择 File > Clear 后：文本变为 Cleared；再次打开 File 时 Clear 变灰。
+- Clear 变灰后点击该项：菜单关闭，文本仍为 Cleared，命令未执行。
+- 两个缩放观察到相同的勾选切换与禁用/拒绝行为。

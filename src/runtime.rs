@@ -9,7 +9,10 @@ use zenui_style::{Length, Property, StyleValue};
 
 use crate::context::{self, ContextFault, DepKey, Phase, with_state};
 use crate::dispatch::{DispatchError, NodeOperation};
-use crate::menu::{CommandError, CommandEvent, CommandHandler, CommandSource, MenuSpec};
+use crate::menu::{
+    CommandError, CommandEvent, CommandHandler, CommandSource, MenuCommand, MenuCommandState,
+    MenuSpec, MenuStateError, MenuStateHandler,
+};
 use crate::presentation::{
     Appearance, NodeId, NodeStatus, PresentationSnapshot, SnapshotAction, SnapshotActions,
     SnapshotAttr, SnapshotElement, SnapshotNode, SnapshotRowBand, SnapshotSemantics, SnapshotValue,
@@ -106,6 +109,8 @@ pub(crate) struct State {
     close_handlers: BTreeMap<&'static str, CloseHandler>,
     /// 每个 activation 在 factory 中注册的命令处理器，随窗口关闭释放。
     command_handlers: BTreeMap<&'static str, BTreeMap<&'static str, CommandHandler>>,
+    /// 每个 activation 的只读菜单状态回调，随窗口关闭释放。
+    menu_state_handlers: BTreeMap<&'static str, MenuStateHandler>,
     /// 按父窗口键索引的待决关闭 epoch；存在即表示父窗口输入被挂起。
     close_epochs: BTreeMap<&'static str, CloseEpoch>,
     /// UI 处理期排队的 Allow/Deny 回复，在事件/交付结算后执行。
@@ -217,6 +222,7 @@ impl State {
             window_requests: Vec::new(),
             close_handlers: BTreeMap::new(),
             command_handlers: BTreeMap::new(),
+            menu_state_handlers: BTreeMap::new(),
             close_epochs: BTreeMap::new(),
             close_replies: Vec::new(),
             next_close_epoch: 1,
@@ -551,6 +557,7 @@ impl State {
         self.window_factory_ran = true;
         // 旧 activation 的处理器不能进入新 factory；正常关闭已经清理过。
         self.command_handlers.remove(key);
+        self.menu_state_handlers.remove(key);
         let activation = self
             .windows
             .get(key)
@@ -572,6 +579,7 @@ impl State {
     pub(crate) fn mark_window_closed(&mut self, key: &'static str) {
         self.close_handlers.remove(key);
         self.command_handlers.remove(key);
+        self.menu_state_handlers.remove(key);
         let Some(record) = self.windows.get_mut(key) else {
             return;
         };
@@ -604,20 +612,31 @@ impl State {
         Ok(())
     }
 
+    /// factory 注册入口共用的阶段、owner 与 activation 校验。
+    fn ensure_factory_registration(
+        &self,
+        window: WindowCtx,
+        message: &'static str,
+    ) -> Result<(), WindowError> {
+        if self.phase != Phase::Setup || self.current_owner != Some(window.owner) {
+            return Err(WindowError::State(message));
+        }
+        if !self.window_is_live(window.key, window.activation, window.owner) {
+            return Err(WindowError::Stale);
+        }
+        Ok(())
+    }
+
     /// 在窗口 factory 中登记关闭处理器；必须是该 activation 自己的 Setup。
     pub(crate) fn register_close_handler(
         &mut self,
         window: WindowCtx,
         handler: CloseHandler,
     ) -> Result<(), WindowError> {
-        if self.phase != Phase::Setup || self.current_owner != Some(window.owner) {
-            return Err(WindowError::State(
-                "close handlers must be registered during the window factory",
-            ));
-        }
-        if !self.window_is_live(window.key, window.activation, window.owner) {
-            return Err(WindowError::Stale);
-        }
+        self.ensure_factory_registration(
+            window,
+            "close handlers must be registered during the window factory",
+        )?;
         if self.close_handlers.contains_key(window.key) {
             return Err(WindowError::State(
                 "a close handler is already registered for this activation",
@@ -634,14 +653,10 @@ impl State {
         id: &'static str,
         handler: CommandHandler,
     ) -> Result<(), WindowError> {
-        if self.phase != Phase::Setup || self.current_owner != Some(window.owner) {
-            return Err(WindowError::State(
-                "command handlers must be registered during the window factory",
-            ));
-        }
-        if !self.window_is_live(window.key, window.activation, window.owner) {
-            return Err(WindowError::Stale);
-        }
+        self.ensure_factory_registration(
+            window,
+            "command handlers must be registered during the window factory",
+        )?;
         let declared = self
             .catalog
             .get(window.key)
@@ -655,6 +670,25 @@ impl State {
             return Err(WindowError::Command(CommandError::AlreadyRegistered(id)));
         }
         handlers.insert(id, handler);
+        Ok(())
+    }
+
+    /// 在窗口 factory 中登记只读菜单状态回调；每个 activation 一次。
+    pub(crate) fn register_menu_state_handler(
+        &mut self,
+        window: WindowCtx,
+        handler: MenuStateHandler,
+    ) -> Result<(), WindowError> {
+        self.ensure_factory_registration(
+            window,
+            "menu state handlers must be registered during the window factory",
+        )?;
+        if self.menu_state_handlers.contains_key(window.key) {
+            return Err(WindowError::State(
+                "a menu state handler is already registered for this activation",
+            ));
+        }
+        self.menu_state_handlers.insert(window.key, handler);
         Ok(())
     }
 
@@ -1718,6 +1752,68 @@ impl Runtime {
         }
         let state = self.state.borrow();
         state.catalog.get(window.key)?.menu.clone()
+    }
+
+    /// 在只读作用域内求值窗口的菜单状态回调。
+    ///
+    /// 没有注册回调时返回 `Ok(None)`，宿主使用命令的声明默认状态。回调内的
+    /// Signal 写与 Store 事务被拒绝并作为 typed error 返回，模型保持已提交值；
+    /// 回调 panic 被 contain。宿主在 `WM_INITMENU`/`WM_INITMENUPOPUP` 与命令
+    /// 派发前调用。
+    pub fn menu_state(
+        &self,
+        window: WindowCtx,
+        command: &MenuCommand,
+    ) -> Result<Option<MenuCommandState>, MenuStateError> {
+        let state = self.state.clone();
+        if window.runtime != state.borrow().id {
+            return Err(MenuStateError::WrongRuntime);
+        }
+        let handler = {
+            let state = state.borrow();
+            if !state.window_is_live(window.key, window.activation, window.owner) {
+                return Err(MenuStateError::Stale);
+            }
+            state.menu_state_handlers.get(window.key).cloned()
+        };
+        let Some(handler) = handler else {
+            return Ok(None);
+        };
+        context::install(&state, || {
+            let previous_phase = with_state(|state| {
+                state.fault = None;
+                state.write_error = None;
+                state.read_only += 1;
+                state.phase
+            });
+            let outcome =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(command)));
+            with_state(|state| {
+                state.phase = previous_phase;
+                state.read_only = state.read_only.saturating_sub(1);
+            });
+            let value = match outcome {
+                Ok(value) => value,
+                Err(_) => {
+                    // 展开前记录的部分 fault 不属于任何调用方，丢弃后再报告 panic。
+                    with_state(|state| {
+                        state.fault = None;
+                        state.write_error = None;
+                    });
+                    return Err(MenuStateError::HandlerPanicked);
+                }
+            };
+            if let Some(fault) = with_state(|state| state.fault.take()) {
+                return Err(MenuStateError::Context {
+                    operation: fault.operation,
+                    phase: fault.phase,
+                });
+            }
+            if let Some(error) = with_state(|state| state.write_error.take()) {
+                return Err(MenuStateError::Write(error));
+            }
+            Ok(Some(value))
+        })
     }
 
     /// 显示目录中的窗口：未打开时运行 factory 产生新 activation；已打开时只聚焦，

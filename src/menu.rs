@@ -9,7 +9,9 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::rc::Rc;
 
+use crate::context::Phase;
 use crate::presentation::NodeId;
+use crate::store::WriteError;
 use crate::view::MountError;
 
 /// 命令来源。
@@ -126,6 +128,81 @@ impl std::error::Error for CommandError {
     }
 }
 
+/// 菜单状态回调的失败原因。
+///
+/// 回调在只读作用域内运行；Signal 写与 Store 事务被拒绝并在这里报告，模型与
+/// 菜单项保持原来的已提交状态。
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum MenuStateError {
+    /// 窗口属于另一个 Runtime。
+    WrongRuntime,
+    /// activation 已关闭或已被新一代替换。
+    Stale,
+    /// 回调尝试了只读作用域禁止的操作。
+    Context {
+        operation: &'static str,
+        phase: Phase,
+    },
+    /// 回调尝试提交 Store 事务。
+    Write(WriteError),
+    /// handler panic；错误被 contain，不向调用方展开。
+    HandlerPanicked,
+}
+
+impl fmt::Display for MenuStateError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::WrongRuntime => {
+                f.write_str("a WindowCtx from another ZenUI Runtime cannot query menu state")
+            }
+            Self::Stale => f.write_str("the window activation is no longer live"),
+            Self::Context { operation, phase } => {
+                write!(
+                    f,
+                    "{operation} is not allowed during menu state ({phase:?})"
+                )
+            }
+            Self::Write(error) => write!(f, "{error}"),
+            Self::HandlerPanicked => f.write_str("the menu state handler panicked"),
+        }
+    }
+}
+
+impl std::error::Error for MenuStateError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Write(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+/// 一个菜单命令在打开时的启用与勾选状态。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MenuCommandState {
+    enabled: bool,
+    checked: bool,
+}
+
+impl MenuCommandState {
+    /// 由启用与勾选位组成的状态；参数顺序为 `enabled`、`checked`。
+    pub const fn new(enabled: bool, checked: bool) -> Self {
+        Self { enabled, checked }
+    }
+
+    /// 命令是否可被选择。
+    pub const fn enabled(self) -> bool {
+        self.enabled
+    }
+
+    /// 命令是否显示勾选标记。
+    pub const fn checked(self) -> bool {
+        self.checked
+    }
+}
+
+pub(crate) type MenuStateHandler = Rc<dyn Fn(&MenuCommand) -> MenuCommandState>;
+
 /// 一个菜单项。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MenuItem {
@@ -197,6 +274,11 @@ impl MenuCommand {
     /// 打开菜单时的默认勾选状态；这不是运行时状态。
     pub const fn is_checked(&self) -> bool {
         self.checked
+    }
+
+    /// 没有状态回调或回调返回默认值时使用的状态。
+    pub const fn default_state(&self) -> MenuCommandState {
+        MenuCommandState::new(self.enabled, self.checked)
     }
 }
 

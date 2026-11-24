@@ -164,6 +164,10 @@ _Avoid_: origin, base offset
 core 的一次事务提交单位；无修饰的 “frame” 不用于 presentation。
 _Avoid_: frame
 
+**Menu command state**:
+窗口在菜单打开时通过 `WindowCtx::on_menu_state` 提交的只读 enabled/checked 结果；宿主在 `WM_INITMENU`/`WM_INITMENUPOPUP` 与派发前用 `Runtime::menu_state` 求值，没有回调时使用 `MenuCommand` 的声明默认值。回调内的 Signal 写与 Store 事务被拒绝为 typed error，模型保持已提交值。
+_Avoid_: menu flag, UI state snapshot
+
 **Window scale**:
 窗口逻辑坐标到物理像素的缩放；布局始终使用逻辑像素。
 _Avoid_: DPI factor, zoom

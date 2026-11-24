@@ -27,7 +27,8 @@ pub use file_dialog::{
     FileDialogRequestError, FileFilter,
 };
 pub use menu::{
-    CommandError, CommandEvent, CommandSource, MenuCommand, MenuItem, MenuSpec, Submenu,
+    CommandError, CommandEvent, CommandSource, MenuCommand, MenuCommandState, MenuItem, MenuSpec,
+    MenuStateError, Submenu,
 };
 pub use presentation::{
     Appearance, NodeId, NodeStatus, PresentationSnapshot, SnapshotAction, SnapshotActions,
@@ -60,14 +61,14 @@ pub mod prelude {
         CompositionEvent, CompositionPhase, Condition, DeliveryReport, DispatchError, Field,
         FieldError, FileDialogError, FileDialogKind, FileDialogOptions, FileDialogOutcome,
         FileDialogRequest, FileDialogRequestError, FileFilter, FocusCause, FocusEvent, FocusInfo,
-        Key, KeyEvent, Length, LengthUnit, Memo, MenuCommand, MenuItem, MenuSpec, MountError,
-        MountPlan, MountResult, NodeId, NodeOperation, NodeStatus, Once, Opacity,
-        PresentationSnapshot, Property, Runtime, Signal, SnapshotAction, SnapshotActions,
-        SnapshotAttr, SnapshotElement, SnapshotNode, SnapshotRowBand, SnapshotSemantics,
-        SnapshotValue, Store, StyleDeclaration, StyleOrigin, StyleValue, Submenu, SubmitEvent,
-        Task, TaskError, TaskScope, TaskStatus, TaskToken, TextEditState, TodoId, Transaction,
-        WindowCatalog, WindowCtx, WindowError, WindowInfo, WindowRole, WindowSpec, WriteError,
-        WriteOp, component, em, memo, once, px, signal, view,
+        Key, KeyEvent, Length, LengthUnit, Memo, MenuCommand, MenuCommandState, MenuItem, MenuSpec,
+        MenuStateError, MountError, MountPlan, MountResult, NodeId, NodeOperation, NodeStatus,
+        Once, Opacity, PresentationSnapshot, Property, Runtime, Signal, SnapshotAction,
+        SnapshotActions, SnapshotAttr, SnapshotElement, SnapshotNode, SnapshotRowBand,
+        SnapshotSemantics, SnapshotValue, Store, StyleDeclaration, StyleOrigin, StyleValue,
+        Submenu, SubmitEvent, Task, TaskError, TaskScope, TaskStatus, TaskToken, TextEditState,
+        TodoId, Transaction, WindowCatalog, WindowCtx, WindowError, WindowInfo, WindowRole,
+        WindowSpec, WriteError, WriteOp, component, em, memo, once, px, signal, view,
     };
     pub use zenui_core::Filter;
 }
