@@ -160,6 +160,10 @@ _Avoid_: rich text provider, text model (when meaning the committed value)
 在 caret/selection 上执行的平台无关编辑操作，例如插入、退格、删除；每次编辑派发一次 `on:input`。
 _Avoid_: input event, keystroke
 
+**Text edit history**:
+每个文本输入自己在运行时保存的有界撤销/重做历史：条目记录编辑前后的已提交值、caret、anchor 与归一化 selection；连续单字符输入按 run 合并（至多 64 个字符，空白并入前一个 run），移动、焦点变化、删除、多字符插入、整体替换、组合提交、撤销/重做与外部替换开启新步。撤销/重做通过一次 `on:input` 写回，模型仍是值的权威；精确恢复只对原样提交值的处理器成立。它不是应用层的业务撤销，也不跨输入共享。
+_Avoid_: application undo, model undo (when meaning text-input history), shared edit history
+
 **Selection anchor**:
 selection 的固定端；caret 是活动端（焦点）。Shift+方向键移动活动端而 anchor 不动，折叠时两者相等。
 _Avoid_: origin, base offset
@@ -191,6 +195,10 @@ _Avoid_: node menu, right-click handler, popup window state
 **Application command**:
 通过 `Runtime::on_app_command` 在首个窗口打开或根树挂载前注册的应用级处理器；没有窗口时也能运行，事件通过 `CommandEvent::window` 暴露可选的目标 activation。窗口菜单声明项可以由它承接，窗口目标派发只在窗口没有注册同一 id 时回退到它，`CommandSource::Tray` 从不运行窗口处理器。处理器在 `Phase::Event` 中可写应用 Signal/Store 并排队窗口请求；启动后注册、重复 id 与 panic 返回 typed error。
 _Avoid_: global command, background command
+
+**Application undo**:
+应用自己的业务状态撤销或事务回滚，由应用实现；文本编辑历史只撤销单个输入内的本地编辑，不等于应用撤销，也不会撤销窗口请求、模型事务或其它输入。本里程碑不提供通用应用撤销。
+_Avoid_: text edit history, editor undo (when meaning application state)
 
 **Tray icon**:
 应用级托盘声明 `TraySpec`：一个 tooltip 与一份右键 `MenuSpec`，在首个窗口打开或根树挂载前通过 `Runtime::declare_tray` 注册，全部菜单命令必须有应用级处理器。宿主用一个从不显示的顶层托盘 HWND 接住自己的回调消息与 Explorer 的 `TaskbarCreated` 广播；左键或键盘激活恢复可见焦点窗口，没有可见焦点时恢复 primary，primary 不在时选择任一存活窗口；右键在宿主借用之外展示菜单并以 `CommandSource::Tray` 派发恰好一次。默认会话策略下图标随最后一个窗口关闭移除；`StayResident` 会话保留图标并可在零窗口时恢复 primary。`TaskbarCreated` 后重新添加。第一切片使用共享系统图标，不承诺自定义图标资产；零窗口的托盘独存由应用会话策略显式决定，不是隐式默认，隐藏到托盘由应用的 hide 请求进入。
