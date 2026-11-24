@@ -117,9 +117,9 @@ impl WindowCtx {
 
     /// 在窗口 factory 中为菜单命令注册处理器；每个 activation、每个 id 一次。
     ///
-    /// 菜单树声明的每个命令都必须有处理器，否则这次打开失败。注册只发生在
-    /// 窗口 factory 自己的 Setup 中；嵌套组件的 Setup、事件与交付阶段都拒绝。
-    /// 关闭窗口释放全部处理器，重新打开必须重新注册。
+    /// 菜单栏与上下文菜单声明的每个命令都必须有处理器，否则这次打开失败。
+    /// 注册只发生在窗口 factory 自己的 Setup 中；嵌套组件的 Setup、事件与
+    /// 交付阶段都拒绝。关闭窗口释放全部处理器，重新打开必须重新注册。
     pub fn on_command(
         self,
         id: &'static str,
@@ -368,6 +368,7 @@ pub(crate) struct CatalogEntry {
     pub(crate) spec: WindowSpec,
     pub(crate) factory: WindowFactory,
     pub(crate) menu: Option<MenuSpec>,
+    pub(crate) context_menu: Option<MenuSpec>,
 }
 
 /// 一个仍然存活的窗口及它的目录描述；原生宿主据此同步 HWND。
@@ -387,6 +388,7 @@ pub(crate) type WindowFactory = Rc<dyn Fn(WindowCtx) -> MountResult<MountPlan>>;
 pub struct WindowCatalog {
     entries: Vec<(WindowSpec, WindowFactory)>,
     menus: Vec<(&'static str, MenuSpec)>,
+    context_menus: Vec<(&'static str, MenuSpec)>,
 }
 
 impl WindowCatalog {
@@ -394,6 +396,7 @@ impl WindowCatalog {
         Self {
             entries: Vec::new(),
             menus: Vec::new(),
+            context_menus: Vec::new(),
         }
     }
 
@@ -422,6 +425,23 @@ impl WindowCatalog {
         Ok(())
     }
 
+    /// 为一个目录窗口附加窗口级上下文菜单；菜单不创建原生界面。
+    ///
+    /// 与菜单栏共享命令处理器，但两者的命令 id 不能重复；上下文菜单不声明
+    /// 快捷键，也不参与 `HACCEL`。未知窗口、重复声明、重复命令 id 与超限在
+    /// `Runtime::declare_windows` 完成时校验，重复上下文菜单立即报错。
+    pub fn context_menu(
+        &mut self,
+        window: &'static str,
+        menu: MenuSpec,
+    ) -> Result<(), CatalogError> {
+        if self.context_menus.iter().any(|(key, _)| *key == window) {
+            return Err(CatalogError::DuplicateContextMenu(window));
+        }
+        self.context_menus.push((window, menu));
+        Ok(())
+    }
+
     pub(crate) fn finish(
         self,
     ) -> Result<(BTreeMap<&'static str, CatalogEntry>, &'static str), CatalogError> {
@@ -437,6 +457,7 @@ impl WindowCatalog {
                     spec,
                     factory,
                     menu: None,
+                    context_menu: None,
                 },
             );
         }
@@ -447,13 +468,7 @@ impl WindowCatalog {
             let Some(entry) = entries.get_mut(key) else {
                 return Err(CatalogError::UnknownMenuWindow(key));
             };
-            let items = menu.item_count();
-            if items > MENU_ITEM_LIMIT {
-                return Err(CatalogError::MenuTooLarge { window: key, items });
-            }
-            if let Some(id) = menu.first_duplicate_command() {
-                return Err(CatalogError::DuplicateMenuCommand { window: key, id });
-            }
+            validate_menu_commands(key, &menu)?;
             if let Some((id, shortcut)) = menu.first_duplicate_shortcut() {
                 return Err(CatalogError::DuplicateMenuShortcut {
                     window: key,
@@ -462,6 +477,26 @@ impl WindowCatalog {
                 });
             }
             entry.menu = Some(menu);
+        }
+        for (key, menu) in self.context_menus {
+            let Some(entry) = entries.get_mut(key) else {
+                return Err(CatalogError::UnknownContextMenuWindow(key));
+            };
+            validate_menu_commands(key, &menu)?;
+            if let Some(id) = menu.first_shortcut_command() {
+                return Err(CatalogError::ContextMenuShortcut { window: key, id });
+            }
+            if let Some(menu_bar) = entry.menu.as_ref() {
+                let declared: BTreeSet<_> = menu_bar.command_ids().into_iter().collect();
+                if let Some(id) = menu
+                    .command_ids()
+                    .into_iter()
+                    .find(|id| declared.contains(id))
+                {
+                    return Err(CatalogError::DuplicateMenuCommand { window: key, id });
+                }
+            }
+            entry.context_menu = Some(menu);
         }
         let mut confirmation_parents = BTreeSet::new();
         for (key, entry) in &entries {
@@ -486,6 +521,18 @@ impl WindowCatalog {
         }
         Ok((entries, primary))
     }
+}
+
+/// 菜单栏与上下文菜单共享的声明校验：项数上限与树内重复命令 id。
+fn validate_menu_commands(window: &'static str, menu: &MenuSpec) -> Result<(), CatalogError> {
+    let items = menu.item_count();
+    if items > MENU_ITEM_LIMIT {
+        return Err(CatalogError::MenuTooLarge { window, items });
+    }
+    if let Some(id) = menu.first_duplicate_command() {
+        return Err(CatalogError::DuplicateMenuCommand { window, id });
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -514,6 +561,15 @@ pub enum CatalogError {
     UnknownMenuWindow(&'static str),
     /// 同一个目录窗口声明了不止一个菜单。
     DuplicateMenu(&'static str),
+    /// 上下文菜单绑定的窗口键不在目录中。
+    UnknownContextMenuWindow(&'static str),
+    /// 同一个目录窗口声明了不止一个上下文菜单。
+    DuplicateContextMenu(&'static str),
+    /// 上下文菜单声明了快捷键；窗口级上下文菜单不参与 HACCEL。
+    ContextMenuShortcut {
+        window: &'static str,
+        id: &'static str,
+    },
     /// 一个窗口的菜单树里命令 id 重复。
     DuplicateMenuCommand {
         window: &'static str,
@@ -578,6 +634,16 @@ impl fmt::Display for CatalogError {
             Self::DuplicateMenu(key) => {
                 write!(f, "window {key} declares more than one menu")
             }
+            Self::UnknownContextMenuWindow(key) => {
+                write!(f, "context menu window {key} is not in the catalog")
+            }
+            Self::DuplicateContextMenu(key) => {
+                write!(f, "window {key} declares more than one context menu")
+            }
+            Self::ContextMenuShortcut { window, id } => write!(
+                f,
+                "window {window} declares a shortcut on context menu command {id}"
+            ),
             Self::DuplicateMenuCommand { window, id } => {
                 write!(f, "window {window} declares command id {id} more than once")
             }

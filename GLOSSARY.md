@@ -172,6 +172,10 @@ _Avoid_: global hotkey, raw accelerator string
 窗口在菜单打开时通过 `WindowCtx::on_menu_state` 提交的只读 enabled/checked 结果；宿主在 `WM_INITMENU`/`WM_INITMENUPOPUP` 与派发前用 `Runtime::menu_state` 求值，没有回调时使用 `MenuCommand` 的声明默认值。回调内的 Signal 写与 Store 事务被拒绝为 typed error，模型保持已提交值。
 _Avoid_: menu flag, UI state snapshot
 
+**Context menu**:
+窗口目录通过 `WindowCatalog::context_menu` 声明的窗口级菜单；与菜单栏共享命令处理器但命令 id 不能重复，也不声明快捷键。宿主从 `WM_CONTEXTMENU` 打开，presenter 在 `&mut Host` 借用之外用 `TrackPopupMenuEx(TPM_RETURNCMD)` 展示，返回命令以 `CommandSource::ContextMenu` 派发一次；右键与键盘（Apps/Shift+F10）命中同一份声明。
+_Avoid_: node menu, right-click handler, popup window state
+
 **Window scale**:
 窗口逻辑坐标到物理像素的缩放；布局始终使用逻辑像素。
 _Avoid_: DPI factor, zoom

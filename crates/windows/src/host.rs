@@ -10,7 +10,9 @@ use windows::Win32::Foundation::{
     ERROR_CLASS_ALREADY_EXISTS, GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE,
     WPARAM,
 };
-use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, PAINTSTRUCT, ValidateRect};
+use windows::Win32::Graphics::Gdi::{
+    BeginPaint, ClientToScreen, EndPaint, PAINTSTRUCT, ValidateRect,
+};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Accessibility::{
     IRawElementProviderSimple, UiaReturnRawElementProvider, UiaRootObjectId,
@@ -40,8 +42,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SWP_NOZORDER, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SetForegroundWindow, SetTimer,
     SetWindowLongPtrW, SetWindowPos, ShowWindow, SystemParametersInfoW, TranslateAcceleratorW,
     TranslateMessage, WINDOW_EX_STYLE, WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE, WM_COMMAND,
-    WM_DESTROY, WM_DPICHANGED, WM_ENTERMENULOOP, WM_GETDPISCALEDSIZE, WM_GETOBJECT, WM_IME_CHAR,
-    WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_STARTCOMPOSITION, WM_INITMENU,
+    WM_CONTEXTMENU, WM_DESTROY, WM_DPICHANGED, WM_ENTERMENULOOP, WM_GETDPISCALEDSIZE, WM_GETOBJECT,
+    WM_IME_CHAR, WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_STARTCOMPOSITION, WM_INITMENU,
     WM_INITMENUPOPUP, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEHWHEEL,
     WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_SETTINGCHANGE, WM_SIZE, WM_SYSKEYDOWN, WM_TIMER,
     WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
@@ -54,6 +56,7 @@ use crate::accessibility::{
     self, AccessibilityAction, AccessibilityIds, AccessibilityTree, ScrollCommand,
     WindowAccessibility,
 };
+use crate::context_menu::{ContextMenuPresenter, ContextMenuRequest, NativeContextMenuPresenter};
 use crate::file_dialog::{FileDialogPresenter, NativeFileDialog};
 use crate::menus::{MenuError, NativeAccelerator, NativeMenu};
 use crate::ole::{OleApartment, OleError};
@@ -476,6 +479,10 @@ pub struct Host {
     file_dialog_presenter: Option<Box<dyn FileDialogPresenter>>,
     /// 原生弹窗期间拒绝替换 presenter；只在 UI 线程读写。
     file_dialog_active: bool,
+    /// 窗口级上下文菜单 presenter；隐藏模式默认没有，避免 CI 打开原生弹窗。
+    context_menu_presenter: Option<Box<dyn ContextMenuPresenter>>,
+    /// 上下文菜单弹窗正在展示；期间的菜单初始化不属于窗口菜单栏。
+    context_menu_active: bool,
     /// OLE 初始化失败的稳定原因；避免每次请求重试并保留显式错误。
     ole_error: Option<OleError>,
     /// 必须最后声明：最后一个字段最后释放，OLE 生命周期覆盖 presenter。
@@ -593,6 +600,10 @@ impl Host {
             focus_after_sync: false,
             file_dialog_presenter: None,
             file_dialog_active: false,
+            context_menu_presenter: config
+                .visible
+                .then(|| Box::new(NativeContextMenuPresenter) as Box<dyn ContextMenuPresenter>),
+            context_menu_active: false,
             ole_error: None,
             ole: None,
         };
@@ -700,6 +711,16 @@ impl Host {
         }
         self.file_dialog_presenter = Some(Box::new(presenter));
         Ok(())
+    }
+
+    /// 替换窗口级上下文菜单 presenter。
+    ///
+    /// 隐藏宿主默认没有 presenter，因此 CI 不会打开原生弹窗；测试或嵌入方可以
+    /// 注入 fake 来记录请求并返回命令。presenter 在菜单关闭后归还宿主。弹窗由
+    /// 本线程的模态循环持有，调用方无法在展示期间取得 `&mut Host`，因此不需要
+    /// 运行时拒绝替换。
+    pub fn set_context_menu_presenter(&mut self, presenter: impl ContextMenuPresenter + 'static) {
+        self.context_menu_presenter = Some(Box::new(presenter));
     }
 
     /// 显示所有打开的窗口（若配置为可见）并进入消息循环，直到最后一个窗口关闭。
@@ -978,11 +999,18 @@ impl Host {
             self.ime_cancel(window)
         } else if message == WM_KILLFOCUS {
             self.focus_lost(window)
-        } else if message == WM_INITMENU {
-            self.apply_menu_state(window, HMENU(wparam.0 as *mut c_void), false)
-        } else if message == WM_INITMENUPOPUP {
-            let system_menu = (lparam.0 >> 16) & 0xFFFF != 0;
-            self.apply_menu_state(window, HMENU(wparam.0 as *mut c_void), system_menu)
+        } else if message == WM_INITMENU || message == WM_INITMENUPOPUP {
+            // 上下文菜单弹窗拥有自己的 HMENU 与命令编号；窗口菜单栏的状态回调
+            // 不能按数字 id 命中它，否则两个菜单的同号命令会互相改写状态。
+            if self.context_menu_active {
+                return Ok(());
+            }
+            if message == WM_INITMENU {
+                self.apply_menu_state(window, HMENU(wparam.0 as *mut c_void), false)
+            } else {
+                let system_menu = (lparam.0 >> 16) & 0xFFFF != 0;
+                self.apply_menu_state(window, HMENU(wparam.0 as *mut c_void), system_menu)
+            }
         } else if message == WM_COMMAND {
             self.menu_command(window, wparam, lparam)
         } else if message == WM_ENTERMENULOOP {
@@ -1816,6 +1844,69 @@ impl Host {
         accelerator_is_shadowed(VIRTUAL_KEY(message.wParam.0 as u16), control, composing)
     }
 
+    /// 从窗口过程借出一次上下文菜单工作；presenter 与请求在菜单期间离开宿主。
+    fn begin_context_menu(
+        &mut self,
+        hwnd: HWND,
+        lparam: LPARAM,
+    ) -> Option<(Box<dyn ContextMenuPresenter>, ContextMenuRequest)> {
+        let key = self.key_for(hwnd)?;
+        let (ctx, close_requested) = {
+            let window = self.windows.get(key)?;
+            (window.ctx, window.close_requested)
+        };
+        if close_requested || !self.runtime.window_accepts_input(ctx) {
+            return None;
+        }
+        let presenter = self.context_menu_presenter.take()?;
+        let Some(menu) = self.runtime.window_context_menu(ctx) else {
+            self.context_menu_presenter = Some(presenter);
+            return None;
+        };
+        self.context_menu_active = true;
+        Some((
+            presenter,
+            ContextMenuRequest::new(ctx, hwnd, context_menu_point(hwnd, lparam), menu),
+        ))
+    }
+
+    /// 菜单关闭后归还 presenter，并在窗口仍然接受输入时派发一次选择。
+    ///
+    /// 弹窗期间 owner 被关闭、隐藏或进入关闭确认时，返回值被丢弃，不产生 stale
+    /// 命令。presenter 只能返回这个窗口声明过的命令 id；未声明的 id 是调用方
+    /// 错误，作为宿主错误上报。
+    fn finish_context_menu(
+        &mut self,
+        presenter: Box<dyn ContextMenuPresenter>,
+        window: WindowCtx,
+        result: Result<Option<&'static str>, HostError>,
+    ) -> Result<(), HostError> {
+        self.context_menu_active = false;
+        self.context_menu_presenter = Some(presenter);
+        let Some(id) = result? else {
+            return Ok(());
+        };
+        if !self.runtime.window_accepts_input(window) {
+            return Ok(());
+        }
+        self.dispatch_menu_command(window, id, CommandSource::ContextMenu)
+    }
+
+    /// 派发菜单命令；窗口状态的竞态是正常交互结果，其余错误交给消息循环。
+    fn dispatch_menu_command(
+        &mut self,
+        window: WindowCtx,
+        id: &'static str,
+        source: CommandSource,
+    ) -> Result<(), HostError> {
+        match self.runtime.dispatch_command(window, id, source) {
+            Ok(()) | Err(CommandError::Stale | CommandError::Hidden | CommandError::Suspended) => {
+                Ok(())
+            }
+            Err(error) => Err(HostError::Command(error)),
+        }
+    }
+
     /// `WM_COMMAND` 的菜单或快捷键形式：HIWORD=0/1 且 lParam=0。
     ///
     /// 命令 id 必须是这个窗口菜单分配过的稳定项；隐藏、待决关闭与已关闭窗口已由
@@ -1853,15 +1944,7 @@ impl Host {
         if !state.enabled() {
             return Ok(());
         }
-        match self
-            .runtime
-            .dispatch_command(window.ctx, command.id(), source)
-        {
-            Ok(()) | Err(CommandError::Hidden | CommandError::Suspended | CommandError::Stale) => {
-                Ok(())
-            }
-            Err(error) => Err(HostError::Command(error)),
-        }
+        self.dispatch_menu_command(window.ctx, command.id(), source)
     }
 
     /// `WM_INITMENU`/`WM_INITMENUPOPUP`：按只读状态回调设置 enabled/checked。
@@ -3453,6 +3536,10 @@ pub enum HostError {
     Menu(MenuError),
     /// 原生快捷键表构建失败。
     Accelerator(MenuError),
+    /// 窗口级上下文菜单构建失败。
+    ContextMenu(MenuError),
+    /// 上下文菜单 presenter 失败；panic 不能穿过窗口过程的系统边界。
+    ContextMenuPresenter(String),
     /// 菜单命令在运行时命令路径上失败；窗口状态竞态已在调用方过滤。
     Command(CommandError),
     /// 菜单状态回调失败；回调内的写入已被只读作用域拒绝。
@@ -3484,6 +3571,10 @@ impl fmt::Display for HostError {
             Self::FileDialog(error) => write!(f, "file dialog request failed: {error}"),
             Self::Menu(error) => write!(f, "menu creation failed: {error}"),
             Self::Accelerator(error) => write!(f, "accelerator table creation failed: {error}"),
+            Self::ContextMenu(error) => write!(f, "context menu creation failed: {error}"),
+            Self::ContextMenuPresenter(message) => {
+                write!(f, "context menu presentation failed: {message}")
+            }
             Self::Command(error) => write!(f, "menu command failed: {error}"),
             Self::MenuState(error) => write!(f, "menu state query failed: {error}"),
             Self::Scene(error) => write!(f, "scene failed: {error}"),
@@ -4041,6 +4132,18 @@ impl Drop for HostPointer {
     }
 }
 
+/// 取回窗口过程对应的宿主裸指针；未安装时返回 `None`。
+///
+/// # Safety
+///
+/// 指针由 `HostPointer` 安装在 `run`/`pump` 期间，指向不会移动的 `Host`；
+/// 通过它访问宿主时必须保证同一时刻没有其它引用。
+unsafe fn host_pointer(hwnd: HWND) -> Option<*mut Host> {
+    // 安全：读取窗口的 user data 槽；未安装时为零。
+    let pointer = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut Host;
+    (!pointer.is_null()).then_some(pointer)
+}
+
 /// 在窗口过程里取回宿主并执行一次动作；未安装指针时什么也不做。
 ///
 /// # Safety
@@ -4048,15 +4151,11 @@ impl Drop for HostPointer {
 /// 动作执行期间不得通过其他引用访问宿主。`run`/`pump` 满足这一点：它们在
 /// 派发消息时只持有裸指针，派发返回后才重新借出宿主。
 unsafe fn with_host(hwnd: HWND, action: impl FnOnce(&mut Host)) {
-    // 安全：读取窗口的 user data 槽；未安装时为零。
-    let pointer = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut Host;
-    if pointer.is_null() {
-        return;
+    // 安全：指针有效；调用方不在动作执行期间访问宿主。
+    if let Some(pointer) = unsafe { host_pointer(hwnd) } {
+        let host = unsafe { &mut *pointer };
+        action(host);
     }
-    // 安全：指针由 HostPointer 安装，指向在 `run`/`pump` 期间不会移动的 Host；
-    // 调用方不在动作执行期间访问宿主。
-    let host = unsafe { &mut *pointer };
-    action(host);
 }
 
 /// 取走窗口过程的延迟捕获释放请求；调用时不得持有宿主引用。
@@ -4065,14 +4164,34 @@ unsafe fn with_host(hwnd: HWND, action: impl FnOnce(&mut Host)) {
 ///
 /// 调用方必须在窗口过程借出宿主结束后调用，期间不得有其它引用指向宿主。
 unsafe fn take_capture_release(hwnd: HWND) -> bool {
-    // 安全：读取窗口的 user data 槽；未安装时为零。
-    let pointer = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut Host;
-    if pointer.is_null() {
-        return false;
+    // 安全：指针有效；调用方不持有宿主引用。
+    match unsafe { host_pointer(hwnd) } {
+        Some(pointer) => unsafe { (&mut *pointer).take_release_capture(hwnd) },
+        None => false,
     }
-    // 安全：指针由 HostPointer 安装；调用方不持有宿主引用。
-    let host = unsafe { &mut *pointer };
-    host.take_release_capture(hwnd)
+}
+
+/// `WM_CONTEXTMENU` 的屏幕坐标；键盘调用（-1,-1）放在客户区中心。
+fn context_menu_point(hwnd: HWND, lparam: LPARAM) -> (i32, i32) {
+    let x = (lparam.0 & 0xFFFF) as u16 as i16;
+    let y = ((lparam.0 >> 16) & 0xFFFF) as u16 as i16;
+    if (x, y) != (-1, -1) {
+        return (i32::from(x), i32::from(y));
+    }
+    let mut rect = RECT::default();
+    // 安全：hwnd 由宿主持有；rect 是本地输出缓冲。
+    if unsafe { GetClientRect(hwnd, &mut rect) }.is_err() {
+        return (0, 0);
+    }
+    let mut point = POINT {
+        x: (rect.right - rect.left) / 2,
+        y: (rect.bottom - rect.top) / 2,
+    };
+    // 安全：同一 HWND 的客户区坐标转屏幕坐标；失败时退回原点。
+    if !unsafe { ClientToScreen(hwnd, &mut point) }.as_bool() {
+        return (0, 0);
+    }
+    (point.x, point.y)
 }
 
 /// 翻译并派发一条消息；快捷键先于字符翻译与窗口过程。
@@ -4302,6 +4421,40 @@ unsafe extern "system" fn wndproc(
             // 安全：派发期间不持有宿主引用；结束该窗口的 activation。
             // HWND 由消息循环在派发返回后同步销毁，最后一个窗口关闭时循环退出。
             unsafe { with_host(hwnd, |host| host.close_from_window(hwnd)) };
+            LRESULT(0)
+        }
+        WM_CONTEXTMENU => {
+            // 菜单自己的模态循环在窗口过程内运行，不会再回到消息循环。presenter
+            // 打开菜单期间不持有宿主借用，因此到达的唤醒和其它窗口消息照常重入。
+            let Some(pointer) = (unsafe { host_pointer(hwnd) }) else {
+                return unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
+            };
+            // 安全：派发期间不持有宿主引用，窗口过程借出一次。
+            let work = unsafe { (&mut *pointer).begin_context_menu(hwnd, lparam) };
+            if let Some((mut presenter, request)) = work {
+                let window = request.window();
+                // 安全：菜单打开期间不持有宿主引用，presenter 可以重入窗口过程。
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    presenter.show(request)
+                }))
+                .unwrap_or_else(|_| {
+                    Err(HostError::ContextMenuPresenter(String::from(
+                        "the presenter panicked",
+                    )))
+                });
+                // 安全：菜单已关闭且没有其它引用；重新借出宿主结算这次打开。
+                let host = unsafe { &mut *pointer };
+                let mut error = host.finish_context_menu(presenter, window, result).err();
+                if let Err(failure) = host.settle_window_requests() {
+                    error.get_or_insert(failure);
+                }
+                if let Err(failure) = host.repaint_changed_windows() {
+                    error.get_or_insert(failure);
+                }
+                if let Some(failure) = error {
+                    host.deferred_error.get_or_insert(failure);
+                }
+            }
             LRESULT(0)
         }
         WM_DESTROY => {
@@ -7094,6 +7247,140 @@ mod tests {
         }
     }
 
+    /// 一次 fake 上下文菜单打开收到的请求快照。
+    #[derive(Clone, Debug, PartialEq)]
+    struct ContextMenuRecord {
+        window: WindowCtx,
+        hwnd: HWND,
+        point: (i32, i32),
+        menu: MenuSpec,
+    }
+
+    /// 在“弹窗期间”重入窗口过程的动作。
+    type DuringShow = Box<dyn FnMut(HWND, &MenuSpec)>;
+
+    /// 记录请求并返回固定命令的 presenter；可选动作在“弹窗期间”重入窗口过程。
+    struct FakeContextMenuPresenter {
+        records: Rc<RefCell<Vec<ContextMenuRecord>>>,
+        result: Option<&'static str>,
+        panic_first: Rc<Cell<bool>>,
+        during_show: Option<DuringShow>,
+    }
+
+    impl ContextMenuPresenter for FakeContextMenuPresenter {
+        fn show(&mut self, request: ContextMenuRequest) -> Result<Option<&'static str>, HostError> {
+            if self.panic_first.replace(false) {
+                panic!("the fake context menu presenter failed");
+            }
+            self.records.borrow_mut().push(ContextMenuRecord {
+                window: request.window(),
+                hwnd: request.hwnd(),
+                point: request.point(),
+                menu: request.menu().clone(),
+            });
+            if let Some(action) = self.during_show.as_mut() {
+                action(request.hwnd(), request.menu());
+            }
+            Ok(self.result)
+        }
+    }
+
+    fn context_menu_declaration() -> MenuSpec {
+        MenuSpec::new()
+            .command("edit.copy", "Copy")
+            .separator()
+            .submenu("More", MenuSpec::new().command("edit.paste", "Paste"))
+    }
+
+    /// fake presenter 安装后的隐藏宿主与观察点。
+    struct ContextMenuHarness {
+        host: Host,
+        records: Rc<RefCell<Vec<ContextMenuRecord>>>,
+        runs: Rc<Cell<u32>>,
+    }
+
+    /// 带上下文菜单声明的隐藏宿主；`edit.copy` 的处理器记录派发次数。
+    fn context_menu_host(
+        result: Option<&'static str>,
+        during_show: Option<DuringShow>,
+        panic_first: bool,
+    ) -> ContextMenuHarness {
+        let runs = Rc::new(Cell::new(0));
+        let handler_runs = runs.clone();
+        let mut runtime = Runtime::new();
+        runtime
+            .declare_windows(move |catalog| {
+                catalog.window(WindowSpec::new(MAIN).primary(), move |window| {
+                    let handler_runs = handler_runs.clone();
+                    window
+                        .on_command("edit.copy", move |_| {
+                            handler_runs.set(handler_runs.get() + 1);
+                        })
+                        .expect("register edit.copy");
+                    window
+                        .on_command("edit.paste", |_| {})
+                        .expect("register edit.paste");
+                    view! {
+                        <view>
+                            <text aria:label="status">"Ready"</text>
+                        </view>
+                    }
+                })?;
+                catalog.context_menu(MAIN, context_menu_declaration())?;
+                Ok(())
+            })
+            .expect("declare the context menu host");
+        let mut host =
+            Host::open(runtime, HostConfig::hidden()).expect("open the context menu host");
+        let records = Rc::new(RefCell::new(Vec::new()));
+        host.set_context_menu_presenter(FakeContextMenuPresenter {
+            records: records.clone(),
+            result,
+            panic_first: Rc::new(Cell::new(panic_first)),
+            during_show,
+        });
+        ContextMenuHarness {
+            host,
+            records,
+            runs,
+        }
+    }
+
+    /// 同步派发 `WM_CONTEXTMENU`；`None` 是键盘调用的 (-1,-1)。
+    fn send_context_menu(host: &mut Host, point: Option<(i16, i16)>) -> Option<HostError> {
+        let hwnd = host.hwnd(MAIN).expect("a live window");
+        let (x, y) = point.unwrap_or((-1, -1));
+        let lparam = LPARAM((((y as u16 as u32) << 16) | (x as u16 as u32)) as isize);
+        {
+            let _pointer = HostPointer::install(host as *mut Host);
+            // 安全：SendMessageW 在调用线程同步派发；调用期间不使用 host。
+            unsafe {
+                SendMessageW(hwnd, WM_CONTEXTMENU, Some(WPARAM(0)), Some(lparam));
+            }
+        }
+        host.sync_windows().expect("sync windows");
+        if std::mem::take(&mut host.focus_after_sync) {
+            host.focus_native_focused_window()
+                .expect("focus the active window");
+        }
+        host.repaint_changed_windows().expect("repaint");
+        host.deferred_error.take()
+    }
+
+    /// 键盘打开时客户区中心的屏幕坐标。
+    fn client_center(hwnd: HWND) -> (i32, i32) {
+        let mut rect = RECT::default();
+        // 安全：rect 是本地输出缓冲；hwnd 由宿主持有。
+        unsafe { GetClientRect(hwnd, &mut rect) }.expect("client rect");
+        let mut point = POINT {
+            x: (rect.right - rect.left) / 2,
+            y: (rect.bottom - rect.top) / 2,
+        };
+        // 安全：客户区坐标转屏幕坐标；hwnd 由宿主持有。
+        assert!(unsafe { ClientToScreen(hwnd, &mut point) }.as_bool());
+        (point.x, point.y)
+    }
+
     fn editor_node(host: &Host) -> NodeId {
         host.runtime
             .presentation()
@@ -9306,6 +9593,378 @@ mod tests {
             // 安全：只查询宿主持有的 HWND 的菜单。
             unsafe { GetMenu(hwnd) }.is_invalid(),
             "an empty declaration leaves the HWND without a native menu bar"
+        );
+    }
+
+    #[test]
+    fn context_menu_pointer_and_keyboard_pass_the_same_declaration() {
+        let ContextMenuHarness {
+            mut host,
+            records,
+            runs,
+        } = context_menu_host(Some("edit.copy"), None, false);
+        let hwnd = host.hwnd(MAIN).expect("a live window");
+        let window = host.windows[MAIN].ctx;
+        let keyboard_point = client_center(hwnd);
+
+        assert!(send_context_menu(&mut host, Some((120, 80))).is_none());
+        assert!(send_context_menu(&mut host, None).is_none());
+
+        let records = records.borrow();
+        assert_eq!(records.len(), 2, "each open reaches the presenter once");
+        assert_eq!(records[0].window, window);
+        assert_eq!(records[0].hwnd, hwnd);
+        assert_eq!(records[0].point, (120, 80));
+        assert_eq!(records[0].menu, context_menu_declaration());
+        assert_eq!(
+            records[1].point, keyboard_point,
+            "the keyboard route opens at the client center"
+        );
+        assert_eq!(
+            records[1].menu,
+            context_menu_declaration(),
+            "both routes share one declaration"
+        );
+        assert_eq!(
+            runs.get(),
+            2,
+            "the returned command dispatches once per open, without a second WM_COMMAND"
+        );
+    }
+
+    #[test]
+    fn cancelling_the_context_menu_dispatches_nothing_and_restores_the_presenter() {
+        let ContextMenuHarness {
+            mut host,
+            records,
+            runs,
+        } = context_menu_host(None, None, false);
+        assert!(send_context_menu(&mut host, Some((10, 10))).is_none());
+        assert_eq!(records.borrow().len(), 1);
+        assert_eq!(runs.get(), 0, "a cancel dispatches no command");
+        assert!(
+            host.context_menu_presenter.is_some(),
+            "the presenter returns after a cancel"
+        );
+
+        assert!(send_context_menu(&mut host, Some((12, 14))).is_none());
+        assert_eq!(
+            records.borrow().len(),
+            2,
+            "the next open reaches the restored presenter"
+        );
+    }
+
+    #[test]
+    fn a_worker_wake_during_the_open_menu_is_delivered() {
+        let mut runtime = Runtime::new();
+        runtime
+            .declare_windows(|catalog| {
+                catalog.window(WindowSpec::new(MAIN).primary(), |window| {
+                    window
+                        .on_command("edit.copy", |_| {})
+                        .expect("register edit.copy");
+                    window
+                        .on_command("edit.paste", |_| {})
+                        .expect("register edit.paste");
+                    view! {
+                        <view>
+                            <button
+                                aria:label="start"
+                                on:click={move || {
+                                    let task = window
+                                        .task_scope()
+                                        .spawn(|_| String::from("ready"))
+                                        .expect("spawn the task");
+                                    task.on_done(move |_| {
+                                        window.request_show("details").expect("queue the show");
+                                        Ok(())
+                                    })
+                                    .expect("register the continuation");
+                                }}
+                            >"Start"</button>
+                        </view>
+                    }
+                })?;
+                catalog.window(
+                    WindowSpec::new("details"),
+                    |_| view! { <text>"details"</text> },
+                )?;
+                catalog.context_menu(MAIN, context_menu_declaration())?;
+                Ok(())
+            })
+            .expect("declare the wake host");
+        let mut host = Host::open(runtime, HostConfig::hidden()).expect("open the wake host");
+        let records = Rc::new(RefCell::new(Vec::new()));
+        host.set_context_menu_presenter(FakeContextMenuPresenter {
+            records: records.clone(),
+            result: None,
+            panic_first: Rc::new(Cell::new(false)),
+            during_show: Some(Box::new(|hwnd, _| {
+                // 菜单自己的模态循环不返回外层消息循环；这里同步投递唤醒，
+                // 重入窗口过程交付任务结果。
+                // 安全：hwnd 由宿主持有；SendMessageW 在本线程同步派发。
+                unsafe {
+                    SendMessageW(hwnd, host_message::WAKE, Some(WPARAM(0)), Some(LPARAM(0)));
+                }
+            })),
+        });
+        host.runtime.click_label("start").expect("start the task");
+        host.runtime.wait_for_tasks();
+        assert!(
+            host.hwnd("details").is_none(),
+            "the request waits for a wake delivery"
+        );
+
+        assert!(send_context_menu(&mut host, Some((30, 40))).is_none());
+        assert_eq!(records.borrow().len(), 1, "the popup opened");
+        assert!(
+            host.hwnd("details").is_some(),
+            "the wake delivered during the popup opened its window"
+        );
+        assert!(host.scene("details").is_some(), "the new window paints");
+    }
+
+    #[test]
+    fn closing_the_owner_during_the_open_menu_discards_the_command() {
+        let ContextMenuHarness {
+            mut host,
+            records,
+            runs,
+        } = context_menu_host(
+            Some("edit.copy"),
+            Some(Box::new(|hwnd, _| {
+                // 弹窗期间用户关闭 owner：同步派发 WM_CLOSE 重入窗口过程。
+                // 安全：hwnd 由宿主持有；SendMessageW 在本线程同步派发。
+                unsafe {
+                    SendMessageW(hwnd, WM_CLOSE, Some(WPARAM(0)), Some(LPARAM(0)));
+                }
+            })),
+            false,
+        );
+        assert!(send_context_menu(&mut host, Some((15, 25))).is_none());
+        assert_eq!(records.borrow().len(), 1);
+        assert_eq!(
+            runs.get(),
+            0,
+            "a command chosen for a closed owner is discarded"
+        );
+        assert!(host.hwnd(MAIN).is_none(), "the owner window is gone");
+        assert!(host.runtime.windows().is_empty());
+        assert!(
+            host.context_menu_presenter.is_some(),
+            "the presenter returns even when the owner closes"
+        );
+    }
+
+    #[test]
+    fn a_panicking_context_menu_presenter_is_contained_and_restored() {
+        let ContextMenuHarness {
+            mut host,
+            records,
+            runs,
+        } = context_menu_host(Some("edit.copy"), None, true);
+        let error = send_context_menu(&mut host, Some((5, 5)))
+            .expect("the panic cannot cross the window procedure boundary");
+        assert!(
+            matches!(error, HostError::ContextMenuPresenter(_)),
+            "{error}"
+        );
+        assert_eq!(runs.get(), 0);
+        assert!(
+            host.context_menu_presenter.is_some(),
+            "the presenter returns after a contained panic"
+        );
+
+        assert!(send_context_menu(&mut host, Some((5, 5))).is_none());
+        assert_eq!(
+            records.borrow().len(),
+            1,
+            "the second open reaches the restored presenter"
+        );
+        assert_eq!(runs.get(), 1);
+    }
+
+    #[test]
+    fn an_undeclared_presenter_command_is_a_host_error() {
+        let ContextMenuHarness {
+            mut host,
+            records,
+            runs,
+        } = context_menu_host(Some("edit.unknown"), None, false);
+        let error = send_context_menu(&mut host, Some((5, 5)))
+            .expect("a presenter must return a declared command id");
+        assert!(
+            matches!(
+                error,
+                HostError::Command(CommandError::UnknownCommand("edit.unknown"))
+            ),
+            "{error}"
+        );
+        assert_eq!(runs.get(), 0);
+        assert_eq!(records.borrow().len(), 1, "the presenter saw the request");
+        assert!(
+            host.context_menu_presenter.is_some(),
+            "the presenter returns after an invalid command"
+        );
+    }
+
+    #[test]
+    fn context_popup_ignores_menu_bar_state_with_colliding_numeric_ids() {
+        let menu_bar = MenuSpec::new()
+            .command("file.clear", "Clear")
+            .command("view.status", "Show status");
+        let context = MenuSpec::new()
+            .command("edit.copy", "Copy")
+            .command("edit.paste", "Paste");
+        let mut runtime = Runtime::new();
+        runtime
+            .declare_windows(move |catalog| {
+                catalog.window(WindowSpec::new(MAIN).primary(), |window| {
+                    for id in ["file.clear", "view.status", "edit.copy", "edit.paste"] {
+                        window.on_command(id, |_| {}).expect("register");
+                    }
+                    window
+                        .on_menu_state(|command| match command.id() {
+                            "file.clear" => MenuCommandState::new(false, false),
+                            "view.status" => MenuCommandState::new(true, true),
+                            _ => command.default_state(),
+                        })
+                        .expect("register menu state");
+                    view! { <view /> }
+                })?;
+                catalog.menu(MAIN, menu_bar)?;
+                catalog.context_menu(MAIN, context)?;
+                Ok(())
+            })
+            .expect("declare the colliding menus");
+        let mut host = Host::open(runtime, HostConfig::hidden()).expect("open the host");
+        let records = Rc::new(RefCell::new(Vec::new()));
+        let observed = Rc::new(Cell::new(None));
+        let probe = observed.clone();
+        host.set_context_menu_presenter(FakeContextMenuPresenter {
+            records: records.clone(),
+            result: None,
+            panic_first: Rc::new(Cell::new(false)),
+            during_show: Some(Box::new(move |hwnd, menu| {
+                let native = NativeMenu::build_popup(menu).expect("build the popup");
+                // 安全：句柄由本闭包持有；只读取菜单项状态。
+                let before = unsafe {
+                    (
+                        GetMenuState(native.handle(), 1, MF_BYCOMMAND),
+                        GetMenuState(native.handle(), 2, MF_BYCOMMAND),
+                    )
+                };
+                // 原生菜单的模态循环会向 owner 发送这条初始化消息。
+                // 安全：句柄由本闭包持有；SendMessageW 在本线程同步派发。
+                unsafe {
+                    SendMessageW(
+                        hwnd,
+                        WM_INITMENUPOPUP,
+                        Some(WPARAM(native.handle().0 as usize)),
+                        Some(LPARAM(0)),
+                    );
+                }
+                // 安全：句柄由本闭包持有；只读取菜单项状态。
+                let after = unsafe {
+                    (
+                        GetMenuState(native.handle(), 1, MF_BYCOMMAND),
+                        GetMenuState(native.handle(), 2, MF_BYCOMMAND),
+                    )
+                };
+                probe.set(Some((before, after)));
+            })),
+        });
+
+        assert!(send_context_menu(&mut host, Some((10, 10))).is_none());
+        assert_eq!(records.borrow().len(), 1, "the popup opened once");
+        let Some(((before_copy, before_paste), (after_copy, after_paste))) = observed.get() else {
+            panic!("the presenter did not probe the popup");
+        };
+        assert_eq!(
+            (before_copy, before_paste),
+            (after_copy, after_paste),
+            "the menu-bar state callback must not change the context popup"
+        );
+        assert_eq!(
+            after_copy & MF_GRAYED.0,
+            0,
+            "popup id 1 stays enabled although menu-bar id 1 is disabled"
+        );
+        assert_eq!(
+            after_paste & MF_CHECKED.0,
+            0,
+            "popup id 2 stays unchecked although menu-bar id 2 is checked"
+        );
+    }
+
+    #[test]
+    fn a_hidden_window_does_not_open_the_context_menu() {
+        let ContextMenuHarness {
+            mut host,
+            records,
+            runs,
+        } = context_menu_host(Some("edit.copy"), None, false);
+        let window = host.windows[MAIN].ctx;
+        host.runtime.hide(window).expect("hide the window");
+        assert!(send_context_menu(&mut host, Some((10, 10))).is_none());
+        assert!(records.borrow().is_empty(), "a hidden window opens nothing");
+        assert_eq!(runs.get(), 0);
+        assert!(
+            host.context_menu_presenter.is_some(),
+            "the presenter was never taken"
+        );
+    }
+
+    #[test]
+    fn a_hidden_host_never_installs_the_native_context_menu_presenter() {
+        let mut runtime = Runtime::new();
+        runtime
+            .declare_windows(|catalog| {
+                catalog.window(WindowSpec::new(MAIN).primary(), |window| {
+                    window
+                        .on_command("edit.copy", |_| {})
+                        .expect("register edit.copy");
+                    window
+                        .on_command("edit.paste", |_| {})
+                        .expect("register edit.paste");
+                    view! { <view /> }
+                })?;
+                catalog.context_menu(MAIN, context_menu_declaration())?;
+                Ok(())
+            })
+            .expect("declare the hidden context menu host");
+        let mut host = Host::open(runtime, HostConfig::hidden()).expect("open the host");
+        assert!(
+            host.context_menu_presenter.is_none(),
+            "hidden CI installs no native presenter"
+        );
+        assert!(send_context_menu(&mut host, Some((3, 4))).is_none());
+        assert!(host.context_menu_presenter.is_none());
+    }
+
+    #[test]
+    fn a_window_without_a_context_menu_leaves_the_presenter_installed() {
+        let mut runtime = Runtime::new();
+        runtime
+            .declare_windows(|catalog| {
+                catalog.window(WindowSpec::new(MAIN).primary(), |_| view! { <view /> })?;
+                Ok(())
+            })
+            .expect("declare the plain host");
+        let mut host = Host::open(runtime, HostConfig::hidden()).expect("open the host");
+        let records = Rc::new(RefCell::new(Vec::new()));
+        host.set_context_menu_presenter(FakeContextMenuPresenter {
+            records: records.clone(),
+            result: None,
+            panic_first: Rc::new(Cell::new(false)),
+            during_show: None,
+        });
+        assert!(send_context_menu(&mut host, Some((3, 4))).is_none());
+        assert!(records.borrow().is_empty());
+        assert!(
+            host.context_menu_presenter.is_some(),
+            "an undeclared window does not consume the presenter"
         );
     }
 }

@@ -14,6 +14,8 @@ pub mod accessibility;
 #[cfg(windows)]
 pub mod clipboard;
 #[cfg(windows)]
+mod context_menu;
+#[cfg(windows)]
 pub mod drag_drop;
 #[cfg(windows)]
 mod file_dialog;
@@ -26,6 +28,8 @@ mod ole;
 #[cfg(windows)]
 mod shortcuts;
 
+#[cfg(windows)]
+pub use context_menu::{ContextMenuPresenter, ContextMenuRequest};
 #[cfg(windows)]
 pub use file_dialog::FileDialogPresenter;
 #[cfg(windows)]

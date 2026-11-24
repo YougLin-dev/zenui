@@ -657,12 +657,7 @@ impl State {
             window,
             "command handlers must be registered during the window factory",
         )?;
-        let declared = self
-            .catalog
-            .get(window.key)
-            .and_then(|entry| entry.menu.as_ref())
-            .is_some_and(|menu| menu.contains_command(id));
-        if !declared {
+        if !self.menu_declares(window.key, id) {
             return Err(WindowError::Command(CommandError::UnknownCommand(id)));
         }
         let handlers = self.command_handlers.entry(window.key).or_default();
@@ -694,19 +689,25 @@ impl State {
 
     /// 菜单声明但没有注册处理器的第一个命令 id；打开窗口前必须为空。
     pub(crate) fn missing_command_handler(&self, key: &'static str) -> Option<&'static str> {
-        let menu = self.catalog.get(key)?.menu.as_ref()?;
+        let entry = self.catalog.get(key)?;
         let handlers = self.command_handlers.get(key);
-        menu.command_ids()
-            .into_iter()
+        entry
+            .menu
+            .iter()
+            .chain(entry.context_menu.iter())
+            .flat_map(MenuSpec::command_ids)
             .find(|id| handlers.is_none_or(|handlers| !handlers.contains_key(id)))
     }
 
-    /// 窗口的静态菜单是否声明了这个命令 id。
+    /// 窗口的菜单栏或上下文菜单是否声明了这个命令 id。
     pub(crate) fn menu_declares(&self, key: &'static str, id: &str) -> bool {
-        self.catalog
-            .get(key)
-            .and_then(|entry| entry.menu.as_ref())
-            .is_some_and(|menu| menu.contains_command(id))
+        self.catalog.get(key).is_some_and(|entry| {
+            entry
+                .menu
+                .iter()
+                .chain(entry.context_menu.iter())
+                .any(|menu| menu.contains_command(id))
+        })
     }
 
     /// 当前 activation 注册的命令处理器。
@@ -1752,6 +1753,16 @@ impl Runtime {
         }
         let state = self.state.borrow();
         state.catalog.get(window.key)?.menu.clone()
+    }
+
+    /// 窗口声明的窗口级上下文菜单；没有声明、窗口已关闭或属于另一个 Runtime
+    /// 时为 `None`。菜单在打开时由宿主构建，命令仍经运行时命令路径派发。
+    pub fn window_context_menu(&self, window: WindowCtx) -> Option<MenuSpec> {
+        if !self.window_alive(window) {
+            return None;
+        }
+        let state = self.state.borrow();
+        state.catalog.get(window.key)?.context_menu.clone()
     }
 
     /// 在只读作用域内求值窗口的菜单状态回调。

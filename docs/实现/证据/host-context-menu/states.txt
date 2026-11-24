@@ -1,0 +1,46 @@
+# #196 窗口级上下文菜单可见证据
+日期: 2026-11-24
+示例: crates/windows/examples/menu_host.rs (ZenUI Menu)，debug 构建
+窗口: 560x320 逻辑像素；100% 位于屏幕 (52,52)，150% 位于 (190,190)
+
+缩放  DPI  外框      客户区    客户区原点        右键弹出                  键盘弹出（Shift+F10 / Apps）
+100%  96   576x379   560x320   (60,103)          (400,300) 158x81          (340,263) 158x81
+150%  144  862x566   840x480   (201,265)         (600,400) 222x122         (621,505) 222x122
+
+窗口几何来自 GetWindowRect / GetClientRect / GetDpiForWindow。弹出菜单窗口由枚举同一
+进程的顶层窗口获得，类名 #32768；100% 的矩形来自 DPI-aware 查询，150% 的物理矩阵同样是
+DPI-aware 读数。键盘打开的位置等于客户区中心：(60+280,103+160) 与 (201+420,265+240)。
+两种缩放使用同一份声明：Copy、Paste、分隔线、Clear note；弹出菜单按 96/144 DPI 绘制。
+
+采集方式:
+- *-initial.png / *-cleared.png / *-copied.png:
+  PrintWindow(PW_RENDERFULLCONTENT) 读取完整窗口；右/下的黑色条是采集产物。
+- *-popup.png / *-keyboard-popup.png:
+  以真实 SendInput 打开菜单，用 DPI-aware CopyFromScreen 只裁剪菜单周围的屏幕区域；
+  菜单外的灰色背景是窗口内容，不是应用绘制的菜单边框。
+
+操作读数:
+- 初始：状态文本 Ready，note 输入为空。
+- 点击 note 输入并键入 abc：输入显示 abc，状态仍为 Ready。
+- 在 (400,300) 右键：同一窗口的默认上下文菜单打开，菜单窗口类名 #32768，位置等于
+  点击的物理坐标；菜单文本为 Copy / Paste / Clear note。
+- 按 Down 三次再 Enter 选择 Clear note：状态文本变为 Note cleared，输入清空。
+- 聚焦窗口后按 Shift+F10：同一份菜单在客户区中心打开，尺寸与右键菜单相同。
+- 150% 下聚焦窗口后按 Apps 键：同一份菜单同样在客户区中心打开，尺寸相同，
+  窗口类名 #32768。
+- 按 Down 再 Enter 选择 Copy：状态文本变为 Copied。
+- 两次选择各只产生一次状态变化；没有额外的 WM_COMMAND 或第二次命令。
+
+实现读数:
+- 菜单栏使用 CreateMenu 构建并交给 HWND；TrackPopupMenuEx 展示的窗口级菜单使用
+  CreatePopupMenu 构建。把 CreateMenu 的菜单栏句柄直接交给 TrackPopupMenuEx 时，
+  本机 Windows 11 只显示一个 6px 宽的白色窗口条；改为弹出菜单句柄后恢复完整标签与
+  命中。弹出菜单的构建与菜单栏共享命令 id 映射和声明项。
+
+隐藏测试补充:
+- fake presenter 记录每次请求的 activation、HWND、屏幕坐标与完整 MenuSpec；右键与
+  键盘 (-1,-1) 两条路径得到同一份声明，客户区中心由宿主计算。
+- presenter 返回命令后宿主恰好派发一次 CommandSource::ContextMenu；取消不派发。
+- 弹窗期间同步投递宿主唤醒仍会交付任务结果；owner 在弹窗期间关闭时返回值被丢弃。
+- presenter panic 被 contain 为 HostError::ContextMenuPresenter，presenter 归还宿主。
+- 隐藏窗口不打开菜单；隐藏宿主默认没有原生 presenter，CI 不会弹出真实菜单。
