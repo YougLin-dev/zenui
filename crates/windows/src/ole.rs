@@ -1,9 +1,10 @@
 //! 宿主拥有的 OLE 套间。
 //!
-//! Shell 文件对话框与后续剪贴板/拖放都需要 UI 线程先初始化 STA。这里只在
-//! 第一次需要时初始化，并让 `Host` 持有唯一的所有权：每个成功的
-//! `OleInitialize`（`S_OK` 或 `S_FALSE`）恰好配对一次 `OleUninitialize`。
-//! 注入 presenter 的隐藏宿主不初始化 OLE。
+//! Shell 文件对话框与后续 OLE 拖放都需要 UI 线程先初始化 STA；剪贴板使用
+//! 独立的 `OpenClipboard` 系列 API，不经过这里。这里只在第一次需要时初始化，
+//! 并让 `Host` 持有唯一的所有权：每个成功的 `OleInitialize`（`S_OK` 或
+//! `S_FALSE`）恰好配对一次 `OleUninitialize`。注入 presenter 的隐藏宿主不
+//! 初始化 OLE。
 
 use std::fmt;
 

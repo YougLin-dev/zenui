@@ -31,6 +31,8 @@ mod shortcuts;
 mod tray;
 
 #[cfg(windows)]
+pub use clipboard::{ClipboardError, ClipboardProvider};
+#[cfg(windows)]
 pub use context_menu::{ContextMenuPresenter, ContextMenuRequest};
 #[cfg(windows)]
 pub use file_dialog::FileDialogPresenter;
