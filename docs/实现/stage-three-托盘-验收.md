@@ -25,7 +25,7 @@
 
 - `Runtime::declare_tray(TraySpec)` 在首个窗口打开或根树挂载前声明 tooltip 与右键菜单；每个 Runtime 一次。`TraySpec::validate` 按 UTF-16 单元限制 tooltip 为 127，菜单拒绝重复命令 id、快捷键、超过 65535 项；失败不保留声明。声明后仍可注册应用级处理器，宿主在 `Host::open` 时用 `Runtime::missing_tray_handler` 校验每个菜单命令都有应用级处理器，缺失时返回错误并指出命令 id。
 - 宿主创建自己从不显示的顶层托盘 HWND，与可见窗口共用 `ZenUIHostWindow` 类；`HostPointer` 在 `run`/`pump` 期间也给它安装 `GWLP_USERDATA`，菜单展示、窗口销毁与 `without_routing` 的重入抑制覆盖这个 HWND。图标 id 固定为 1，`NOTIFYICONDATAW::hWnd` 指向托盘 HWND。
-- 左键与键盘激活从目录存活窗口中选择目标：可见焦点窗口优先，其次 primary，最后任一存活窗口；已经关闭的窗口不会重新打开。目标通过 `Runtime::show` 重新显示并聚焦，已经关闭的窗口不会因托盘点击重新打开。原生显示留给随后的窗口同步阶段，避免在窗口过程里同步派发 `WM_SHOWWINDOW` 的重入。
+- 左键与键盘激活从目录存活窗口中选择目标：可见焦点窗口优先，其次 primary，最后任一存活窗口；目标通过 `Runtime::show` 重新显示并聚焦。默认 `QuitOnLastClose` 策略下最后一个窗口关闭后会话结束，点击不会重开窗口；`StayResident` 零窗口时点击恢复 primary，见 [stage-three 会话验收](stage-three-会话-验收.md)。原生显示留给随后的窗口同步阶段，避免在窗口过程里同步派发 `WM_SHOWWINDOW` 的重入。
 - 右键回调在托盘 HWND 的窗口过程里处理。宿主先把 presenter 与菜单移出 `Host`，在**不持有宿主借用**的情况下展示；菜单关闭后重新借出，归还 presenter 并以 `CommandSource::Tray` 派发一次应用级命令。菜单期间目标窗口关闭是正常竞态，丢弃 stale 命令；presenter 返回未声明的 id 作为宿主错误上报。presenter 的 add/update/remove/menu 调用都由 `catch_unwind` 包住，panic 转为 `HostError::TrayPresenter`，不穿过窗口过程或 `Drop`。
 - 原生 presenter 用 `NIM_ADD` 添加图标并 `NIM_SETVERSION(NOTIFYICON_VERSION_4)`，随后 `NIM_MODIFY` 写入标准 tooltip；`NIM_DELETE` 移除。右键菜单用 `CreatePopupMenu` 构建，`SetForegroundWindow` 后调用 `TrackPopupMenuEx(TPM_RETURNCMD | TPM_RIGHTBUTTON)`，关闭后投递 `WM_NULL` 完成前台清理。
 - `TaskbarCreated` 在创建图标前注册；Explorer 重建通知区域时向顶层窗口广播。宿主只在托盘 HWND 收到该消息时重新添加图标与 tooltip，避免每个窗口各添加一次。

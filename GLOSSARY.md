@@ -173,7 +173,7 @@ _Avoid_: frame
 _Avoid_: global menu, app shell menu
 
 **Menu command**:
-`MenuCommand` 声明的一项菜单动作：稳定 id、标签、可选快捷键、默认 enabled/checked 与子菜单；它是声明而不是处理器。菜单栏、上下文菜单与快捷键按 id 进入同一命令路径，窗口处理器优先，窗口没有同一 id 时回退应用级处理器。
+`MenuCommand` 声明的一项菜单动作：稳定 id、标签、可选快捷键与默认 enabled/checked；它是声明而不是处理器。菜单栏、上下文菜单与快捷键按 id 进入同一命令路径，窗口处理器优先，窗口没有同一 id 时回退应用级处理器。子菜单与分隔线属于 `MenuSpec`，不是命令。
 _Avoid_: menu action, menu item id
 
 **Menu shortcut**:

@@ -13,7 +13,7 @@
 
 **命令路径**
 
-- 菜单栏、快捷键、上下文菜单、辅助技术动作与托盘都进入同一运行时命令路径，分别标记 `CommandSource::{MenuBar, Accelerator, ContextMenu, Accessibility, Tray}`。
+- 菜单栏、快捷键、上下文菜单与托盘都进入同一运行时命令路径，分别标记 `CommandSource::{MenuBar, Accelerator, ContextMenu, Tray}`。辅助技术的写动作走 `Runtime` 的节点操作与 UIA 动作队列，不冒充菜单命令。
 - 窗口目标的派发优先运行该窗口注册的处理器；窗口没有同一 id 时回退应用级处理器。`CommandSource::Tray` 从不运行窗口处理器，事件只通过 `CommandEvent::window` 暴露可选目标。
 - 原生事件只翻译成一次逻辑命令：菜单栏接受 `WM_COMMAND` 的 `HIWORD=0` 且 `lParam=0`，快捷键接受 `HIWORD=1`；上下文菜单与托盘菜单使用 `TrackPopupMenuEx(TPM_RETURNCMD)`，系统不再发送第二次 `WM_COMMAND`。
 
@@ -26,7 +26,7 @@
 
 **原生所有权**
 
-- 声明了菜单的窗口在创建 HWND 前构建一个菜单栏 `HMENU`，在需要时构建一个 `HACCEL`；创建、非客户区计算与 DPI 换算都读取同一份菜单存在性。菜单与快捷键表随窗口条目释放，创建失败时由构建值立即注销。
+- 声明了非空菜单的窗口在创建 HWND 前构建一个菜单栏 `HMENU`，在需要时构建一个 `HACCEL`；创建、非客户区计算与 DPI 换算都读取同一份菜单存在性。菜单与快捷键表随窗口条目释放，创建失败时由构建值立即注销。
 - 上下文菜单每次打开时用 `CreatePopupMenu` 构建，菜单关闭后随本次打开释放；它不复用窗口菜单栏句柄。
 - 托盘宿主拥有一个从不显示的顶层 `ZenUIHostWindow`，图标 id 固定为 1，`NOTIFYICONDATAW::hWnd` 指向它。presenter 执行 `NIM_ADD`、`NIM_SETVERSION(NOTIFYICON_VERSION_4)`、`NIM_MODIFY` 与 `NIM_DELETE`；图标句柄来自共享的 `IDI_APPLICATION`，宿主与 presenter 都不销毁它。
 - `TaskbarCreated` 在创建图标前注册；Explorer 重建通知区域后，宿主只在托盘 HWND 收到广播时重新添加图标与 tooltip。
@@ -59,4 +59,4 @@
 - 菜单、快捷键、上下文菜单与托盘共用一条命令路径和一份声明；新增来源只需提供 `CommandSource` 与目标身份。
 - `HMENU`、`HACCEL`、`HICON` 与 `NOTIFYICONDATAW` 的生命周期分别绑定窗口、activation、进程共享图标与托盘宿主，`Host` 析构和会话退出都有确定的清理路径。
 - 隐藏宿主不安装原生 presenter，测试通过 fake 记录 add/update/remove/menu；菜单栏、快捷键与上下文菜单记录了 100%/150% 可见行为，托盘记录单屏 150% 的点击、菜单与 Explorer 重建，Windows 11 溢出面板不承诺图标始终可见。
-- 托盘独存与最小化恢复由应用会话策略驱动；ADR-0018 记录默认退出、显式退出与零窗口常驻的边界。
+- 零窗口托盘独存由应用会话策略驱动；原生最小化恢复发生在托盘激活时，与零窗口会话无关。ADR-0018 记录默认退出、显式退出与零窗口常驻的边界。
