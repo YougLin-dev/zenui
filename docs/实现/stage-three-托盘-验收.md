@@ -1,6 +1,6 @@
 # Stage-three 应用托盘验收（实机）
 
-本页记录 #198：应用声明一个托盘图标与右键菜单，宿主用独立的隐藏托盘 HWND 接收通知区域回调与 Explorer 的 `TaskbarCreated` 广播。左键或键盘激活恢复窗口，右键菜单在宿主借用之外展示，选中命令以 `CommandSource::Tray` 派发一次。节点级上下文菜单不在本页范围；零窗口托盘独存与最小化恢复由 [stage-three 会话验收](stage-three-会话-验收.md) 的会话策略处理。
+本页记录 #198：应用声明一个托盘图标与右键菜单，宿主用独立的隐藏托盘 HWND 接收通知区域回调与 Explorer 的 `TaskbarCreated` 广播。左键或键盘激活恢复窗口，右键菜单在宿主借用之外展示，选中命令以 `CommandSource::Tray` 派发一次。节点级上下文菜单不在本页范围；零窗口托盘独存由 [stage-three 会话验收](stage-three-会话-验收.md) 的会话策略处理，原生最小化窗口由托盘激活恢复，不依赖会话策略。
 
 **状态：可见自动驱动完成（Windows 11 单屏 150%）；隐藏 fake presenter 测试只是部分证据，系统 tooltip、原生菜单绘制与 Explorer 重建以可见运行为准。**
 
