@@ -4,15 +4,12 @@ use std::marker::PhantomData;
 use std::rc::Rc;
 
 use crate::menu::{
-    CommandError, CommandEvent, MenuCommand, MenuCommandState, MenuShortcut, MenuSpec,
-    ShortcutError,
+    CommandError, CommandEvent, MENU_ITEM_LIMIT, MenuCommand, MenuCommandState, MenuShortcut,
+    MenuSpec, ShortcutError,
 };
 use crate::presentation::Appearance;
 use crate::task::TaskScope;
 use crate::view::{MountError, MountPlan, MountResult};
-
-/// 菜单树的可表示上限；子菜单、分隔线与命令各计一项。
-const MENU_ITEM_LIMIT: usize = u16::MAX as usize;
 
 /// 一次窗口打开的 identity；它不等于目录键，也不保证窗口仍然存活。
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -528,8 +525,7 @@ impl WindowCatalog {
 
 /// 菜单栏与上下文菜单共享的声明校验：项数上限与树内重复命令 id。
 fn validate_menu_commands(window: &'static str, menu: &MenuSpec) -> Result<(), CatalogError> {
-    let items = menu.item_count();
-    if items > MENU_ITEM_LIMIT {
+    if let Some(items) = menu.items_over_limit() {
         return Err(CatalogError::MenuTooLarge { window, items });
     }
     if let Some(id) = menu.first_duplicate_command() {

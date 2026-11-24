@@ -32,21 +32,23 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     TrackMouseEvent, VIRTUAL_KEY, VK_BACK, VK_CONTROL, VK_DELETE, VK_END, VK_ESCAPE, VK_HOME,
     VK_LEFT, VK_NEXT, VK_PRIOR, VK_PROCESSKEY, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_TAB,
 };
+use windows::Win32::UI::Shell::NIN_SELECT;
 use windows::Win32::UI::WindowsAndMessaging::{
     CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CheckMenuItem, CreateWindowExW, DefWindowProcW,
-    DestroyWindow, DispatchMessageW, EnableMenuItem, GWLP_USERDATA, GetClientRect,
+    DestroyWindow, DispatchMessageW, EnableMenuItem, GWLP_USERDATA, GetClientRect, GetCursorPos,
     GetForegroundWindow, GetMenu, GetMenuItemCount, GetMenuItemID, GetMessageW, GetWindowLongPtrW,
-    HACCEL, HMENU, IDC_ARROW, IsIconic, IsZoomed, KillTimer, LoadCursorW, MF_BYCOMMAND, MF_CHECKED,
-    MF_ENABLED, MF_GRAYED, MF_UNCHECKED, MSG, PM_REMOVE, PeekMessageW, PostMessageW,
-    RegisterClassExW, SPI_GETWHEELSCROLLLINES, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOZORDER, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SetForegroundWindow, SetTimer,
-    SetWindowLongPtrW, SetWindowPos, ShowWindow, SystemParametersInfoW, TranslateAcceleratorW,
-    TranslateMessage, WINDOW_EX_STYLE, WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE, WM_COMMAND,
-    WM_CONTEXTMENU, WM_DESTROY, WM_DPICHANGED, WM_ENTERMENULOOP, WM_GETDPISCALEDSIZE, WM_GETOBJECT,
-    WM_IME_CHAR, WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_STARTCOMPOSITION, WM_INITMENU,
+    HACCEL, HICON, HMENU, IDC_ARROW, IDI_APPLICATION, IsIconic, IsZoomed, KillTimer, LoadCursorW,
+    LoadIconW, MF_BYCOMMAND, MF_CHECKED, MF_ENABLED, MF_GRAYED, MF_UNCHECKED, MSG, PM_REMOVE,
+    PeekMessageW, PostMessageW, RegisterClassExW, RegisterWindowMessageW, SPI_GETWHEELSCROLLLINES,
+    SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER,
+    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SetForegroundWindow, SetTimer, SetWindowLongPtrW,
+    SetWindowPos, ShowWindow, SystemParametersInfoW, TranslateAcceleratorW, TranslateMessage,
+    WINDOW_EX_STYLE, WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY,
+    WM_DPICHANGED, WM_ENTERMENULOOP, WM_GETDPISCALEDSIZE, WM_GETOBJECT, WM_IME_CHAR,
+    WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_STARTCOMPOSITION, WM_INITMENU,
     WM_INITMENUPOPUP, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEHWHEEL,
     WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_SETTINGCHANGE, WM_SIZE, WM_SYSKEYDOWN, WM_TIMER,
-    WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
+    WNDCLASSEXW, WS_OVERLAPPEDWINDOW, WS_POPUP,
 };
 
 use windows::core::{HSTRING, w};
@@ -61,6 +63,9 @@ use crate::file_dialog::{FileDialogPresenter, NativeFileDialog};
 use crate::menus::{MenuError, NativeAccelerator, NativeMenu};
 use crate::ole::{OleApartment, OleError};
 use crate::shortcuts::{EditorAction, accelerator_is_shadowed, editor_shortcut};
+use crate::tray::{
+    NativeTrayPresenter, TrayIconRequest, TrayMenuRequest, TrayPresenter, TrayTooltipRequest,
+};
 use zenui_render::{
     GpuRenderer, Point, Rect, RenderPalette, RenderTargetConfig, Scene, SceneCache, SceneElement,
     SceneEnv, SceneRowBand, Scrollbar, Viewport, Visual, wgpu,
@@ -76,12 +81,16 @@ mod host_message {
     pub(super) const DEVICE_LOSS: u32 = WM_APP + 2;
     /// 辅助技术动作请求，保留给 UIA 工单。
     pub(super) const UIA_ACTION: u32 = WM_APP + 3;
-    /// 托盘回调，保留给托盘工单；托盘 HWND 使用自己的路由分支。
+    /// 托盘回调；托盘 HWND 在窗口过程里使用自己的路由分支。
     pub(super) const TRAY_CALLBACK: u32 = WM_APP + 4;
 
-    /// 注册表全集；`handle_message` 显式认领它们，保留值不会落入窗口路由。
+    /// 注册表全集；窗口过程与 `handle_message` 显式认领它们，保留值不会落入
+    /// 窗口输入路由。
     pub(super) const ALL: [u32; 4] = [WAKE, DEVICE_LOSS, UIA_ACTION, TRAY_CALLBACK];
 }
+
+/// `NIN_KEYSELECT`；windows crate 只生成了相邻的 `NIN_SELECT`。
+const NIN_KEYSELECT: u32 = NIN_SELECT + 1;
 
 /// 唤醒窗口的 UI 线程以执行排队的辅助技术动作。
 ///
@@ -483,6 +492,12 @@ pub struct Host {
     context_menu_presenter: Option<Box<dyn ContextMenuPresenter>>,
     /// 上下文菜单弹窗正在展示；期间的菜单初始化不属于窗口菜单栏。
     context_menu_active: bool,
+    /// 应用托盘；隐藏模式也保留自己的顶层 HWND 以接住回调广播。
+    tray: Option<TrayHost>,
+    /// 可见宿主默认安装原生 presenter；隐藏模式由测试注入。
+    tray_presenter: Option<Box<dyn TrayPresenter>>,
+    /// Explorer 重建通知区域时广播的注册消息；0 表示没有声明托盘。
+    taskbar_created: u32,
     /// OLE 初始化失败的稳定原因；避免每次请求重试并保留显式错误。
     ole_error: Option<OleError>,
     /// 必须最后声明：最后一个字段最后释放，OLE 生命周期覆盖 presenter。
@@ -502,6 +517,11 @@ impl Host {
         let primary = runtime
             .primary_key()
             .ok_or_else(|| HostError::Window(String::from("the window catalog is not declared")))?;
+        if let Some(id) = runtime.missing_tray_handler() {
+            return Err(HostError::Tray(format!(
+                "tray command {id} has no application-level handler"
+            )));
+        }
         runtime
             .set_appearance(config.appearance)
             .map_err(HostError::Runtime)?;
@@ -604,6 +624,9 @@ impl Host {
                 .visible
                 .then(|| Box::new(NativeContextMenuPresenter) as Box<dyn ContextMenuPresenter>),
             context_menu_active: false,
+            tray: None,
+            tray_presenter: None,
+            taskbar_created: 0,
             ole_error: None,
             ole: None,
         };
@@ -623,6 +646,7 @@ impl Host {
         }
         host.revision = host.runtime.window_revision();
         host.update_wake_target();
+        host.install_tray()?;
         Ok(host)
     }
 
@@ -723,6 +747,189 @@ impl Host {
         self.context_menu_presenter = Some(Box::new(presenter));
     }
 
+    /// 替换托盘 presenter；隐藏宿主不会自动安装原生通知区域。
+    ///
+    /// 已声明的托盘在安装时立即收到一次图标添加与 tooltip 更新；替换已有
+    /// presenter 时先移除旧图标。隐藏测试可以用 fake 记录这些调用，CI 不会
+    /// 触碰真实通知区域。没有托盘声明时只保存 presenter，不产生 shell 调用。
+    ///
+    /// # Errors
+    ///
+    /// presenter 的添加或 tooltip 失败时返回 [`HostError::Tray`]；旧 presenter
+    /// 的移除失败按尽力而为忽略，新 presenter 仍会添加一次。presenter panic
+    /// 时返回 [`HostError::TrayPresenter`]。
+    pub fn set_tray_presenter(
+        &mut self,
+        presenter: impl TrayPresenter + 'static,
+    ) -> Result<(), HostError> {
+        let presenter: Box<dyn TrayPresenter> = Box::new(presenter);
+        let mut previous = self.tray_presenter.replace(presenter);
+        let added_hwnd = self
+            .tray
+            .as_mut()
+            .and_then(|tray| std::mem::take(&mut tray.added).then_some(tray.window.hwnd));
+        if let (Some(previous), Some(hwnd)) = (previous.as_mut(), added_hwnd) {
+            // 旧 presenter 的移除是尽力而为；新 presenter 仍要添加一次。
+            let _ = tray_presenter_call(|| previous.remove(hwnd));
+        }
+        self.sync_tray()
+    }
+
+    /// 创建托盘 HWND、共享图标与注册消息，并在可见宿主安装原生 presenter。
+    fn install_tray(&mut self) -> Result<(), HostError> {
+        let Some(spec) = self.runtime.tray() else {
+            return Ok(());
+        };
+        // 安全：只注册系统广播消息，不解引用指针。
+        let taskbar_created = unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) };
+        if taskbar_created == 0 {
+            return Err(HostError::Tray(String::from(
+                "RegisterWindowMessageW(TaskbarCreated) failed",
+            )));
+        }
+        let window = TrayMessageWindow::new(self.hinstance)?;
+        // 安全：系统共享图标；presenter 与宿主都不销毁它。
+        let icon = unsafe { LoadIconW(None, IDI_APPLICATION) }
+            .map_err(|error| HostError::Tray(error.to_string()))?;
+        self.tray = Some(TrayHost {
+            window,
+            spec,
+            icon,
+            added: false,
+        });
+        self.taskbar_created = taskbar_created;
+        if self.show_windows {
+            self.tray_presenter = Some(Box::new(NativeTrayPresenter));
+        }
+        self.present_tray_add()
+    }
+
+    /// 让当前 presenter 添加图标并更新 tooltip；没有 presenter 时什么也不做。
+    fn present_tray_add(&mut self) -> Result<(), HostError> {
+        let (Some(tray), Some(presenter)) = (self.tray.as_mut(), self.tray_presenter.as_mut())
+        else {
+            return Ok(());
+        };
+        tray_presenter_call(|| {
+            presenter.add(TrayIconRequest::new(
+                tray.window.hwnd,
+                tray.icon,
+                host_message::TRAY_CALLBACK,
+            ))
+        })?;
+        tray.added = true;
+        tray_presenter_call(|| {
+            presenter.update(TrayTooltipRequest::new(
+                tray.window.hwnd,
+                tray.spec.tooltip(),
+            ))
+        })
+    }
+
+    /// 移除图标；移除成功后才清除 added，失败留给下一次同步或析构重试。
+    fn remove_tray_icon(&mut self) {
+        let Some(tray) = self.tray.as_ref() else {
+            return;
+        };
+        if !tray.added {
+            return;
+        }
+        let hwnd = tray.window.hwnd;
+        let removed = self
+            .tray_presenter
+            .as_mut()
+            .is_none_or(|presenter| tray_presenter_call(|| presenter.remove(hwnd)).is_ok());
+        if removed && let Some(tray) = self.tray.as_mut() {
+            tray.added = false;
+        }
+    }
+
+    /// 最后一个窗口关闭时移除图标；窗口重新出现时再次添加。
+    fn sync_tray(&mut self) -> Result<(), HostError> {
+        if self.tray.is_none() {
+            return Ok(());
+        }
+        if self.windows.is_empty() {
+            self.remove_tray_icon();
+        } else if !self.tray.as_ref().is_some_and(|tray| tray.added) {
+            self.present_tray_add()?;
+        }
+        Ok(())
+    }
+
+    /// Explorer 重建通知区域后重新添加图标；旧图标已随旧任务栏消失。
+    fn re_add_tray(&mut self) -> Result<(), HostError> {
+        let Some(tray) = self.tray.as_mut() else {
+            return Ok(());
+        };
+        tray.added = false;
+        self.present_tray_add()
+    }
+
+    fn is_tray_window(&self, hwnd: HWND) -> bool {
+        self.tray
+            .as_ref()
+            .is_some_and(|tray| tray.window.hwnd == hwnd)
+    }
+
+    /// 托盘动作的窗口目标：可见焦点窗口优先，其次目录 primary，最后任一存活窗口。
+    fn tray_target_window(&self) -> Option<WindowCtx> {
+        let infos = self.runtime.windows();
+        self.runtime
+            .focused_window()
+            .or_else(|| {
+                let primary = self.runtime.primary_key()?;
+                infos
+                    .iter()
+                    .find(|info| info.spec.key() == primary)
+                    .map(|info| info.window)
+            })
+            .or_else(|| infos.first().map(|info| info.window))
+    }
+
+    /// 左键或键盘激活托盘：恢复焦点窗口；全部隐藏时恢复 primary。
+    ///
+    /// 只在 runtime 的窗口目录里选择目标，不重新打开已经关闭的窗口。原生显示
+    /// 留给随后的同步阶段，避免在窗口过程里同步派发 `WM_SHOWWINDOW` 的重入。
+    fn restore_from_tray(&mut self) -> Result<(), HostError> {
+        let Some(key) = self.tray_target_window().map(|window| window.key()) else {
+            return Ok(());
+        };
+        self.runtime.show(key).map_err(HostError::Open)?;
+        self.focus_after_sync = true;
+        Ok(())
+    }
+
+    /// 从宿主取走一次右键菜单工作；菜单与 presenter 在展示期间离开宿主。
+    fn begin_tray_menu(&mut self) -> Option<(Box<dyn TrayPresenter>, MenuSpec, Option<WindowCtx>)> {
+        let menu = self.tray.as_ref()?.spec.menu().clone();
+        let presenter = self.tray_presenter.take()?;
+        Some((presenter, menu, self.tray_target_window()))
+    }
+
+    /// 菜单关闭后归还 presenter，并派发选中的托盘命令一次。
+    ///
+    /// presenter 只能返回托盘声明过的命令 id；未声明的 id 作为宿主错误上报。
+    /// 菜单展示期间目标窗口关闭是正常竞态，不产生 stale 命令。
+    fn finish_tray_menu(
+        &mut self,
+        presenter: Box<dyn TrayPresenter>,
+        target: Option<WindowCtx>,
+        result: Result<Option<&'static str>, HostError>,
+    ) -> Result<(), HostError> {
+        self.tray_presenter = Some(presenter);
+        let Some(id) = result? else {
+            return Ok(());
+        };
+        match self
+            .runtime
+            .dispatch_app_command(id, CommandSource::Tray, target)
+        {
+            Ok(()) | Err(CommandError::Stale) => Ok(()),
+            Err(error) => Err(HostError::Command(error)),
+        }
+    }
+
     /// 显示所有打开的窗口（若配置为可见）并进入消息循环，直到最后一个窗口关闭。
     pub fn run(&mut self) -> Result<(), HostError> {
         self.sync_windows()?;
@@ -756,6 +963,16 @@ impl Host {
     /// 的：任一 HWND 收到唤醒都交付全部 worker 结果，再逐窗口比较快照重绘；
     /// 尚未实现的保留消息被显式忽略，不会落入窗口输入路由。
     fn handle_message(&mut self, hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) {
+        if self.taskbar_created != 0 && message == self.taskbar_created {
+            // Explorer 向所有顶层窗口广播；只有托盘 HWND 重新添加，避免每个
+            // 窗口各添加一次。其它窗口直接认领，不落入普通输入路由。
+            if self.is_tray_window(hwnd)
+                && let Err(error) = self.re_add_tray()
+            {
+                self.deferred_error.get_or_insert(error);
+            }
+            return;
+        }
         if message == host_message::UIA_ACTION {
             self.run_queued_accessibility_actions(hwnd);
             return;
@@ -3000,6 +3217,9 @@ impl Host {
 
     fn routing_hwnds(&self, extra: Option<HWND>) -> Vec<HWND> {
         let mut hwnds: Vec<HWND> = self.windows.values().map(WindowHost::hwnd).collect();
+        if let Some(tray) = &self.tray {
+            hwnds.push(tray.window.hwnd);
+        }
         if let Some(extra) = extra
             && !hwnds.contains(&extra)
         {
@@ -3132,6 +3352,7 @@ impl Host {
         self.sync_enabled()?;
         self.sync_accessibility();
         self.update_wake_target();
+        self.sync_tray()?;
         Ok(())
     }
 
@@ -3493,7 +3714,9 @@ fn scene_env(window: &WindowHost) -> SceneEnv {
 
 impl Drop for Host {
     fn drop(&mut self) {
-        // Drop 不能返回错误；先阻断 worker 唤醒，再尽力释放每个窗口的 activation。
+        // Drop 不能返回错误；先移除通知区域图标，再阻断 worker 唤醒并释放
+        // 每个窗口的 activation。
+        self.remove_tray_icon();
         self.wake.close();
         for window in self.windows.values() {
             window.kill_timer();
@@ -3540,6 +3763,12 @@ pub enum HostError {
     ContextMenu(MenuError),
     /// 上下文菜单 presenter 失败；panic 不能穿过窗口过程的系统边界。
     ContextMenuPresenter(String),
+    /// 托盘窗口、广播注册或通知区域操作失败。
+    Tray(String),
+    /// 托盘右键菜单构建失败。
+    TrayMenu(MenuError),
+    /// 托盘 presenter 失败；panic 不能穿过窗口过程的系统边界。
+    TrayPresenter(String),
     /// 菜单命令在运行时命令路径上失败；窗口状态竞态已在调用方过滤。
     Command(CommandError),
     /// 菜单状态回调失败；回调内的写入已被只读作用域拒绝。
@@ -3575,6 +3804,11 @@ impl fmt::Display for HostError {
             Self::ContextMenuPresenter(message) => {
                 write!(f, "context menu presentation failed: {message}")
             }
+            Self::Tray(message) => write!(f, "tray icon failed: {message}"),
+            Self::TrayMenu(error) => write!(f, "tray menu creation failed: {error}"),
+            Self::TrayPresenter(message) => {
+                write!(f, "tray presentation failed: {message}")
+            }
             Self::Command(error) => write!(f, "menu command failed: {error}"),
             Self::MenuState(error) => write!(f, "menu state query failed: {error}"),
             Self::Scene(error) => write!(f, "scene failed: {error}"),
@@ -3605,6 +3839,56 @@ fn complete_window_menu(menu: Option<NativeMenu>) -> Result<Option<WindowMenu>, 
     menu.map(WindowMenu::build)
         .transpose()
         .map_err(HostError::Accelerator)
+}
+
+/// 应用托盘：自己的顶层 HWND、共享图标与声明。
+///
+/// 顶层 popup 让 Explorer 的 `TaskbarCreated` 广播与托盘回调都能到达；它从不
+/// 显示，只承载通知区域句柄。`added` 记录 presenter 侧是否仍有图标，保证
+/// 移除幂等。
+struct TrayHost {
+    window: TrayMessageWindow,
+    spec: TraySpec,
+    icon: HICON,
+    added: bool,
+}
+
+/// 托盘消息窗口；宿主在析构前先移除图标，再销毁这个 HWND。
+struct TrayMessageWindow {
+    hwnd: HWND,
+}
+
+impl TrayMessageWindow {
+    fn new(hinstance: HINSTANCE) -> Result<Self, HostError> {
+        // 安全：类已注册；无父窗口的顶层 popup 接收 Explorer 广播，且保持隐藏。
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                w!("ZenUIHostWindow"),
+                w!("ZenUI Tray"),
+                WS_POPUP,
+                0,
+                0,
+                0,
+                0,
+                None,
+                None,
+                Some(hinstance),
+                None,
+            )
+        }
+        .map_err(|error| HostError::Tray(error.to_string()))?;
+        Ok(Self { hwnd })
+    }
+}
+
+impl Drop for TrayMessageWindow {
+    fn drop(&mut self) {
+        // 安全：HWND 由本结构独占；重复销毁只返回错误。
+        unsafe {
+            let _ = DestroyWindow(self.hwnd);
+        }
+    }
 }
 
 struct NativeWindow {
@@ -4112,8 +4396,8 @@ impl HostPointer {
         // 内有效，且此时没有其它引用正在访问它。
         unsafe {
             (*host).dispatching = Some(host);
-            for window in (*host).windows.values() {
-                SetWindowLongPtrW(window.hwnd(), GWLP_USERDATA, host as isize);
+            for hwnd in (*host).routing_hwnds(None) {
+                SetWindowLongPtrW(hwnd, GWLP_USERDATA, host as isize);
             }
         }
         Self { host }
@@ -4124,8 +4408,8 @@ impl Drop for HostPointer {
     fn drop(&mut self) {
         // 安全：循环已返回，重新通过裸指针访问宿主。
         unsafe {
-            for window in (*self.host).windows.values() {
-                SetWindowLongPtrW(window.hwnd(), GWLP_USERDATA, 0);
+            for hwnd in (*self.host).routing_hwnds(None) {
+                SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
             }
             (*self.host).dispatching = None;
         }
@@ -4192,6 +4476,80 @@ fn context_menu_point(hwnd: HWND, lparam: LPARAM) -> (i32, i32) {
         return (0, 0);
     }
     (point.x, point.y)
+}
+
+/// 托盘回调的屏幕坐标；通知区域版本 4 把鼠标位置放进 `wParam`。
+fn tray_menu_point(wparam: WPARAM) -> (i32, i32) {
+    let x = (wparam.0 & 0xFFFF) as u16 as i16;
+    let y = ((wparam.0 >> 16) & 0xFFFF) as u16 as i16;
+    if (x, y) != (0, 0) {
+        return (i32::from(x), i32::from(y));
+    }
+    let mut point = POINT::default();
+    // 安全：point 是本地输出缓冲。
+    if unsafe { GetCursorPos(&mut point) }.is_ok() {
+        return (point.x, point.y);
+    }
+    (0, 0)
+}
+
+/// 执行一次托盘 presenter 调用；panic 转为宿主错误，不穿过消息循环或 Drop。
+fn tray_presenter_call<T>(action: impl FnOnce() -> Result<T, HostError>) -> Result<T, HostError> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(action)).unwrap_or_else(|_| {
+        Err(HostError::TrayPresenter(String::from(
+            "the presenter panicked",
+        )))
+    })
+}
+
+/// 托盘回调：左键/键盘恢复窗口，右键在宿主借用之外展示声明菜单。
+///
+/// # Safety
+///
+/// 调用时不持有宿主引用；presenter 的菜单循环可以重入窗口过程。
+unsafe fn handle_tray_callback(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
+    // 安全：指针由 HostPointer 安装在重入安全的派发期间。
+    let Some(pointer) = (unsafe { host_pointer(hwnd) }) else {
+        return;
+    };
+    if !unsafe { &*pointer }.is_tray_window(hwnd) {
+        return;
+    }
+    // 版本 4：事件在 `lParam` 低字，高字是图标 id；鼠标位置在 `wParam`。
+    match (lparam.0 & 0xFFFF) as u32 {
+        NIN_SELECT | NIN_KEYSELECT => {
+            // 安全：回调期间不持有宿主引用；恢复只更新运行时目录。
+            let host = unsafe { &mut *pointer };
+            if let Err(error) = host.restore_from_tray() {
+                host.deferred_error.get_or_insert(error);
+            }
+        }
+        WM_CONTEXTMENU => {
+            let point = tray_menu_point(wparam);
+            // 安全：presenter 与菜单在展示期间离开宿主。
+            let work = unsafe { (&mut *pointer).begin_tray_menu() };
+            let Some((mut presenter, menu, target)) = work else {
+                return;
+            };
+            // 安全：菜单打开期间不持有宿主引用，presenter 可以重入窗口过程。
+            let result = tray_presenter_call(|| {
+                presenter.show_menu(TrayMenuRequest::new(hwnd, point, &menu))
+            });
+            // 安全：菜单已关闭且没有其它引用；重新借出宿主结算这次打开。
+            let host = unsafe { &mut *pointer };
+            let mut error = host.finish_tray_menu(presenter, target, result).err();
+            if let Err(failure) = host.settle_window_requests() {
+                error.get_or_insert(failure);
+            }
+            if let Err(failure) = host.repaint_changed_windows() {
+                error.get_or_insert(failure);
+            }
+            if let Some(failure) = error {
+                host.deferred_error.get_or_insert(failure);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// 翻译并派发一条消息；快捷键先于字符翻译与窗口过程。
@@ -4370,6 +4728,12 @@ unsafe extern "system" fn wndproc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    if message == host_message::TRAY_CALLBACK {
+        // 托盘菜单自己的模态循环在窗口过程内运行；展示期间不持有宿主引用，
+        // 与上下文菜单走同一条重入安全路径。
+        unsafe { handle_tray_callback(hwnd, wparam, lparam) };
+        return LRESULT(0);
+    }
     match message {
         // 提交已经由 WM_IME_COMPOSITION 的 GCS_RESULTSTR 或 WM_CHAR 处理；
         // WM_IME_CHAR 若再交给默认窗口过程会产生重复字符。
@@ -4884,6 +5248,420 @@ mod tests {
             "the host registry stays inside the private message range"
         );
         assert_eq!(host_message::WAKE, WM_APP + 1);
+        assert_ne!(host_message::TRAY_CALLBACK, host_message::WAKE);
+    }
+
+    #[derive(Default)]
+    struct TrayCalls {
+        adds: Vec<(HWND, HICON, u32)>,
+        updates: Vec<(HWND, String)>,
+        removes: Vec<HWND>,
+        menus: Vec<(HWND, (i32, i32), MenuSpec)>,
+    }
+
+    /// 记录通知区域调用并返回固定菜单命令的 fake。
+    struct FakeTrayPresenter {
+        calls: Rc<RefCell<TrayCalls>>,
+        result: Option<&'static str>,
+        panic_first: Rc<Cell<bool>>,
+    }
+
+    impl TrayPresenter for FakeTrayPresenter {
+        fn add(&mut self, request: TrayIconRequest) -> Result<(), HostError> {
+            self.calls.borrow_mut().adds.push((
+                request.hwnd(),
+                request.icon(),
+                request.callback_message(),
+            ));
+            Ok(())
+        }
+
+        fn update(&mut self, request: TrayTooltipRequest<'_>) -> Result<(), HostError> {
+            self.calls
+                .borrow_mut()
+                .updates
+                .push((request.hwnd(), request.tooltip().to_owned()));
+            Ok(())
+        }
+
+        fn remove(&mut self, hwnd: HWND) -> Result<(), HostError> {
+            self.calls.borrow_mut().removes.push(hwnd);
+            Ok(())
+        }
+
+        fn show_menu(
+            &mut self,
+            request: TrayMenuRequest<'_>,
+        ) -> Result<Option<&'static str>, HostError> {
+            if self.panic_first.replace(false) {
+                panic!("the fake tray presenter failed");
+            }
+            self.calls.borrow_mut().menus.push((
+                request.hwnd(),
+                request.point(),
+                request.menu().clone(),
+            ));
+            Ok(self.result)
+        }
+    }
+
+    type TrayRuns = Rc<RefCell<Vec<(CommandSource, Option<WindowCtx>, Option<NodeId>)>>>;
+
+    struct TrayHarness {
+        host: Host,
+        calls: Rc<RefCell<TrayCalls>>,
+        runs: TrayRuns,
+    }
+
+    fn tray_declaration() -> TraySpec {
+        TraySpec::new("ZenUI tray").with_menu(
+            MenuSpec::new()
+                .command("app.one", "One")
+                .separator()
+                .command("app.two", "Two"),
+        )
+    }
+
+    fn tray_host(result: Option<&'static str>, with_presenter: bool) -> TrayHarness {
+        let runs: TrayRuns = Rc::new(RefCell::new(Vec::new()));
+        let mut runtime = Runtime::new();
+        for id in ["app.one", "app.two"] {
+            let runs = runs.clone();
+            runtime
+                .on_app_command(id, move |event| {
+                    runs.borrow_mut()
+                        .push((event.source(), event.window(), event.target()));
+                })
+                .expect("register the tray app command");
+        }
+        runtime
+            .declare_tray(tray_declaration())
+            .expect("declare the tray");
+        runtime
+            .declare_windows(|catalog| {
+                catalog.window(WindowSpec::new(MAIN).primary(), |_| {
+                    view! {
+                        <view>
+                            <text aria:label="status">"Ready"</text>
+                        </view>
+                    }
+                })?;
+                Ok(())
+            })
+            .expect("declare the tray window");
+        let mut host = Host::open(runtime, HostConfig::hidden()).expect("open the tray host");
+        let calls = Rc::new(RefCell::new(TrayCalls::default()));
+        if with_presenter {
+            host.set_tray_presenter(FakeTrayPresenter {
+                calls: calls.clone(),
+                result,
+                panic_first: Rc::new(Cell::new(false)),
+            })
+            .expect("install the fake tray presenter");
+        }
+        TrayHarness { host, calls, runs }
+    }
+
+    fn tray_hwnd(host: &Host) -> HWND {
+        host.tray.as_ref().expect("a declared tray").window.hwnd
+    }
+
+    /// 同步派发托盘回调，并在返回后完成宿主的同步/重绘结算。
+    fn send_tray_callback(host: &mut Host, event: u32, point: (i16, i16)) -> Option<HostError> {
+        let hwnd = tray_hwnd(host);
+        let (x, y) = point;
+        // 版本 4：鼠标位置在 wParam，事件和图标 id 在 lParam。
+        let wparam = WPARAM((x as u16 as usize) | ((y as u16 as usize) << 16));
+        let lparam = LPARAM(((1u32 << 16) | event) as isize);
+        {
+            let _pointer = HostPointer::install(host as *mut Host);
+            // 安全：SendMessageW 在调用线程同步派发；调用期间不使用 host。
+            unsafe {
+                SendMessageW(
+                    hwnd,
+                    host_message::TRAY_CALLBACK,
+                    Some(wparam),
+                    Some(lparam),
+                );
+            }
+        }
+        host.sync_windows().expect("sync windows");
+        if std::mem::take(&mut host.focus_after_sync) {
+            host.focus_native_focused_window()
+                .expect("focus the active window");
+        }
+        host.repaint_changed_windows().expect("repaint");
+        host.deferred_error.take()
+    }
+
+    #[test]
+    fn the_fake_tray_presenter_records_one_add_update_menu_and_delete() {
+        let TrayHarness {
+            mut host,
+            calls,
+            runs,
+        } = tray_host(Some("app.one"), true);
+        let hwnd = tray_hwnd(&host);
+        let main = host.windows[MAIN].ctx;
+        {
+            let calls = calls.borrow();
+            assert_eq!(calls.adds.len(), 1, "installation adds one icon");
+            assert_eq!(calls.adds[0].0, hwnd);
+            assert!(!calls.adds[0].1.is_invalid(), "the shared system icon");
+            assert_eq!(
+                calls.adds[0].2,
+                host_message::TRAY_CALLBACK,
+                "the callback message is the tray value, not worker wake"
+            );
+            assert_eq!(calls.updates.len(), 1, "one tooltip update follows the add");
+            assert_eq!(
+                calls.updates[0],
+                (hwnd, String::from("ZenUI tray")),
+                "the declared tooltip reaches the presenter"
+            );
+            assert!(calls.menus.is_empty());
+            assert!(calls.removes.is_empty());
+        }
+
+        assert!(send_tray_callback(&mut host, WM_CONTEXTMENU, (30, 40)).is_none());
+        {
+            let calls = calls.borrow();
+            assert_eq!(calls.menus.len(), 1, "one right-click opens one menu");
+            assert_eq!(calls.menus[0].0, hwnd);
+            assert_eq!(calls.menus[0].1, (30, 40));
+            assert_eq!(calls.menus[0].2, tray_declaration().menu().clone());
+        }
+        assert_eq!(
+            runs.borrow().len(),
+            1,
+            "the selected command runs exactly once"
+        );
+        let (source, window, target) = runs.borrow()[0];
+        assert_eq!(source, CommandSource::Tray);
+        assert_eq!(window, Some(main), "the menu exposes the preferred window");
+        assert_eq!(target, None);
+
+        drop(host);
+        let calls = calls.borrow();
+        assert_eq!(calls.removes, [hwnd], "Host drop removes the icon once");
+    }
+
+    #[test]
+    fn a_hidden_tray_without_a_presenter_does_not_add_an_icon() {
+        let TrayHarness { host, calls, .. } = tray_host(None, false);
+        assert!(host.tray_presenter.is_none());
+        assert!(
+            !host.tray.as_ref().expect("declared tray").added,
+            "no presenter means no presenter-side icon state"
+        );
+        drop(host);
+        assert!(
+            calls.borrow().adds.is_empty(),
+            "hidden mode makes no shell call without a presenter"
+        );
+    }
+
+    #[test]
+    fn the_tray_callback_routes_only_through_the_tray_hwnd() {
+        let TrayHarness {
+            mut host,
+            calls,
+            runs,
+        } = tray_host(Some("app.one"), true);
+        let main_hwnd = host.hwnd(MAIN).expect("the main window");
+        {
+            let _pointer = HostPointer::install(&mut host as *mut Host);
+            // 安全：同步派发到普通窗口；托盘分支必须拒绝非托盘 HWND。
+            unsafe {
+                SendMessageW(
+                    main_hwnd,
+                    host_message::TRAY_CALLBACK,
+                    Some(WPARAM(0)),
+                    Some(LPARAM(WM_CONTEXTMENU as isize)),
+                );
+            }
+        }
+        assert!(
+            calls.borrow().menus.is_empty(),
+            "a window HWND is not the tray"
+        );
+        assert!(runs.borrow().is_empty());
+
+        assert!(send_tray_callback(&mut host, WM_CONTEXTMENU, (5, 6)).is_none());
+        assert_eq!(calls.borrow().menus.len(), 1);
+        assert_eq!(runs.borrow().len(), 1);
+    }
+
+    #[test]
+    fn clicking_the_tray_restores_the_primary_window() {
+        let TrayHarness { mut host, runs, .. } = tray_host(Some("app.one"), true);
+        let main = host.windows[MAIN].ctx;
+        host.hide(MAIN).expect("hide the only window");
+        assert_eq!(
+            host.runtime.focused_window(),
+            None,
+            "a hidden window is not a focused tray target"
+        );
+
+        assert!(send_tray_callback(&mut host, NIN_SELECT, (0, 0)).is_none());
+        assert_eq!(
+            host.runtime.focused_window().map(|window| window.key()),
+            Some(MAIN),
+            "a left click restores and focuses the primary window"
+        );
+        assert!(host.runtime.window_alive(main));
+        assert!(runs.borrow().is_empty(), "restoring is not a command");
+    }
+
+    #[test]
+    fn taskbar_created_re_adds_and_the_last_close_removes_once() {
+        let TrayHarness {
+            mut host,
+            calls,
+            runs,
+        } = tray_host(None, true);
+        let hwnd = tray_hwnd(&host);
+        let taskbar_created = host.taskbar_created;
+        assert_ne!(
+            taskbar_created, 0,
+            "Explorer's broadcast message is registered"
+        );
+
+        // Explorer 向所有顶层窗口广播；只有托盘 HWND 负责重新添加。
+        let main_hwnd = host.hwnd(MAIN).expect("the main window");
+        {
+            let _pointer = HostPointer::install(&mut host as *mut Host);
+            // 安全：同步派发注册消息；调用期间不使用 host。
+            unsafe {
+                SendMessageW(hwnd, taskbar_created, Some(WPARAM(0)), Some(LPARAM(0)));
+                SendMessageW(main_hwnd, taskbar_created, Some(WPARAM(0)), Some(LPARAM(0)));
+            }
+        }
+        {
+            let calls = calls.borrow();
+            assert_eq!(
+                calls.adds.len(),
+                2,
+                "the tray HWND re-adds and a normal window does not add a second icon"
+            );
+            assert_eq!(calls.updates.len(), 2, "the tooltip follows every add");
+        }
+        assert!(runs.borrow().is_empty());
+
+        host.close(MAIN).expect("close the last window");
+        assert_eq!(
+            calls.borrow().removes,
+            [hwnd],
+            "the last close removes the icon"
+        );
+        drop(host);
+        assert_eq!(
+            calls.borrow().removes.len(),
+            1,
+            "Host drop does not delete the icon a second time"
+        );
+    }
+
+    #[test]
+    fn reopening_after_the_last_close_adds_the_icon_again() {
+        let TrayHarness {
+            mut host,
+            calls,
+            runs,
+        } = tray_host(None, true);
+        let hwnd = tray_hwnd(&host);
+        host.close(MAIN).expect("close the last window");
+        assert_eq!(calls.borrow().removes, [hwnd]);
+        host.show(MAIN).expect("reopen the catalog window");
+        {
+            let calls = calls.borrow();
+            assert_eq!(calls.adds.len(), 2, "a live window adds the icon again");
+            assert_eq!(calls.updates.len(), 2, "the tooltip follows the new add");
+        }
+        drop(host);
+        assert_eq!(calls.borrow().removes.len(), 2, "drop removes the new icon");
+        assert!(runs.borrow().is_empty(), "lifecycle changes run no command");
+    }
+
+    #[test]
+    fn the_tray_uses_the_shared_system_icon() {
+        let TrayHarness { host, calls, .. } = tray_host(None, true);
+        let icon = calls.borrow().adds[0].1;
+        drop(host);
+        // 安全：只查询系统共享图标的句柄；宿主从不 DestroyIcon。
+        let again = unsafe { LoadIconW(None, IDI_APPLICATION) }.expect("reload the system icon");
+        assert_eq!(
+            again, icon,
+            "the shared system icon survives the host instead of being destroyed"
+        );
+    }
+
+    #[test]
+    fn a_panicking_tray_presenter_is_contained_and_restored() {
+        let TrayHarness {
+            mut host,
+            calls,
+            runs,
+        } = tray_host(Some("app.one"), true);
+        let presenter = host.tray_presenter.take().expect("installed presenter");
+        // 重新安装一个 panic-first 的 fake，保留同一个记录器。
+        host.set_tray_presenter(FakeTrayPresenter {
+            calls: calls.clone(),
+            result: Some("app.one"),
+            panic_first: Rc::new(Cell::new(true)),
+        })
+        .expect("replace the fake");
+        drop(presenter);
+
+        let error =
+            send_tray_callback(&mut host, WM_CONTEXTMENU, (1, 2)).expect("the panic is reported");
+        assert!(matches!(error, HostError::TrayPresenter(_)));
+        assert!(host.tray_presenter.is_some(), "the presenter is restored");
+        assert!(runs.borrow().is_empty(), "a panicking menu runs no command");
+
+        assert!(send_tray_callback(&mut host, WM_CONTEXTMENU, (3, 4)).is_none());
+        assert_eq!(
+            runs.borrow().len(),
+            1,
+            "the next open runs the command once"
+        );
+    }
+
+    #[test]
+    fn a_tray_menu_cannot_return_an_undeclared_command() {
+        let TrayHarness { mut host, runs, .. } = tray_host(Some("app.undeclared"), true);
+        let error = send_tray_callback(&mut host, WM_CONTEXTMENU, (1, 2))
+            .expect("the undeclared id is a host error");
+        assert!(matches!(
+            error,
+            HostError::Command(CommandError::MissingHandler("app.undeclared"))
+        ));
+        assert!(runs.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_tray_declaration_requires_application_handlers_before_the_host_opens() {
+        let mut runtime = Runtime::new();
+        runtime
+            .declare_tray(
+                TraySpec::new("ZenUI tray")
+                    .with_menu(MenuSpec::new().command("app.missing", "Missing")),
+            )
+            .expect("declare the tray");
+        runtime
+            .declare_windows(|catalog| {
+                catalog.window(WindowSpec::new(MAIN).primary(), |_| view! { <view /> })?;
+                Ok(())
+            })
+            .expect("declare the window");
+        let error = match Host::open(runtime, HostConfig::hidden()) {
+            Ok(_) => panic!("an unhandled tray command must fail the open"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("app.missing"),
+            "the host names the missing tray command: {error}"
+        );
     }
 
     #[test]

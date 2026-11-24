@@ -17,6 +17,7 @@ pub mod signal;
 pub mod store;
 pub mod task;
 mod text_edit;
+pub mod tray;
 pub mod view;
 pub mod window;
 
@@ -39,6 +40,7 @@ pub use runtime::{FocusInfo, Runtime};
 pub use signal::{Memo, Once, Signal, memo, once, signal};
 pub use store::{Field, FieldError, Store, TodoId, Transaction, WriteError, WriteOp};
 pub use task::{DeliveryReport, Task, TaskError, TaskScope, TaskStatus, TaskToken};
+pub use tray::{TrayError, TraySpec};
 pub use view::{
     BlurEvent, Children, ChildrenFactory, CompositionEvent, CompositionPhase, FocusCause,
     FocusEvent, Key, KeyEvent, MountError, MountPlan, MountResult, SubmitEvent,
@@ -67,9 +69,9 @@ pub mod prelude {
         ShortcutError, ShortcutKey, Signal, SnapshotAction, SnapshotActions, SnapshotAttr,
         SnapshotElement, SnapshotNode, SnapshotRowBand, SnapshotSemantics, SnapshotValue, Store,
         StyleDeclaration, StyleOrigin, StyleValue, Submenu, SubmitEvent, Task, TaskError,
-        TaskScope, TaskStatus, TaskToken, TextEditState, TodoId, Transaction, WindowCatalog,
-        WindowCtx, WindowError, WindowInfo, WindowRole, WindowSpec, WriteError, WriteOp, component,
-        em, memo, once, px, signal, view,
+        TaskScope, TaskStatus, TaskToken, TextEditState, TodoId, Transaction, TrayError, TraySpec,
+        WindowCatalog, WindowCtx, WindowError, WindowInfo, WindowRole, WindowSpec, WriteError,
+        WriteOp, component, em, memo, once, px, signal, view,
     };
     pub use zenui_core::Filter;
 }

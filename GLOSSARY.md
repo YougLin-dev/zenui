@@ -180,6 +180,14 @@ _Avoid_: node menu, right-click handler, popup window state
 通过 `Runtime::on_app_command` 在首个窗口打开或根树挂载前注册的应用级处理器；没有窗口时也能运行，事件通过 `CommandEvent::window` 暴露可选的目标 activation。窗口菜单声明项可以由它承接，窗口目标派发只在窗口没有注册同一 id 时回退到它，`CommandSource::Tray` 从不运行窗口处理器。处理器在 `Phase::Event` 中可写应用 Signal/Store 并排队窗口请求；启动后注册、重复 id 与 panic 返回 typed error。
 _Avoid_: global command, background command
 
+**Tray icon**:
+应用级托盘声明 `TraySpec`：一个 tooltip 与一份右键 `MenuSpec`，在首个窗口打开或根树挂载前通过 `Runtime::declare_tray` 注册，全部菜单命令必须有应用级处理器。宿主用一个从不显示的顶层托盘 HWND 接住自己的回调消息与 Explorer 的 `TaskbarCreated` 广播；左键或键盘激活恢复可见焦点窗口，没有可见焦点时恢复 primary，primary 不在时选择任一存活窗口；右键在宿主借用之外展示菜单并以 `CommandSource::Tray` 派发恰好一次。图标随最后一个窗口关闭移除，窗口重新出现时再次添加；`TaskbarCreated` 后重新添加。第一切片使用共享系统图标，不承诺自定义图标资产，也不包含托盘独存或最小化到托盘。
+_Avoid_: notification area widget, tray window, background app icon
+
+**Tray presenter**:
+`TrayPresenter` 是宿主执行 `Shell_NotifyIconW` 与右键菜单的 seam。可见宿主安装原生 presenter；隐藏宿主默认没有，测试注入 fake 记录 add/update/remove/menu，CI 不触碰真实通知区域。
+_Avoid_: tray backend, shell hook
+
 **Window scale**:
 窗口逻辑坐标到物理像素的缩放；布局始终使用逻辑像素。
 _Avoid_: DPI factor, zoom
