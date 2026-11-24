@@ -55,4 +55,4 @@ The verification checklist's Windows-only items about origin/revision traces, co
 
 ## Consequences
 
-Undo/redo do not map Ctrl+Z/Ctrl+Y in the Windows host, do not use the clipboard and do not change the demo in this milestone; those are separate host and product steps. The runtime API is headless and deterministic: tests drive edits, composition, external replacements, shared Signals, visibility, caps and unmounting through public runtime entry points, plus one runtime-internal test that inspects a dead slot to prove history text was released.
+The Windows host maps Ctrl+Z/Ctrl+Y on the focused enabled text input to `Runtime::undo_node`/`redo_node` and requests reveal and repaint; undo/redo do not use the clipboard and do not change the demo in this milestone. Visible host acceptance is recorded in [stage-three 文本编辑历史验收](../实现/stage-three-文本编辑历史-验收.md). The runtime API is headless and deterministic: tests drive edits, composition, external replacements, shared Signals, visibility, caps and unmounting through public runtime entry points, plus one runtime-internal test that inspects a dead slot to prove history text was released.

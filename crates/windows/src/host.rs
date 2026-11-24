@@ -2651,9 +2651,9 @@ impl Host {
         self.key_down_with(window, key, shift, control)
     }
 
-    /// 键盘映射本体：编辑、caret/selection、焦点遍历与表单提交。
+    /// 键盘映射本体：编辑、撤销/重做、caret/selection、焦点遍历与表单提交。
     ///
-    /// Shift+方向键保留 anchor、移动焦点端；Ctrl+A 全选。
+    /// Shift+方向键保留 anchor、移动焦点端；Ctrl+A 全选，Ctrl+Z/Y 走运行时历史。
     fn key_down_with(
         &mut self,
         window: &mut WindowHost,
@@ -2732,13 +2732,19 @@ impl Host {
                     window.reveal_requested = true;
                     window.paint_requested = true;
                 }
-                // Undo/Redo/Cut/Copy/Paste 已由后续工单保留；在接线前消费按键，
+                EditorAction::Undo => {
+                    ignore_expected_dispatch(self.runtime.undo_node(focused))?;
+                    window.reveal_requested = true;
+                    window.paint_requested = true;
+                }
+                EditorAction::Redo => {
+                    ignore_expected_dispatch(self.runtime.redo_node(focused))?;
+                    window.reveal_requested = true;
+                    window.paint_requested = true;
+                }
+                // Cut/Copy/Paste 仍由后续剪贴板工单保留；在接线前消费按键，
                 // 避免它们落入普通字符编辑。
-                EditorAction::Undo
-                | EditorAction::Redo
-                | EditorAction::Cut
-                | EditorAction::Copy
-                | EditorAction::Paste => {}
+                EditorAction::Cut | EditorAction::Copy | EditorAction::Paste => {}
             }
             return Ok(());
         }
@@ -5059,7 +5065,7 @@ mod tests {
         UIA_TogglePatternId, UIA_ValuePatternId, UiaAppendRuntimeId, UiaPoint,
     };
     use windows::Win32::UI::Input::KeyboardAndMouse::{
-        GetKeyboardState, IsWindowEnabled, SetKeyboardState, VK_A, VK_NEXT, VK_S,
+        GetKeyboardState, IsWindowEnabled, SetKeyboardState, VK_A, VK_NEXT, VK_S, VK_Y, VK_Z,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         CopyAcceleratorTableW, GetMenuItemCount, GetMenuItemID, GetMenuState, GetMenuStringW,
@@ -8457,6 +8463,237 @@ mod tests {
         let edit = element.edit().expect("edit");
         assert_eq!(edit.caret(), 1);
         assert_eq!(edit.selection(), None, "typing collapses the selection");
+    }
+
+    /// 撤销/重做探针：一个记录每次 `on:input` 的输入，以及一个不抢焦点的禁用按钮。
+    fn open_history_probe() -> (Host, &'static Mutex<Vec<String>>) {
+        let inputs = leak(Mutex::new(Vec::new()));
+        let mut runtime = Runtime::new();
+        runtime
+            .declare_windows(move |catalog| {
+                catalog.window(WindowSpec::new(MAIN).primary().sized(320, 240), move |_| {
+                    let value = signal(String::from("old"));
+                    let locked = signal(false);
+                    view! {
+                        <view>
+                            <button
+                                aria:label="Lock"
+                                on:click={move || locked.set(true)}
+                            >"Lock"</button>
+                            <text-input
+                                aria:label="Field"
+                                value={value}
+                                disabled={locked}
+                                on:input={move |next: String| {
+                                    inputs.lock().expect("inputs").push(next.clone());
+                                    value.set(next);
+                                }}
+                            />
+                        </view>
+                    }
+                })?;
+                Ok(())
+            })
+            .expect("declare the history probe window");
+        runtime.show(MAIN).expect("show the history probe window");
+        let mut host = Host::open(runtime, HostConfig::hidden()).expect("open the history host");
+        host.render().expect("render the history probe window");
+        (host, inputs)
+    }
+
+    fn history_node(host: &Host) -> NodeId {
+        host.runtime
+            .presentation()
+            .expect("snapshot")
+            .find_label("Field")
+            .expect("field")
+            .id()
+    }
+
+    #[test]
+    fn ctrl_z_undoes_and_ctrl_y_redoes_value_caret_and_selection_once() {
+        let (mut host, inputs) = open_history_probe();
+        host.runtime.focus("Field").expect("focus");
+        let node = history_node(&host);
+        host.runtime
+            .set_selection_node(node, 1, 3)
+            .expect("select the middle");
+        with_main(&mut host, |host, window| {
+            host.char_typed(window, WPARAM('X' as usize))
+        });
+        {
+            let snapshot = host.runtime.presentation().expect("snapshot");
+            let element = snapshot.node(node).expect("field");
+            assert_eq!(element.text_value(), Some("oX"));
+            let edit = element.edit().expect("edit");
+            assert_eq!((edit.anchor(), edit.caret()), (2, 2));
+            assert_eq!(edit.selection(), None, "typing collapses the selection");
+        }
+        assert_eq!(*inputs.lock().expect("inputs"), ["oX"]);
+
+        with_main(&mut host, |host, window| {
+            host.key_down_with(window, VK_Z, false, true)
+        });
+        {
+            let snapshot = host.runtime.presentation().expect("snapshot");
+            let element = snapshot.node(node).expect("field");
+            assert_eq!(element.text_value(), Some("old"));
+            let edit = element.edit().expect("edit");
+            assert_eq!((edit.anchor(), edit.caret()), (1, 3));
+            assert_eq!(
+                edit.selection(),
+                Some((1, 3)),
+                "undo restores the pre-edit selection"
+            );
+        }
+        assert_eq!(
+            *inputs.lock().expect("inputs"),
+            ["oX", "old"],
+            "one on:input per undo"
+        );
+
+        with_main(&mut host, |host, window| {
+            host.key_down_with(window, VK_Y, false, true)
+        });
+        {
+            let snapshot = host.runtime.presentation().expect("snapshot");
+            let element = snapshot.node(node).expect("field");
+            assert_eq!(element.text_value(), Some("oX"));
+            let edit = element.edit().expect("edit");
+            assert_eq!((edit.anchor(), edit.caret()), (2, 2));
+            assert_eq!(edit.selection(), None);
+        }
+        assert_eq!(
+            *inputs.lock().expect("inputs"),
+            ["oX", "old", "oX"],
+            "one on:input per redo"
+        );
+    }
+
+    #[test]
+    fn typing_after_undo_clears_the_redo_stack() {
+        let (mut host, inputs) = open_history_probe();
+        host.runtime.focus("Field").expect("focus");
+        let node = history_node(&host);
+        host.runtime.set_caret_node(node, 3).expect("caret at end");
+        with_main(&mut host, |host, window| {
+            host.char_typed(window, WPARAM('X' as usize))
+        });
+        with_main(&mut host, |host, window| {
+            host.key_down_with(window, VK_Z, false, true)
+        });
+        with_main(&mut host, |host, window| {
+            host.char_typed(window, WPARAM('Y' as usize))
+        });
+
+        with_main(&mut host, |host, window| {
+            host.key_down_with(window, VK_Y, false, true)
+        });
+        let snapshot = host.runtime.presentation().expect("snapshot");
+        assert_eq!(
+            snapshot.node(node).expect("field").text_value(),
+            Some("oldY")
+        );
+        assert_eq!(
+            *inputs.lock().expect("inputs"),
+            ["oldX", "old", "oldY"],
+            "the stale redo dispatches nothing"
+        );
+    }
+
+    #[test]
+    fn undo_and_redo_without_a_focused_input_are_consumed_no_ops() {
+        let (mut host, inputs) = open_history_probe();
+        let focus_before = host.runtime.presentation().expect("snapshot").focus();
+        with_main(&mut host, |host, window| {
+            host.key_down_with(window, VK_Z, false, true)
+        });
+        with_main(&mut host, |host, window| {
+            host.key_down_with(window, VK_Y, false, true)
+        });
+        let snapshot = host.runtime.presentation().expect("snapshot");
+        assert_eq!(snapshot.focus(), focus_before, "focus does not move");
+        assert_eq!(
+            snapshot.find_label("Field").expect("field").text_value(),
+            Some("old")
+        );
+        assert!(inputs.lock().expect("inputs").is_empty());
+    }
+
+    #[test]
+    fn undo_and_redo_during_composition_are_consumed_no_ops() {
+        let (mut host, inputs) = open_history_probe();
+        host.runtime.focus("Field").expect("focus");
+        let node = history_node(&host);
+        host.runtime.compose_start_node(node).expect("start");
+        host.runtime
+            .compose_update_node(node, "ni")
+            .expect("update");
+
+        with_main(&mut host, |host, window| {
+            host.key_down_with(window, VK_Z, false, true)
+        });
+        with_main(&mut host, |host, window| {
+            host.key_down_with(window, VK_Y, false, true)
+        });
+        let snapshot = host.runtime.presentation().expect("snapshot");
+        let element = snapshot.node(node).expect("field");
+        assert_eq!(element.text_value(), Some("old"));
+        assert!(
+            element.edit().expect("edit").composition().is_some(),
+            "the composition survives"
+        );
+        assert_eq!(element.edit().expect("edit").preedit(), Some("ni"));
+        assert_eq!(snapshot.focus(), Some(node));
+        assert!(inputs.lock().expect("inputs").is_empty());
+    }
+
+    #[test]
+    fn undo_and_redo_after_the_focused_input_is_disabled_are_consumed_no_ops() {
+        let (mut host, inputs) = open_history_probe();
+        host.runtime.focus("Field").expect("focus");
+        let node = history_node(&host);
+        let lock = host
+            .runtime
+            .presentation()
+            .expect("snapshot")
+            .find_label("Lock")
+            .expect("lock")
+            .id();
+        host.runtime.click_node(lock).expect("disable the field");
+        let focus_after_disable = host.runtime.presentation().expect("snapshot").focus();
+        assert!(
+            host.runtime
+                .presentation()
+                .expect("snapshot")
+                .node(node)
+                .expect("field")
+                .disabled(),
+            "the field is disabled"
+        );
+        assert_ne!(
+            focus_after_disable,
+            Some(node),
+            "disabling the field moves focus away from it"
+        );
+
+        with_main(&mut host, |host, window| {
+            host.key_down_with(window, VK_Z, false, true)
+        });
+        with_main(&mut host, |host, window| {
+            host.key_down_with(window, VK_Y, false, true)
+        });
+        let snapshot = host.runtime.presentation().expect("snapshot");
+        assert_eq!(
+            snapshot.focus(),
+            focus_after_disable,
+            "the keys do not move focus"
+        );
+        assert_eq!(
+            snapshot.node(node).expect("field").text_value(),
+            Some("old")
+        );
+        assert!(inputs.lock().expect("inputs").is_empty());
     }
 
     #[test]
