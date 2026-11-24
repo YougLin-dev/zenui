@@ -1,7 +1,7 @@
 # 文件拖放可见证据
 
 日期: 2026-11-25
-基线: main 5b6970d（#207 运行时拖放事件）；本文件对应 #208 的多文件可见证据
+基线: main 5b6970d（#207 运行时拖放事件）+ #208 分支实现（合并为 3cb3cdb）；本文件对应 #208 的多文件可见证据
 完整场景、边界与读数见 [stage-three 文件拖放验收](../../stage-three-文件拖放-验收.md)
 示例: crates/windows/examples/todo_host.rs（ZenUI Todo），debug 构建
 拖放源: Windows 文件资源管理器，临时目录 zenui-drop-evidence
@@ -20,8 +20,9 @@
   Windows 不把硬件光标写入位图，脚本按当前位置补画光标。Shell 的拖放 ghost
   由合成器绘制，未进入这张截图；选中行、光标位置与落点后的应用状态共同构成本次证据。
 - 应用窗口图来自 PrintWindow(PW_RENDERFULLCONTENT)，整窗读取。
-- 资源管理器证据图只裁列表区，不含导航窗格、地址栏或窗口标题；不读取用户已有的
-  其它资源管理器窗口。临时目录只含上述两个文本文件。
+- 资源管理器单独图只裁列表区；拖放中的合成图裁到状态栏以上，不含导航窗格、
+  地址栏、窗口标题或其它窗口内容。不读取用户已有的其它资源管理器窗口。
+  临时目录只含上述两个文本文件。
 
 ## 一次拖放的结果
 
@@ -41,8 +42,8 @@
 - workspace 843 个测试通过；`cargo fmt --all -- --check` 与 workspace clippy
   `-D warnings` 通过。
 - drag_drop 模块 7 个：Unicode/重复路径按序提取、未配对代理项原样保留、
-  缺失或空 CF_HDROP、COPY/启用/文件列表的 effect 判定、注册策略、medium 释放、
-  ChangedMode 映射。
+  缺失或空 CF_HDROP、COPY/启用/文件列表的 effect 判定、注册策略与 ChangedMode 映射；
+  medium 释放由单一 ReleaseStgMedium 路径保证，测试未直接断言。
 - Windows 宿主新增 1 个：隐藏宿主即使注册了 on_drop 也不创建 drop target，
   且不初始化 OLE。
 - 运行时与 demo 的交付行为由 #207 的 10 个测试覆盖；本切片只增加 OLE 注册、
@@ -96,6 +97,7 @@
 - 草稿 `Unsaved drop draft`；关闭后确认窗口 `Discard draft?`
 - 拖到确认窗口: target=(1826,913) selected=1 remaining=1 notice=False error=False
   - titles=[Write tests | Read docs]
+- 父窗口的 IsWindowEnabled 未单独读数；禁用由宿主待决关闭逻辑与宿主测试覆盖。
 - Continue editing 后: confirmVisible=False draft=[Unsaved drop draft]
 
 ### 150% 模态选择器

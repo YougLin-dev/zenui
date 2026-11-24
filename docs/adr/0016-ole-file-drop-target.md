@@ -46,7 +46,7 @@ COM callbacks run inside the shell's drag loop. They only inspect the HWND and d
 
 Expected races between the native acceptance and the drain (window hidden, suspended or closed in between) are treated as rejected drops rather than fatal host errors. Genuine handler or refresh failures surface as `HostError::Drop`; a failed `PostMessage` cancels the drop and reports `E_FAIL` to OLE.
 
-The native target checks `IsWindowEnabled`. A modal shell picker disables its owner, and the host disables a parent while a close confirmation is pending; drops over those windows return NONE. The confirmation window used by the demo has no `on_drop` handler and therefore no target. This is why no extra modal-state flag is needed in the drop path.
+The native target checks `IsWindowEnabled`. A modal shell picker disables its owner, and the host disables a parent while a close confirmation is pending; drops over the owner and parent return NONE. The confirmation window used by the demo has no `on_drop` handler and therefore no target. A confirmation window with a handler is a different case: it remains enabled, so its target accepts during the drag, and `Runtime::drop_files` rejects the queued drop as `Suspended`; the handler still does not run. This is why the drag path needs no extra modal-state flag.
 
 ### DropEvent is not a host task
 
@@ -70,4 +70,4 @@ The native host needs OLE on its UI thread; a thread already in another COM apar
 
 No custom drag image, drag-over highlight, drop-position hit testing, auto-scroll or programmatic drag is implemented. The target accepts over the whole client area and relies on the shell cursor/effect. Out of scope for this slice: text/URL/image drops, MOVE/LINK effects, multiple simultaneous drags and cross-monitor behavior.
 
-Fake `IDataObject` tests cover effects, extraction, registration policy and medium lifetime; hidden tests cover the runtime validation and lifetime. They are partial evidence. The visible Windows acceptance at 100% and 150% is recorded in [stage-three file drop acceptance](../实现/stage-three-文件拖放-验收.md); the `DropEvent` API and validation rules are described in the [window and task SDK](../SDK/窗口与任务.md).
+Fake `IDataObject` tests cover effects, extraction and registration policy; medium release is enforced by the single `ReleaseStgMedium` path in `collect_paths`, but the current tests do not assert that call directly. Hidden tests cover the runtime validation and lifetime. Together they are partial evidence. The visible Windows acceptance at 100% and 150% is recorded in [stage-three file drop acceptance](../实现/stage-three-文件拖放-验收.md); the `DropEvent` API and validation rules are described in the [window and task SDK](../SDK/窗口与任务.md).

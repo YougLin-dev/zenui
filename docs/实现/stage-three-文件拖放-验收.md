@@ -2,7 +2,7 @@
 
 本页记录 Windows 宿主从资源管理器接收 OLE 文件拖放的可见结果：单文件与多文件、Unicode/非 BMP/长路径、文件夹、非文件数据、无处理器窗口、关闭提示、模态选择器打开、关闭重开与拖放后可用性。契约见 [ADR-0016](../adr/0016-ole-file-drop-target.md)，SDK 用法见[窗口与任务](../SDK/窗口与任务.md#文件拖放的事件与所有权)。
 
-- 基线：`main` `3cb3cdb`（#208 合并后的 OLE drop target；多文件图沿用同一实现）
+- 基线：`main` `3cb3cdb`（#208 合并后的 OLE drop target）。多文件图在 #208 分支（基于 `5b6970d`）采集，合并后的实现与 `3cb3cdb` 相同；其余场景在 `3cb3cdb` 上采集。
 - 示例：`crates/windows/examples/todo_host.rs`（ZenUI Todo / ZenUI Details），debug 构建
 - 平台：Windows 11，单屏 2560×1600
 
@@ -19,7 +19,7 @@
 - 新采集的样本位于 `E:\code\mine\zenui\target\drop-acceptance`：`single.txt`、`multi-a.txt`、`multi-b.txt`、`unicode-你好-🙂.txt`、`folder-drop/` 与 272 字符的长路径文件。多文件图沿用 #208 的 `drop-two.txt` 与 `drop-unicode-你好-🙂.txt`；文件名与内容出现在图中，源目录未显示。
 - 资源管理器窗口每次由脚本打开并置于应用左侧，Details 视图。单文件直接点击；多文件图使用真实点击第一行后 Ctrl+A 选中两行。每次拖动前由 UIA `SelectionItemPattern` 读回选中数量。
 - 拖动是仓库外 PowerShell 脚本注入的 Win32 鼠标事件：按下后先移出拖拽阈值，再分 30 步移到目标，停留后释放。拖放中的截图在按钮仍按下时用 `BitBlt` 的 `SRCCOPY|CAPTUREBLT` 抓取；位图不含硬件光标，脚本按当前位置补画。
-- 应用窗口图来自 `PrintWindow(PW_RENDERFULLCONTENT)`。资源管理器证据图只裁文件列表，不含导航窗格、地址栏或窗口标题；原生对话框只保留标题条与文件列表；Notepad 只保留文档区。截图不含 OneDrive 登录名或其它个人路径。
+- 应用窗口图来自 `PrintWindow(PW_RENDERFULLCONTENT)`。资源管理器单独图（`*-00-explorer.png`）只保留文件列表；拖放中的合成图保留应用内容区、资源管理器文件列表与顶部命令栏，底边裁到状态栏以上，不含导航窗格、地址栏、窗口标题或其它窗口内容；原生对话框只保留标题条与文件列表；Notepad 只保留文档区。所有截图不含 OneDrive 登录名或其它个人路径。
 - Notepad 复用用户已打开的窗口，仅新增并操作 `non-file.txt` 标签页；未打开或修改其它恢复标签页，也未读取其文档内容。采集后关闭该标签页并把窗口尺寸恢复，Notepad 保持打开。
 - 应用任务在落点后约 1.8–2.8 秒读取；截图中的 `Imported N task(s)` 与任务行是最终可见结果。原始场景读数见 `证据/host-drop/states.txt` 的 #209 段。
 
@@ -65,10 +65,10 @@
 主窗口草稿为 `Unsaved drop draft` 时发送关闭请求，出现 `Discard draft?` 确认窗口。确认窗口没有 `on_drop`，父窗口处于关闭挂起；把 `single.txt` 拖到确认窗口后：
 
 - 任务仍为 `Write tests`、`Read docs`，没有通知或错误；
-- 确认窗口保持打开，父窗口保持禁用；
-- 通过 UIA 触发 Continue editing 后确认窗口关闭，主窗口恢复，草稿仍为 `Unsaved drop draft`。
+- 确认窗口保持打开；父窗口处于关闭挂起，宿主在待决关闭期间用 `EnableWindow(false)` 禁用它（ADR-0016 与宿主测试），本页截图只覆盖确认窗口，未单独读取父窗口的 `IsWindowEnabled`；
+- 通过 UIA 触发 Continue editing 后确认窗口关闭（`confirmVisible=False`），主窗口保持打开，草稿仍为 `Unsaved drop draft`。
 
-证据：`150-close-prompt-01-main.png`、`150-close-prompt-02-confirm.png`、`150-close-prompt-03-drag.png`、`150-close-prompt-04-confirm-after.png`、`150-close-prompt-05-main-after-deny.png`。
+证据：`150-close-prompt-01-main.png`、`150-close-prompt-02-confirm.png`、`150-close-prompt-03-drag.png`、`150-close-prompt-04-confirm-after.png`、`150-close-prompt-05-main-after-deny.png`；`states.txt` 记录任务、通知与草稿读数。
 
 ## 模态选择器打开
 
@@ -78,7 +78,7 @@
 | --- | --- | --- |
 | 对话框 | `Import tasks` 标题与文件列表可见，拖放后仍打开 | `150-picker-00-title.png`、`150-picker-01-dialog.png`、`150-picker-04-dialog-after.png` |
 | 主窗口 | 任务仍为 2，无通知或错误 | `150-picker-02-main.png`、`150-picker-03-drag.png` |
-| 取消 | 通过 UIA 调用取消按钮后对话框关闭，主窗口恢复 | `150-picker-05-main-after-cancel.png` |
+| 取消 | 通过 UIA 调用取消按钮后对话框关闭（`dialogOpenAfterCancel=False`）；主窗口保持打开 | `150-picker-05-main-after-cancel.png`、`states.txt` |
 
 模态期间 owner 由 shell 禁用，目标的 `IsWindowEnabled` 检查返回 false；宿主不需要额外的模态标志，也没有把拖放排入队列。
 
@@ -89,7 +89,7 @@
 | 阶段 | 主窗口任务 | Details | 证据 |
 | --- | --- | --- | --- |
 | 第一次打开 | 3 | `Imported 1 task`，行 `Write tests`、`Read docs`、`Single drop` | `150-details-01-drag.png`、`150-details-02-first-after.png` |
-| 关闭后 | 3 | 窗口已释放 | `150-details-03-main-after-close.png` |
+| 关闭后 | 3 | 窗口已释放（`detailsClosed=True`） | `150-details-03-main-after-close.png`（主窗口）、`states.txt` |
 | 重开并再次拖入 | 4 | `Imported 1 task`，新增 `Multi A` | `150-details-04-reopen-drag.png`、`150-details-05-reopen-after.png` |
 
 ## 拖放后可用性
@@ -101,7 +101,7 @@
 ## 隐藏测试与 CI
 
 - workspace 843 个测试通过；`cargo fmt --all -- --check` 与 workspace clippy `-D warnings` 通过。
-- `drag_drop` 模块 7 个测试：Unicode/重复路径按序提取、未配对代理项、缺失或空 `CF_HDROP`、COPY/启用/文件列表判定、注册策略、medium 释放、`RPC_E_CHANGED_MODE` 映射。
+- `drag_drop` 模块 7 个测试：Unicode/重复路径按序提取、未配对代理项、缺失或空 `CF_HDROP`、COPY/启用/文件列表判定、注册策略与 `RPC_E_CHANGED_MODE` 映射。medium 释放由 `collect_paths` 的单一 `ReleaseStgMedium` 路径保证，当前测试未直接断言该调用。
 - Windows 宿主隐藏测试：带 `on_drop` 的窗口在隐藏宿主中不创建 target，也不初始化 OLE。
 - 运行时校验、handler 阶段、任务 scope、关闭/重开与 handler panic 由 #207 的 10 个测试覆盖。
 - 模态 shell 对话框、真实资源管理器和非文件源只能由本页的可见运行证明；fake `IDataObject`、隐藏 smoke 与合成 `Runtime::drop_files` 是部分证据。
@@ -113,4 +113,4 @@
 - 只覆盖 Windows 资源管理器文件列表与 Notepad 文本两个 OLE 源；压缩工具、浏览器下载列表、虚拟文件与网络路径没有真机证据。
 - 只实现 `CF_HDROP` 的 COPY；文本、URL、图片、MOVE/LINK、拖放位置、drag image、自动滚动与程序化拖动不在本切片。
 - 文件夹是路径，接受与否由应用处理器决定；Todo 的读取错误是应用行为，不是宿主拒绝。
-- 新采集场景的文件与错误路径来自仓库内的 `target`；多文件图的源目录未显示，文件名与内容为公开测试字符串。导航窗格、地址栏和个人标签页标题被裁掉或未采集。
+- 新采集场景的文件与错误路径来自仓库内的 `target`；多文件图的源目录未显示，文件名与内容为公开测试字符串。导航窗格、地址栏、状态栏和个人标签页标题被裁掉或未采集。
