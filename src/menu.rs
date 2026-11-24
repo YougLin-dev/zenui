@@ -1,9 +1,9 @@
 //! 静态菜单声明与稳定的命令身份。
 //!
 //! 菜单在窗口目录声明期附加到一个窗口键，不创建原生菜单，也不拥有运行时
-//! 状态。菜单栏、快捷键、上下文菜单、辅助技术与托盘共享同一棵命令树和
-//! 同一个派发入口；每个命令项由调用方给出的 `&'static str` id 标识，id 在
-//! 一个窗口的菜单树内唯一。
+//! 状态。菜单栏、快捷键、上下文菜单与辅助技术共享同一棵窗口命令树和窗口
+//! 派发入口；托盘与应用动作使用应用级命令表。每个命令项由调用方给出的
+//! `&'static str` id 标识，id 在一个窗口的菜单树内唯一。
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -13,11 +13,12 @@ use crate::context::Phase;
 use crate::presentation::NodeId;
 use crate::store::WriteError;
 use crate::view::MountError;
+use crate::window::WindowCtx;
 
 /// 命令来源。
 ///
-/// 非穷尽：菜单栏、快捷键、上下文菜单、辅助技术与托盘已经共享一条路径，
-/// 后续平台入口可以在不破坏下游匹配的情况下加入。
+/// 非穷尽：这些入口已经共享同一条运行时命令路径；托盘来源只选择应用级
+/// 处理器。后续平台入口可以在不破坏下游匹配的情况下加入。
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum CommandSource {
@@ -33,17 +34,40 @@ pub enum CommandSource {
     Tray,
 }
 
-/// 一次命令派发的负载：来源与可选目标节点。
+/// 一次命令派发的负载：来源、可选目标节点与可选目标窗口。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CommandEvent {
     source: CommandSource,
     target: Option<NodeId>,
+    window: Option<WindowCtx>,
 }
 
 impl CommandEvent {
-    /// 构造一个事件；`target` 是派发时的可选上下文节点。
+    /// 构造一个窗口内派发的事件；`target` 是可选上下文节点。
     pub const fn new(source: CommandSource, target: Option<NodeId>) -> Self {
-        Self { source, target }
+        Self {
+            source,
+            target,
+            window: None,
+        }
+    }
+
+    /// 构造一个应用级事件；`window` 是可选的目标 activation。
+    pub(crate) const fn for_app(source: CommandSource, window: Option<WindowCtx>) -> Self {
+        Self {
+            source,
+            target: None,
+            window,
+        }
+    }
+
+    /// 给事件附加目标窗口；应用级回退使用。
+    pub(crate) const fn with_window(self, window: WindowCtx) -> Self {
+        Self {
+            source: self.source,
+            target: self.target,
+            window: Some(window),
+        }
     }
 
     /// 触发这次命令的入口。
@@ -54,6 +78,12 @@ impl CommandEvent {
     /// 命令作用的上下文节点；菜单栏和快捷键通常没有目标。
     pub const fn target(self) -> Option<NodeId> {
         self.target
+    }
+
+    /// 这次派发暴露的目标 activation；由窗口自己的处理器运行时为 `None`，
+    /// 应用级处理器收到调用方提供的目标窗口。
+    pub const fn window(self) -> Option<WindowCtx> {
+        self.window
     }
 }
 
@@ -72,10 +102,12 @@ pub enum CommandError {
     Suspended,
     /// 该窗口的菜单树没有声明这个 command id。
     UnknownCommand(&'static str),
-    /// 菜单声明了该命令，但 activation 没有注册处理器。
+    /// 命令在窗口 factory 或应用级表中没有注册处理器。
     MissingHandler(&'static str),
-    /// 同一 activation 重复注册同一 command id。
+    /// 同一 activation 或应用级表重复注册同一 command id。
     AlreadyRegistered(&'static str),
+    /// 应用级命令必须在运行时打开窗口或挂载根树之前注册。
+    RegistrationClosed,
     /// 上下文目标不属于这个窗口或已经失效。
     InvalidTarget(NodeId),
     /// handler panic；错误被 contain，不向调用方展开。
@@ -96,15 +128,11 @@ impl fmt::Display for CommandError {
             Self::UnknownCommand(id) => {
                 write!(f, "command id {id} is not declared for this window")
             }
-            Self::MissingHandler(id) => {
-                write!(
-                    f,
-                    "command {id} has no handler registered during the window factory"
-                )
-            }
-            Self::AlreadyRegistered(id) => {
-                write!(f, "command {id} already has a handler for this activation")
-            }
+            Self::MissingHandler(id) => write!(f, "command {id} has no registered handler"),
+            Self::AlreadyRegistered(id) => write!(f, "command {id} already has a handler"),
+            Self::RegistrationClosed => f.write_str(
+                "app command handlers must be registered before the first window or root mount",
+            ),
             Self::InvalidTarget(node) => {
                 write!(
                     f,

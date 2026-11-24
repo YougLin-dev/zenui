@@ -109,6 +109,8 @@ pub(crate) struct State {
     close_handlers: BTreeMap<&'static str, CloseHandler>,
     /// 每个 activation 在 factory 中注册的命令处理器，随窗口关闭释放。
     command_handlers: BTreeMap<&'static str, BTreeMap<&'static str, CommandHandler>>,
+    /// 应用级命令处理器；不随窗口关闭释放，运行时启动后拒绝注册。
+    app_command_handlers: BTreeMap<&'static str, CommandHandler>,
     /// 每个 activation 的只读菜单状态回调，随窗口关闭释放。
     menu_state_handlers: BTreeMap<&'static str, MenuStateHandler>,
     /// 按父窗口键索引的待决关闭 epoch；存在即表示父窗口输入被挂起。
@@ -222,6 +224,7 @@ impl State {
             window_requests: Vec::new(),
             close_handlers: BTreeMap::new(),
             command_handlers: BTreeMap::new(),
+            app_command_handlers: BTreeMap::new(),
             menu_state_handlers: BTreeMap::new(),
             close_epochs: BTreeMap::new(),
             close_replies: Vec::new(),
@@ -367,6 +370,11 @@ impl State {
     }
 
     /// 窗口仍存活且其树属于同一 Owner。
+    /// 第一个窗口 factory 或根树已经启动；应用级命令注册在此之前关闭。
+    pub(crate) fn runtime_started(&self) -> bool {
+        self.window_factory_ran || !self.trees.is_empty()
+    }
+
     fn window_live_in_tree(&self, window: WindowCtx) -> bool {
         self.trees
             .get(&TreeKey::Window(window.key))
@@ -687,7 +695,10 @@ impl State {
         Ok(())
     }
 
-    /// 菜单声明但没有注册处理器的第一个命令 id；打开窗口前必须为空。
+    /// 菜单声明但既没有窗口处理器也没有应用级处理器的第一个命令 id。
+    ///
+    /// 打开窗口前必须为空。应用级处理器可以被多个窗口的菜单共享，因此声明
+    /// 项不要求在 factory 里重复注册。
     pub(crate) fn missing_command_handler(&self, key: &'static str) -> Option<&'static str> {
         let entry = self.catalog.get(key)?;
         let handlers = self.command_handlers.get(key);
@@ -696,7 +707,10 @@ impl State {
             .iter()
             .chain(entry.context_menu.iter())
             .flat_map(MenuSpec::command_ids)
-            .find(|id| handlers.is_none_or(|handlers| !handlers.contains_key(id)))
+            .find(|id| {
+                !self.app_command_handlers.contains_key(id)
+                    && handlers.is_none_or(|handlers| !handlers.contains_key(id))
+            })
     }
 
     /// 窗口的菜单栏或上下文菜单是否声明了这个命令 id。
@@ -716,6 +730,11 @@ impl State {
             .get(key)
             .and_then(|handlers| handlers.get(id))
             .cloned()
+    }
+
+    /// 应用级命令处理器；窗口关闭不影响它。
+    pub(crate) fn app_command_handler(&self, id: &str) -> Option<CommandHandler> {
+        self.app_command_handlers.get(id).cloned()
     }
 
     /// 确认窗口读取父窗口当前 epoch 的请求；普通窗口或没有待决请求时为 `None`。
@@ -1596,7 +1615,7 @@ impl Runtime {
             if state.app_setup {
                 return Err(MountError::Setup("application setup already ran"));
             }
-            if state.window_factory_ran || !state.trees.is_empty() {
+            if state.runtime_started() {
                 return Err(MountError::Setup(
                     "application setup must run before any window factory",
                 ));
@@ -1700,7 +1719,7 @@ impl Runtime {
             if state.catalog_declared {
                 return Err(CatalogError::AlreadyDeclared);
             }
-            if state.window_factory_ran || !state.trees.is_empty() {
+            if state.runtime_started() {
                 return Err(CatalogError::DeclaredAfterWindow);
             }
         }
@@ -2082,12 +2101,37 @@ impl Runtime {
             && state.window_accepts_input(window.key)
     }
 
+    /// 注册应用级命令处理器；必须在运行时打开窗口或挂载根树之前调用。
+    ///
+    /// 应用级处理器不依赖 activation，窗口全部关闭后仍可派发。托盘与共享
+    /// 动作使用 [`Runtime::dispatch_app_command`]；窗口目标派发只在窗口没有
+    /// 注册同一 id 时回退到这里。重复 id 与启动后注册都返回 typed error，
+    /// 不覆盖已有处理器。
+    pub fn on_app_command(
+        &mut self,
+        id: &'static str,
+        handler: impl Fn(CommandEvent) + 'static,
+    ) -> Result<(), CommandError> {
+        let mut state = self.state.borrow_mut();
+        if state.runtime_started() {
+            return Err(CommandError::RegistrationClosed);
+        }
+        if state.app_command_handlers.contains_key(id) {
+            return Err(CommandError::AlreadyRegistered(id));
+        }
+        state.app_command_handlers.insert(id, Rc::new(handler));
+        Ok(())
+    }
+
     /// 通过窗口的静态菜单派发一个命令。
     ///
-    /// 菜单栏、快捷键、上下文菜单、辅助技术与托盘共用这条路径。处理器在
+    /// 菜单栏、快捷键、上下文菜单与辅助技术共用这条路径。处理器在
     /// `Phase::Event` 中恰好运行一次，可以写 Store/Signals 并排队窗口请求；
     /// 窗口已关闭、隐藏、等待关闭确认或属于另一个 Runtime 时返回 typed
     /// error。处理器 panic 被 contain，不向调用方展开。
+    ///
+    /// 窗口没有为 `id` 注册处理器时回退到应用级处理器，事件暴露目标窗口。
+    /// `CommandSource::Tray` 从不运行窗口处理器，只查找应用级处理器。
     pub fn dispatch_command(
         &mut self,
         window: WindowCtx,
@@ -2116,16 +2160,28 @@ impl Runtime {
             if !with_state(|state| state.window_live_in_tree(window)) {
                 return Err(CommandError::Stale);
             }
-            if !with_state(|state| state.menu_declares(window.key, id)) {
+            let window_handler = with_state(|state| state.command_handler(window.key, id));
+            let app_handler = with_state(|state| state.app_command_handler(id));
+            // 托盘动作不归任何 activation 所有；窗口来源先用自己的 activation
+            // 处理器，只有它没有注册同一 id 时才回退到应用级表。
+            let (handler, from_app) = if source == CommandSource::Tray {
+                (app_handler.ok_or(CommandError::MissingHandler(id))?, true)
+            } else if let Some(handler) = window_handler {
+                (handler, false)
+            } else if let Some(handler) = app_handler {
+                (handler, true)
+            } else if with_state(|state| state.menu_declares(window.key, id)) {
+                return Err(CommandError::MissingHandler(id));
+            } else {
                 return Err(CommandError::UnknownCommand(id));
-            }
-            let handler = with_state(|state| state.command_handler(window.key, id))
-                .ok_or(CommandError::MissingHandler(id))?;
-            if !with_state(|state| state.window_is_visible(window.key)) {
-                return Err(CommandError::Hidden);
-            }
-            if with_state(|state| state.close_epochs.contains_key(window.key)) {
-                return Err(CommandError::Suspended);
+            };
+            if source != CommandSource::Tray {
+                if !with_state(|state| state.window_is_visible(window.key)) {
+                    return Err(CommandError::Hidden);
+                }
+                if with_state(|state| state.close_epochs.contains_key(window.key)) {
+                    return Err(CommandError::Suspended);
+                }
             }
             if let Some(target) = target {
                 let valid = with_state(|state| {
@@ -2138,21 +2194,73 @@ impl Runtime {
                 }
             }
 
-            let event = CommandEvent::new(source, target);
-            let previous = with_state(|state| {
-                let previous = state.phase;
-                state.phase = Phase::Event;
-                state.fault = None;
-                state.write_error = None;
-                previous
-            });
-            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(event)));
-            with_state(|state| state.phase = previous);
-            if outcome.is_err() {
-                return Err(CommandError::HandlerPanicked(id));
-            }
-            self.finish_command().map_err(CommandError::Mount)
+            let event = if from_app {
+                CommandEvent::new(source, target).with_window(window)
+            } else {
+                CommandEvent::new(source, target)
+            };
+            self.run_command_handler(id, handler, event)
         })
+    }
+
+    /// 派发应用级命令；没有窗口时也能运行。
+    ///
+    /// 只查找应用级处理器，从不回退到窗口处理器。`target` 必须是存活的
+    /// activation：另一个 Runtime 返回 [`CommandError::WrongRuntime`]，关闭或
+    /// 被新一代替换的 activation 返回 [`CommandError::Stale`]，不运行处理器。
+    /// 隐藏与等待关闭确认的窗口仍是合法目标，托盘可借此恢复或关闭窗口。
+    ///
+    /// 目标窗口通过 [`CommandEvent::window`] 暴露；处理器可以排队
+    /// show/hide/close 请求，由 [`Runtime::apply_window_requests`] 结算。
+    pub fn dispatch_app_command(
+        &mut self,
+        id: &'static str,
+        source: CommandSource,
+        target: Option<WindowCtx>,
+    ) -> Result<(), CommandError> {
+        let state = self.state.clone();
+        if target.is_some_and(|target| target.runtime != state.borrow().id) {
+            return Err(CommandError::WrongRuntime);
+        }
+        context::install(&state, || {
+            if let Some(target) = target
+                && !with_state(|state| {
+                    state.window_is_live(target.key, target.activation, target.owner)
+                })
+            {
+                return Err(CommandError::Stale);
+            }
+            let handler = with_state(|state| state.app_command_handler(id))
+                .ok_or(CommandError::MissingHandler(id))?;
+            self.run_command_handler(id, handler, CommandEvent::for_app(source, target))
+        })
+    }
+
+    /// 在 Event 阶段运行一个处理器并提交结果；panic 被 contain。
+    fn run_command_handler(
+        &mut self,
+        id: &'static str,
+        handler: CommandHandler,
+        event: CommandEvent,
+    ) -> Result<(), CommandError> {
+        let previous = with_state(|state| {
+            let previous = state.phase;
+            state.phase = Phase::Event;
+            state.fault = None;
+            state.write_error = None;
+            previous
+        });
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(event)));
+        with_state(|state| state.phase = previous);
+        if outcome.is_err() {
+            return Err(CommandError::HandlerPanicked(id));
+        }
+        if self.tree_keys().is_empty() {
+            return self
+                .finish_command_without_ui()
+                .map_err(CommandError::Mount);
+        }
+        self.finish_command().map_err(CommandError::Mount)
     }
 
     /// 结算 UI 处理器排队的窗口请求与关闭回复，返回已应用的数量。
@@ -4206,6 +4314,12 @@ impl Runtime {
     }
 
     fn finish_command(&mut self) -> Result<(), MountError> {
+        self.finish_command_without_ui()?;
+        self.refresh()
+    }
+
+    /// 没有挂载界面时的命令收尾：只报告 handler 的 fault 与写错误。
+    fn finish_command_without_ui(&mut self) -> Result<(), MountError> {
         let fault = with_state(|state| state.fault);
         if let Some(fault) = fault {
             return Err(State::context_error(fault));
@@ -4214,7 +4328,7 @@ impl Runtime {
         if let Some(error) = write_error {
             return Err(MountError::Write(error));
         }
-        self.refresh()
+        Ok(())
     }
 
     /// 当前焦点窗口中的文本；多窗口下不会混入其他窗口。

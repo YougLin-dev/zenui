@@ -117,9 +117,11 @@ impl WindowCtx {
 
     /// 在窗口 factory 中为菜单命令注册处理器；每个 activation、每个 id 一次。
     ///
-    /// 菜单栏与上下文菜单声明的每个命令都必须有处理器，否则这次打开失败。
-    /// 注册只发生在窗口 factory 自己的 Setup 中；嵌套组件的 Setup、事件与
-    /// 交付阶段都拒绝。关闭窗口释放全部处理器，重新打开必须重新注册。
+    /// 菜单栏与上下文菜单声明的每个命令都必须有窗口或应用级处理器，否则这次
+    /// 打开失败。应用级处理器由 `Runtime::on_app_command` 注册，可被多个窗口
+    /// 共享；窗口处理器优先于应用级处理器。注册只发生在窗口 factory 自己的
+    /// Setup 中；嵌套组件的 Setup、事件与交付阶段都拒绝。关闭窗口释放全部
+    /// 窗口处理器，重新打开必须重新注册。
     pub fn on_command(
         self,
         id: &'static str,
@@ -415,8 +417,9 @@ impl WindowCatalog {
 
     /// 为一个目录窗口附加静态菜单；菜单不创建原生界面。
     ///
-    /// 可以在 `window` 之前或之后调用；未知窗口键、重复菜单、重复命令 id
-    /// 与超限在 `Runtime::declare_windows` 完成时校验，重复菜单立即报错。
+    /// 菜单项可以由窗口 factory 或应用级处理器承接。可以在 `window` 之前或
+    /// 之后调用；未知窗口键、重复菜单、重复命令 id 与超限在
+    /// `Runtime::declare_windows` 完成时校验，重复菜单立即报错。
     pub fn menu(&mut self, window: &'static str, menu: MenuSpec) -> Result<(), CatalogError> {
         if self.menus.iter().any(|(key, _)| *key == window) {
             return Err(CatalogError::DuplicateMenu(window));
@@ -427,9 +430,9 @@ impl WindowCatalog {
 
     /// 为一个目录窗口附加窗口级上下文菜单；菜单不创建原生界面。
     ///
-    /// 与菜单栏共享命令处理器，但两者的命令 id 不能重复；上下文菜单不声明
-    /// 快捷键，也不参与 `HACCEL`。未知窗口、重复声明、重复命令 id 与超限在
-    /// `Runtime::declare_windows` 完成时校验，重复上下文菜单立即报错。
+    /// 与菜单栏共享窗口或应用级命令处理器，但两者的命令 id 不能重复；上下文
+    /// 菜单不声明快捷键，也不参与 `HACCEL`。未知窗口、重复声明、重复命令 id
+    /// 与超限在 `Runtime::declare_windows` 完成时校验，重复上下文菜单立即报错。
     pub fn context_menu(
         &mut self,
         window: &'static str,
