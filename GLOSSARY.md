@@ -164,6 +164,10 @@ _Avoid_: input event, keystroke
 每个文本输入自己在运行时保存的有界撤销/重做历史：条目记录编辑前后的已提交值、caret、anchor 与归一化 selection；连续单字符输入按 run 合并（至多 64 个字符，空白并入前一个 run），移动、焦点变化、删除、多字符插入、整体替换、组合提交、撤销/重做与外部替换开启新步。撤销/重做通过一次 `on:input` 写回，模型仍是值的权威；精确恢复只对原样提交值的处理器成立。它不是应用层的业务撤销，也不跨输入共享。
 _Avoid_: application undo, model undo (when meaning text-input history), shared edit history
 
+**Clipboard**:
+Windows 系统剪贴板上的 Unicode 文本交换，不是应用模型、第二套编辑器状态或跨输入共享的历史。可见宿主安装 `ClipboardProvider` 的 `CF_UNICODETEXT` 原生实现，隐藏宿主默认没有；聚焦启用输入上的 Ctrl+C 写出已提交选区且不派发 `on:input`，Ctrl+X 只在 provider 确认写入成功后才删除选区，Ctrl+V 读取文本、过滤控制字符后走同一插入 reducer。组合中、无焦点、禁用输入与读写失败都是静默无操作。它是宿主能力，不是 SDK 的剪贴板 API。
+_Avoid_: text edit history, selection anchor, clipboard model, rich clipboard
+
 **Selection anchor**:
 selection 的固定端；caret 是活动端（焦点）。Shift+方向键移动活动端而 anchor 不动，折叠时两者相等。
 _Avoid_: origin, base offset
