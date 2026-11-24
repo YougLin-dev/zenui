@@ -4,6 +4,8 @@
 
 **状态：可见自动驱动完成（100% 与 150%）；隐藏 `HACCEL`、`TranslateAccelerator` 与编辑器让位测试只是部分证据。**
 
+**证据等级：** 隐藏测试覆盖 `HACCEL` 构建、消息翻译与编辑器让位；可见读数是真实 `SendInput` 注入；没有单独记录人工逐项按键或视觉复核。菜单/托盘契约见 [ADR-0013](../adr/0013-menu-and-tray-host-services.md)。
+
 验收日期：2026-11-24。功能基线为 `main` 的 `8e19335`。可见运行使用仓库内的 `crates/windows/examples/menu_host.rs`；按键由真实 `SendInput` 注入，截图与窗口查询脚本放在仓库外。
 
 ## 环境
@@ -79,4 +81,4 @@
 
 ## 后续状态
 
-本页关闭 #195 的菜单快捷键声明、HACCEL 生命周期、消息循环翻译与可见证据。#196 的窗口级上下文菜单见 [stage-three 上下文菜单验收](stage-three-上下文菜单-验收.md)，#198 的应用托盘见 [stage-three 托盘验收](stage-three-托盘-验收.md)；#200 的契约汇总仍由后续工单交付。
+本页关闭 #195 的菜单快捷键声明、HACCEL 生命周期、消息循环翻译与可见证据。#196 的窗口级上下文菜单见 [stage-three 上下文菜单验收](stage-three-上下文菜单-验收.md)，#198 的应用托盘见 [stage-three 托盘验收](stage-three-托盘-验收.md)；菜单/托盘的契约汇总见 [ADR-0013](../adr/0013-menu-and-tray-host-services.md) 与 [SDK 窗口与任务](../SDK/窗口与任务.md)。

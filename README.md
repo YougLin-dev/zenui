@@ -67,6 +67,7 @@ target API 的公开行为测试位于根包 `tests/`，其中 `tests/tasks.rs` 
 - [ADR-0010](docs/adr/0010-scroll-is-presentation-state.md)：滚动是宿主拥有的整页呈现偏移，几何、命中与 IME 共享同一份已平移场景。
 - [ADR-0011](docs/adr/0011-windowed-for-mounting.md)：窗口化 `For` 只挂载可见行窗口，spacer 保持完整行范围，宿主是窗口换算方。
 - [ADR-0012](docs/adr/0012-uia-derived-tree-and-action-queue.md)：UIA 树按 HWND 派生，provider 只读发布，写操作经每窗口动作队列。
+- [ADR-0013](docs/adr/0013-menu-and-tray-host-services.md)：菜单、快捷键、上下文菜单与托盘是运行时命令路径上的宿主服务；原生 `HMENU`/`HACCEL`/`HICON`/`NOTIFYICONDATAW` 生命周期归宿主。
 - [Stage-one 验收](docs/实现/stage-one-验收.md)：headless Todo 的可执行完成判据、边界证据与原生缺口。
 - [Stage-two 验收](docs/实现/stage-two-验收.md)：Windows 原生切片、IME、样式与 150% 实机证据。
 - [Stage-three 多窗口验收](docs/实现/stage-three-多窗口-验收.md)：主窗口与详情窗口、hide/show、close/reopen 与关闭确认在 100%/150% 下的可见证据。
@@ -79,6 +80,10 @@ target API 的公开行为测试位于根包 `tests/`，其中 `tests/tasks.rs` 
 - [Stage-three 滚动总验收](docs/实现/stage-three-滚动总验收.md)：滚轮单位与精度累积、边界、翻页、显露、IME 锚点、滚动条、hide/show、close/reopen 与窗口化列表的汇总证据与边界。
 - [Stage-three 辅助技术滚动验收](docs/实现/stage-three-辅助技术滚动-验收.md)：窗口根垂直 ScrollPattern 的读取、百分比映射、动作队列重验与 100%/150% 可见证据。
 - [Stage-three 辅助技术合同与朗读验收](docs/实现/stage-three-辅助技术总验收.md)：每窗口 fragment root、树与角色映射、动作队列、三窗口 Inspect 属性与 Narrator Speech Recap 的 100%/150% 证据。
+- [Stage-three 菜单栏验收](docs/实现/stage-three-菜单栏-验收.md)：原生菜单栏、命令路由与弹窗时 enabled/checked 状态在 100%/150% 下的可见证据。
+- [Stage-three 快捷键验收](docs/实现/stage-three-快捷键-验收.md)：`HACCEL` 翻译、编辑器让位与 Ctrl+S 在 100%/150% 下的可见证据。
+- [Stage-three 上下文菜单验收](docs/实现/stage-three-上下文菜单-验收.md)：右键、Shift+F10 与 Apps 打开同一窗口级菜单的 100%/150% 可见证据。
+- [Stage-three 托盘验收](docs/实现/stage-three-托盘-验收.md)：系统托盘图标、tooltip、点击恢复、右键应用命令、`TaskbarCreated` 与 Windows 11 溢出的可见证据。
 
 ## 界面语法
 

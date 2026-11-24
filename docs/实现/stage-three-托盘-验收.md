@@ -1,8 +1,10 @@
 # Stage-three 应用托盘验收（实机）
 
-本页记录 #198：应用声明一个托盘图标与右键菜单，宿主用独立的隐藏托盘 HWND 接收通知区域回调与 Explorer 的 `TaskbarCreated` 广播。左键或键盘激活恢复窗口，右键菜单在宿主借用之外展示，选中命令以 `CommandSource::Tray` 派发一次。节点级上下文菜单、托盘独存与最小化到托盘不在本页范围。
+本页记录 #198：应用声明一个托盘图标与右键菜单，宿主用独立的隐藏托盘 HWND 接收通知区域回调与 Explorer 的 `TaskbarCreated` 广播。左键或键盘激活恢复窗口，右键菜单在宿主借用之外展示，选中命令以 `CommandSource::Tray` 派发一次。节点级上下文菜单不在本页范围；零窗口托盘独存与最小化恢复由 [stage-three 会话验收](stage-three-会话-验收.md) 的会话策略处理。
 
 **状态：可见自动驱动完成（Windows 11 单屏 150%）；隐藏 fake presenter 测试只是部分证据，系统 tooltip、原生菜单绘制与 Explorer 重建以可见运行为准。**
+
+**证据等级：** 隐藏测试覆盖 presenter 调用、路由与图标生命周期；可见读数是真实 `SendInput` 与系统通知区域；Windows 11 溢出面板的图标位置由系统决定；没有单独记录人工逐项点击或视觉复核。菜单/托盘契约见 [ADR-0013](../adr/0013-menu-and-tray-host-services.md)。
 
 验收日期：2026-11-24。功能基线为 `main` 的 `3290780`。可见运行使用仓库内的 `crates/windows/examples/tray_host.rs`；点击、菜单选择、tooltip 与截图脚本放在仓库外，未修改系统的“始终显示”设置。
 
@@ -27,9 +29,9 @@
 - 右键回调在托盘 HWND 的窗口过程里处理。宿主先把 presenter 与菜单移出 `Host`，在**不持有宿主借用**的情况下展示；菜单关闭后重新借出，归还 presenter 并以 `CommandSource::Tray` 派发一次应用级命令。菜单期间目标窗口关闭是正常竞态，丢弃 stale 命令；presenter 返回未声明的 id 作为宿主错误上报。presenter 的 add/update/remove/menu 调用都由 `catch_unwind` 包住，panic 转为 `HostError::TrayPresenter`，不穿过窗口过程或 `Drop`。
 - 原生 presenter 用 `NIM_ADD` 添加图标并 `NIM_SETVERSION(NOTIFYICON_VERSION_4)`，随后 `NIM_MODIFY` 写入标准 tooltip；`NIM_DELETE` 移除。右键菜单用 `CreatePopupMenu` 构建，`SetForegroundWindow` 后调用 `TrackPopupMenuEx(TPM_RETURNCMD | TPM_RIGHTBUTTON)`，关闭后投递 `WM_NULL` 完成前台清理。
 - `TaskbarCreated` 在创建图标前注册；Explorer 重建通知区域时向顶层窗口广播。宿主只在托盘 HWND 收到该消息时重新添加图标与 tooltip，避免每个窗口各添加一次。
-- 图标随最后一个窗口关闭移除；窗口之后重新出现时再次添加。`Host` 析构先移除图标再释放窗口；`added` 标志让关闭路径与析构路径都幂等。`Host::set_tray_presenter` 在替换 presenter 时先尽力移除旧图标，再让新 presenter 添加一次。
+- 默认 `QuitOnLastClose` 会话在最后一个窗口关闭后移除图标；`StayResident` 会话保留图标（见 [stage-three 会话验收](stage-three-会话-验收.md)）。窗口之后重新出现时再次添加。`Host` 析构先移除图标再释放窗口；`added` 标志让关闭路径与析构路径都幂等。`Host::set_tray_presenter` 在替换 presenter 时先尽力移除旧图标，再让新 presenter 添加一次。
 - 可见宿主在创建时安装原生 presenter；隐藏宿主默认没有 presenter，CI 不触碰真实通知区域。测试与嵌入方通过 `Host::set_tray_presenter` 注入 fake，记录 add/update/remove 与菜单选择。
-- 图标句柄来自 `LoadIconW(None, IDI_APPLICATION)` 的共享系统图标，宿主与 presenter 都不调用 `DestroyIcon`。第一切片不提供自定义图标资产、气球通知或托盘独存。
+- 图标句柄来自 `LoadIconW(None, IDI_APPLICATION)` 的共享系统图标，宿主与 presenter 都不调用 `DestroyIcon`。第一切片不提供自定义图标资产或气球通知；零窗口的托盘独存由 #199 的 `SessionPolicy::StayResident` 显式开启（[stage-three 会话验收](stage-three-会话-验收.md)）。
 
 ## Windows 11 溢出面板
 
@@ -74,7 +76,7 @@
 | --- | --- | --- |
 | fake presenter 恰好记录一次 add、tooltip update、菜单派发与 delete；无 presenter 不调用 shell | 通过 | `the_fake_tray_presenter_records_one_add_update_menu_and_delete`、`a_hidden_tray_without_a_presenter_does_not_add_an_icon` |
 | 托盘回调消息与 worker 唤醒不同，经自己的 HWND 路由；fake 回调恰好运行一次应用命令 | 通过 | `WM_APP + 4`；`the_tray_callback_routes_only_through_the_tray_hwnd` |
-| `TaskbarCreated` 后重新添加；`Host` 析构与最后一个窗口关闭移除图标 | 通过 | 模拟广播测试；可见 Explorer 重启；`taskbar_created_re_adds_and_the_last_close_removes_once` |
+| `TaskbarCreated` 后重新添加；`Host` 析构与默认会话下最后一个窗口关闭移除图标 | 通过（默认会话） | 模拟广播测试；可见 Explorer 重启；`taskbar_created_re_adds_and_the_last_close_removes_once`；`StayResident` 保留图标见 [stage-three 会话验收](stage-three-会话-验收.md) |
 | HICON 无泄漏或双重销毁，使用系统图标 | 通过 | 共享 `IDI_APPLICATION`、无 `DestroyIcon`；`the_tray_uses_the_shared_system_icon` |
 | 可见 tray_host 显示图标、tooltip、点击恢复与右键菜单，诚实记录 Windows 11 溢出 | 通过 | 八张可见图；`states.txt` 的溢出与 #32768 读数 |
 | `cargo fmt --all -- --check`、workspace clippy、workspace tests | 通过 | PR 的 12 个必需检查与本地门禁 |
@@ -92,4 +94,4 @@
 
 ## 后续状态
 
-本页关闭 #198 的托盘声明、presenter seam、隐藏托盘 HWND、回调路由、点击恢复、右键应用命令、`TaskbarCreated` 恢复与 HICON 生存期。#199 的会话退出与托盘独存策略已由 [stage-three 会话验收](stage-three-会话-验收.md) 交付；节点级上下文菜单与 #200 的契约汇总仍由后续工单处理。
+本页关闭 #198 的托盘声明、presenter seam、隐藏托盘 HWND、回调路由、点击恢复、右键应用命令、`TaskbarCreated` 恢复与 HICON 生存期。#199 的会话退出与托盘独存策略已由 [stage-three 会话验收](stage-three-会话-验收.md) 交付；菜单/托盘的契约汇总见 [ADR-0013](../adr/0013-menu-and-tray-host-services.md)，节点级上下文菜单仍由后续工单处理。
