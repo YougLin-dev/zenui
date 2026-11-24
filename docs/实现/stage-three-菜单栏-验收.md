@@ -4,6 +4,8 @@
 
 **状态：可见自动驱动完成（100% 与 150%）；隐藏 `GetMenu`/`GetMenuState` 测试与运行时集成测试只是部分证据。**
 
+**证据等级：** 隐藏测试覆盖声明、数字 id 与状态写回；可见读数是真实 `SendInput` 自动驱动；没有单独记录人工逐项点击或视觉复核。菜单/托盘契约见 [ADR-0013](../adr/0013-menu-and-tray-host-services.md)。
+
 验收日期：2026-11-24。功能基线为 `main` 的 `02f7e1a`。可见运行使用仓库内的 `crates/windows/examples/menu_host.rs`；菜单由真实 `SendInput` 打开和选择，截图与窗口查询脚本放在仓库外。
 
 ## 环境
@@ -94,4 +96,4 @@
 
 ## 后续状态
 
-本页关闭 #193 的原生菜单栏、命令路由与可见证据，以及 #194 的动态启用/勾选状态。#195 的快捷键见 [stage-three 快捷键验收](stage-three-快捷键-验收.md)，#196 的窗口级上下文菜单见 [stage-three 上下文菜单验收](stage-three-上下文菜单-验收.md)，#198 的应用托盘见 [stage-three 托盘验收](stage-three-托盘-验收.md)；#200 的契约汇总仍由后续工单交付。
+本页关闭 #193 的原生菜单栏、命令路由与可见证据，以及 #194 的动态启用/勾选状态。#195 的快捷键见 [stage-three 快捷键验收](stage-three-快捷键-验收.md)，#196 的窗口级上下文菜单见 [stage-three 上下文菜单验收](stage-three-上下文菜单-验收.md)，#198 的应用托盘见 [stage-three 托盘验收](stage-three-托盘-验收.md)；菜单/托盘的契约汇总见 [ADR-0013](../adr/0013-menu-and-tray-host-services.md) 与 [SDK 窗口与任务](../SDK/窗口与任务.md)。

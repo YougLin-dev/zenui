@@ -4,6 +4,8 @@
 
 **状态：可见自动驱动完成（100% 与 150%）；隐藏 fake presenter 测试只是部分证据，原生弹出菜单的绘制与选择以可见运行为准。**
 
+**证据等级：** 隐藏测试覆盖 presenter seam、返回命令与竞态；可见读数是真实 `SendInput` 右键与键盘注入；没有单独记录人工逐项点击或视觉复核。菜单/托盘契约见 [ADR-0013](../adr/0013-menu-and-tray-host-services.md)。
+
 验收日期：2026-11-24。功能基线为 `main` 的 `4cc0e12`。可见运行使用仓库内的 `crates/windows/examples/menu_host.rs`；右键与键盘（Shift+F10、Apps）由真实 `SendInput` 注入，截图与窗口查询脚本放在仓库外。
 
 ## 环境
@@ -81,4 +83,4 @@
 
 ## 后续状态
 
-本页关闭 #196 的窗口级上下文菜单声明、`WM_CONTEXTMENU` 路由、presenter seam 与可见证据。#197 的应用级命令契约见 [SDK 窗口与任务](../SDK/窗口与任务.md) 与 [验证重点](验证重点.md)，#198 的应用托盘见 [stage-three 托盘验收](stage-three-托盘-验收.md)；节点级上下文菜单与 #200 的契约汇总仍由后续工单交付。
+本页关闭 #196 的窗口级上下文菜单声明、`WM_CONTEXTMENU` 路由、presenter seam 与可见证据。#197 的应用级命令契约见 [SDK 窗口与任务](../SDK/窗口与任务.md) 与 [验证重点](验证重点.md)，#198 的应用托盘见 [stage-three 托盘验收](stage-three-托盘-验收.md)；菜单/托盘的契约汇总见 [ADR-0013](../adr/0013-menu-and-tray-host-services.md)，节点级上下文菜单仍由后续工单交付。

@@ -168,6 +168,14 @@ _Avoid_: origin, base offset
 core 的一次事务提交单位；无修饰的 “frame” 不用于 presentation。
 _Avoid_: frame
 
+**Application menu**:
+窗口目录通过 `WindowCatalog::menu` 声明的原生菜单栏：每个窗口一份 `HMENU`，标签、分隔线、子菜单、快捷键与默认 enabled/checked 来自 `MenuSpec`，原生数字 id 只在窗口内按声明前序分配。选择以 `CommandSource::MenuBar` 进入运行时命令路径；它不是全局菜单，也不包含窗口级上下文菜单。
+_Avoid_: global menu, app shell menu
+
+**Menu command**:
+`MenuCommand` 声明的一项菜单动作：稳定 id、标签、可选快捷键与默认 enabled/checked；它是声明而不是处理器。菜单栏、上下文菜单与快捷键按 id 进入同一命令路径，窗口处理器优先，窗口没有同一 id 时回退应用级处理器。子菜单与分隔线属于 `MenuSpec`，不是命令。
+_Avoid_: menu action, menu item id
+
 **Menu shortcut**:
 `MenuCommand` 声明的 Ctrl/Alt 组合与键位；目录拒绝同一窗口的重复归一化快捷键，宿主为每个 HWND 建 `HACCEL`，并在 `TranslateMessage` 之前翻译成 `CommandSource::Accelerator` 命令。聚焦文本输入的 IME 组合与保留编辑键优先，禁用命令不派发。
 _Avoid_: global hotkey, raw accelerator string
