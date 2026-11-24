@@ -30,7 +30,7 @@ use windows::Win32::UI::Input::Ime::{
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     EnableWindow, GetCapture, GetKeyState, ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT,
     TrackMouseEvent, VIRTUAL_KEY, VK_BACK, VK_CONTROL, VK_DELETE, VK_END, VK_ESCAPE, VK_HOME,
-    VK_LEFT, VK_NEXT, VK_PRIOR, VK_PROCESSKEY, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_TAB,
+    VK_LEFT, VK_MENU, VK_NEXT, VK_PRIOR, VK_PROCESSKEY, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_TAB,
 };
 use windows::Win32::UI::Shell::NIN_SELECT;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -58,6 +58,7 @@ use crate::accessibility::{
     self, AccessibilityAction, AccessibilityIds, AccessibilityTree, ScrollCommand,
     WindowAccessibility,
 };
+use crate::clipboard::{ClipboardProvider, NativeClipboard, single_line_text};
 use crate::context_menu::{ContextMenuPresenter, ContextMenuRequest, NativeContextMenuPresenter};
 use crate::file_dialog::{FileDialogPresenter, NativeFileDialog};
 use crate::menus::{MenuError, NativeAccelerator, NativeMenu};
@@ -498,6 +499,8 @@ pub struct Host {
     tray_presenter: Option<Box<dyn TrayPresenter>>,
     /// Explorer 重建通知区域时广播的注册消息；0 表示没有声明托盘。
     taskbar_created: u32,
+    /// 宿主剪贴板 seam；可见宿主安装原生 provider，隐藏宿主默认没有。
+    clipboard: Option<Box<dyn ClipboardProvider>>,
     /// OLE 初始化失败的稳定原因；避免每次请求重试并保留显式错误。
     ole_error: Option<OleError>,
     /// 必须最后声明：最后一个字段最后释放，OLE 生命周期覆盖 presenter。
@@ -634,6 +637,9 @@ impl Host {
             tray: None,
             tray_presenter: None,
             taskbar_created: 0,
+            clipboard: config
+                .visible
+                .then(|| Box::new(NativeClipboard) as Box<dyn ClipboardProvider>),
             ole_error: None,
             ole: None,
         };
@@ -742,6 +748,15 @@ impl Host {
         }
         self.file_dialog_presenter = Some(Box::new(presenter));
         Ok(())
+    }
+
+    /// 安装或替换剪贴板 provider。
+    ///
+    /// 可见宿主默认安装原生 `CF_UNICODETEXT` provider；隐藏宿主默认没有，
+    /// 因此 CI 不触碰系统剪贴板。读失败、写失败与 provider panic 都被宿主
+    /// 当作静默无操作，不产生 [`HostError`]。
+    pub fn set_clipboard_provider(&mut self, provider: impl ClipboardProvider + 'static) {
+        self.clipboard = Some(Box::new(provider));
     }
 
     /// 替换窗口级上下文菜单 presenter。
@@ -2648,7 +2663,10 @@ impl Host {
         // 安全：GetKeyState 只查询本线程最近一条键盘消息的修饰键状态。
         let shift = unsafe { GetKeyState(i32::from(VK_SHIFT.0)) } < 0;
         let control = unsafe { GetKeyState(i32::from(VK_CONTROL.0)) } < 0;
-        self.key_down_with(window, key, shift, control)
+        // AltGr 在 Windows 上表现为 Ctrl+Alt；不能把它当成编辑快捷键，
+        // 否则使用 AltGr 布局的字符会被剪切/粘贴吞掉。
+        let alt = unsafe { GetKeyState(i32::from(VK_MENU.0)) } < 0;
+        self.key_down_with(window, key, shift, control && !alt)
     }
 
     /// 键盘映射本体：编辑、撤销/重做、caret/selection、焦点遍历与表单提交。
@@ -2742,9 +2760,10 @@ impl Host {
                     window.reveal_requested = true;
                     window.paint_requested = true;
                 }
-                // Cut/Copy/Paste 仍由后续剪贴板工单保留；在接线前消费按键，
-                // 避免它们落入普通字符编辑。
-                EditorAction::Cut | EditorAction::Copy | EditorAction::Paste => {}
+                EditorAction::Copy => self.copy_selection(&snapshot, focused),
+                EditorAction::Paste => self.paste_text(window, focused)?,
+                // Cut 仍由后续工单保留；在接线前消费按键。
+                EditorAction::Cut => {}
             }
             return Ok(());
         }
@@ -2782,6 +2801,60 @@ impl Host {
                 ignore_expected_dispatch(self.runtime.set_selection_node(focused, anchor, focus))?;
             }
         }
+        window.reveal_requested = true;
+        window.paint_requested = true;
+        Ok(())
+    }
+
+    /// 把聚焦输入的已提交选区写入剪贴板；不派发 `on:input`。
+    ///
+    /// 折叠 selection、没有 provider、provider 失败或 panic 都是静默无操作。
+    fn copy_selection(&mut self, snapshot: &PresentationSnapshot, focused: NodeId) {
+        let Some(element) = snapshot.node(focused) else {
+            return;
+        };
+        let Some((start, end)) = element.edit().and_then(|edit| edit.selection()) else {
+            return;
+        };
+        if start >= end {
+            return;
+        }
+        let Some(value) = element.text_value() else {
+            return;
+        };
+        let selected: String = value.chars().skip(start).take(end - start).collect();
+        if selected.is_empty() {
+            return;
+        }
+        let Some(provider) = self.clipboard.as_mut() else {
+            return;
+        };
+        // provider 属于嵌入方；panic 与失败一样按无操作处理。
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            provider.write_text(&selected)
+        }));
+    }
+
+    /// 读取剪贴板文本，过滤单行输入不接受的控制字符后插入聚焦输入。
+    ///
+    /// 空文本、非文本、读取失败或 provider panic 都不改模型；成功时只调用一次
+    /// `insert_text_node`，因此恰好一次 `on:input`。
+    fn paste_text(&mut self, window: &mut WindowHost, focused: NodeId) -> Result<(), HostError> {
+        let Some(provider) = self.clipboard.as_mut() else {
+            return Ok(());
+        };
+        let text = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| provider.read_text()))
+            .ok()
+            .and_then(Result::ok)
+            .flatten();
+        let Some(text) = text else {
+            return Ok(());
+        };
+        let filtered = single_line_text(&text);
+        if filtered.is_empty() {
+            return Ok(());
+        }
+        ignore_expected_dispatch(self.runtime.insert_text_node(focused, &filtered))?;
         window.reveal_requested = true;
         window.paint_requested = true;
         Ok(())
@@ -5042,6 +5115,7 @@ mod tests {
 
     use super::*;
     use crate::accessibility::ControlType;
+    use crate::clipboard::ClipboardError;
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
     use std::sync::Mutex;
@@ -5065,7 +5139,8 @@ mod tests {
         UIA_TogglePatternId, UIA_ValuePatternId, UiaAppendRuntimeId, UiaPoint,
     };
     use windows::Win32::UI::Input::KeyboardAndMouse::{
-        GetKeyboardState, IsWindowEnabled, SetKeyboardState, VK_A, VK_NEXT, VK_S, VK_Y, VK_Z,
+        GetKeyboardState, IsWindowEnabled, SetKeyboardState, VK_A, VK_C, VK_MENU, VK_NEXT, VK_S,
+        VK_V, VK_Y, VK_Z,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         CopyAcceleratorTableW, GetMenuItemCount, GetMenuItemID, GetMenuState, GetMenuStringW,
@@ -8510,6 +8585,66 @@ mod tests {
             .id()
     }
 
+    /// 内存剪贴板探针：记录读取次数与写入内容，供宿主路由测试注入。
+    #[derive(Clone, Default)]
+    struct ClipboardProbe(Rc<RefCell<ClipboardProbeState>>);
+
+    #[derive(Default)]
+    struct ClipboardProbeState {
+        text: Option<String>,
+        reads: usize,
+        writes: Vec<String>,
+        fail_read: bool,
+    }
+
+    impl ClipboardProbe {
+        fn install(host: &mut Host) -> Self {
+            let probe = Self::default();
+            host.set_clipboard_provider(MemoryClipboard(probe.clone()));
+            probe
+        }
+
+        fn set_text(&self, text: Option<&str>) {
+            self.0.borrow_mut().text = text.map(str::to_owned);
+        }
+
+        fn text(&self) -> Option<String> {
+            self.0.borrow().text.clone()
+        }
+
+        fn reads(&self) -> usize {
+            self.0.borrow().reads
+        }
+
+        fn writes(&self) -> Vec<String> {
+            self.0.borrow().writes.clone()
+        }
+
+        fn fail_reads(&self) {
+            self.0.borrow_mut().fail_read = true;
+        }
+    }
+
+    struct MemoryClipboard(ClipboardProbe);
+
+    impl ClipboardProvider for MemoryClipboard {
+        fn read_text(&mut self) -> Result<Option<String>, ClipboardError> {
+            let mut state = self.0.0.borrow_mut();
+            state.reads += 1;
+            if state.fail_read {
+                return Err(ClipboardError::new("clipboard read failed"));
+            }
+            Ok(state.text.clone())
+        }
+
+        fn write_text(&mut self, text: &str) -> Result<(), ClipboardError> {
+            let mut state = self.0.0.borrow_mut();
+            state.writes.push(text.to_owned());
+            state.text = Some(text.to_owned());
+            Ok(())
+        }
+    }
+
     #[test]
     fn ctrl_z_undoes_and_ctrl_y_redoes_value_caret_and_selection_once() {
         let (mut host, inputs) = open_history_probe();
@@ -8694,6 +8829,439 @@ mod tests {
             Some("old")
         );
         assert!(inputs.lock().expect("inputs").is_empty());
+    }
+
+    #[test]
+    fn ctrl_c_writes_the_exact_selection_and_dispatches_no_input() {
+        let (mut host, inputs) = open_history_probe();
+        let clipboard = ClipboardProbe::install(&mut host);
+        host.runtime.focus("Field").expect("focus");
+        let node = history_node(&host);
+        host.runtime
+            .set_selection_node(node, 0, 2)
+            .expect("select the prefix");
+        with_main(&mut host, |host, window| {
+            host.key_down_with(window, VK_C, false, true)
+        });
+        assert_eq!(clipboard.writes(), ["ol"]);
+        assert_eq!(clipboard.text().as_deref(), Some("ol"));
+        assert!(inputs.lock().expect("inputs").is_empty());
+
+        host.runtime.set_caret_node(node, 2).expect("collapse");
+        with_main(&mut host, |host, window| {
+            host.key_down_with(window, VK_C, false, true)
+        });
+        assert_eq!(
+            clipboard.writes(),
+            ["ol"],
+            "a collapsed selection copies nothing"
+        );
+
+        let lock = host
+            .runtime
+            .presentation()
+            .expect("snapshot")
+            .find_label("Lock")
+            .expect("lock")
+            .id();
+        host.runtime.click_node(lock).expect("disable the field");
+        with_main(&mut host, |host, window| {
+            host.key_down_with(window, VK_C, false, true)
+        });
+        assert_eq!(
+            clipboard.writes(),
+            ["ol"],
+            "a disabled field copies nothing"
+        );
+        assert!(inputs.lock().expect("inputs").is_empty());
+    }
+
+    #[test]
+    fn ctrl_c_and_ctrl_v_preserve_surrogate_pairs() {
+        let (mut host, inputs) = open_history_probe();
+        let clipboard = ClipboardProbe::install(&mut host);
+        host.runtime.focus("Field").expect("focus");
+        let node = history_node(&host);
+        host.runtime
+            .set_selection_node(node, 0, 3)
+            .expect("select all");
+        host.runtime
+            .insert_text_node(node, "a🙂b")
+            .expect("replace the value");
+        host.runtime
+            .set_selection_node(node, 1, 2)
+            .expect("select the emoji");
+        with_main(&mut host, |host, window| {
+            host.key_down_with(window, VK_C, false, true)
+        });
+        assert_eq!(
+            clipboard.writes(),
+            ["🙂"],
+            "copy slices scalars, not UTF-16 units"
+        );
+
+        clipboard.set_text(Some("🙂你好"));
+        host.runtime
+            .set_selection_node(node, 0, 3)
+            .expect("select all");
+        with_main(&mut host, |host, window| {
+            host.key_down_with(window, VK_V, false, true)
+        });
+        let snapshot = host.runtime.presentation().expect("snapshot");
+        let element = snapshot.node(node).expect("field");
+        assert_eq!(element.text_value(), Some("🙂你好"));
+        let edit = element.edit().expect("edit");
+        assert_eq!((edit.anchor(), edit.caret()), (3, 3));
+        assert_eq!(edit.selection(), None);
+        assert_eq!(*inputs.lock().expect("inputs"), ["a🙂b", "🙂你好"]);
+    }
+
+    #[test]
+    fn ctrl_v_inserts_at_the_caret_once_and_undoes_as_one_edit() {
+        let (mut host, inputs) = open_history_probe();
+        let clipboard = ClipboardProbe::install(&mut host);
+        clipboard.set_text(Some("ink"));
+        host.runtime.focus("Field").expect("focus");
+        let node = history_node(&host);
+        host.runtime
+            .set_caret_node(node, 1)
+            .expect("place the caret");
+        with_main(&mut host, |host, window| {
+            host.key_down_with(window, VK_V, false, true)
+        });
+        {
+            let snapshot = host.runtime.presentation().expect("snapshot");
+            let element = snapshot.node(node).expect("field");
+            assert_eq!(element.text_value(), Some("oinkld"));
+            let edit = element.edit().expect("edit");
+            assert_eq!((edit.anchor(), edit.caret()), (4, 4));
+            assert_eq!(edit.selection(), None);
+        }
+        assert_eq!(*inputs.lock().expect("inputs"), ["oinkld"]);
+        assert_eq!(clipboard.reads(), 1);
+
+        with_main(&mut host, |host, window| {
+            host.key_down_with(window, VK_Z, false, true)
+        });
+        {
+            let snapshot = host.runtime.presentation().expect("snapshot");
+            let element = snapshot.node(node).expect("field");
+            assert_eq!(element.text_value(), Some("old"));
+            let edit = element.edit().expect("edit");
+            assert_eq!((edit.anchor(), edit.caret()), (1, 1));
+        }
+        assert_eq!(*inputs.lock().expect("inputs"), ["oinkld", "old"]);
+
+        with_main(&mut host, |host, window| {
+            host.key_down_with(window, VK_Y, false, true)
+        });
+        assert_eq!(
+            host.runtime
+                .presentation()
+                .expect("snapshot")
+                .node(node)
+                .expect("field")
+                .text_value(),
+            Some("oinkld")
+        );
+    }
+
+    #[test]
+    fn ctrl_v_replaces_a_selection_filters_controls_and_never_deletes_on_failure() {
+        let (mut host, inputs) = open_history_probe();
+        let clipboard = ClipboardProbe::install(&mut host);
+        clipboard.set_text(Some("a\r\nb\0c\td"));
+        host.runtime.focus("Field").expect("focus");
+        let node = history_node(&host);
+        host.runtime
+            .set_selection_node(node, 0, 2)
+            .expect("select the prefix");
+        with_main(&mut host, |host, window| {
+            host.key_down_with(window, VK_V, false, true)
+        });
+        {
+            let snapshot = host.runtime.presentation().expect("snapshot");
+            let element = snapshot.node(node).expect("field");
+            assert_eq!(
+                element.text_value(),
+                Some("abcdd"),
+                "controls are stripped and the selection is replaced"
+            );
+            let edit = element.edit().expect("edit");
+            assert_eq!((edit.anchor(), edit.caret()), (4, 4));
+        }
+        assert_eq!(*inputs.lock().expect("inputs"), ["abcdd"]);
+        assert_eq!(clipboard.reads(), 1);
+
+        clipboard.set_text(Some("\r\n\0\t"));
+        host.runtime
+            .set_selection_node(node, 1, 3)
+            .expect("select again");
+        with_main(&mut host, |host, window| {
+            host.key_down_with(window, VK_V, false, true)
+        });
+        let snapshot = host.runtime.presentation().expect("snapshot");
+        let element = snapshot.node(node).expect("field");
+        assert_eq!(element.text_value(), Some("abcdd"));
+        assert_eq!(
+            element.edit().expect("edit").selection(),
+            Some((1, 3)),
+            "an empty clipboard keeps the selection"
+        );
+        assert_eq!(*inputs.lock().expect("inputs"), ["abcdd"]);
+        assert_eq!(clipboard.reads(), 2);
+
+        clipboard.set_text(None);
+        with_main(&mut host, |host, window| {
+            host.key_down_with(window, VK_V, false, true)
+        });
+        assert_eq!(
+            host.runtime
+                .presentation()
+                .expect("snapshot")
+                .node(node)
+                .expect("field")
+                .edit()
+                .expect("edit")
+                .selection(),
+            Some((1, 3)),
+            "a non-text clipboard keeps the selection"
+        );
+        assert_eq!(clipboard.reads(), 3);
+
+        clipboard.fail_reads();
+        with_main(&mut host, |host, window| {
+            host.key_down_with(window, VK_V, false, true)
+        });
+        assert_eq!(
+            host.runtime
+                .presentation()
+                .expect("snapshot")
+                .node(node)
+                .expect("field")
+                .edit()
+                .expect("edit")
+                .selection(),
+            Some((1, 3)),
+            "a failed read keeps the selection"
+        );
+        assert_eq!(*inputs.lock().expect("inputs"), ["abcdd"]);
+        assert_eq!(clipboard.reads(), 4);
+    }
+
+    #[test]
+    fn clipboard_shortcuts_are_no_ops_while_composing() {
+        let (mut host, inputs) = open_history_probe();
+        let clipboard = ClipboardProbe::install(&mut host);
+        host.runtime.focus("Field").expect("focus");
+        let node = history_node(&host);
+        host.runtime
+            .set_selection_node(node, 0, 2)
+            .expect("select the prefix");
+        host.runtime.compose_start_node(node).expect("start");
+        host.runtime
+            .compose_update_node(node, "ni")
+            .expect("update");
+
+        with_main(&mut host, |host, window| {
+            host.key_down_with(window, VK_C, false, true)
+        });
+        with_main(&mut host, |host, window| {
+            host.key_down_with(window, VK_V, false, true)
+        });
+        assert!(clipboard.writes().is_empty());
+        assert_eq!(clipboard.reads(), 0);
+        let snapshot = host.runtime.presentation().expect("snapshot");
+        let element = snapshot.node(node).expect("field");
+        assert_eq!(element.text_value(), Some("old"));
+        assert_eq!(element.edit().expect("edit").preedit(), Some("ni"));
+        assert!(inputs.lock().expect("inputs").is_empty());
+    }
+
+    #[test]
+    fn clipboard_shortcuts_without_a_focused_input_are_no_ops() {
+        let (mut host, inputs) = open_history_probe();
+        let clipboard = ClipboardProbe::install(&mut host);
+        host.runtime.focus("Field").expect("focus");
+        let node = history_node(&host);
+        host.runtime
+            .set_selection_node(node, 0, 2)
+            .expect("select the prefix");
+        let lock = host
+            .runtime
+            .presentation()
+            .expect("snapshot")
+            .find_label("Lock")
+            .expect("lock")
+            .id();
+        host.runtime.click_node(lock).expect("disable the field");
+
+        with_main(&mut host, |host, window| {
+            host.key_down_with(window, VK_C, false, true)
+        });
+        with_main(&mut host, |host, window| {
+            host.key_down_with(window, VK_V, false, true)
+        });
+        assert!(clipboard.writes().is_empty());
+        assert_eq!(clipboard.reads(), 0);
+        assert_eq!(
+            host.runtime
+                .presentation()
+                .expect("snapshot")
+                .node(node)
+                .expect("field")
+                .text_value(),
+            Some("old")
+        );
+        assert!(inputs.lock().expect("inputs").is_empty());
+    }
+
+    #[test]
+    fn a_hidden_host_without_a_provider_drives_no_clipboard_io() {
+        let (mut host, inputs) = open_history_probe();
+        host.runtime.focus("Field").expect("focus");
+        let node = history_node(&host);
+        host.runtime
+            .set_selection_node(node, 0, 2)
+            .expect("select the prefix");
+
+        with_main(&mut host, |host, window| {
+            host.key_down_with(window, VK_C, false, true)
+        });
+        with_main(&mut host, |host, window| {
+            host.key_down_with(window, VK_V, false, true)
+        });
+        let snapshot = host.runtime.presentation().expect("snapshot");
+        assert_eq!(
+            snapshot.node(node).expect("field").text_value(),
+            Some("old")
+        );
+        assert_eq!(
+            snapshot
+                .node(node)
+                .expect("field")
+                .edit()
+                .expect("edit")
+                .selection(),
+            Some((0, 2))
+        );
+        assert!(inputs.lock().expect("inputs").is_empty());
+    }
+
+    #[test]
+    fn altgr_does_not_trigger_copy_or_paste() {
+        let (mut host, _inputs) = open_history_probe();
+        let clipboard = ClipboardProbe::install(&mut host);
+        host.runtime.focus("Field").expect("focus");
+        let node = history_node(&host);
+        host.runtime
+            .set_selection_node(node, 0, 2)
+            .expect("select the prefix");
+        let hwnd = host.hwnd(MAIN).expect("a live window");
+
+        let _altgr = AltGrPressed::press();
+        // AltGr 在 Windows 上是 Ctrl+Alt；两个快捷键都必须让位给字符输入。
+        // 安全：消息目标是宿主持有的 HWND。
+        unsafe { PostMessageW(Some(hwnd), WM_KEYDOWN, WPARAM(VK_C.0 as usize), LPARAM(0)) }
+            .expect("post AltGr+C");
+        host.pump().expect("pump AltGr+C");
+        assert!(
+            clipboard.writes().is_empty(),
+            "AltGr+C is not a copy shortcut"
+        );
+        // 安全：消息目标是宿主持有的 HWND。
+        unsafe { PostMessageW(Some(hwnd), WM_KEYDOWN, WPARAM(VK_V.0 as usize), LPARAM(0)) }
+            .expect("post AltGr+V");
+        host.pump().expect("pump AltGr+V");
+        assert_eq!(clipboard.reads(), 0, "AltGr+V is not a paste shortcut");
+    }
+
+    #[test]
+    fn copy_and_paste_route_between_windows_through_one_provider() {
+        let mut host = open_host();
+        host.render().expect("render the primary window");
+        let clipboard = ClipboardProbe::install(&mut host);
+        host.runtime
+            .focus("What needs to be done?")
+            .expect("focus the draft");
+        let draft = host
+            .runtime
+            .presentation()
+            .expect("snapshot")
+            .find_label("What needs to be done?")
+            .expect("draft")
+            .id();
+        host.runtime
+            .insert_text_node(draft, "shared")
+            .expect("type the draft");
+        host.runtime
+            .set_selection_node(draft, 0, 6)
+            .expect("select the draft");
+        with_main(&mut host, |host, window| {
+            host.key_down_with(window, VK_C, false, true)
+        });
+        assert_eq!(clipboard.writes(), ["shared"]);
+
+        host.show(zenui_demo::DETAILS_WINDOW)
+            .expect("show the details window");
+        host.runtime
+            .focus("Details note")
+            .expect("focus the details note");
+        let note = host
+            .presentation(zenui_demo::DETAILS_WINDOW)
+            .expect("details snapshot")
+            .find_label("Details note")
+            .expect("note")
+            .id();
+        assert_eq!(
+            host.presentation(zenui_demo::DETAILS_WINDOW)
+                .expect("details snapshot")
+                .node(note)
+                .expect("note")
+                .text_value(),
+            Some("")
+        );
+        host.with_window(zenui_demo::DETAILS_WINDOW, |host, window| {
+            host.key_down_with(window, VK_V, false, true)
+        })
+        .expect("paste into the details note");
+        let details = host
+            .presentation(zenui_demo::DETAILS_WINDOW)
+            .expect("details snapshot");
+        let element = details.node(note).expect("note");
+        assert_eq!(element.text_value(), Some("shared"));
+        assert_eq!(element.edit().expect("edit").caret(), 6);
+        assert_eq!(
+            host.presentation(MAIN)
+                .expect("main snapshot")
+                .find_label("What needs to be done?")
+                .expect("draft")
+                .text_value(),
+            Some("shared"),
+            "pasting into details does not touch the main draft"
+        );
+
+        host.with_window(zenui_demo::DETAILS_WINDOW, |host, window| {
+            host.key_down_with(window, VK_Z, false, true)
+        })
+        .expect("undo in the details note");
+        assert_eq!(
+            host.presentation(zenui_demo::DETAILS_WINDOW)
+                .expect("details snapshot")
+                .node(note)
+                .expect("note")
+                .text_value(),
+            Some("")
+        );
+        assert_eq!(
+            host.presentation(MAIN)
+                .expect("main snapshot")
+                .find_label("What needs to be done?")
+                .expect("draft")
+                .text_value(),
+            Some("shared"),
+            "undo in details leaves the main draft alone"
+        );
     }
 
     #[test]
@@ -9962,6 +10530,32 @@ mod tests {
     }
 
     impl Drop for ControlPressed {
+        fn drop(&mut self) {
+            // 安全：恢复测试线程自己的键盘状态。
+            let _ = unsafe { SetKeyboardState(&self.previous) };
+        }
+    }
+
+    /// 测试线程按住 Ctrl+Alt（AltGr 在 Windows 上的表现），析构时恢复。
+    struct AltGrPressed {
+        previous: [u8; 256],
+    }
+
+    impl AltGrPressed {
+        fn press() -> Self {
+            let mut previous = [0u8; 256];
+            // 安全：缓冲区由本地数组提供。
+            unsafe { GetKeyboardState(&mut previous) }.expect("save the keyboard state");
+            let mut pressed = [0u8; 256];
+            pressed[VK_CONTROL.0 as usize] = 0x80;
+            pressed[VK_MENU.0 as usize] = 0x80;
+            // 安全：缓冲区由本地数组提供；测试线程与消息循环同一线程。
+            unsafe { SetKeyboardState(&pressed) }.expect("press AltGr");
+            Self { previous }
+        }
+    }
+
+    impl Drop for AltGrPressed {
         fn drop(&mut self) {
             // 安全：恢复测试线程自己的键盘状态。
             let _ = unsafe { SetKeyboardState(&self.previous) };

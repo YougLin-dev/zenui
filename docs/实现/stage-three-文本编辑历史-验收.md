@@ -18,7 +18,7 @@
 
 ## 方法
 
-- `shortcuts::editor_shortcut` 是宿主与编辑器之间的唯一策略 seam：只有聚焦的启用可编辑输入、按下 Ctrl 且没有进行中的 IME 组合时返回动作。Ctrl+A 全选，Ctrl+Z/Y 进入运行时历史，Ctrl+C/X/V 继续由宿主消费并保留给剪贴板工单。
+- `shortcuts::editor_shortcut` 是宿主与编辑器之间的唯一策略 seam：只有聚焦的启用可编辑输入、按下 Ctrl 且没有进行中的 IME 组合时返回动作。Ctrl+A 全选，Ctrl+Z/Y 进入运行时历史；Ctrl+C/V 已由剪贴板工单接线，Ctrl+X 仍由宿主消费并保留给剪切工单。
 - `Host::key_down_with` 在快照中解析聚焦输入；Ctrl+Z 调用 `Runtime::undo_node`，Ctrl+Y 调用 `Runtime::redo_node`，随后请求显露与重绘。一次成功的历史应用恰好派发一次 `on:input`，应用模型仍是值的权威。
 - 连续单字符插入合并为一个撤销步：条目保留第一次插入的 `before` 与最近一次插入的 `after`，每个键入字符仍各派发一次 `on:input`，撤销/重做则整步写回。run 最多 64 个字符；空白并入前一个 run（行首空白自成一个 run），下一个非空白字符开启新步。
 - caret/selection 移动、焦点变化、Backspace/Delete、多字符插入、整体替换、组合开始/提交、撤销/重做与外部替换都会结束当前 run。空 run 的撤销/重做是静默无操作；新编辑清空 redo。

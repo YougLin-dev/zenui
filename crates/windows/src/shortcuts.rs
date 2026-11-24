@@ -2,8 +2,8 @@
 //!
 //! 这是宿主与文本编辑之间的唯一策略 seam：只有聚焦的可编辑输入、按下 Ctrl、
 //! 且没有进行中的 IME 组合时才返回动作。Ctrl+A 接到全选，Ctrl+Z/Y 接到
-//! runtime 的 undo/redo；Ctrl+C/X/V 仍由宿主消费并保留给剪贴板工单，避免
-//! 它们落入普通字符编辑。
+//! runtime 的 undo/redo，Ctrl+C/V 接到宿主的剪贴板读写；Ctrl+X 仍由宿主
+//! 消费并保留给剪切工单，避免这些按键落入普通字符编辑。
 
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     VIRTUAL_KEY, VK_A, VK_C, VK_V, VK_X, VK_Y, VK_Z,
