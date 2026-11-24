@@ -60,6 +60,7 @@ use crate::accessibility::{
 };
 use crate::clipboard::{ClipboardProvider, NativeClipboard, single_line_text};
 use crate::context_menu::{ContextMenuPresenter, ContextMenuRequest, NativeContextMenuPresenter};
+use crate::drag_drop::{DragDropError, DropRegistration, should_register};
 use crate::file_dialog::{FileDialogPresenter, NativeFileDialog};
 use crate::menus::{MenuError, NativeAccelerator, NativeMenu};
 use crate::ole::{OleApartment, OleError};
@@ -84,10 +85,12 @@ mod host_message {
     pub(super) const UIA_ACTION: u32 = WM_APP + 3;
     /// 托盘回调；托盘 HWND 在窗口过程里使用自己的路由分支。
     pub(super) const TRAY_CALLBACK: u32 = WM_APP + 4;
+    /// OLE drop target 已把文件路径排入窗口队列。
+    pub(super) const DROP: u32 = WM_APP + 5;
 
     /// 注册表全集；窗口过程与 `handle_message` 显式认领它们，保留值不会落入
     /// 窗口输入路由。
-    pub(super) const ALL: [u32; 4] = [WAKE, DEVICE_LOSS, UIA_ACTION, TRAY_CALLBACK];
+    pub(super) const ALL: [u32; 5] = [WAKE, DEVICE_LOSS, UIA_ACTION, TRAY_CALLBACK, DROP];
 }
 
 /// `NIN_KEYSELECT`；windows crate 只生成了相邻的 `NIN_SELECT`。
@@ -99,6 +102,12 @@ const NIN_KEYSELECT: u32 = NIN_SELECT + 1;
 pub(crate) fn post_uia_action(hwnd: HWND) -> bool {
     // 安全：HWND 由窗口条目持有；消息只排队，不跨线程解引用。
     unsafe { PostMessageW(Some(hwnd), host_message::UIA_ACTION, WPARAM(0), LPARAM(0)).is_ok() }
+}
+
+/// 唤醒窗口的 UI 线程，drain OLE drop target 排队的路径。
+pub(crate) fn post_drop_drain(hwnd: HWND) -> bool {
+    // 安全：HWND 由窗口条目持有；消息只排队，不跨线程解引用。
+    unsafe { PostMessageW(Some(hwnd), host_message::DROP, WPARAM(0), LPARAM(0)).is_ok() }
 }
 
 /// `SPI_GETWHEELSCROLLLINES` 的哨兵值：一个 notch 滚动一页。
@@ -374,6 +383,8 @@ struct WindowHost {
     // 要求创建 surface 的 HWND 在 surface 存活期间保持有效。
     surface: Option<wgpu::Surface<'static>>,
     surface_config: wgpu::SurfaceConfiguration,
+    /// 可见且有 `on_drop` 的窗口的 OLE drop target；在 HWND 销毁前撤销。
+    drop_target: Option<DropRegistration>,
     native: NativeWindow,
     /// 命令 id 映射、菜单句柄与同一代快捷键表；随着窗口条目一起释放。
     menu: Option<WindowMenu>,
@@ -1033,7 +1044,9 @@ impl Host {
             return;
         }
         if host_message::ALL.contains(&message) {
-            if message == host_message::WAKE
+            if message == host_message::DROP {
+                self.drain_drop_message(hwnd);
+            } else if message == host_message::WAKE
                 && let Err(error) = self.deliver_tasks()
             {
                 self.deferred_error.get_or_insert(error);
@@ -3520,6 +3533,7 @@ impl Host {
         }
         self.sync_visibility();
         self.sync_enabled()?;
+        self.sync_drop_targets()?;
         self.sync_accessibility();
         self.update_wake_target();
         self.sync_tray()?;
@@ -3617,6 +3631,101 @@ impl Host {
         for (key, enabled) in states {
             self.set_native_enabled(key, enabled)?;
         }
+        Ok(())
+    }
+
+    /// 只给可见且注册了 `on_drop` 的窗口安装 OLE drop target。
+    ///
+    /// 隐藏宿主从不初始化 OLE，也不注册 target；窗口隐藏、关闭或失去处理器时
+    /// 撤销注册。重新显示或重开会创建新的 target 与空队列。启用状态由 COM
+    /// 回调在每次拖动时检查，窗口重新启用不必重建 target。
+    fn sync_drop_targets(&mut self) -> Result<(), HostError> {
+        if !self.show_windows {
+            for window in self.windows.values_mut() {
+                window.drop_target = None;
+            }
+            return Ok(());
+        }
+        let states: Vec<(&'static str, bool, HWND)> = self
+            .windows
+            .iter()
+            .map(|(key, window)| {
+                (
+                    *key,
+                    should_register(
+                        self.show_windows,
+                        self.runtime.window_visible(window.ctx),
+                        self.runtime.window_has_drop_handler(window.ctx),
+                    ),
+                    window.hwnd(),
+                )
+            })
+            .collect();
+        for (key, should, hwnd) in states {
+            if !should {
+                if let Some(window) = self.windows.get_mut(key) {
+                    window.drop_target = None;
+                }
+                continue;
+            }
+            if self
+                .windows
+                .get(key)
+                .is_some_and(|window| window.drop_target.is_some())
+            {
+                continue;
+            }
+            self.ensure_ole()
+                .map_err(|error| HostError::DragDrop(DragDropError::from_ole(error)))?;
+            let target = DropRegistration::register(hwnd).map_err(HostError::DragDrop)?;
+            if let Some(window) = self.windows.get_mut(key) {
+                window.drop_target = Some(target);
+            }
+        }
+        Ok(())
+    }
+
+    /// 派发一条 `DROP`：执行本窗口排队的交付，再结算处理器产生的请求与重绘。
+    fn drain_drop_message(&mut self, hwnd: HWND) {
+        let Some(key) = self.key_for(hwnd) else {
+            return;
+        };
+        let result = self.with_window(key, |host, window| host.drain_drop(window));
+        if let Err(error) = result {
+            self.deferred_error.get_or_insert(error);
+        }
+        if let Err(error) = self.settle_requests() {
+            self.deferred_error.get_or_insert(error);
+        }
+        if let Err(error) = self.repaint_changed_windows() {
+            self.deferred_error.get_or_insert(error);
+        }
+    }
+
+    /// 取走 OLE target 排队的路径并交给运行时；一次 drop 只运行一次处理器。
+    fn drain_drop(&mut self, window: &mut WindowHost) -> Result<(), HostError> {
+        let paths = window
+            .drop_target
+            .as_ref()
+            .and_then(DropRegistration::take_pending);
+        let Some(paths) = paths else {
+            return Ok(());
+        };
+        // OLE 接受与这条消息的派发之间，窗口可能被隐藏、挂起或关闭；
+        // 运行时拒绝这些已经无效的投递是正常的竞态结果，不是宿主失败。
+        match self.runtime.drop_files(window.ctx, paths) {
+            Ok(())
+            | Err(
+                zenui::DropError::Stale
+                | zenui::DropError::Hidden
+                | zenui::DropError::Suspended
+                | zenui::DropError::Empty
+                | zenui::DropError::NoHandler,
+            ) => {}
+            Err(error) => return Err(HostError::Drop(error)),
+        }
+        window.reveal_requested = true;
+        window.paint_requested = true;
         Ok(())
     }
 
@@ -3722,6 +3831,7 @@ impl WindowHost {
         Self {
             surface: Some(surface),
             surface_config,
+            drop_target: None,
             native,
             menu,
             ctx,
@@ -3957,6 +4067,10 @@ pub enum HostError {
     Render(zenui_render::RenderError),
     /// 指针命中后的运行时派发失败。
     Input(DispatchError),
+    /// OLE drop target 注册失败。
+    DragDrop(DragDropError),
+    /// 拖放已交给运行时但处理器或刷新失败。
+    Drop(zenui::DropError),
     /// 消息循环失败。
     MessageLoop,
 }
@@ -3993,6 +4107,8 @@ impl fmt::Display for HostError {
             Self::Scene(error) => write!(f, "scene failed: {error}"),
             Self::Render(error) => write!(f, "render failed: {error}"),
             Self::Input(error) => write!(f, "pointer dispatch failed: {error}"),
+            Self::DragDrop(error) => write!(f, "file drop target failed: {error}"),
+            Self::Drop(error) => write!(f, "dropped files failed: {error}"),
             Self::MessageLoop => f.write_str("the Win32 message loop failed"),
         }
     }
@@ -9404,6 +9520,35 @@ mod tests {
             Some((0, 2))
         );
         assert!(inputs.lock().expect("inputs").is_empty());
+    }
+
+    #[test]
+    fn a_hidden_host_never_registers_a_drop_target_or_initializes_ole() {
+        let mut runtime = Runtime::new();
+        runtime
+            .declare_windows(|catalog| {
+                catalog.window(WindowSpec::new(MAIN).primary(), |window| {
+                    window
+                        .on_drop(|drop| {
+                            let _ = drop.into_paths();
+                        })
+                        .expect("register the drop handler");
+                    view! { <view /> }
+                })
+            })
+            .expect("declare the drop window");
+        let mut host = Host::open(runtime, HostConfig::hidden()).expect("open the host");
+        host.sync_windows().expect("sync the hidden host");
+        let ctx = host.windows[MAIN].ctx;
+        assert!(
+            host.runtime.window_has_drop_handler(ctx),
+            "the runtime still exposes the registered handler"
+        );
+        assert!(
+            host.windows[MAIN].drop_target.is_none(),
+            "a hidden host registers no drop target"
+        );
+        assert!(host.ole.is_none(), "a hidden host initializes no OLE");
     }
 
     #[test]

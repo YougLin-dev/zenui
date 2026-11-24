@@ -35,6 +35,8 @@ pub use clipboard::{ClipboardError, ClipboardProvider};
 #[cfg(windows)]
 pub use context_menu::{ContextMenuPresenter, ContextMenuRequest};
 #[cfg(windows)]
+pub use drag_drop::DragDropError;
+#[cfg(windows)]
 pub use file_dialog::FileDialogPresenter;
 #[cfg(windows)]
 pub use host::{Frame, Host, HostConfig, HostError};
