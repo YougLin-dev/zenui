@@ -39,7 +39,7 @@ jobs:
           rustup component add clippy rustfmt
 
       - name: Install Linux font dependencies
-        if: matrix.os == 'ubuntu-latest'
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends --yes libfontconfig1-dev
@@ -56,19 +56,19 @@ jobs:
       # 模板有自己的 workspace、Cargo.lock 与工具链；隐藏 WARP smoke 是
       # partial evidence，可见窗口验收仍需在 Windows 11 实机执行。
       - name: Template format
-        if: matrix.os == 'windows-latest'
+        if: runner.os == 'Windows'
         run: cargo fmt --manifest-path templates/minimal-app/Cargo.toml --all -- --check
 
       - name: Template clippy
-        if: matrix.os == 'windows-latest'
+        if: runner.os == 'Windows'
         run: cargo clippy --manifest-path templates/minimal-app/Cargo.toml --workspace --all-targets --locked -- -D warnings
 
       - name: Template test (drift + headless + hidden WARP)
-        if: matrix.os == 'windows-latest'
+        if: runner.os == 'Windows'
         run: cargo test --manifest-path templates/minimal-app/Cargo.toml --workspace --locked
 
       - name: Template release build
-        if: matrix.os == 'windows-latest'
+        if: runner.os == 'Windows'
         run: cargo build --manifest-path templates/minimal-app/Cargo.toml --release --locked
 
   prototypes:
@@ -96,7 +96,7 @@ jobs:
           rustup component add clippy rustfmt
 
       - name: Install Linux font dependencies
-        if: matrix.os == 'ubuntu-latest' && matrix.example == 'examples/native_poc'
+        if: runner.os == 'Linux' && matrix.example == 'examples/native_poc'
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends --yes libfontconfig1-dev
