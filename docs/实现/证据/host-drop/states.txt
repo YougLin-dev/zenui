@@ -1,7 +1,8 @@
-# #208 OLE 文件拖放可见证据
+# 文件拖放可见证据
 
 日期: 2026-11-25
-基线: main 5b6970d（#207 运行时拖放事件）；本目录对应 #208 工作区
+基线: main 5b6970d（#207 运行时拖放事件）；本文件对应 #208 的多文件可见证据
+完整场景、边界与读数见 [stage-three 文件拖放验收](../../stage-three-文件拖放-验收.md)
 示例: crates/windows/examples/todo_host.rs（ZenUI Todo），debug 构建
 拖放源: Windows 文件资源管理器，临时目录 zenui-drop-evidence
 
@@ -52,7 +53,62 @@
 - 只在单屏 2560×1600 运行；100% 临时切换后恢复 150%，不声明混合 DPI 或多显示器。
 - 可见证据覆盖两个文件的成功拖放；非文件数据、空列表、启用窗口判定与
   关闭确认挂起由单元测试和运行时测试覆盖。
-- 模态选择器依赖原生窗口禁用；关闭/重开时旧 target 队列随 registration
-  释放。这两条未在真机拖动中单独采集。
+- 模态选择器、关闭提示与关闭/重开已在本文件的 #209 段与验收页补充。
 - 没有覆盖其它拖放源（压缩工具、浏览器下载列表等）；它们同样通过 OLE
   IDataObject 进入本切片，但没有真机证据。
+
+## #209 场景原始读数
+
+日期: 2026-11-25（#208 合并后 3cb3cdb）
+样本: `E:\code\mine\zenui\target\drop-acceptance`；100% 采集从 150% 临时切到 96 DPI，结束后恢复 144 DPI。
+
+### 100% 单文件与拖后可用性
+
+- `single.txt`: selected=1 remaining=2 notice=True error=False
+  - titles=[Write tests | Read docs | Single drop]
+- 拖后 UIA 设置草稿 `Post drop task` 并点击 Add: remaining=3 notice=True error=False
+  - titles=[Write tests | Read docs | Single drop | Post drop task]
+
+### 150% 单文件
+
+- `single.txt`: selected=1 remaining=2 notice=True error=False
+  - titles=[Write tests | Read docs | Single drop]
+
+### 150% 长路径
+
+- `pathChars=272`; selected=1 remaining=2 notice=True error=False
+  - titles=[Write tests | Read docs | Long path drop]
+
+### 150% 文件夹
+
+- `folder-drop`: selected=1 remaining=1 notice=False error=True
+  - titles=[Write tests | Read docs]
+  - 可见错误: `Import failed: Could not read E:\code\mine\zenui\target\drop-acceptance\folder-drop: 拒绝访问。 (os error 5)`
+
+### 150% 非文件（Notepad 选中文本）
+
+- TextPattern selection=[Not a file drag]
+- remaining=1 notice=False error=False
+  - titles=[Write tests | Read docs]
+
+### 150% 无处理器/关闭提示
+
+- 草稿 `Unsaved drop draft`；关闭后确认窗口 `Discard draft?`
+- 拖到确认窗口: target=(1826,913) selected=1 remaining=1 notice=False error=False
+  - titles=[Write tests | Read docs]
+- Continue editing 后: confirmVisible=False draft=[Unsaved drop draft]
+
+### 150% 模态选择器
+
+- 对话框 `Import tasks` 的列表: `folder-drop`、`long-path-segment-01`、`long-path-segment-xxxxxxxxxx00`、`multi-a.txt`
+- 拖到被禁用的主窗口: selected=1 dialogOpen=True remaining=1 notice=False error=False
+  - titles=[Write tests | Read docs]
+- UIA 取消后: dialogOpenAfterCancel=False
+
+### 150% Details 关闭与重开
+
+- 第一次: hwnd=0x3DC11A6 target=(1801,703) selected=1 remaining=2 notice=True error=False
+  - titles=[Write tests | Read docs | Single drop]
+- 关闭: detailsClosed=True
+- 重开: hwnd=0x133079A newActivation=True selected=1 remaining=3 notice=True error=False
+  - titles=[Write tests | Read docs | Single drop | Multi A]

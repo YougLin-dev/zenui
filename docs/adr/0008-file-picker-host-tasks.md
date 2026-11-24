@@ -1,6 +1,8 @@
 # File pickers are host tasks with explicit job ownership
 
 > Superseded in part by [ADR-0009](0009-file-dialog-family.md): the entry point is now `WindowCtx::request_file_dialog`, and the family covers open, save and folder selection. This page remains the historical record of the open-file slice and its host-task contract.
+>
+> The COM initialization paragraph is superseded by [ADR-0016](0016-ole-file-drop-target.md): the shared UI-thread apartment now uses `OleInitialize` so file dialogs and OLE drag-and-drop share one initialization, still pairing every successful call with one `OleUninitialize`.
 
 ZenUI needs a native open-file dialog and a real import in the Todo demo. A file picker is a host service: the runtime owns the request and the task identity, and the platform host presents the dialog. The anchor window decides where the dialog appears, not how long the selected work lives. `WindowCtx::pick_file(options, scope)` returns a normal `Task<FileDialogOutcome>`; the caller passes `window.task_scope()` to cancel the selection with the activation, or `window.app_task_scope()` to let an app-owned import continue after the anchor closes. The anchor never silently promotes or demotes the owner.
 
@@ -28,6 +30,6 @@ COM is initialized lazily on the UI thread with `CoInitializeEx(COINIT_APARTMENT
 
 ## Consequences
 
-A pending picker survives `drive_tasks` and `settle_tasks` and completes only through its backend. Dialog failures are values; the task model never panics for them. The shell dialog is modal on the UI thread: closing the last window while it is open waits for the user to dismiss it, and programmatic cancellation is not part of this slice. Save dialogs, folder pickers and their native mapping are recorded in [ADR-0009](0009-file-dialog-family.md); drag-and-drop, initial-directory/MRU policy and programmatic cancellation remain out of scope.
+A pending picker survives `drive_tasks` and `settle_tasks` and completes only through its backend. Dialog failures are values; the task model never panics for them. The shell dialog is modal on the UI thread: closing the last window while it is open waits for the user to dismiss it, and programmatic cancellation is not part of this slice. Save dialogs, folder pickers and their native mapping are recorded in [ADR-0009](0009-file-dialog-family.md); drag-and-drop is recorded in [ADR-0016](0016-ole-file-drop-target.md). Initial-directory/MRU policy and programmatic cancellation remain out of scope.
 
 Hidden and injected-presenter tests exercise request routing, exactly-once completion, nested message pumping and Host usability, but they are not native acceptance. The visible Windows run is recorded in [stage-three file picker acceptance](../实现/stage-three-文件对话框-验收.md); ADR-0005's rule that hidden smoke and WARP are partial evidence still applies. The API and behavior are described in [window and task SDK](../SDK/窗口与任务.md).
