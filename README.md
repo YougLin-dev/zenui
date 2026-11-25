@@ -4,6 +4,18 @@ ZenUI 使用 Rust 编写原生桌面界面。它保留控件及其编辑状态�
 
 你可以用 Rust 管理模型和派生逻辑，用 `view!` 声明结构，用静态 class 书写样式。ZenUI 不嵌入浏览器，也不依赖 JavaScript、HTML DOM 或通用 CSS 引擎。2D 是主干，3D 作为布局中的可选内容接入。
 
+## 开始一个新应用
+
+新应用从 [`templates/minimal-app`](templates/minimal-app/README.md) 开始。克隆仓库后，从仓库根运行：
+
+```sh
+cargo run --manifest-path templates/minimal-app/Cargo.toml --locked
+```
+
+窗口标题为 `ZenUI Starter`，`Increment` 按钮增加 `Count`，关闭窗口退出。模板是独立 workspace，拥有自己的 `Cargo.lock` 与 `rust-toolchain.toml`。[从空目录开始](docs/SDK/从空目录开始.md)说明如何把模板复制到仓库外、改用 git 依赖、准备 Windows 构建环境并生成可双击运行的 release exe；[快速开始](docs/SDK/快速开始.md)说明仓库结构、内部示例与开发检查。
+
+ZenUI 仍在 1.0 之前，根包与模板都设置 `publish = false`，没有发布到 crates.io；依赖只能来自仓库路径或 git，API 与模板会随仓库变化。
+
 ## 当前能力
 
 ZenUI 处在开发阶段。阶段一的 target API、阶段二的 Windows 原生切片，以及阶段三的多窗口、关闭确认、应用会话策略与显式退出、原生打开/保存/文件夹对话框、整页滚动、焦点显露、覆盖层滚动条、窗口化 `For`、只读 UIA 树、UIA Invoke/Toggle/Value/SetFocus 动作、UIA 焦点/状态/结构事件、UIA TextPattern 与窗口根 ScrollPattern、原生菜单栏/快捷键/窗口级上下文菜单、应用托盘与文件拖放已可运行；节点级上下文菜单与跨平台支持仍在开发中。跨显示器混合 DPI 仍是 #63 的开放证据缺口；实机 device loss 已在单屏可见窗口上尝试（Win+Ctrl+Shift+B 与同适配器 GPU 挂起），未观察到丢失，记录见 [设备丢失实机尝试](docs/实现/stage-three-设备丢失-验收.md)。
@@ -30,7 +42,7 @@ ZenUI 处在开发阶段。阶段一的 target API、阶段二的 Windows 原生
 - 独立的宏、文本、布局和 GPU 原型；
 - 目标界面语法的预览。
 
-你可以运行 headless Todo、target API 的最小 Todo，或 Windows 原生多窗口 Todo：
+仓库内的示例用于了解已有能力，不是新应用的起点：
 
 ```sh
 cargo run -p zenui-app --example todolist_headless --locked
@@ -42,7 +54,7 @@ cargo run -p zenui-windows --example todo_host --locked
 
 target API 的公开行为测试位于根包 `tests/`，其中 `tests/tasks.rs` 覆盖窗口关闭、重开代际、过期交付与 app 所有权模型提交，`tests/ime.rs` 覆盖 headless composition 的 preedit、候选确认与取消；这些测试不代替原生窗口或真实 IME 验收，原生路径由 `crates/windows` 的隐藏 smoke 与可见窗口验收覆盖。
 
-根工程的二进制只保留最小入口；原生窗口由 `zenui-windows` 的 `todo_host` 示例打开。目标语法的预览文件不参与默认 workspace 构建，因为只有部分所需 API 已经存在。
+根包的 `src/main.rs` 只是占位入口（打印 `Hello, world!`），不是新应用的起点；`zenui-windows` 的 `todo_host` 是仓库内示例，用于演示已实现的原生能力。目标语法的预览文件不参与默认 workspace 构建，因为只有部分所需 API 已经存在。
 
 ## 阅读路径
 
@@ -53,7 +65,7 @@ target API 的公开行为测试位于根包 `tests/`，其中 `tests/tasks.rs` 
 
 ### SDK
 
-- [快速开始](docs/SDK/快速开始.md)：工具链、运行方式、工作区结构。
+- [快速开始](docs/SDK/快速开始.md)：模板入口、工具链、工作区结构与内部示例。
 - [从空目录开始](docs/SDK/从空目录开始.md)：在仓库外复制模板或使用 git 依赖，准备 Windows 构建环境、运行第一个窗口，并生成可双击运行的 release exe。
 - [界面与组件](docs/SDK/界面与组件.md)：组件、属性、条件、列表和 `view!`。
 - [数据与更新](docs/SDK/数据与更新.md)：Signal、Memo、Store、Field 和异步边界。

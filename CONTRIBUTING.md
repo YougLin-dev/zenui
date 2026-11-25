@@ -4,6 +4,8 @@
 
 ZenUI 使用固定 Rust 工具链。主工作区聚焦 headless Runtime 和可重复执行的模型场景；独立原型位于 `examples/`，各自管理依赖。
 
+新应用从 `templates/minimal-app` 开始；它是独立 workspace，拥有自己的 `Cargo.lock` 与 `rust-toolchain.toml`。根包的 `src/main.rs` 只是占位入口，`examples/` 与 `zenui-windows` 的 `todo_host` 是仓库内示例，不是新应用的起点。复制到仓库外、git 依赖与 release 构建见[从空目录开始](docs/SDK/从空目录开始.md)。
+
 `crates/core` 保持标准库依赖，不加入 `unsafe`。修改它的身份、事务或释放语义时，同时更新相应单元测试和本地说明，不需要外部背景才能读懂行为。
 
 ## 必做检查
@@ -21,7 +23,7 @@ cargo test -p zenui-core --example syntax_model_shapes
 cargo test --manifest-path examples/macro_poc/Cargo.toml --workspace --locked
 ```
 
-这些检查验证实际的格式、类型和单元行为，不引入文档治理、编号或统计台账。
+这些检查验证实际的格式、类型和单元行为，不引入文档治理、编号或统计台账。修改模板时，同时运行[模板说明](templates/minimal-app/README.md)中 `## 检查` 的命令。
 
 ## 改动原则
 
