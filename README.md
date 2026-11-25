@@ -54,6 +54,7 @@ target API 的公开行为测试位于根包 `tests/`，其中 `tests/tasks.rs` 
 ### SDK
 
 - [快速开始](docs/SDK/快速开始.md)：工具链、运行方式、工作区结构。
+- [从空目录开始](docs/SDK/从空目录开始.md)：在仓库外复制模板或使用 git 依赖，准备 Windows 构建环境并运行第一个窗口。
 - [界面与组件](docs/SDK/界面与组件.md)：组件、属性、条件、列表和 `view!`。
 - [数据与更新](docs/SDK/数据与更新.md)：Signal、Memo、Store、Field 和异步边界。
 - [窗口与任务](docs/SDK/窗口与任务.md)：窗口实例、关闭确认、对话框和任务归属。
@@ -90,6 +91,7 @@ target API 的公开行为测试位于根包 `tests/`，其中 `tests/tasks.rs` 
 - [Stage-three 文本编辑历史验收](docs/实现/stage-three-文本编辑历史-验收.md)：按输入的撤销/重做、Ctrl+Z/Y、连续输入合并、选择替换、Backspace/Delete、中文组合提交、两窗口隔离与 150% 可见证据。
 - [Stage-three 剪贴板验收](docs/实现/stage-three-剪贴板-验收.md)：Ctrl+C/X/V、Notepad 双向互操作、应用内剪切与跨窗口粘贴、空/非文本剪贴板、组合 no-op、焦点保持与 100%/150% 可见证据。
 - [Stage-three 文件拖放验收](docs/实现/stage-three-文件拖放-验收.md)：真实资源管理器拖放的单文件/多文件、Unicode/非 BMP/长路径、文件夹、非文件、无处理器、关闭提示、模态选择器与关闭重开的 100%/150% 可见证据与边界。
+- [Stage-three 空目录启动验收](docs/实现/stage-three-空目录启动-验收.md)：仓库外模板副本的可见窗口、UIA 计数与 150% 证据；CI copy-out 与可见运行分开记录。
 
 ## 界面语法
 
