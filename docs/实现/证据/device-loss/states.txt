@@ -1,0 +1,68 @@
+# 实机设备丢失尝试状态记录（#214）
+
+日期: 2026-11-25 12:50 与 12:53（本地时间），单屏 2560×1600，150%（144 DPI）。
+系统: Windows 11 Pro 10.0.26300。GPU: NVIDIA GeForce RTX 4060 Laptop GPU，
+驱动 32.0.15.7283，DX12，非 WARP。应用: `crates/windows/examples/todo_host.rs`，
+debug 构建，基线提交 4d0ea63；探针打印（adapter、丢失回调、恢复尝试、成功呈现的
+代际与阶段）是临时源码改动，采集后已移除，不进入提交。截图/触发脚本与 GPU helper
+已从 target 采集目录删除。
+截图: `PrintWindow(PW_CLIENTONLY | PW_RENDERFULLCONTENT)` 只读取应用客户区；
+不含桌面、标题栏、用户名或本机路径。
+
+## 运行 A：真实 Win+Ctrl+Shift+B（12:50）
+
+脚本用 `keybd_event` 发送 Win+Ctrl+Shift+B（轻按一次、按住 4 秒一次），
+前台 HWND 由 `SetForegroundWindow` 确认。
+[12:50:48.402] app pid=46392 hwnd=32244006 title='ZenUI Todo' client=900x700 dpi=144 visible=True enabled=True
+[12:50:48.727] foreground=32244006 hwnd=32244006
+[12:50:50.174] before draft='recovery draft' selection=' draft' focus='What needs to be done?'
+[12:50:50.175] before texts=1 remaining | All | Active | Reverse | Complete Write tests | Write tests | Edit Write tests | Delete Write tests | Complete Read docs | Read docs | Edit Read docs | Delete Read docs
+[12:50:50.176] before hwnd=32244006 visible=True enabled=True
+[12:50:50.188] trigger A: tap Win+Ctrl+Shift+B
+[12:50:54.325] trigger B: hold Win+Ctrl+Shift+B for 4s
+[12:51:00.404] after-attempt draft='recovery draft' selection=' draft' focus='What needs to be done?'
+[12:51:00.405] after-attempt texts=1 remaining | All | Active | Reverse | Complete Write tests | Write tests | Edit Write tests | Delete Write tests | Complete Read docs | Read docs | Edit Read docs | Delete Read docs
+[12:51:00.406] after-attempt hwnd=32244006 visible=True enabled=True
+[12:51:01.899] display events since trigger: 0
+
+运行 A 的探针日志没有 callback、DEVICE_LOSS、recover 或非 Clear 阶段呈现；
+HWND、draft、selection、focus 与任务内容在触发前后相同。
+
+## 运行 B：强制驱动重置（12:53）
+
+临时 helper 进程在同一高性能适配器上创建一个 wgpu 设备，提交一个永不结束、
+持续写 storage buffer 的 fragment 着色器，然后等待 10 秒退出；这是用户态可
+执行的驱动重置触发，不需要管理员权限。
+[12:53:05.846] app pid=53088 hwnd=73796238 title='ZenUI Todo' client=900x700 dpi=144 visible=True enabled=True
+[12:53:06.155] foreground=73796238 hwnd=73796238
+[12:53:07.581] before draft='recovery draft' (14 chars) selection=' draft' (8..14) focus='What needs to be done?'; caret at the active end 8
+[12:53:07.582] before texts=1 remaining | All | Active | Reverse | Complete Write tests | Write tests | Edit Write tests | Delete Write tests | Complete Read docs | Read docs | Edit Read docs | Delete Read docs
+[12:53:07.583] before hwnd=73796238 visible=True enabled=True
+[12:53:07.593] trigger: forced TDR from a hung fragment shader on the same high-performance adapter
+[12:53:21.542] tdr helper exited=True
+[12:53:24.599] after-attempt draft='recovery draft' selection=' draft' focus='What needs to be done?'; caret unchanged at 8
+[12:53:24.600] after-attempt texts=1 remaining | All | Active | Reverse | Complete Write tests | Write tests | Edit Write tests | Delete Write tests | Complete Read docs | Read docs | Edit Read docs | Delete Read docs
+[12:53:24.601] after-attempt hwnd=73796238 visible=True enabled=True
+[12:53:26.016] after-input-filter draft='recoveryX' selection='' focus='What needs to be done?'
+（输入 X 后点击 Complete Write tests，Write tests 取消完成，remaining 1→2；再点击 Active。）
+[12:53:26.017] after-input-filter texts=2 remaining | All | Active | Reverse | Complete Write tests | Write tests | Edit Write tests | Delete Write tests | Complete Read docs | Read docs | Edit Read docs | Delete Read docs
+[12:53:26.018] after-input-filter hwnd=73796238 visible=True enabled=True
+[12:53:26.770] display events since trigger: 0
+
+探针日志（54 行，节选）:
+[probe] adapter GpuAdapterInfo { name: "NVIDIA GeForce RTX 4060 Laptop GPU", backend: "Dx12", device_type: "DiscreteGpu", driver: "32.0.15.7283", driver_info: "", fallback: false }
+[probe] main hwnd Some(HWND(0x4660a8e))
+[probe] present ok generation=1 phase=Clear window=main
+...（全部 52 条呈现行都是 generation=1 phase=Clear；没有 callback、DEVICE_LOSS、recover 行）
+
+系统日志:
+[12:53:12.728] nvlddmkm 事件 153，`\Device\Video3`，`Error occurred on GPUID: 100`
+（Display provider 在触发后没有事件；没有 4101/TDR 恢复事件。）
+
+## 结论
+
+运行 A 的 Win+Ctrl+Shift+B 没有产生 Display provider 事件或 D3D12 设备事件
+（未单独查询 nvlddmkm provider）。运行 B 记录了真实的 NVIDIA 驱动错误事件
+（nvlddmkm 153），但没有 4101/TDR 或 D3D12 设备移除：没有丢失回调、
+Lost/Validation 或重建，呈现仍是 generation=1；触发后的输入、模型与过滤动作
+正常呈现。未观察到真实设备丢失，因此没有恢复证据，本工单不宣称恢复。

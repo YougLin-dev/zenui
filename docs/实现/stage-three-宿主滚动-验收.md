@@ -83,7 +83,7 @@
 - **可见自动驱动（本页）：** 真实可见 HWND、真实 OS 滚轮路由与 `SendInput`、宿主默认 DX12 presenter、真实窗口过程与 `PrintWindow` 像素。不是人工操作；不证明用户注视下的 DWM 合成、z-order 或被其它窗口遮挡时的表现。
 - **隐藏 smoke：** `crates/windows/tests/hidden_smoke.rs` 覆盖 `WM_MOUSEWHEEL`/翻页键的偏移与夹取、滚动后按同一指针位置重新命中并把 hover 与 `hit_test` 对齐、滚动不刷新快照与 Node ID、hide/show 保留偏移、close/reopen 归零、聚焦编辑器的 glyph 数与 End/Home caret 移动（并断言同一 NodeId 保持焦点）、滚动后重绘帧像素变化。它们是路由与状态证据，不是原生验收。滚轮移动断言只在系统 `SPI_GETWHEELSCROLLLINES` 非零时执行；禁用分支由单元测试覆盖。
 - **单元测试：** `WheelScroll` 的 notch 累积、亚 notch residue（5 × 24 单位 = 72 px，逐事件截断会得到 70）、符号、行数变化丢弃 residue、`SPI_GETWHEELSCROLLLINES` 原始值 0/`WHEEL_PAGESCROLL`/N 的映射与极端 delta；`host::tests::device_loss_preserves_the_applied_scroll_offset` 覆盖重建 surface 后偏移保留。
-- **未覆盖与后续证据：** 本页当时没有 hide/show 的可见运行（外部脚本只能 `ShowWindow`，不改变 activation）；该缺口已由滚动总验收使用公开 `Host::hide`/`Host::show` 补齐，hide/show 与 close/reopen 以汇总页为准。模拟设备丢失仍只有单元测试证据：宿主没有公开的模拟设备丢失触发器，汇总页将其标为部分证据。`WM_SETTINGCHANGE` 消息处理本身没有直接测试（只测 SPI 值映射与 `set_lines` 的丢弃行为）；IME 候选窗定位与焦点自动显露属于 #180；滚动条属于 #181/#182；列表虚拟化已由 #184 交付，见[窗口化 For 验收](stage-three-窗口化-for-验收.md)；混合 DPI 多显示器与真实硬件设备丢失仍属 #63。
+- **未覆盖与后续证据：** 本页当时没有 hide/show 的可见运行（外部脚本只能 `ShowWindow`，不改变 activation）；该缺口已由滚动总验收使用公开 `Host::hide`/`Host::show` 补齐，hide/show 与 close/reopen 以汇总页为准。模拟设备丢失仍只有单元测试证据：宿主没有公开的模拟设备丢失触发器，汇总页将其标为部分证据。`WM_SETTINGCHANGE` 消息处理本身没有直接测试（只测 SPI 值映射与 `set_lines` 的丢弃行为）；IME 候选窗定位与焦点自动显露属于 #180；滚动条属于 #181/#182；列表虚拟化已由 #184 交付，见[窗口化 For 验收](stage-three-窗口化-for-验收.md)；混合 DPI 多显示器与真实硬件设备丢失仍属 #63；实机丢失尝试未观察到丢失（[记录](stage-three-设备丢失-验收.md)）。
 - `states.txt` 中的 hover/press NodeId 是场景元素身份；press 的 capture 语义与松开命中判定来自窗口过程，截图只能证明最终视觉状态。
 
 ## 判据对照
