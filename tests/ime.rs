@@ -269,7 +269,7 @@ fn ExternalReset() -> MountResult<MountPlan> {
 }
 
 #[test]
-fn an_external_value_change_is_not_clobbered_by_commit() {
+fn an_external_value_change_cancels_the_composition() {
     let mut app = Runtime::new();
     app.mount(|| view! { <ExternalReset /> }).expect("mount");
     app.input("editor", "ab").expect("type the committed text");
@@ -280,16 +280,30 @@ fn an_external_value_change_is_not_clobbered_by_commit() {
     app.click_label("reset")
         .expect("an external write replaces the value mid-composition");
     assert_eq!(app.texts(), vec![String::from("x")]);
-
-    app.compose_commit("editor", "你")
-        .expect("confirm the candidate");
     assert_eq!(
-        app.texts(),
-        vec![String::from("x你")],
-        "the recorded caret is clamped into the current value, not the start snapshot"
+        app.preedit("editor"),
+        None,
+        "the external reset cancels the preedit"
     );
+    assert_eq!(
+        app.caret("editor"),
+        Some(1),
+        "the caret moves to the end of the replacing value"
+    );
+
+    assert_eq!(
+        app.compose_commit("editor", "你")
+            .expect_err("the reset already ended the composition"),
+        MountError::Component("text input is not composing")
+    );
+
+    app.compose_start("editor")
+        .expect("the editor stays usable for the next composition");
+    app.compose_update("editor", "ni").expect("preedit");
+    app.compose_commit("editor", "你")
+        .expect("commit on the new value");
+    assert_eq!(app.texts(), vec![String::from("x你")]);
     assert_eq!(app.caret("editor"), Some(2));
-    assert_eq!(app.preedit("editor"), None);
 }
 
 #[test]
