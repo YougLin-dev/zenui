@@ -1,0 +1,18 @@
+commit	ad7538d
+date	2026-11-25 local (17:38-17:56)
+os	Windows 11 Pro 10.0.26300 x64
+gpu	NVIDIA GeForce RTX 4060 Laptop GPU, driver 32.0.15.7283
+adapter	DX12 hardware RTX 4060, fallback=false (GpuAdapterInfo in stage-three-设备丢失-验收)
+display	1 display, 2560x1600 @240Hz, scale 150% (dpi 144)
+build	todo_host/menu_host debug examples; template release
+template	repo run: client 630x420, dpi 144, UIA Count: 0 -> Invoke "Increment counter" -> Count: 1, WM_CLOSE exited
+release	path E:\code\mine\zenui-220\release-copy\minimal-app.exe, size 15716864, subsystem 2, sha256 2A4F31F37E9D6F03D1600CFAE8A73D3211A79BA8A6B28E61544D071551F2E3B7
+release-run	client 630x420, dpi 144, UIA Count: 0 -> 1, process path matched the copied exe, WM_CLOSE exited
+todo	client 1350x1050, dpi 144
+uia-actions	SetValue draft "UIA action" + Invoke Add -> 2 remaining; Toggle "Complete Read docs" -> 1 remaining; Invoke Reverse
+import	real IFileOpenDialog "Import tasks"; double-click import-10k.txt; 10001 remaining; total 10002
+scroll-pattern	VerticallyScrollable=True, VerticalViewSize=0.18902928063557, percent 0 -> 50.0001352766272 -> 100 -> 0
+wheel	5x24 -> 1.9479834313187%; 10x120 -> 21.4278177445057%
+keys	End -> 100%; Home -> 0%; PageDown -> 18.2893999940478%
+menu	File menu (Save Ctrl+S, Clear, Close); File > Clear -> status Cleared; View > Show status -> status Status hidden; Shift+F10 > Clear note -> status Note cleared
+device-loss	Win+Ctrl+Shift+B tap; process and HWND alive; draft "final acceptance draft" and focus preserved; Display/nvlddmkm event count 0
