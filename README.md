@@ -105,6 +105,7 @@ target API 的公开行为测试位于根包 `tests/`，其中 `tests/tasks.rs` 
 - [Stage-three 文件拖放验收](docs/实现/stage-three-文件拖放-验收.md)：真实资源管理器拖放的单文件/多文件、Unicode/非 BMP/长路径、文件夹、非文件、无处理器、关闭提示、模态选择器与关闭重开的 100%/150% 可见证据与边界。
 - [Stage-three 空目录启动验收](docs/实现/stage-three-空目录启动-验收.md)：仓库外模板副本的可见窗口、UIA 计数与 150% 证据；CI copy-out 与可见运行分开记录。
 - [Stage-three 发布打包验收](docs/实现/stage-three-发布打包-验收.md)：release exe 的 GUI 子系统、复制到另一目录后的可见运行与 UIA 计数。
+- [Stage-three 最终跨方向验收](docs/实现/stage-three-最终跨方向-验收.md)：模板、滚动、UIA、菜单/托盘、剪贴板/编辑历史、拖放与设备丢失的单提交汇总索引与 100%/150% 整合运行。
 
 ## 界面语法
 
