@@ -79,7 +79,7 @@ mod host_message {
 
     /// worker 唤醒；任一存活窗口收到后交付全部 worker 结果。
     pub(super) const WAKE: u32 = WM_APP + 1;
-    /// 设备丢失恢复请求，保留给设备丢失工单。
+    /// 设备丢失恢复请求；回调与失败尝试的重试都投递它。
     pub(super) const DEVICE_LOSS: u32 = WM_APP + 2;
     /// 辅助技术动作请求，保留给 UIA 工单。
     pub(super) const UIA_ACTION: u32 = WM_APP + 3;
@@ -424,11 +424,20 @@ impl DeviceLossSignal {
         self.lock().epoch
     }
 
-    /// 投递一条合并后的恢复消息；没有存活目标时保留信号，等目标出现。
+    /// 回调驱动的投递；旧代设备的迟到回调被信号代际淘汰。
     fn post(&self, generation: u64) {
         if self.lock().generation != generation {
             return;
         }
+        self.post_from_host(generation);
+    }
+
+    /// 宿主驱动的投递；没有存活目标时保留信号，等目标出现。
+    ///
+    /// 失败的 staging 会先把信号代际推进到未发布的设备，因此这里不按信号
+    /// 代际过滤；`generation` 是宿主已发布的代际，派发端用它淘汰重建完成后
+    /// 的迟到消息。
+    fn post_from_host(&self, generation: u64) {
         if self.pending.swap(true, Ordering::SeqCst) {
             return;
         }
@@ -486,8 +495,8 @@ impl DeviceLossSignal {
 /// 为新 device 安装丢失回调，并让信号接受这一代。
 ///
 /// 调用发生在 surface 配置与渲染器创建之前：staging 期间的丢失也必须进入
-/// 信号。信号代际先于宿主字段前进；重建失败时旧设备已经丢失，它的回调不再
-/// 承担新事件，下一次尝试会复用同一个代际。
+/// 信号。每次尝试安装自己的代际；staging 失败时丢弃设备的迟到回调不会与
+/// 之后发布的设备代际重合。
 fn install_loss_callback(device: &wgpu::Device, loss: &Arc<DeviceLossSignal>, generation: u64) {
     loss.set_generation(generation);
     let loss = Arc::clone(loss);
@@ -658,13 +667,25 @@ pub struct Host {
     loss_phase: LossPhase,
     /// 设备代际；每次新 device 递增，旧回调按它淘汰。
     device_generation: u64,
+    /// 下一个待安装的设备代际；每次安装回调时前进，失败的 staging 也消耗一个，
+    /// 避免被丢弃设备的迟到回调命中后来发布的设备。
+    next_device_generation: u64,
     /// `AwaitingPresent` 对应的丢失序号；呈现只清除同一序号的信号。
     loss_epoch: u64,
     /// 本次恢复开始后是否已经成功呈现过一帧。
     presented_since_rebuild: bool,
+    /// 本轮丢失事件已经消耗的恢复尝试次数；完整证明性呈现后归零。
+    recovery_attempts: u32,
+    /// 最近一次重建尝试拿到的适配器；失败时用于终止错误。
+    attempt_adapter: Option<GpuAdapterInfo>,
+    /// 达到尝试上限后的终止错误；存在时不再创建设备。
+    latched_loss: Option<DeviceLostError>,
     /// 测试注入的 surface 状态队列；只存在于测试构建。
     #[cfg(test)]
     forced_surface_statuses: std::collections::VecDeque<wgpu::CurrentSurfaceTexture>,
+    /// 测试注入的重建失败次数；只存在于测试构建。
+    #[cfg(test)]
+    injected_rebuild_failures: usize,
     /// 窗口过程不能返回错误；消息循环在派发后取走并返回。
     deferred_error: Option<HostError>,
     /// 关闭协议改变了焦点/启用状态，消息循环在下次同步后重定向前台。
@@ -816,10 +837,16 @@ impl Host {
             loss,
             loss_phase: LossPhase::Clear,
             device_generation: 1,
+            next_device_generation: 1,
             loss_epoch: 0,
             presented_since_rebuild: false,
+            recovery_attempts: 0,
+            attempt_adapter: None,
+            latched_loss: None,
             #[cfg(test)]
             forced_surface_statuses: std::collections::VecDeque::new(),
+            #[cfg(test)]
+            injected_rebuild_failures: 0,
             deferred_error: None,
             focus_after_sync: false,
             file_dialog_presenter: None,
@@ -869,6 +896,14 @@ impl Host {
     /// 指定窗口最近一次呈现的场景；指针命中与几何查询使用。
     pub fn scene(&self, key: &str) -> Option<&Scene> {
         self.windows.get(key)?.scene.as_ref()
+    }
+
+    /// 当前 device 使用的适配器；用于日志、验收记录与设备丢失诊断。
+    ///
+    /// `fallback` 表示软件回退（WARP），由 `device_type` 为 `Cpu` 判定。该信息
+    /// 不参与渲染能力协商。
+    pub fn adapter_info(&self) -> GpuAdapterInfo {
+        adapter_info_of(&self.adapter)
     }
 
     /// 指定窗口当前已提交的呈现描述；嵌入方与测试可据此按 Node ID 或标签定位。
@@ -1181,6 +1216,7 @@ impl Host {
     /// 托盘与 worker 消息，直到应用显式退出。没有声明托盘的常驻会话在
     /// [`Host::open`] 被拒绝。
     pub fn run(&mut self) -> Result<(), HostError> {
+        self.reject_latched_loss()?;
         self.sync_windows()?;
         if !self.session_running() {
             return Ok(());
@@ -1202,6 +1238,7 @@ impl Host {
     /// 返回 `false`，直到显式退出。把宿主嵌进别的消息循环，或在测试里驱动
     /// 一次输入而不阻塞时使用。
     pub fn pump(&mut self) -> Result<bool, HostError> {
+        self.reject_latched_loss()?;
         self.sync_windows()?;
         let host = self as *mut Self;
         let _pointer = HostPointer::install(host);
@@ -1259,15 +1296,27 @@ impl Host {
         }
     }
 
-    /// 处理设备丢失消息；代际不匹配或信号已被呈现清除时忽略。
+    /// 处理设备丢失消息；代际不匹配或信号已被呈现清除时忽略该消息，
+    /// 但仍在等待重建时补发一条已发布代际的恢复消息。
     fn handle_device_loss(&mut self, wparam: WPARAM) {
         self.loss.observed();
         let generation = wparam.0 as u64;
-        if generation != self.device_generation || !self.loss.is_lost() {
+        if generation != self.device_generation {
+            // 丢弃的 staging 设备或旧设备的迟到消息可能先占住合并标志，把失败
+            // 尝试的重试挡掉；仍在等待重建时补发一条已发布代际的消息。
+            if self.loss_phase == LossPhase::Pending && self.loss.is_lost() {
+                self.loss.post_from_host(self.device_generation);
+            }
+            return;
+        }
+        if !self.loss.is_lost() {
             return;
         }
         self.loss_phase = LossPhase::Pending;
-        if let Err(error) = self.recover_device() {
+        // 可重试的失败已经排入恢复消息；只有锁存的终止错误进入消息循环。
+        if let Err(error) = self.recover_device()
+            && self.latched_loss.is_some()
+        {
             self.deferred_error.get_or_insert(error);
         }
     }
@@ -1678,6 +1727,7 @@ impl Host {
     ///
     /// 任一窗口的 surface、场景或绘制失败时返回对应错误。
     pub fn render(&mut self) -> Result<(), HostError> {
+        self.reject_latched_loss()?;
         for key in self.windows.keys().copied().collect::<Vec<_>>() {
             self.render_key(key)?;
         }
@@ -1891,6 +1941,7 @@ impl Host {
         snapshot: &mut PresentationSnapshot,
         snapshot_changed: bool,
     ) -> Result<bool, HostError> {
+        self.reject_latched_loss()?;
         // 丢失回调先置位信号、再投递消息；消息处理前阶段仍是 `Clear`，
         // `AwaitingPresent` 也可能因重建设备再次丢失而落后于丢失序号。
         // 两种情况下这一帧都不能创建 surface，也不能呈现。
@@ -1898,6 +1949,11 @@ impl Host {
             self.loss_phase == LossPhase::AwaitingPresent && self.loss.epoch() != self.loss_epoch;
         if (self.loss_phase == LossPhase::Clear && self.loss.is_lost()) || stale_proving {
             self.loss_phase = LossPhase::Pending;
+            return Ok(false);
+        }
+        if self.loss_phase == LossPhase::Pending && !self.recovering {
+            // 上一次尝试已失败并排入重试，surface 为空；这一帧留给重试之后。
+            window.paint_requested = true;
             return Ok(false);
         }
         self.ensure_surface(window)?;
@@ -1970,6 +2026,9 @@ impl Host {
             {
                 self.loss_phase = LossPhase::Clear;
                 self.loss_epoch = 0;
+                // 第一次成功呈现补上了缺失的证明性呈现，本轮尝试到此结束。
+                self.recovery_attempts = 0;
+                self.attempt_adapter = None;
             }
             commit_scene(window, snapshot, scene);
             window.paint_requested = false;
@@ -2013,15 +2072,30 @@ impl Host {
         Ok(())
     }
 
-    /// 重新创建 device/queue/renderer 与每个窗口的 surface，然后重绘全部窗口。
+    /// 在尝试上限内重建 device/queue/renderer 与全部 surface，然后重绘。
     ///
     /// 丢失信号跨重建保留；只有新设备成功呈现至少一帧且恢复期间没有新的
     /// 丢失/渲染失败时才清除。没有可见窗口时停在 `AwaitingPresent`，不会
-    /// 因为重复消息反复创建设备。
+    /// 因为重复消息反复创建设备。失败的尝试排入一条恢复消息并回到消息循环；
+    /// 达到上限后锁存一个 [`HostError::DeviceLost`]，之后的调用不再创建设备。
     fn recover_device(&mut self) -> Result<(), HostError> {
-        if self.loss_phase != LossPhase::Pending || self.recovering {
+        if self.recovering {
             return Ok(());
         }
+        if let Some(error) = &self.latched_loss {
+            return Err(HostError::DeviceLost(Box::new(error.clone())));
+        }
+        if self.loss_phase != LossPhase::Pending {
+            return Ok(());
+        }
+        if self.recovery_attempts >= MAX_RECOVERY_ATTEMPTS {
+            // 重建成功的设备在证明性呈现之前又丢了：本轮尝试已经用尽。
+            return Err(self.latch_device_lost(String::from(
+                "the device was lost again before a proving present",
+            )));
+        }
+        self.recovery_attempts += 1;
+        self.attempt_adapter = None;
         let epoch = self.loss.epoch();
         self.recovering = true;
         self.presented_since_rebuild = false;
@@ -2035,6 +2109,8 @@ impl Host {
                     if self.loss.clear_if(epoch) {
                         self.loss_phase = LossPhase::Clear;
                         self.loss_epoch = 0;
+                        self.recovery_attempts = 0;
+                        self.attempt_adapter = None;
                     } else {
                         self.loss_phase = LossPhase::AwaitingPresent;
                         self.loss_epoch = epoch;
@@ -2045,8 +2121,39 @@ impl Host {
                 }
                 Ok(())
             }
-            Err(error) => Err(error),
+            Err(error) => {
+                let message = error.to_string();
+                if self.recovery_attempts >= MAX_RECOVERY_ATTEMPTS {
+                    Err(self.latch_device_lost(message))
+                } else {
+                    // 信号保持置位；下一条消息在上限内重试，不阻塞 UI 线程。
+                    self.loss.post_from_host(self.device_generation);
+                    Err(error)
+                }
+            }
         }
+    }
+
+    /// 本轮丢失事件达到上限后的终止错误；之后的调用直接返回它。
+    fn reject_latched_loss(&self) -> Result<(), HostError> {
+        match &self.latched_loss {
+            Some(error) => Err(HostError::DeviceLost(Box::new(error.clone()))),
+            None => Ok(()),
+        }
+    }
+
+    /// 锁存终止错误；之后不再创建设备，也不清除丢失信号。
+    fn latch_device_lost(&mut self, message: String) -> HostError {
+        let error = DeviceLostError {
+            attempts: self.recovery_attempts,
+            adapter: self
+                .attempt_adapter
+                .clone()
+                .unwrap_or_else(|| self.adapter_info()),
+            message,
+        };
+        self.latched_loss = Some(error.clone());
+        HostError::DeviceLost(Box::new(error))
     }
 
     /// 当前 device 代是否可以创建 surface。
@@ -2056,6 +2163,9 @@ impl Host {
     /// 重建的 device 上建 surface；丢失序号前进后（重建后的设备又丢了）
     /// 才再次禁止。
     fn can_create_surface(&self) -> bool {
+        if self.latched_loss.is_some() {
+            return false;
+        }
         match self.loss_phase {
             LossPhase::Clear => !self.loss.is_lost(),
             LossPhase::Pending => false,
@@ -2646,7 +2756,20 @@ impl Host {
     }
 
     /// 用指定窗口自己的场景渲染到离屏纹理并读回 BGRA 像素；隐藏 CI smoke 使用。
+    ///
+    /// 设备丢失期间返回 [`HostError::Surface`]；读回不会在旧设备上继续。
     pub fn read_frame(&mut self, key: &str) -> Result<Frame, HostError> {
+        self.reject_latched_loss()?;
+        let stale_proving =
+            self.loss_phase == LossPhase::AwaitingPresent && self.loss.epoch() != self.loss_epoch;
+        if self.loss_phase == LossPhase::Pending
+            || (self.loss_phase == LossPhase::Clear && self.loss.is_lost())
+            || stale_proving
+        {
+            return Err(HostError::Surface(String::from(
+                "the device is lost; readback needs the rebuilt device",
+            )));
+        }
         let hwnd = self
             .hwnd(key)
             .ok_or_else(|| HostError::UnknownWindow(key.to_owned()))?;
@@ -3434,18 +3557,38 @@ impl Host {
             .ok_or_else(|| HostError::Surface(String::from("the surface is not available")))
     }
 
+    /// 为新 device 分配代际并安装丢失回调；每次尝试都消耗一个代际。
+    fn install_device_callback(&mut self, device: &wgpu::Device) -> u64 {
+        let generation = self.next_device_generation.wrapping_add(1).max(1);
+        self.next_device_generation = generation;
+        install_loss_callback(device, &self.loss, generation);
+        generation
+    }
+
+    /// 测试注入一次重建失败；只存在于测试构建。
+    #[cfg(test)]
+    fn inject_rebuild_failure(&mut self) -> Result<(), HostError> {
+        if self.injected_rebuild_failures == 0 {
+            return Ok(());
+        }
+        self.injected_rebuild_failures -= 1;
+        Err(HostError::Device(String::from("injected rebuild failure")))
+    }
+
     /// 设备丢失后重建 device/queue/renderer 与每个窗口的 surface。
     ///
     /// 先释放所有旧交换链；用第一个窗口的 surface 请求新 device，再让其余
-    /// 窗口共享同一 adapter/device/format。失败时保持 surface 为空，下一次
-    /// 消息会再次尝试重建。
+    /// 窗口共享同一 adapter/device/format。失败时保持 surface 为空，由
+    /// [`Host::recover_device`] 在尝试上限内重试；达到上限后锁存终止错误。
     fn rebuild_presentations(&mut self) -> Result<(), HostError> {
         let Some(first_key) = self.windows.keys().next().copied() else {
             // 零窗口的常驻宿主没有 surface 可绑定；仍换掉丢失的 device，
             // 保持旧格式与 1×1 目标，窗口重开时再建 surface。
+            #[cfg(test)]
+            self.inject_rebuild_failure()?;
             let (adapter, device, queue) = request_backend_without_surface(&self._instance)?;
-            let generation = self.device_generation.wrapping_add(1).max(1);
-            install_loss_callback(&device, &self.loss, generation);
+            self.attempt_adapter = Some(adapter_info_of(&adapter));
+            let generation = self.install_device_callback(&device);
             let format = self.format;
             let target = target_config(format, 1, 1)?;
             let renderer =
@@ -3462,11 +3605,14 @@ impl Host {
         for window in self.windows.values_mut() {
             window.surface = None;
         }
+        // 注入点在释放之后：测试覆盖的是真实失败留下的空 surface，而不是早退。
+        #[cfg(test)]
+        self.inject_rebuild_failure()?;
         let first_hwnd = self.windows[&first_key].hwnd();
         let first_surface = create_surface(&self._instance, first_hwnd, self.hinstance)?;
         let (adapter, device, queue) = request_backend(&self._instance, &first_surface)?;
-        let generation = self.device_generation.wrapping_add(1).max(1);
-        install_loss_callback(&device, &self.loss, generation);
+        self.attempt_adapter = Some(adapter_info_of(&adapter));
+        let generation = self.install_device_callback(&device);
         let first_config = surface_configuration(&adapter, &first_surface, first_hwnd)?;
         first_surface.configure(&device, &first_config);
         let format = first_config.format;
@@ -3507,6 +3653,7 @@ impl Host {
             return Ok(());
         }
         if window.surface.is_none() {
+            self.reject_latched_loss()?;
             if !self.can_create_surface() {
                 return Err(HostError::Surface(String::from(
                     "the device is lost; a surface cannot be created on it",
@@ -3672,7 +3819,12 @@ impl Host {
         let result = self.without_routing(Some(hwnd), |host| action(host, &mut window));
         self.windows.insert(key, window);
         if result.is_ok() && self.loss_phase == LossPhase::Pending && !self.recovering {
-            self.recover_device()?;
+            // 可重试的失败已经排入恢复消息；只有锁存的终止错误向上传播。
+            if let Err(error) = self.recover_device()
+                && self.latched_loss.is_some()
+            {
+                return Err(error);
+            }
         }
         result
     }
@@ -3770,12 +3922,19 @@ impl Host {
     }
 
     fn add_window(&mut self, info: &WindowInfo) -> Result<WindowAdd, HostError> {
+        self.reject_latched_loss()?;
         if !self.can_create_surface() {
             // 丢失信号可能先于 `DEVICE_LOSS` 消息置位，消息也可能随旧目标
             // 丢弃；`AwaitingPresent` 后重建设备再次丢失时同样没有消息推动。
             // 新窗口必须在有效设备上创建 surface，先补一次重建。
             self.loss_phase = LossPhase::Pending;
-            self.recover_device()?;
+            if let Err(error) = self.recover_device() {
+                if self.latched_loss.is_some() {
+                    return Err(error);
+                }
+                // 重建失败已排入恢复消息；请求留到下一次同步重试。
+                return Ok(WindowAdd::Deferred);
+            }
             if !self.can_create_surface() {
                 // 重建期间又发生丢失：信号保持置位，请求留到下一次同步重试。
                 return Ok(WindowAdd::Deferred);
@@ -4130,7 +4289,7 @@ impl Host {
             let needs_rebuild = self.loss_phase != LossPhase::AwaitingPresent
                 || self.loss.epoch() != self.loss_epoch;
             if self.loss.is_lost() && needs_rebuild {
-                self.loss.post(self.device_generation);
+                self.loss.post_from_host(self.device_generation);
             }
         }
     }
@@ -4370,6 +4529,51 @@ impl Drop for Host {
     }
 }
 
+/// 当前 device 使用的适配器诊断信息。
+///
+/// 用于日志、验收记录与 [`DeviceLostError`]；不参与渲染能力协商。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GpuAdapterInfo {
+    /// 适配器名称。
+    pub name: String,
+    /// 后端（`Dx12`、`Vulkan` 等）。
+    pub backend: String,
+    /// 设备类型（`DiscreteGpu`、`IntegratedGpu`、`Cpu` 等）。
+    pub device_type: String,
+    /// 驱动名称。
+    pub driver: String,
+    /// 驱动版本或附加信息。
+    pub driver_info: String,
+    /// 是否是软件回退适配器（WARP）；`device_type` 为 `Cpu`。
+    pub fallback: bool,
+}
+
+/// 三次恢复尝试后设备仍不可用时的终止错误。
+#[derive(Clone, Debug)]
+pub struct DeviceLostError {
+    /// 本轮丢失事件消耗的恢复尝试次数。
+    pub attempts: u32,
+    /// 最后一次尝试使用的适配器；没有拿到适配器时是当前 device 的适配器。
+    pub adapter: GpuAdapterInfo,
+    /// 最后一次尝试的错误描述。
+    pub message: String,
+}
+
+impl fmt::Display for DeviceLostError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "device lost after {} attempts on {} ({}): {}",
+            self.attempts, self.adapter.name, self.adapter.backend, self.message
+        )
+    }
+}
+
+impl Error for DeviceLostError {}
+
+/// 一次丢失事件允许的恢复尝试次数。
+const MAX_RECOVERY_ATTEMPTS: u32 = 3;
+
 /// 宿主的一帧失败；没有 panics。
 #[derive(Debug)]
 pub enum HostError {
@@ -4385,6 +4589,11 @@ pub enum HostError {
     NoAdapter,
     /// 设备创建失败。
     Device(String),
+    /// 设备在三次恢复尝试后仍然不可用；后续调用返回同一个错误。
+    ///
+    /// 载荷装箱：`HostError` 出现在每帧都返回的 `Result` 里，不能让诊断字段
+    /// 撑大所有调用点的返回值。
+    DeviceLost(Box<DeviceLostError>),
     /// 宿主没有这个目录键的原生窗口。
     UnknownWindow(String),
     /// 打开或显示窗口失败。
@@ -4440,6 +4649,7 @@ impl fmt::Display for HostError {
             Self::Readback(message) => write!(f, "frame readback failed: {message}"),
             Self::NoAdapter => f.write_str("no usable DX12 adapter, including WARP"),
             Self::Device(message) => write!(f, "device creation failed: {message}"),
+            Self::DeviceLost(error) => write!(f, "device lost: {error}"),
             Self::UnknownWindow(key) => write!(f, "window key {key} has no native window"),
             Self::Open(error) => write!(f, "opening the window failed: {error}"),
             Self::Close(error) => write!(f, "closing the window failed: {error}"),
@@ -4701,6 +4911,19 @@ fn request_backend_inner(
         Some(message) => HostError::Device(message),
         None => HostError::NoAdapter,
     })
+}
+
+/// 读取适配器的诊断信息；`Cpu` 设备类型表示软件回退（WARP）。
+fn adapter_info_of(adapter: &wgpu::Adapter) -> GpuAdapterInfo {
+    let info = adapter.get_info();
+    GpuAdapterInfo {
+        name: info.name,
+        backend: format!("{:?}", info.backend),
+        device_type: format!("{:?}", info.device_type),
+        driver: info.driver,
+        driver_info: info.driver_info,
+        fallback: info.device_type == wgpu::DeviceType::Cpu,
+    }
 }
 
 /// Presenter 可能返回与请求 kind 不匹配的路径数量；宿主不能把无效的
@@ -8707,6 +8930,225 @@ mod tests {
         );
         let frame = host.read_frame(MAIN).expect("frame after recovery");
         assert!(!frame.pixels().is_empty());
+    }
+
+    #[test]
+    fn a_one_shot_rebuild_failure_recovers_on_the_second_attempt() {
+        let mut host = open_host();
+        host.render().expect("render before the loss");
+        let generation = host.device_generation;
+
+        host.injected_rebuild_failures = 1;
+        host.device.destroy();
+        let _ = host.device.poll(wgpu::PollType::wait_indefinitely());
+        host.pump()
+            .expect("the failure is retried from the message loop");
+
+        assert!(
+            host.latched_loss.is_none(),
+            "one failure stays inside the bound"
+        );
+        assert_eq!(
+            host.recovery_attempts, 0,
+            "a proving present resets the attempt counter"
+        );
+        assert_eq!(host.device_generation, generation + 1);
+        assert_eq!(host.loss_phase, LossPhase::Clear);
+        assert!(!host.loss.is_lost());
+        assert!(host.windows.values().all(|window| window.surface.is_some()));
+    }
+
+    #[test]
+    fn a_permanent_failure_latches_after_three_attempts() {
+        let mut host = open_host();
+        host.render().expect("render before the loss");
+        let generation = host.device_generation;
+        let current_adapter = host.adapter_info();
+
+        host.injected_rebuild_failures = 99;
+        host.device.destroy();
+        let _ = host.device.poll(wgpu::PollType::wait_indefinitely());
+        let error = host.pump().expect_err("the bounded recovery gives up");
+        let HostError::DeviceLost(lost) = error else {
+            panic!("the terminal error is typed: {error}");
+        };
+        assert_eq!(lost.attempts, 3, "exactly the bounded attempts run");
+        assert_eq!(
+            lost.adapter, current_adapter,
+            "without an attempt adapter the terminal error falls back to the current device"
+        );
+        assert!(
+            !lost.message.is_empty(),
+            "the terminal error keeps the last failure"
+        );
+        assert_eq!(host.injected_rebuild_failures, 96);
+        assert_eq!(
+            host.device_generation, generation,
+            "no failed device is published"
+        );
+
+        let error = host
+            .pump()
+            .expect_err("later pumps return the latched error");
+        let HostError::DeviceLost(lost) = error else {
+            panic!("the latched error stays typed: {error}");
+        };
+        assert_eq!(lost.attempts, 3);
+        assert_eq!(
+            host.injected_rebuild_failures, 96,
+            "a latched host never attempts another rebuild"
+        );
+        assert!(
+            matches!(host.read_frame(MAIN), Err(HostError::DeviceLost(_))),
+            "readback returns the latched error"
+        );
+    }
+
+    #[test]
+    fn a_failed_staging_attempt_still_posts_the_retry() {
+        let mut host = open_host();
+        host.render().expect("render before the loss");
+        let generation = host.device_generation;
+
+        // 安装新回调之后失败的重建：信号代际已推进到未发布的设备，
+        // 宿主已发布的代际仍是旧值。
+        host.loss.mark_lost();
+        host.loss.set_generation(generation + 1);
+        host.loss_phase = LossPhase::Pending;
+        host.injected_rebuild_failures = 1;
+        host.recover_device()
+            .expect_err("the injected attempt fails before publishing");
+        assert_eq!(
+            host.device_generation, generation,
+            "the failed attempt does not publish a generation"
+        );
+        assert!(
+            matches!(host.read_frame(MAIN), Err(HostError::Surface(_))),
+            "readback during a pending recovery reports the lost device"
+        );
+
+        host.pump().expect("the queued retry recovers");
+
+        assert_eq!(host.device_generation, generation + 1);
+        assert_eq!(host.loss_phase, LossPhase::Clear);
+        assert!(!host.loss.is_lost());
+    }
+
+    #[test]
+    fn a_rejected_staging_message_reschedules_the_pending_recovery() {
+        let mut host = open_host();
+        host.render().expect("render before the loss");
+        let generation = host.device_generation;
+
+        // 安装回调后失败的重建：丢弃设备的回调抢占了合并标志，失败尝试自己
+        // 的重试被合并掉；派发时它又因代际超前而被拒绝。
+        host.loss.mark_lost();
+        host.loss.set_generation(generation + 1);
+        host.next_device_generation = generation + 1;
+        host.loss.raise(generation + 1);
+        host.loss_phase = LossPhase::Pending;
+        host.recovery_attempts = 1;
+
+        host.pump()
+            .expect("the rejected message reschedules the recovery");
+
+        assert_eq!(
+            host.device_generation,
+            generation + 2,
+            "the retry publishes a fresh generation, not the discarded one"
+        );
+        assert_eq!(host.loss_phase, LossPhase::Clear);
+        assert!(!host.loss.is_lost());
+        assert_eq!(host.recovery_attempts, 0);
+    }
+
+    #[test]
+    fn readback_refuses_only_the_lost_states() {
+        let mut host = open_host();
+        host.render().expect("render before the loss");
+
+        host.loss.mark_lost();
+        assert!(
+            matches!(host.read_frame(MAIN), Err(HostError::Surface(_))),
+            "a signalled loss refuses readback before the message is dispatched"
+        );
+
+        host.loss_phase = LossPhase::AwaitingPresent;
+        host.loss_epoch = 0;
+        assert!(
+            matches!(host.read_frame(MAIN), Err(HostError::Surface(_))),
+            "a stale proving pass refuses readback"
+        );
+
+        host.loss_epoch = host.loss.epoch();
+        assert!(
+            host.read_frame(MAIN).is_ok(),
+            "the rebuilt device still reads back while its first present is pending"
+        );
+    }
+
+    #[test]
+    fn the_terminal_error_prefers_the_final_attempt_adapter() {
+        let mut host = open_host();
+        let final_attempt = GpuAdapterInfo {
+            name: String::from("final attempt"),
+            backend: String::from("Dx12"),
+            device_type: String::from("Cpu"),
+            driver: String::from("warp"),
+            driver_info: String::new(),
+            fallback: true,
+        };
+        host.attempt_adapter = Some(final_attempt.clone());
+        host.recovery_attempts = MAX_RECOVERY_ATTEMPTS;
+        let error = host.latch_device_lost(String::from("the fallback device stayed lost"));
+        let HostError::DeviceLost(lost) = error else {
+            panic!("the terminal error is typed: {error}");
+        };
+        assert_eq!(lost.attempts, MAX_RECOVERY_ATTEMPTS);
+        assert_eq!(
+            lost.adapter, final_attempt,
+            "the terminal error reports the adapter of the final attempt"
+        );
+        assert!(
+            lost.adapter.fallback,
+            "a WARP final attempt stays observable"
+        );
+    }
+
+    #[test]
+    fn a_failed_attempt_keeps_the_episode_open_for_the_next_window_action() {
+        let mut host = open_two_window_host();
+        host.render().expect("render both windows");
+        let generation = host.device_generation;
+
+        host.injected_rebuild_failures = 1;
+        host.surface_lost().expect("mark the synthetic loss");
+        host.render()
+            .expect("the next window action retries the failed attempt");
+
+        assert!(host.latched_loss.is_none());
+        assert_eq!(host.recovery_attempts, 0);
+        assert_eq!(host.device_generation, generation + 1);
+        assert_eq!(host.loss_phase, LossPhase::Clear);
+        assert!(host.windows.values().all(|window| window.surface.is_some()));
+    }
+
+    #[test]
+    fn adapter_info_reports_the_active_adapter() {
+        let host = open_host();
+        let info = host.adapter_info();
+        let raw = host.adapter.get_info();
+        assert!(!info.name.is_empty(), "the adapter has a name");
+        assert_eq!(info.name, raw.name);
+        assert_eq!(info.backend, format!("{:?}", raw.backend));
+        assert_eq!(info.device_type, format!("{:?}", raw.device_type));
+        assert_eq!(info.driver, raw.driver);
+        assert_eq!(info.driver_info, raw.driver_info);
+        assert_eq!(
+            info.fallback,
+            raw.device_type == wgpu::DeviceType::Cpu,
+            "software fallback is observable"
+        );
     }
 
     #[test]

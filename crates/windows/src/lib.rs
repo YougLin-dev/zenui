@@ -39,6 +39,6 @@ pub use drag_drop::DragDropError;
 #[cfg(windows)]
 pub use file_dialog::FileDialogPresenter;
 #[cfg(windows)]
-pub use host::{Frame, Host, HostConfig, HostError};
+pub use host::{DeviceLostError, Frame, GpuAdapterInfo, Host, HostConfig, HostError};
 #[cfg(windows)]
 pub use tray::{TrayIconRequest, TrayMenuRequest, TrayPresenter, TrayTooltipRequest};
