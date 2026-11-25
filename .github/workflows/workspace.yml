@@ -22,7 +22,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # 宿主测试按窗口 surface（DirectComposition 交换链）请求 DX12 适配器。
+        # Blacksmith Windows runner 上 D3D12/WARP 可用（无 surface 的 GPU
+        # 测试通过），但与窗口 surface 兼容的适配器请求失败（NoAdapter），
+        # 因此这一 leg 保留在 GitHub 托管的 windows-latest。
+        os: [blacksmith-4vcpu-ubuntu-2604, blacksmith-6vcpu-macos-15, windows-latest]
     env:
       CARGO_TERM_COLOR: always
       # 模板是独立 workspace，但 Windows leg 与根 workspace 共享 target，
@@ -39,7 +43,7 @@ jobs:
           rustup component add clippy rustfmt
 
       - name: Install Linux font dependencies
-        if: matrix.os == 'ubuntu-latest'
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends --yes libfontconfig1-dev
@@ -56,19 +60,19 @@ jobs:
       # 模板有自己的 workspace、Cargo.lock 与工具链；隐藏 WARP smoke 是
       # partial evidence，可见窗口验收仍需在 Windows 11 实机执行。
       - name: Template format
-        if: matrix.os == 'windows-latest'
+        if: runner.os == 'Windows'
         run: cargo fmt --manifest-path templates/minimal-app/Cargo.toml --all -- --check
 
       - name: Template clippy
-        if: matrix.os == 'windows-latest'
+        if: runner.os == 'Windows'
         run: cargo clippy --manifest-path templates/minimal-app/Cargo.toml --workspace --all-targets --locked -- -D warnings
 
       - name: Template test (drift + headless + hidden WARP)
-        if: matrix.os == 'windows-latest'
+        if: runner.os == 'Windows'
         run: cargo test --manifest-path templates/minimal-app/Cargo.toml --workspace --locked
 
       - name: Template release build
-        if: matrix.os == 'windows-latest'
+        if: runner.os == 'Windows'
         run: cargo build --manifest-path templates/minimal-app/Cargo.toml --release --locked
 
   prototypes:
@@ -78,7 +82,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [blacksmith-4vcpu-ubuntu-2604, blacksmith-6vcpu-macos-15, blacksmith-4vcpu-windows-2025]
         example:
           - examples/macro_poc
           - examples/native_poc
@@ -96,7 +100,7 @@ jobs:
           rustup component add clippy rustfmt
 
       - name: Install Linux font dependencies
-        if: matrix.os == 'ubuntu-latest' && matrix.example == 'examples/native_poc'
+        if: runner.os == 'Linux' && matrix.example == 'examples/native_poc'
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends --yes libfontconfig1-dev
