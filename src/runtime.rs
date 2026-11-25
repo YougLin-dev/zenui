@@ -1397,9 +1397,7 @@ impl TextEditing {
                         stale,
                     })
                 } else {
-                    let revision = self.lineage.revision;
-                    self.reset_to(committed);
-                    Some(TextTrace::ExternalReset { origin, revision })
+                    Some(self.external_reset(committed))
                 }
             }
             Some(revision) => {
@@ -1443,8 +1441,7 @@ impl TextEditing {
                     // 模型仍停在编辑前的值：处理器把写入推迟到了之后的命令。
                     None
                 } else {
-                    self.reset_to(committed);
-                    Some(TextTrace::ExternalReset { origin, revision })
+                    Some(self.external_reset(committed))
                 }
             }
         };
@@ -1461,12 +1458,38 @@ impl TextEditing {
         normalized
     }
 
-    /// 外部替换：丢弃在途派发、清空历史并采用模型值。
-    fn reset_to(&mut self, committed: &str) {
+    /// 外部替换：丢弃在途派发、清空历史、采用模型值并确定 selection 结果。
+    ///
+    /// 组合中到达的替换取消组合：preedit 被丢弃且不派发 `on:input`，caret
+    /// 落到新值末尾。非组合替换按下述规则夹取：空值归零并清空选择；非空值
+    /// 夹取 caret/anchor，完整落在新值内的 selection 保留，越界的收拢到末尾。
+    fn external_reset(&mut self, committed: &str) -> TextTrace {
+        let origin = self.lineage.origin;
+        let revision = self.lineage.revision;
         self.history.clear();
         self.lineage.in_flight.clear();
         self.lineage.settled = self.lineage.revision;
         self.adopt(committed);
+        let length = self.value.chars().count();
+        if self.composition.take().is_some() {
+            self.caret = length;
+            self.anchor = length;
+            self.selection = None;
+            return TextTrace::CompositionCancelledByReset { origin, revision };
+        }
+        if length == 0 {
+            self.caret = 0;
+            self.anchor = 0;
+            self.selection = None;
+        } else if self.selection.is_some_and(|(_, end)| end > length) {
+            self.caret = length;
+            self.anchor = length;
+            self.selection = None;
+        } else {
+            self.caret = self.caret.min(length);
+            self.anchor = self.anchor.min(length);
+        }
+        TextTrace::ExternalReset { origin, revision }
     }
 
     /// 采用模型值并把 caret/anchor/selection 夹回文本范围。
@@ -1585,6 +1608,8 @@ enum TextTrace {
     },
     /// 非本地编辑产生的值；编辑器采用它并清空历史。
     ExternalReset { origin: u64, revision: u64 },
+    /// 外部替换在组合中到达：preedit 被丢弃，编辑器采用新值。
+    CompositionCancelledByReset { origin: u64, revision: u64 },
     /// 文本输入挂载建立新的编辑 origin；初次挂载同样计入。
     Remount { origin: u64 },
 }
@@ -6121,6 +6146,81 @@ mod lineage_tests {
                 origin,
                 revision: 1,
                 normalized: false,
+            })
+        );
+    }
+
+    #[component]
+    fn Resettable(calls: Rc<Cell<u32>>) -> MountResult<MountPlan> {
+        let draft = signal(String::from("abcd"));
+
+        view! {
+            <view>
+                <text-input
+                    aria:label="reset"
+                    value={draft}
+                    on:input={move |value: String| {
+                        calls.set(calls.get() + 1);
+                        draft.set(value);
+                    }}
+                />
+                <button
+                    aria:label="external"
+                    on:click={move || draft.set(String::from("remote"))}
+                >
+                    "External"
+                </button>
+            </view>
+        }
+    }
+
+    #[test]
+    fn an_external_reset_during_composition_traces_the_cancellation() {
+        let calls = Rc::new(Cell::new(0));
+        let mut app = Runtime::new();
+        app.mount({
+            let calls = calls.clone();
+            move || view! { <Resettable calls={calls} /> }
+        })
+        .expect("mount");
+        let input = input_id(&app, "reset");
+
+        app.set_selection_node(input, 1, 3).expect("selection");
+        app.compose_start_node(input).expect("start composing");
+        app.compose_update_node(input, "ni").expect("preedit");
+        assert_eq!(
+            app.presentation()
+                .expect("snapshot")
+                .find_label("reset")
+                .expect("the input")
+                .edit()
+                .expect("edit")
+                .preedit(),
+            Some("ni")
+        );
+
+        app.click_label("external")
+            .expect("replace the value from outside");
+        let snapshot = app.presentation().expect("snapshot");
+        let field = snapshot.find_label("reset").expect("the input");
+        assert_eq!(field.text_value(), Some("remote"));
+        let edit = field.edit().expect("edit");
+        assert_eq!((edit.caret(), edit.anchor()), (6, 6));
+        assert_eq!(edit.selection(), None);
+        assert_eq!(edit.preedit(), None);
+        assert_eq!(edit.composition(), None);
+        assert_eq!(calls.get(), 0, "the cancellation dispatches no on:input");
+
+        let events = trace(&app);
+        let origin = match events[0] {
+            TextTrace::Remount { origin } => origin,
+            other => panic!("the first event is the mount: {other:?}"),
+        };
+        assert_eq!(
+            events.last(),
+            Some(&TextTrace::CompositionCancelledByReset {
+                origin,
+                revision: 0,
             })
         );
     }
