@@ -20,7 +20,9 @@ jobs:
     timeout-minutes: 5
     outputs:
       code_count: ${{ steps.filter.outputs.code_count }}
-      docs: ${{ steps.filter.outputs.docs }}
+      # dorny/paths-filter 的 <filter> 输出是布尔值；启用 list-files 后，
+      # 文件列表在 <filter>_files。
+      docs: ${{ steps.filter.outputs.docs_files }}
       docs_count: ${{ steps.filter.outputs.docs_count }}
     steps:
       - name: Check out
