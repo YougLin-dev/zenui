@@ -19,7 +19,7 @@ A plain `text-input` now keeps bounded undo/redo history in the headless runtime
 
 ## External replacement
 
-Each history records the last committed value observed by refresh. A value change seen at refresh without a local edit in flight is an external replacement and clears both stacks. A local edit marks its own settlement before dispatching, so the handler's model write is not mistaken for an external change.
+Each history records the last committed value observed by refresh. A value change seen at refresh without a local edit in flight is an external replacement and clears both stacks. A local edit marks its own settlement before dispatching, so the handler's model write is not mistaken for an external change. [ADR-0019](0019-text-edit-origin-and-revision.md) refines this detection with the per-mount edit lineage; the history consequences recorded here are unchanged.
 
 `Runtime::input(label, value)` is explicitly an external whole-value replacement: it clears both stacks and still dispatches one `on:input`. A shared `Signal` edit in another window changes this input's value externally and therefore invalidates its history; the history never crosses inputs or windows.
 
@@ -35,16 +35,13 @@ Each input keeps at most 100 entries and at most 256 KiB of snapshot text per st
 
 Unmounting an element clears its undo and redo stacks, the observed value and the local-settlement flag, so a dead element slot retains no history snapshot text or observed value. The element slot itself and its committed `value` attribute (and any composition preedit) remain until the Runtime is dropped; this ADR bounds history memory, not the existing element-table lifetime. The paths that unmount a branch (`release_nodes`, a replaced `Show` branch and removed `For` items) all clear history before disposing the Owner. Remounting creates a new Node ID and a fresh empty history; an old Node ID is `StaleNode`.
 
-## Superseding the SDK revision/origin target
+## Revision/origin protocol
 
-`docs/SDK/样式与输入.md` describes a future editor protocol where `value` carries an origin and revision: a matching origin only confirms synchronization, while external resets arrive under an independent revision, and selection policy is chosen per external replacement reason. That protocol is **not implemented** in this headless slice, and this ADR supersedes it as the current text-history contract:
+The SDK's original target — `value` carrying an origin and revision, external resets arriving under an independent revision, and selection policy chosen per replacement reason — is delivered by the runtime-local edit lineage in [ADR-0019](0019-text-edit-origin-and-revision.md). That ADR supersedes this section and records the classification of settlements, stale deliveries and external resets, the selection policy, composition cancellation, the internal trace, the host boundary and the remaining same-value limitations.
 
-- History is runtime-local and identified by the input's Node ID, not by an editor revision carried through the model.
-- External replacement is detected by comparing the committed value at refresh; there is no origin/revision handshake.
-- Exact caret/anchor/selection restoration is promised only for identity handlers; the documented "restore a specified range or collapse to the end per replacement reason" policy remains future work.
-- The SDK's "clear, undo, format or remote update is an external replacement" remains true in spirit: any committed value change not caused by this input's local edit clears history.
+The history rules in this ADR are unchanged. History is runtime-local and identified by the input's Node ID; entries store the committed value; exact caret/anchor/selection restoration is promised only for identity handlers; a remount gets a fresh empty history. ADR-0019 adds the per-mount origin and revision that classify deliveries on top of this history, so a committed value change not caused by this input's own edit applies and clears both stacks instead of being inferred from value comparison alone.
 
-The verification checklist's Windows-only items about origin/revision traces, consecutive edits before value delivery and external replace during composition remain target design. They must not be read as covered by this ADR. The native adapter can later add revision/origin on top of this runtime seam without changing the model-authority rule.
+Application-selected selection policies keyed by replacement reason remain out of scope; the deterministic defaults are recorded in ADR-0019.
 
 ## Considered options
 

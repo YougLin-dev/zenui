@@ -600,6 +600,12 @@ struct WindowHost {
     accessibility: Arc<WindowAccessibility>,
     /// UIA 运行时 ID 分配器；与发布树一起更新。
     accessibility_ids: AccessibilityIds,
+    /// 测试注入的 OS 组合状态；真实宿主读取 HIMC 的组合串长度。
+    #[cfg(test)]
+    os_composition: Option<bool>,
+    /// 测试期计入的 `ImmNotifyIME` 取消次数；真实宿主只调用系统 API。
+    #[cfg(test)]
+    ime_cancel_notifications: usize,
 }
 
 impl WindowHost {
@@ -3425,7 +3431,23 @@ impl Host {
         Ok(cancelled)
     }
 
-    fn notify_ime_cancel(&self, window: &WindowHost) {
+    /// 运行时已无聚焦组合、OS IME 组合串仍在时丢弃 OS 组合串。
+    ///
+    /// 外部 reset（共享 Signal、worker 交付、文件对话框结果等）只在运行时取消
+    /// preedit；OS IME 不知道这次取消，会继续接收按键，下一次 `COMPSTR` 把
+    /// preedit 重新带回编辑器，候选确认时提交已取消的内容。正常组合路径里
+    /// 两者同进同退，不会触碰 IME。
+    fn reconcile_ime_composition(&mut self, window: &mut WindowHost, runtime_composing: bool) {
+        if !runtime_composing && self.os_composition_active(window) {
+            self.notify_ime_cancel(window);
+        }
+    }
+
+    fn notify_ime_cancel(&mut self, window: &mut WindowHost) {
+        #[cfg(test)]
+        {
+            window.ime_cancel_notifications += 1;
+        }
         // 安全：HIMC 由 ImmGetContext 获取并与 HWND 配对释放。
         unsafe {
             let himc = ImmGetContext(window.hwnd());
@@ -3447,6 +3469,10 @@ impl Host {
 
     /// OS IME 当前是否仍有组合串；Escape 取消后部分 IME 直接清空它。
     fn os_composition_active(&self, window: &WindowHost) -> bool {
+        #[cfg(test)]
+        if let Some(active) = window.os_composition {
+            return active;
+        }
         // 安全：himc 与 HWND 配对；只查询组合串长度，不读取缓冲。
         let himc = unsafe { ImmGetContext(window.hwnd()) };
         if himc.0.is_null() {
@@ -4326,7 +4352,13 @@ impl Host {
             if unchanged {
                 continue;
             }
-            self.with_window(key, |host, window| host.render_window(window, snapshot))?;
+            let composing = focused_composition(&snapshot);
+            self.with_window(key, |host, window| {
+                // 快照已在上面提交外部 reset；先让 OS IME 与运行时组合状态一致，
+                // 再呈现这一帧。
+                host.reconcile_ime_composition(window, composing);
+                host.render_window(window, snapshot)
+            })?;
         }
         Ok(())
     }
@@ -4374,6 +4406,10 @@ impl WindowHost {
             title,
             accessibility,
             accessibility_ids: AccessibilityIds::new(),
+            #[cfg(test)]
+            os_composition: None,
+            #[cfg(test)]
+            ime_cancel_notifications: 0,
         }
     }
 
@@ -11802,6 +11838,143 @@ mod tests {
             "a synchronous IME message borrowed the host twice: {:?}",
             host.deferred_error
         );
+    }
+
+    /// 外部 reset 探针：编辑器的值来自应用 Signal，任务交付时写入新值。
+    fn external_reset_host(reset: &'static str) -> (Host, NodeId) {
+        let mut runtime = Runtime::new();
+        let field = runtime
+            .setup(|| signal(String::from("old")))
+            .expect("application setup");
+        runtime
+            .declare_windows(move |catalog| {
+                catalog.window(WindowSpec::new(MAIN).primary().sized(320, 240), move |_| {
+                    view! {
+                        <text-input
+                            aria:label="Field"
+                            value={field}
+                            on:input={move |value: String| field.set(value)}
+                        />
+                    }
+                })?;
+                Ok(())
+            })
+            .expect("catalog");
+        let task = runtime
+            .spawn_task(runtime.task_scope(), move |_| String::from(reset))
+            .expect("spawn the reset task");
+        runtime
+            .task_done(task, move |value| {
+                field.set(value);
+                Ok(())
+            })
+            .expect("reset continuation");
+        let mut host = Host::open(runtime, HostConfig::hidden()).expect("open host");
+        host.runtime.focus("Field").expect("focus");
+        let node = host
+            .runtime
+            .presentation()
+            .expect("snapshot")
+            .find_label("Field")
+            .expect("field")
+            .id();
+        (host, node)
+    }
+
+    #[test]
+    fn an_external_reset_during_composition_cancels_the_os_composition() {
+        let (mut host, node) = external_reset_host("external");
+        with_main(&mut host, |host, window| {
+            host.ime_start(window)?;
+            host.apply_ime_composition(window, node, request(false, true), None, Some("ni".into()))
+        });
+        with_main(&mut host, |_, window| {
+            window.os_composition = Some(true);
+            Ok(())
+        });
+
+        host.runtime.wait_for_tasks();
+        host.deliver_tasks().expect("deliver the external reset");
+
+        let snapshot = host.runtime.presentation().expect("snapshot");
+        let element = snapshot.node(node).expect("field");
+        assert_eq!(element.text_value(), Some("external"));
+        let edit = element.edit().expect("edit");
+        assert_eq!(edit.preedit(), None, "the reset cancelled the preedit");
+        assert_eq!(edit.caret(), 8, "the caret moves to the end");
+        assert_eq!(edit.selection(), None);
+        let notifications = with_main(&mut host, |_, window| Ok(window.ime_cancel_notifications));
+        assert_eq!(
+            notifications, 1,
+            "the host tells the OS IME to drop its composition string"
+        );
+    }
+
+    #[test]
+    fn a_normal_composition_survives_an_unrelated_task_delivery() {
+        let mut runtime = Runtime::new();
+        let (field, status) = runtime
+            .setup(|| (signal(String::from("old")), signal(String::from("idle"))))
+            .expect("application setup");
+        runtime
+            .declare_windows(move |catalog| {
+                catalog.window(WindowSpec::new(MAIN).primary().sized(320, 240), move |_| {
+                    let shown = memo(move || status.get());
+                    view! {
+                        <view>
+                            <text aria:label="status">{shown}</text>
+                            <text-input
+                                aria:label="Field"
+                                value={field}
+                                on:input={move |value: String| field.set(value)}
+                            />
+                        </view>
+                    }
+                })?;
+                Ok(())
+            })
+            .expect("catalog");
+        let task = runtime
+            .spawn_task(runtime.task_scope(), |_| String::from("done"))
+            .expect("spawn the status task");
+        runtime
+            .task_done(task, move |value| {
+                status.set(value);
+                Ok(())
+            })
+            .expect("status continuation");
+        let mut host = Host::open(runtime, HostConfig::hidden()).expect("open host");
+        host.runtime.focus("Field").expect("focus");
+        let node = host
+            .runtime
+            .presentation()
+            .expect("snapshot")
+            .find_label("Field")
+            .expect("field")
+            .id();
+        with_main(&mut host, |host, window| {
+            host.ime_start(window)?;
+            host.apply_ime_composition(window, node, request(false, true), None, Some("ni".into()))
+        });
+        with_main(&mut host, |_, window| {
+            window.os_composition = Some(true);
+            Ok(())
+        });
+
+        host.runtime.wait_for_tasks();
+        host.deliver_tasks().expect("deliver the status");
+
+        let snapshot = host.runtime.presentation().expect("snapshot");
+        assert_eq!(
+            snapshot.find_label("status").expect("label").text(),
+            "done",
+            "the unrelated delivery repainted the window"
+        );
+        let edit = snapshot.node(node).expect("field").edit().expect("edit");
+        assert_eq!(edit.preedit(), Some("ni"), "the composition survives");
+        assert!(edit.composition().is_some());
+        let notifications = with_main(&mut host, |_, window| Ok(window.ime_cancel_notifications));
+        assert_eq!(notifications, 0, "the OS IME keeps its composition");
     }
 
     #[test]

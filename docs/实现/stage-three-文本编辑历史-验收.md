@@ -128,4 +128,4 @@
 
 ## 后续状态
 
-本页关闭 #204、#205 与 #206 的文本编辑历史切片。当前交付是每个输入自己的有界 undo/redo、Windows Ctrl+Z/Y 映射与确定性 run 合并；带 origin/revision 的编辑器协议、按原因恢复 selection 与跨输入/应用级撤销仍是目标设计，不与本页的已交付语义混用。契约见 [ADR-0014](../adr/0014-text-edit-history.md)。
+本页关闭 #204、#205 与 #206 的文本编辑历史切片。当前交付是每个输入自己的有界 undo/redo、Windows Ctrl+Z/Y 映射与确定性 run 合并；带 origin/revision 的编辑血统随后交付（[ADR-0019](../adr/0019-text-edit-origin-and-revision.md)），由应用按替换原因选择 selection 策略与跨输入/应用级撤销仍是目标设计，不与本页的已交付语义混用。历史契约见 [ADR-0014](../adr/0014-text-edit-history.md)。
