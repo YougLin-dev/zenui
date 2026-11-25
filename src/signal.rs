@@ -29,6 +29,12 @@ impl<T: Clone + PartialEq + 'static> Signal<T> {
         with_state_of(self.runtime, |state| state.write_signal(self.id, value));
     }
 
+    /// 应用写入代数；相等写入同样推进。文本编辑器据此辨认处理器是否写入过
+    /// 值绑定，而不是把“写入相同值”与“没有写入”混为一谈。
+    pub(crate) fn write_epoch(self, state: &crate::runtime::State) -> u64 {
+        state.signals[state.signal_index(self.id)].writes
+    }
+
     /// 只读作用域：内部的 setter 与模型事务在改动前被拒绝。
     pub fn with<R>(self, f: impl FnOnce(&T) -> R) -> R {
         struct Guard {
@@ -75,6 +81,14 @@ impl<T> Clone for Memo<T> {
 }
 
 impl<T: Clone + PartialEq + 'static> Memo<T> {
+    /// 值绑定的写入代数：只有计算值变化才推进。
+    ///
+    /// 相等写入（包括归一化后写回原值）无法与“把写入推迟到之后的命令”
+    /// 区分，因此不结算；编辑器保留本地文本，等模型值变化或外部替换。
+    pub(crate) fn write_epoch(self, state: &crate::runtime::State) -> u64 {
+        state.memos[state.memo_index(self.id)].revision
+    }
+
     pub fn get(self) -> T {
         let ready = with_state_of(self.runtime, |state| {
             let value = state.memo_ready::<T>(self.id);
@@ -152,6 +166,9 @@ pub fn once<T>(value: T) -> Once<T> {
 
 pub(crate) struct SignalCell {
     pub(crate) value: Rc<dyn Any>,
+    /// 应用写入代数。相等写入同样推进：文本编辑器据此判断处理器是否处理过
+    /// 一次编辑，而不是比较写入前后的值。
+    pub(crate) writes: u64,
     pub(crate) disposed: bool,
 }
 
@@ -159,6 +176,9 @@ pub(crate) struct MemoCell {
     pub(crate) compute: Option<Box<dyn Fn() -> Box<dyn Any>>>,
     pub(crate) value: Option<Rc<dyn Any>>,
     pub(crate) deps: Vec<DepKey>,
+    /// 计算值变化时推进的代数。值绑定用它近似“处理器写过绑定”；
+    /// 相等写入无法与推迟写入区分。
+    pub(crate) revision: u64,
     pub(crate) dirty: bool,
     pub(crate) computing: bool,
     pub(crate) disposed: bool,
@@ -170,6 +190,7 @@ impl MemoCell {
             compute: Some(compute),
             value: None,
             deps: Vec::new(),
+            revision: 0,
             dirty: true,
             computing: false,
             disposed: false,
@@ -190,6 +211,7 @@ impl crate::runtime::State {
         let id = u32::try_from(self.signals.len()).expect("signal arena exhausted");
         self.signals.push(SignalCell {
             value: Rc::from(value),
+            writes: 0,
             disposed: false,
         });
         self.attach_to_owner(crate::runtime::Resource::Signal(id));
@@ -226,10 +248,11 @@ impl crate::runtime::State {
             .clone()
             .downcast::<T>()
             .unwrap_or_else(|_| panic!("signal {id} has a different value type"));
+        // 相等写入不改变值，但仍是应用对这次写入的处理；编辑器依赖这个区别。
+        self.signals[index].writes = self.signals[index].writes.wrapping_add(1);
         if *current == value {
             return;
         }
-        let index = self.signal_index(id);
         self.signals[index].value = Rc::new(value);
         self.bump(DepKey::Signal(id));
     }
@@ -277,7 +300,7 @@ impl crate::runtime::State {
         (compute, previous)
     }
 
-    /// 本轮依赖集整体替换旧依赖；只有值变化才推进 Memo revision 并使下游失效。
+    /// 本轮依赖集整体替换旧依赖；只有值变化才使下游失效。
     /// 依赖边用于定向标脏，避免无关节点重新求值。
     pub(crate) fn finish_memo<T: Clone + PartialEq + 'static>(
         &mut self,
@@ -298,6 +321,9 @@ impl crate::runtime::State {
             Some(current) => *current.clone().downcast::<T>().expect("memo value type") != value,
             None => true,
         };
+        if changed {
+            cell.revision = cell.revision.wrapping_add(1);
+        }
         cell.value = Some(Rc::new(value));
 
         for key in &cell.deps {
