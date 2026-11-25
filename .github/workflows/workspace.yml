@@ -58,6 +58,23 @@ jobs:
       - name: Test
         run: cargo test --workspace --locked
 
+      # LICENSE 文件使用规范全文；根 workspace 的包与模板声明同一 SPDX 表达式，
+      # 包文档链接两份许可。
+      - name: License files (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          test -s LICENSE-MIT
+          test -s LICENSE-APACHE
+          echo "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30  LICENSE-APACHE" | sha256sum -c -
+          echo "6dcb1b91cbdf1a59b1762178774951ffb6c59f75761623429c5f0d3f5dca0937  LICENSE-MIT" | sha256sum -c -
+          for manifest in Cargo.toml crates/*/Cargo.toml templates/minimal-app/Cargo.toml; do
+            grep -q '^license = "MIT OR Apache-2.0"$' "$manifest"
+          done
+          for doc in README.md templates/minimal-app/README.md docs/SDK/从空目录开始.md docs/SDK/快速开始.md; do
+            grep -q 'LICENSE-MIT' "$doc"
+            grep -q 'LICENSE-APACHE' "$doc"
+          done
+
       # 模板是「从空目录开始」的起点：复制到 checkout 之外，只把两个 path
       # 依赖指向 checkout，再构建/测试。Linux leg 复用根 workspace 的 target，
       # 不重复一次冷构建；Windows 的模板构建仍在下面原地执行。
@@ -150,8 +167,9 @@ jobs:
           fi
           grep -F "revspec 'HEAD' not found" "$RUNNER_TEMP/rev-head.log"
 
-      # 模板有自己的 workspace、Cargo.lock 与工具链；隐藏 WARP smoke 是
-      # partial evidence，可见窗口验收仍需在 Windows 11 实机执行。
+      # 模板有自己的 workspace、Cargo.lock 与工具链；隐藏 smoke 是 partial
+      # evidence（宿主在没有硬件适配器时回退 WARP），可见窗口验收仍需在
+      # Windows 11 实机执行。
       - name: Template format
         if: runner.os == 'Windows'
         run: cargo fmt --manifest-path templates/minimal-app/Cargo.toml --all -- --check
@@ -160,13 +178,23 @@ jobs:
         if: runner.os == 'Windows'
         run: cargo clippy --manifest-path templates/minimal-app/Cargo.toml --workspace --all-targets --locked -- -D warnings
 
-      - name: Template test (drift + headless + hidden WARP)
+      - name: Template test (drift + headless + hidden host)
         if: runner.os == 'Windows'
         run: cargo test --manifest-path templates/minimal-app/Cargo.toml --workspace --locked
 
+      # release 构建必须留下 GUI 子系统的 exe：双击时不附带控制台。
       - name: Template release build
         if: runner.os == 'Windows'
-        run: cargo build --manifest-path templates/minimal-app/Cargo.toml --release --locked
+        shell: pwsh
+        run: |
+          cargo build --manifest-path templates/minimal-app/Cargo.toml --release --locked
+          $exe = Join-Path $env:CARGO_TARGET_DIR 'release\minimal-app.exe'
+          if (-not (Test-Path -LiteralPath $exe)) { throw "missing release exe: $exe" }
+          $bytes = [IO.File]::ReadAllBytes($exe)
+          $pe = [BitConverter]::ToInt32($bytes, 0x3C)
+          $subsystem = [BitConverter]::ToUInt16($bytes, $pe + 0x5C)
+          if ($subsystem -ne 2) { throw "release exe subsystem $subsystem, expected Windows GUI (2)" }
+          Write-Output "release exe: $exe (subsystem $subsystem)"
 
   prototypes:
     name: prototypes (${{ matrix.os }} / ${{ matrix.example }})

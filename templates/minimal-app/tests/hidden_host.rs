@@ -1,6 +1,7 @@
-//! Windows 隐藏宿主 smoke：不显示 HWND，但在 WARP 上渲染并读回一帧。
+//! Windows 隐藏宿主 smoke：不显示 HWND，在可用的 DX12 适配器上渲染并读回一帧。
 //!
-//! 这是 partial evidence；可见窗口、真实 GPU 与关闭退出仍由人工运行记录。
+//! 宿主先请求硬件适配器，没有时回退 WARP；这是 partial evidence，可见窗口、
+//! 真实 GPU 与关闭退出仍由人工运行记录。
 
 #![cfg(windows)]
 
@@ -8,7 +9,7 @@ use minimal_app::{STARTER_WINDOW, open_starter_window};
 use zenui_windows::{Host, HostConfig};
 
 #[test]
-fn hidden_host_renders_the_starter_on_warp() {
+fn hidden_host_renders_the_starter() {
     let mut runtime = zenui::Runtime::new();
     open_starter_window(&mut runtime).expect("open the starter window");
     let mut host = Host::open(runtime, HostConfig::hidden()).expect("open a hidden host");
