@@ -280,6 +280,19 @@ impl TextSlot {
             Self::Memo(memo) => memo.get(),
         }
     }
+
+    /// 值绑定的写入代数；静态值没有写入路径，返回 `None`。
+    ///
+    /// 编辑器用它区分“处理器写过值绑定”和“模型尚未追上本地编辑”。
+    /// Signal 绑定对相等写入也推进；Memo 绑定只观察计算值变化，写回原值的
+    /// 归一化因此不会被误当成推迟写入（编辑器保留本地文本）。
+    pub(crate) fn epoch(&self, state: &crate::runtime::State) -> Option<u64> {
+        match self {
+            Self::Static(_) | Self::Once(_) => None,
+            Self::Signal(signal) => Some(signal.write_epoch(state)),
+            Self::Memo(memo) => Some(memo.write_epoch(state)),
+        }
+    }
 }
 
 pub enum AttrValue {

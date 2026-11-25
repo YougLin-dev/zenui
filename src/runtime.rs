@@ -1,5 +1,7 @@
 use std::cell::{Cell, RefCell};
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -163,6 +165,8 @@ pub(crate) struct State {
     next_instance: u64,
     next_node_mount: u64,
     unmounts: u64,
+    /// 文本编辑谱系归约的有界记录；测试据此刻画分类顺序，不是公开 API。
+    text_trace: VecDeque<TextTrace>,
 }
 
 /// 旧焦点离开可见集合后的一次结算：旧目标（可选 blur）与接任目标。
@@ -269,7 +273,27 @@ impl State {
             next_instance: 1,
             next_node_mount: 0,
             unmounts: 0,
+            text_trace: VecDeque::new(),
         }
+    }
+
+    /// 追加一条文本编辑谱系事件；超出测试序列所需的长度后丢弃最旧记录。
+    fn push_text_trace(&mut self, event: TextTrace) {
+        self.text_trace.push_back(event);
+        while self.text_trace.len() > TEXT_TRACE_EVENTS {
+            self.text_trace.pop_front();
+        }
+    }
+
+    /// 把编辑器文本推进到派发值并记录这次本地编辑。
+    fn dispatch_text_edit(&mut self, element: usize, value: &str, epoch: Option<u64>) {
+        let trace = {
+            let LocalState::TextInput(editor) = &mut self.elements[element].local else {
+                unreachable!("dispatch requires a mounted text input");
+            };
+            editor.dispatch(value, epoch)
+        };
+        self.push_text_trace(trace);
     }
 
     /// 每次元素挂载分配新的 generation；旧挂载的身份不会命中重新挂载的元素。
@@ -421,8 +445,8 @@ impl State {
             self.bump_presentation();
             // 焦点变化结束所有输入的连续输入 run。
             for element in &mut self.elements {
-                if let LocalState::TextInput { history, .. } = &mut element.local {
-                    history.break_run();
+                if let LocalState::TextInput(editor) = &mut element.local {
+                    editor.history.break_run();
                 }
             }
         }
@@ -943,18 +967,14 @@ impl State {
 
     fn update_local(&mut self, element: usize, value: LocalUpdate) {
         match (&mut self.elements[element].local, value) {
-            (
-                LocalState::TextInput {
-                    caret,
-                    anchor,
-                    selection,
-                    ..
-                },
-                LocalUpdate::Input(value),
-            ) => {
-                *caret = value.chars().count();
-                *anchor = *caret;
-                *selection = None;
+            (LocalState::TextInput(editor), LocalUpdate::Input(value)) => {
+                let length = value.chars().count();
+                editor.value = value;
+                editor.caret = length;
+                editor.anchor = length;
+                editor.selection = None;
+                // 整体替换是外部编辑：丢弃在途派发，等待绑定确认新值。
+                editor.lineage.discard_pending();
             }
             (LocalState::Checkbox { checked }, LocalUpdate::Change(value)) => {
                 *checked = value;
@@ -966,8 +986,8 @@ impl State {
 
     fn text_input(&self, target: &FindTarget) -> Option<usize> {
         let element = self.find_element(target)?;
-        match self.elements[element].local {
-            LocalState::TextInput { caret, .. } => Some(caret),
+        match &self.elements[element].local {
+            LocalState::TextInput(editor) => Some(editor.caret),
             _ => None,
         }
     }
@@ -979,7 +999,7 @@ impl State {
         element: usize,
         operation: NodeOperation,
     ) -> Result<(), DispatchError> {
-        if matches!(self.elements[element].local, LocalState::TextInput { .. }) {
+        if matches!(self.elements[element].local, LocalState::TextInput(_)) {
             Ok(())
         } else {
             Err(DispatchError::WrongKind { node, operation })
@@ -1100,23 +1120,15 @@ impl State {
         if !self.element_accepts_input(element) {
             return false;
         }
-        if let LocalState::TextInput {
-            caret,
-            anchor,
-            selection,
-            composition,
-            ..
-        } = &mut self.elements[element].local
-        {
-            if composition.is_some() {
-                return false;
-            }
-            *caret = offset;
-            *anchor = offset;
-            *selection = Some((offset, offset));
-        } else {
+        let LocalState::TextInput(editor) = &mut self.elements[element].local else {
+            return false;
+        };
+        if editor.is_composing() {
             return false;
         }
+        editor.caret = offset;
+        editor.anchor = offset;
+        editor.selection = Some((offset, offset));
         self.bump_presentation();
         true
     }
@@ -1244,14 +1256,14 @@ impl MountedElement {
             })
     }
 
-    fn text_value(&self) -> Option<&str> {
+    /// `value` 绑定的写入代数；静态值或缺失绑定返回 `None`。
+    fn value_epoch(&self, state: &State) -> Option<u64> {
         self.attrs
             .iter()
             .find(|attr| attr.name == "value")
-            .and_then(|attr| attr.current.as_ref())
-            .and_then(|current| match current {
-                AttrCurrent::Text(text) => Some(text.as_str()),
-                AttrCurrent::Bool(_) => None,
+            .and_then(|attr| match &attr.value {
+                AttrValue::Text(slot) => slot.epoch(state),
+                AttrValue::Bool(_) | AttrValue::ResultBool(_) => None,
             })
     }
 
@@ -1278,16 +1290,8 @@ enum AttrCurrent {
 
 enum LocalState {
     None,
-    TextInput {
-        caret: usize,
-        /// 选择的活动端（焦点）；`caret` 与它相同表示折叠。
-        anchor: usize,
-        selection: Option<(usize, usize)>,
-        composition: Option<Composition>,
-        /// 这个输入自己的撤销/重做历史；随元素卸载释放。
-        /// Box 让每个元素槽位保持小尺寸，只有文本输入承担历史分配。
-        history: Box<TextHistory>,
-    },
+    /// Box 让每个元素槽位保持小尺寸，只有文本输入承担编辑器状态的分配。
+    TextInput(Box<TextEditing>),
     Checkbox {
         checked: bool,
     },
@@ -1295,14 +1299,294 @@ enum LocalState {
 
 impl LocalState {
     fn is_composing(&self) -> bool {
-        matches!(
-            self,
-            Self::TextInput {
-                composition: Some(_),
-                ..
-            }
-        )
+        matches!(self, Self::TextInput(editor) if editor.is_composing())
     }
+}
+
+/// 一个已挂载文本输入的本地编辑状态。
+///
+/// `value` 是编辑器当前文本：本地编辑先写这里，模型结算或外部替换再更新它。
+/// 渲染与辅助功能读取的是这个值，因此模型滞后时不会把刚输入的文字回滚。
+struct TextEditing {
+    value: String,
+    caret: usize,
+    /// 选择的活动端（焦点）；`caret` 与它相同表示折叠。
+    anchor: usize,
+    selection: Option<(usize, usize)>,
+    composition: Option<Composition>,
+    /// 这个输入自己的撤销/重做历史；随元素卸载释放。
+    history: TextHistory,
+    lineage: EditLineage,
+}
+
+impl TextEditing {
+    fn new(origin: u64) -> Self {
+        Self {
+            value: String::new(),
+            caret: 0,
+            anchor: 0,
+            selection: None,
+            composition: None,
+            history: TextHistory::default(),
+            lineage: EditLineage::new(origin),
+        }
+    }
+
+    fn is_composing(&self) -> bool {
+        self.composition.is_some()
+    }
+
+    /// 记一次本地派发并把编辑器文本推进到派发值；处理器随后运行。
+    fn dispatch(&mut self, value: &str, epoch: Option<u64>) -> TextTrace {
+        self.adopt(value);
+        let lineage = &mut self.lineage;
+        lineage.revision = lineage.revision.wrapping_add(1);
+        lineage.in_flight.push_back(DispatchedEdit {
+            revision: lineage.revision,
+            digest: text_digest(value),
+        });
+        while lineage.in_flight.len() > TEXT_IN_FLIGHT {
+            lineage.in_flight.pop_front();
+        }
+        lineage.turn_epoch = Some(epoch);
+        TextTrace::LocalEdit {
+            origin: lineage.origin,
+            revision: lineage.revision,
+        }
+    }
+
+    /// 归约刷新看到的已提交值；返回需要写入 trace 的分类事件。
+    ///
+    /// 模型是值的权威，但模型可能滞后于本地编辑。分类依据是编辑谱系而不是
+    /// 单纯的“值变了”：同一命令内处理器写过的绑定按结算处理（包括归一化、
+    /// 截断或写回原值）；晚到的旧 revision 结算被忽略；其余变化是外部替换。
+    fn observe(&mut self, committed: &str, epoch: Option<u64>) -> Option<TextTrace> {
+        let origin = self.lineage.origin;
+        if self.lineage.observed.is_none() {
+            // 挂载后的第一次刷新：以绑定值初始化编辑器，没有可分类的编辑。
+            self.adopt(committed);
+            self.lineage.observed = Some(committed.to_owned());
+            return None;
+        }
+        let observed_changed = self.lineage.observed.as_deref() != Some(committed);
+        let turn = self.lineage.turn_epoch.take();
+        // 只有高于结算水位的派发才是当前编辑；更早的记录只用于辨认晚到值。
+        let pending = self
+            .lineage
+            .in_flight
+            .back()
+            .filter(|edit| edit.revision > self.lineage.settled)
+            .map(|edit| edit.revision);
+        let digest = text_digest(committed);
+        let stale = self
+            .lineage
+            .in_flight
+            .iter()
+            .rev()
+            .find(|edit| Some(edit.revision) != pending && edit.digest == digest)
+            .map(|edit| edit.revision);
+        let event = match pending {
+            None => {
+                if self.value == committed {
+                    None
+                } else if let Some(stale) = stale {
+                    // 已结算 revision 的晚到或重复值：本地文本与历史保持不变。
+                    Some(TextTrace::StaleSettlement {
+                        origin,
+                        current: self.lineage.revision,
+                        stale,
+                    })
+                } else {
+                    let revision = self.lineage.revision;
+                    self.reset_to(committed);
+                    Some(TextTrace::ExternalReset { origin, revision })
+                }
+            }
+            Some(revision) => {
+                let matched = self
+                    .lineage
+                    .in_flight
+                    .back()
+                    .is_some_and(|edit| edit.revision == revision && edit.digest == digest);
+                if matched {
+                    let normalized = self.settle_committed(committed, revision);
+                    Some(TextTrace::Settlement {
+                        origin,
+                        revision,
+                        normalized,
+                    })
+                } else if let Some(stale) = stale {
+                    // 旧 revision 的结算晚到：保留最新本地文本与历史。
+                    Some(TextTrace::StaleSettlement {
+                        origin,
+                        current: revision,
+                        stale,
+                    })
+                } else if let Some(base) = turn {
+                    let written = match (base, epoch) {
+                        (None, _) | (Some(_), None) => true,
+                        (Some(base), Some(current)) => base != current,
+                    };
+                    // 同一命令内的刷新：处理器已经处理过这次编辑，写入值
+                    // 即使等于旧值或被归一化，也仍是这次编辑的结算。
+                    if written || observed_changed {
+                        let normalized = self.settle_committed(committed, revision);
+                        Some(TextTrace::Settlement {
+                            origin,
+                            revision,
+                            normalized,
+                        })
+                    } else {
+                        None
+                    }
+                } else if !observed_changed {
+                    // 模型仍停在编辑前的值：处理器把写入推迟到了之后的命令。
+                    None
+                } else {
+                    self.reset_to(committed);
+                    Some(TextTrace::ExternalReset { origin, revision })
+                }
+            }
+        };
+        self.note_observed(committed);
+        event
+    }
+
+    /// 结算当前派发：采用提交值、夹取偏移并推进结算水位。
+    fn settle_committed(&mut self, committed: &str, revision: u64) -> bool {
+        let normalized = self.value != committed;
+        self.settle_value(committed);
+        self.lineage.settled = self.lineage.settled.max(revision);
+        self.lineage.in_flight.pop_back();
+        normalized
+    }
+
+    /// 外部替换：丢弃在途派发、清空历史并采用模型值。
+    fn reset_to(&mut self, committed: &str) {
+        self.history.clear();
+        self.lineage.in_flight.clear();
+        self.lineage.settled = self.lineage.revision;
+        self.adopt(committed);
+    }
+
+    /// 采用模型值并把 caret/anchor/selection 夹回文本范围。
+    fn settle_value(&mut self, value: &str) {
+        self.adopt(value);
+        self.clamp_offsets();
+    }
+
+    fn adopt(&mut self, value: &str) {
+        if self.value != value {
+            self.value.clear();
+            self.value.push_str(value);
+        }
+    }
+
+    fn note_observed(&mut self, committed: &str) {
+        if self.lineage.observed.as_deref() != Some(committed) {
+            self.lineage.observed = Some(committed.to_owned());
+        }
+    }
+
+    fn clamp_offsets(&mut self) {
+        let length = self.value.chars().count();
+        self.caret = self.caret.min(length);
+        self.anchor = self.anchor.min(length);
+        if let Some((start, end)) = self.selection {
+            self.selection = Some(text_edit::normalized_range(start, end, length));
+        }
+    }
+
+    /// 元素卸载时释放编辑器文本、历史与谱系观察值。
+    fn reset(&mut self) {
+        self.value = String::new();
+        self.history.clear();
+        self.lineage.discard_pending();
+        self.lineage.observed = None;
+    }
+}
+
+/// 一个文本输入的编辑谱系。
+///
+/// `origin` 取本次挂载的 Node ID generation：重挂载必然得到新的 origin，
+/// 旧挂载的派发也只可能落在旧 Node ID 上。`revision` 只随本地编辑推进，
+/// `in_flight` 保留尚未结算的派发摘要，使模型滞后时刷新不会回滚本地文本。
+struct EditLineage {
+    origin: u64,
+    revision: u64,
+    /// 已结算的最高 revision。更早的派发即使仍在 `in_flight` 里保留摘要供
+    /// 晚到结算匹配，也不再是“当前编辑”，不能被当作待结算的目标。
+    settled: u64,
+    /// 按 revision 递增的未结算派发；容量有界，更早的记录用于识别晚到的结算。
+    in_flight: VecDeque<DispatchedEdit>,
+    /// 最近一次刷新看到的已提交值；`None` 表示还未绑定初值。
+    observed: Option<String>,
+    /// 本次命令的收尾刷新尚未发生。外层 `None` 表示不在命令内；内层 `None`
+    /// 表示值绑定不可写（静态值或缺失），此时任何提交值都按已结算处理。
+    turn_epoch: Option<Option<u64>>,
+}
+
+impl EditLineage {
+    fn new(origin: u64) -> Self {
+        Self {
+            origin,
+            revision: 0,
+            settled: 0,
+            in_flight: VecDeque::new(),
+            observed: None,
+            turn_epoch: None,
+        }
+    }
+
+    /// 丢弃在途派发与本次命令的结算窗口；外部整体替换或卸载使用。
+    fn discard_pending(&mut self) {
+        self.in_flight.clear();
+        self.turn_epoch = None;
+    }
+
+    /// 派发命令在收尾前失败：这次编辑不再等待结算。
+    fn abort_dispatch(&mut self) {
+        self.turn_epoch = None;
+        self.in_flight.pop_back();
+    }
+}
+
+/// 一次已派发、尚未被模型结算的本地编辑。
+struct DispatchedEdit {
+    revision: u64,
+    /// 派发值的摘要。保留摘要而不是整段文本，让证据窗口覆盖更多编辑；
+    /// 模型值是普通 `String`，识别晚到结算只需要相等性。
+    digest: u64,
+}
+
+/// 编辑值的稳定摘要；同一进程内的相等比较足够，不用于持久化或跨进程。
+fn text_digest(value: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// 文本编辑谱系归约的有界内部记录；测试据此刻画分类顺序，不属于公开 API。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TextTrace {
+    /// 一次本地编辑派发。
+    LocalEdit { origin: u64, revision: u64 },
+    /// 当前编辑被模型结算；`normalized` 表示提交值不同于派发值。
+    Settlement {
+        origin: u64,
+        revision: u64,
+        normalized: bool,
+    },
+    /// 旧编辑的结算晚到，被忽略。
+    StaleSettlement {
+        origin: u64,
+        current: u64,
+        stale: u64,
+    },
+    /// 非本地编辑产生的值；编辑器采用它并清空历史。
+    ExternalReset { origin: u64, revision: u64 },
+    /// 文本输入挂载建立新的编辑 origin；初次挂载同样计入。
+    Remount { origin: u64 },
 }
 
 /// preedit 只存在于编辑器本地；`base_*` 记录组合开始时的已提交状态，取消时恢复。
@@ -1323,7 +1607,8 @@ impl Composition {
     }
 }
 
-/// 一次可撤销编辑前后的完整本地状态；`value` 是已经提交到模型的值。
+/// 一次可撤销编辑前后的完整本地状态；`value` 是编辑器当时的文本，
+/// 在模型滞后时可能还未被结算。
 #[derive(Clone, PartialEq, Eq, Debug)]
 struct TextSnapshot {
     value: String,
@@ -1362,37 +1647,30 @@ struct InsertRun {
 
 const HISTORY_ENTRIES: usize = 100;
 const HISTORY_BYTES: usize = 256 * 1024;
+
+/// 每个文本输入保留的未结算派发摘要数；更早的晚到结算按外部替换处理。
+const TEXT_IN_FLIGHT: usize = 256;
+
+/// 编辑谱系 trace 的事件上限；测试只依赖最近一次序列。
+const TEXT_TRACE_EVENTS: usize = 64;
 /// 一个连续输入 run 最多合并的单字符数；到界后下一次插入开启新步。
 const INSERT_RUN_SCALARS: usize = 64;
 
 /// 每个文本输入自己的有界编辑历史。
 ///
 /// 历史只保存已提交值的快照；撤销和重做都通过一次 `on:input` 写回模型，因此
-/// 应用始终是值的权威。`observed` 是最近一次刷新看到的已提交值，外部替换据此
-/// 清空两个栈；`settle_local` 让一次本地编辑自己的刷新不被误判为外部变化。
+/// 应用始终是值的权威。结算与外部替换的区分在 [`EditLineage`]；这里只保存
+/// 撤销/重做栈和连续输入 run。
 #[derive(Default)]
 struct TextHistory {
     undo: VecDeque<TextEntry>,
     redo: VecDeque<TextEntry>,
     undo_bytes: usize,
     redo_bytes: usize,
-    observed: Option<String>,
-    settle_local: bool,
     run: Option<InsertRun>,
 }
 
 impl TextHistory {
-    /// 接受一次刷新看到的值；不是本地编辑结算时，变化即为外部替换。
-    fn observe(&mut self, value: &str) {
-        if self.settle_local {
-            self.settle_local = false;
-            self.observed = Some(value.to_owned());
-        } else if self.observed.as_deref() != Some(value) {
-            self.observed = Some(value.to_owned());
-            self.clear();
-        }
-    }
-
     fn clear(&mut self) {
         self.undo.clear();
         self.redo.clear();
@@ -1404,13 +1682,6 @@ impl TextHistory {
     /// 结束当前连续输入；下一次单字符插入开启新的撤销步。
     fn break_run(&mut self) {
         self.run = None;
-    }
-
-    /// 元素卸载时释放历史与观察到的值，不在死槽位里保留文本。
-    fn reset(&mut self) {
-        self.clear();
-        self.observed = None;
-        self.settle_local = false;
     }
 
     /// 记录一次已提交编辑；提交前后值相同则不记录，也不清空 redo。
@@ -1508,20 +1779,14 @@ fn trim_history(stack: &mut VecDeque<TextEntry>, bytes: &mut usize) {
 }
 
 fn text_snapshot(element: &MountedElement) -> Option<TextSnapshot> {
-    let LocalState::TextInput {
-        caret,
-        anchor,
-        selection,
-        ..
-    } = &element.local
-    else {
+    let LocalState::TextInput(editor) = &element.local else {
         return None;
     };
     Some(TextSnapshot {
-        value: element.text_value().unwrap_or_default().to_owned(),
-        caret: *caret,
-        anchor: *anchor,
-        selection: *selection,
+        value: editor.value.clone(),
+        caret: editor.caret,
+        anchor: editor.anchor,
+        selection: editor.selection,
     })
 }
 
@@ -3199,18 +3464,18 @@ impl Runtime {
                             }
                         }
                     }
+                    let id = state.mint_node();
+                    // 每次挂载（包括同 key 重挂载）都建立新的编辑 origin；
+                    // 旧挂载的 Node ID 是 StaleNode，旧派发无法命中新编辑器。
                     let local = match tag {
-                        "text-input" => LocalState::TextInput {
-                            caret: 0,
-                            anchor: 0,
-                            selection: None,
-                            composition: None,
-                            history: Box::default(),
-                        },
+                        "text-input" => {
+                            let origin = id.generation();
+                            state.push_text_trace(TextTrace::Remount { origin });
+                            LocalState::TextInput(Box::new(TextEditing::new(origin)))
+                        }
                         "checkbox" => LocalState::Checkbox { checked: false },
                         _ => LocalState::None,
                     };
-                    let id = state.mint_node();
                     let slot = state.elements.len();
                     let inline_styles = plan
                         .inline_styles
@@ -3396,30 +3661,45 @@ impl Runtime {
         for style in &mut styles {
             style.current = Some(style.slot.evaluate());
         }
+        // 值绑定的写入代数要在同一份新属性上读取，且不能嵌套借用 State。
+        let committed = attrs
+            .iter()
+            .find(|attr| attr.name == "value")
+            .and_then(|attr| attr.current.as_ref())
+            .and_then(|current| match current {
+                AttrCurrent::Text(text) => Some(text.as_str()),
+                AttrCurrent::Bool(_) => None,
+            })
+            .unwrap_or_default()
+            .to_owned();
         with_state(|state| {
-            let element = &mut state.elements[id];
-            if let LocalState::Checkbox { checked } = &mut element.local
-                && let Some(AttrCurrent::Bool(value)) = attrs
-                    .iter()
-                    .find(|attr| attr.name == "checked")
-                    .and_then(|attr| attr.current.clone())
-            {
-                *checked = value;
-            }
-            element.attrs = attrs;
-            element.inline_styles = styles;
-            if let LocalState::TextInput { history, .. } = &mut element.local {
-                let value = element
-                    .attrs
-                    .iter()
-                    .find(|attr| attr.name == "value")
-                    .and_then(|attr| attr.current.as_ref())
-                    .and_then(|current| match current {
-                        AttrCurrent::Text(text) => Some(text.as_str()),
-                        AttrCurrent::Bool(_) => None,
-                    })
-                    .unwrap_or_default();
-                history.observe(value);
+            // 属性已经取出；绑定代数必须从这份新属性读取。
+            let epoch = attrs
+                .iter()
+                .find(|attr| attr.name == "value")
+                .and_then(|attr| match &attr.value {
+                    AttrValue::Text(slot) => slot.epoch(state),
+                    AttrValue::Bool(_) | AttrValue::ResultBool(_) => None,
+                });
+            let event = {
+                let element = &mut state.elements[id];
+                if let LocalState::Checkbox { checked } = &mut element.local
+                    && let Some(AttrCurrent::Bool(value)) = attrs
+                        .iter()
+                        .find(|attr| attr.name == "checked")
+                        .and_then(|attr| attr.current.clone())
+                {
+                    *checked = value;
+                }
+                element.attrs = attrs;
+                element.inline_styles = styles;
+                match &mut element.local {
+                    LocalState::TextInput(editor) => editor.observe(&committed, epoch),
+                    _ => None,
+                }
+            };
+            if let Some(event) = event {
+                state.push_text_trace(event);
             }
         });
     }
@@ -3754,8 +4034,8 @@ impl Runtime {
                 state.phase = Phase::Event;
                 state.fault = None;
                 state.write_error = None;
-                if let LocalState::TextInput { history, .. } = &mut state.elements[element].local {
-                    history.clear();
+                if let LocalState::TextInput(editor) = &mut state.elements[element].local {
+                    editor.history.clear();
                 }
                 state.update_local(element, LocalUpdate::Input(value.to_owned()));
             });
@@ -3860,8 +4140,8 @@ impl Runtime {
             Movement::SelectAll => (0, length),
         };
         set_local_selection(&mut state.elements[element].local, anchor, focus);
-        if let LocalState::TextInput { history, .. } = &mut state.elements[element].local {
-            history.break_run();
+        if let LocalState::TextInput(editor) = &mut state.elements[element].local {
+            editor.history.break_run();
         }
         state.bump_presentation();
         Ok(())
@@ -3874,28 +4154,20 @@ impl Runtime {
         operation: NodeOperation,
         edit: Edit<'_>,
     ) -> Result<(), DispatchError> {
+        with_state(|state| state.require_editable_text_input(node, element, operation))?;
         let (before, caret, selection) = with_state(|state| {
-            state.require_editable_text_input(node, element, operation)?;
-            let LocalState::TextInput {
-                caret,
-                anchor,
-                selection,
-                ..
-            } = &state.elements[element].local
-            else {
+            let LocalState::TextInput(editor) = &state.elements[element].local else {
                 unreachable!("require_editable_text_input validated the input");
             };
             let before = TextSnapshot {
-                value: state.elements[element]
-                    .text_value()
-                    .unwrap_or_default()
-                    .to_owned(),
-                caret: *caret,
-                anchor: *anchor,
-                selection: *selection,
+                value: editor.value.clone(),
+                caret: editor.caret,
+                anchor: editor.anchor,
+                selection: editor.selection,
             };
-            Ok::<_, DispatchError>((before, *caret, *selection))
-        })?;
+            (before, editor.caret, editor.selection)
+        });
+        let epoch = with_state(|state| state.elements[element].value_epoch(state));
         let kind = match edit {
             Edit::Insert(text) => {
                 let mut scalars = text.chars();
@@ -3916,21 +4188,12 @@ impl Runtime {
         let (event_id, mut event) =
             self.take_node_event(node, element, EventKind::Input, operation)?;
         with_state(|state| {
-            let LocalState::TextInput {
-                caret,
-                anchor,
-                selection,
-                history,
-                ..
-            } = &mut state.elements[element].local
-            else {
-                unreachable!("require_editable_text_input validated the input");
-            };
-            *caret = next_caret;
-            *anchor = next_caret;
-            *selection = None;
-            // 这次编辑自己的模型写入不能被当作外部替换。
-            history.settle_local = true;
+            if let LocalState::TextInput(editor) = &mut state.elements[element].local {
+                editor.caret = next_caret;
+                editor.anchor = next_caret;
+                editor.selection = None;
+            }
+            state.dispatch_text_edit(element, &new_value, epoch);
         });
         with_state(State::bump_presentation);
         // handler unwind 不能把占位事件或 Event 阶段留在槽位里。
@@ -3944,11 +4207,11 @@ impl Runtime {
             state.phase = Phase::Idle;
         });
         if let Err(payload) = outcome {
-            with_state(|state| clear_history_settle(state, element));
+            with_state(|state| abort_text_dispatch(state, element));
             std::panic::resume_unwind(payload);
         }
         if let Err(error) = self.finish_command() {
-            with_state(|state| clear_history_settle(state, element));
+            with_state(|state| abort_text_dispatch(state, element));
             return Err(DispatchError::Command(error));
         }
         with_state(|state| clamp_local_edit(state, element));
@@ -3956,10 +4219,10 @@ impl Runtime {
         Ok(())
     }
 
-    /// 把一次编辑前后的已提交状态记入该输入自己的历史。
+    /// 把一次编辑前后的编辑器状态记入该输入自己的历史。
     ///
-    /// 只记录仍然挂载的元素；处理器改写的值以刷新后的已提交值为准，
-    /// 提交前后值相同的编辑不产生条目。
+    /// 只记录仍然挂载的元素；同一命令内结算的归一化值已经写回编辑器，
+    /// 因此条目以提交后的文本为准；提交前后值相同的编辑不产生条目。
     fn record_text_edit(&mut self, element: usize, before: TextSnapshot, kind: EditKind) {
         with_state(|state| {
             if !state.element_is_mounted(element) {
@@ -3968,10 +4231,10 @@ impl Runtime {
             let Some(after) = text_snapshot(&state.elements[element]) else {
                 return;
             };
-            let LocalState::TextInput { history, .. } = &mut state.elements[element].local else {
+            let LocalState::TextInput(editor) = &mut state.elements[element].local else {
                 return;
             };
-            history.record(before, after, kind);
+            editor.history.record(before, after, kind);
         });
     }
 
@@ -4004,19 +4267,18 @@ impl Runtime {
             with_state(|state| state.require_editable_text_input(node, element, operation))?;
             // 撤销/重做后继续输入必须开启新的 run，不能并入更早的条目。
             with_state(|state| {
-                let LocalState::TextInput { history, .. } = &mut state.elements[element].local
-                else {
+                let LocalState::TextInput(editor) = &mut state.elements[element].local else {
                     unreachable!("require_editable_text_input validated the input");
                 };
-                history.break_run();
+                editor.history.break_run();
             });
             let entry = with_state(|state| {
-                let LocalState::TextInput { history, .. } = &state.elements[element].local else {
+                let LocalState::TextInput(editor) = &state.elements[element].local else {
                     unreachable!("require_editable_text_input validated the input");
                 };
                 match direction {
-                    HistoryDirection::Undo => history.undo.back(),
-                    HistoryDirection::Redo => history.redo.back(),
+                    HistoryDirection::Undo => editor.history.undo.back(),
+                    HistoryDirection::Redo => editor.history.redo.back(),
                 }
                 .cloned()
             });
@@ -4029,24 +4291,22 @@ impl Runtime {
             };
             let (event_id, mut event) =
                 self.take_node_event(node, element, EventKind::Input, operation)?;
-            let (caret, anchor, selection) = (target.caret, target.anchor, target.selection);
+            let epoch = with_state(|state| state.elements[element].value_epoch(state));
+            let length = target.value.chars().count();
+            let (caret, anchor, selection) = (
+                target.caret.min(length),
+                target.anchor.min(length),
+                target
+                    .selection
+                    .map(|(start, end)| text_edit::normalized_range(start, end, length)),
+            );
             with_state(|state| {
-                let LocalState::TextInput {
-                    caret: current_caret,
-                    anchor: current_anchor,
-                    selection: current_selection,
-                    history,
-                    ..
-                } = &mut state.elements[element].local
-                else {
-                    unreachable!("require_editable_text_input validated the input");
-                };
-                let length = target.value.chars().count();
-                *current_caret = caret.min(length);
-                *current_anchor = anchor.min(length);
-                *current_selection =
-                    selection.map(|(start, end)| text_edit::normalized_range(start, end, length));
-                history.settle_local = true;
+                if let LocalState::TextInput(editor) = &mut state.elements[element].local {
+                    editor.caret = caret;
+                    editor.anchor = anchor;
+                    editor.selection = selection;
+                }
+                state.dispatch_text_edit(element, &target.value, epoch);
             });
             with_state(State::bump_presentation);
             // handler unwind 不能把占位事件或 Event 阶段留在槽位里。
@@ -4060,11 +4320,11 @@ impl Runtime {
                 state.phase = Phase::Idle;
             });
             if let Err(payload) = outcome {
-                with_state(|state| clear_history_settle(state, element));
+                with_state(|state| abort_text_dispatch(state, element));
                 std::panic::resume_unwind(payload);
             }
             if let Err(error) = self.finish_command() {
-                with_state(|state| clear_history_settle(state, element));
+                with_state(|state| abort_text_dispatch(state, element));
                 return Err(DispatchError::Command(error));
             }
             with_state(|state| {
@@ -4072,19 +4332,18 @@ impl Runtime {
                 if !state.element_is_mounted(element) {
                     return;
                 }
-                let LocalState::TextInput { history, .. } = &mut state.elements[element].local
-                else {
+                let LocalState::TextInput(editor) = &mut state.elements[element].local else {
                     return;
                 };
                 match direction {
                     HistoryDirection::Undo => {
-                        if history.pop_undo().is_some() {
-                            history.push_redo(entry);
+                        if editor.history.pop_undo().is_some() {
+                            editor.history.push_redo(entry);
                         }
                     }
                     HistoryDirection::Redo => {
-                        if history.pop_redo().is_some() {
-                            history.push_undo(entry);
+                        if editor.history.pop_redo().is_some() {
+                            editor.history.push_undo(entry);
                         }
                     }
                 }
@@ -4112,32 +4371,24 @@ impl Runtime {
                 state.require_enabled_text_input(node, element, NodeOperation::CompositionStart)
             })?;
             let (caret, selection) = with_state(|state| {
-                let LocalState::TextInput {
-                    caret,
-                    anchor,
-                    selection,
-                    composition,
-                    history,
-                    ..
-                } = &mut state.elements[element].local
-                else {
+                let LocalState::TextInput(editor) = &mut state.elements[element].local else {
                     unreachable!("require_enabled_text_input validated the input");
                 };
-                if composition.is_some() {
+                if editor.is_composing() {
                     return Err(DispatchError::Rejected {
                         node,
                         operation: NodeOperation::CompositionStart,
                         reason: "text input is already composing",
                     });
                 }
-                *composition = Some(Composition {
-                    base_caret: *caret,
-                    base_anchor: *anchor,
-                    base_selection: *selection,
+                editor.composition = Some(Composition {
+                    base_caret: editor.caret,
+                    base_anchor: editor.anchor,
+                    base_selection: editor.selection,
                     preedit: String::new(),
                 });
-                history.break_run();
-                Ok((*caret, *selection))
+                editor.history.break_run();
+                Ok((editor.caret, editor.selection))
             })?;
             with_state(State::bump_presentation);
             self.enter_event_phase();
@@ -4178,17 +4429,10 @@ impl Runtime {
                 state.require_enabled_text_input(node, element, NodeOperation::CompositionUpdate)
             })?;
             let (caret, selection) = with_state(|state| {
-                let LocalState::TextInput {
-                    caret,
-                    anchor,
-                    selection,
-                    composition,
-                    ..
-                } = &mut state.elements[element].local
-                else {
+                let LocalState::TextInput(editor) = &mut state.elements[element].local else {
                     unreachable!("require_enabled_text_input validated the input");
                 };
-                let Some(composition) = composition else {
+                let Some(composition) = editor.composition.as_mut() else {
                     return Err(DispatchError::Rejected {
                         node,
                         operation: NodeOperation::CompositionUpdate,
@@ -4196,10 +4440,11 @@ impl Runtime {
                     });
                 };
                 composition.preedit = preedit.to_owned();
-                *caret = composition.base_range().0 + preedit.chars().count();
-                *anchor = *caret;
-                *selection = None;
-                Ok((*caret, *selection))
+                let caret = composition.base_range().0 + preedit.chars().count();
+                editor.caret = caret;
+                editor.anchor = caret;
+                editor.selection = None;
+                Ok((caret, editor.selection))
             })?;
             with_state(State::bump_presentation);
             self.enter_event_phase();
@@ -4243,7 +4488,7 @@ impl Runtime {
             self.enter_event_phase();
             let before = self.commit_composition(node, element, text)?;
             if let Err(error) = self.leave_event_phase() {
-                with_state(|state| clear_history_settle(state, element));
+                with_state(|state| abort_text_dispatch(state, element));
                 return Err(DispatchError::Command(error));
             }
             with_state(|state| clamp_local_edit(state, element));
@@ -4286,29 +4531,25 @@ impl Runtime {
         element: usize,
         text: &str,
     ) -> Result<Option<TextSnapshot>, DispatchError> {
-        // 组合期间外部 value 可能已更新；候选插入当前文本并按长度夹取组合区间。
+        // 组合期间外部 value 可能已更新；候选插入编辑器当前文本并按长度夹取组合区间。
         let current_text = with_state(|state| {
-            state.elements[element]
-                .text_value()
-                .unwrap_or_default()
-                .to_owned()
-        });
-        let (before, new_text, caret) = with_state(|state| {
-            let LocalState::TextInput {
-                caret,
-                anchor,
-                selection,
-                composition,
-                history,
-                ..
-            } = &mut state.elements[element].local
-            else {
+            let LocalState::TextInput(editor) = &state.elements[element].local else {
                 return Err(DispatchError::WrongKind {
                     node,
                     operation: NodeOperation::CompositionCommit,
                 });
             };
-            let Some(composition) = composition.take() else {
+            Ok::<_, DispatchError>(editor.value.clone())
+        })?;
+        let epoch = with_state(|state| state.elements[element].value_epoch(state));
+        let (before, new_text, caret) = with_state(|state| {
+            let LocalState::TextInput(editor) = &mut state.elements[element].local else {
+                return Err(DispatchError::WrongKind {
+                    node,
+                    operation: NodeOperation::CompositionCommit,
+                });
+            };
+            let Some(composition) = editor.composition.take() else {
                 return Err(DispatchError::Rejected {
                     node,
                     operation: NodeOperation::CompositionCommit,
@@ -4324,12 +4565,12 @@ impl Runtime {
             };
             let (start, end) = composition.base_range();
             let (new_text, next_caret) = text_edit::replace_range(&current_text, start, end, text);
-            *caret = next_caret;
-            *anchor = next_caret;
-            *selection = None;
-            history.settle_local = true;
-            Ok((before, new_text, *caret))
+            editor.caret = next_caret;
+            editor.anchor = next_caret;
+            editor.selection = None;
+            Ok::<_, DispatchError>((before, new_text, next_caret))
         })?;
+        with_state(|state| state.dispatch_text_edit(element, &new_text, epoch));
         with_state(State::bump_presentation);
         self.dispatch_element_event(element, EventKind::CompositionEnd, |event| {
             if let Event::CompositionEnd(handler) = event {
@@ -4351,30 +4592,23 @@ impl Runtime {
 
     fn cancel_composition(&mut self, node: NodeId, element: usize) -> Result<(), DispatchError> {
         let (discarded, caret, selection) = with_state(|state| {
-            let LocalState::TextInput {
-                caret,
-                anchor,
-                selection,
-                composition,
-                ..
-            } = &mut state.elements[element].local
-            else {
+            let LocalState::TextInput(editor) = &mut state.elements[element].local else {
                 return Err(DispatchError::WrongKind {
                     node,
                     operation: NodeOperation::CompositionCancel,
                 });
             };
-            let Some(composition) = composition.take() else {
+            let Some(composition) = editor.composition.take() else {
                 return Err(DispatchError::Rejected {
                     node,
                     operation: NodeOperation::CompositionCancel,
                     reason: "text input is not composing",
                 });
             };
-            *caret = composition.base_caret;
-            *anchor = composition.base_anchor;
-            *selection = composition.base_selection;
-            Ok((composition.preedit, *caret, *selection))
+            editor.caret = composition.base_caret;
+            editor.anchor = composition.base_anchor;
+            editor.selection = composition.base_selection;
+            Ok((composition.preedit, editor.caret, editor.selection))
         })?;
         with_state(State::bump_presentation);
         self.dispatch_element_event(element, EventKind::CompositionCancel, |event| {
@@ -4833,10 +5067,10 @@ impl Runtime {
         let state = self.state.borrow();
         let element = state.find_element(&FindTarget::Label(label.to_owned()))?;
         match &state.elements[element].local {
-            LocalState::TextInput {
-                composition: Some(composition),
-                ..
-            } => Some(composition.preedit.clone()),
+            LocalState::TextInput(editor) => editor
+                .composition
+                .as_ref()
+                .map(|composition| composition.preedit.clone()),
             _ => None,
         }
     }
@@ -5016,57 +5250,41 @@ fn focus_replacement(
 }
 
 fn text_length(element: &MountedElement) -> usize {
-    element
-        .text_value()
-        .map_or(0, |value| value.chars().count())
-}
-
-fn clear_history_settle(state: &mut State, element: usize) {
-    if let LocalState::TextInput { history, .. } = &mut state.elements[element].local {
-        history.settle_local = false;
+    match &element.local {
+        LocalState::TextInput(editor) => editor.value.chars().count(),
+        _ => 0,
     }
 }
 
-/// 释放一批已卸载节点及其子树中的文本历史与观察值。
+fn abort_text_dispatch(state: &mut State, element: usize) {
+    if let LocalState::TextInput(editor) = &mut state.elements[element].local {
+        editor.lineage.abort_dispatch();
+    }
+}
+
+/// 释放一批已卸载节点及其子树中的编辑器文本、历史与谱系观察值。
 fn clear_history_in_nodes(state: &mut State, nodes: &[MountedNode]) {
     let mut elements = Vec::new();
     collect_elements(state, nodes, &mut elements);
     for element in elements {
-        if let LocalState::TextInput { history, .. } = &mut state.elements[element].local {
-            history.reset();
+        if let LocalState::TextInput(editor) = &mut state.elements[element].local {
+            editor.reset();
         }
     }
 }
 
 /// handler 可能改写了值；刷新后把本地 caret/selection 夹回新值范围。
 fn clamp_local_edit(state: &mut State, element: usize) {
-    let length = text_length(&state.elements[element]);
-    if let LocalState::TextInput {
-        caret,
-        anchor,
-        selection,
-        ..
-    } = &mut state.elements[element].local
-    {
-        *caret = (*caret).min(length);
-        *anchor = (*anchor).min(length);
-        if let Some((start, end)) = *selection {
-            *selection = Some(text_edit::normalized_range(start, end, length));
-        }
+    if let LocalState::TextInput(editor) = &mut state.elements[element].local {
+        editor.clamp_offsets();
     }
 }
 
 fn set_local_selection(local: &mut LocalState, anchor: usize, focus: usize) {
-    if let LocalState::TextInput {
-        caret,
-        anchor: fixed,
-        selection,
-        ..
-    } = local
-    {
-        *caret = focus;
-        *fixed = anchor;
-        *selection = Some((anchor.min(focus), anchor.max(focus)));
+    if let LocalState::TextInput(editor) = local {
+        editor.caret = focus;
+        editor.anchor = anchor;
+        editor.selection = Some((anchor.min(focus), anchor.max(focus)));
     }
 }
 
@@ -5233,26 +5451,22 @@ fn collect_row_bands(state: &State, nodes: &[MountedNode], out: &mut Vec<Snapsho
 }
 
 fn snapshot_edit(local: &LocalState) -> Option<TextEditState> {
-    match local {
-        LocalState::TextInput {
-            caret,
-            anchor,
-            selection,
-            composition,
-            ..
-        } => Some(TextEditState {
-            caret: *caret,
-            anchor: *anchor,
-            selection: *selection,
-            preedit: composition
-                .as_ref()
-                .map(|composition| composition.preedit.clone()),
-            composition: composition
-                .as_ref()
-                .map(|composition| composition.base_range()),
-        }),
-        _ => None,
-    }
+    let LocalState::TextInput(editor) = local else {
+        return None;
+    };
+    Some(TextEditState {
+        caret: editor.caret,
+        anchor: editor.anchor,
+        selection: editor.selection,
+        preedit: editor
+            .composition
+            .as_ref()
+            .map(|composition| composition.preedit.clone()),
+        composition: editor
+            .composition
+            .as_ref()
+            .map(|composition| composition.base_range()),
+    })
 }
 
 /// 只复制已提交的声明；inline 槽的当前值在刷新时已经算好。
@@ -5295,6 +5509,15 @@ fn snapshot_attrs(element: &MountedElement) -> Vec<SnapshotAttr> {
                 value: SnapshotValue::Bool(checked),
             }),
         }
+    }
+    // 文本输入呈现编辑器当前文本；`value` 绑定可能尚未追上本地编辑。
+    if let LocalState::TextInput(editor) = &element.local
+        && let Some(SnapshotValue::Text(value)) = attrs
+            .iter_mut()
+            .find(|attr| attr.name == "value")
+            .map(|attr| &mut attr.value)
+    {
+        *value = editor.value.clone();
     }
     attrs
 }
@@ -5397,17 +5620,27 @@ mod history_tests {
         app.click_label("hide-toggle").expect("unmount the input");
 
         let state = app.state.borrow();
-        let LocalState::TextInput { history, .. } = &state.elements[input.slot() as usize].local
-        else {
+        let LocalState::TextInput(editor) = &state.elements[input.slot() as usize].local else {
             panic!("the slot was a text input");
         };
-        assert!(history.undo.is_empty(), "the undo stack was released");
-        assert!(history.redo.is_empty(), "the redo stack was released");
-        assert_eq!(history.undo_bytes, 0);
-        assert_eq!(history.redo_bytes, 0);
         assert!(
-            history.observed.is_none(),
+            editor.history.undo.is_empty(),
+            "the undo stack was released"
+        );
+        assert!(
+            editor.history.redo.is_empty(),
+            "the redo stack was released"
+        );
+        assert_eq!(editor.history.undo_bytes, 0);
+        assert_eq!(editor.history.redo_bytes, 0);
+        assert_eq!(editor.value, "", "the editor text was released");
+        assert!(
+            editor.lineage.observed.is_none(),
             "the observed value does not stay in the dead slot"
+        );
+        assert!(
+            editor.lineage.in_flight.is_empty(),
+            "dispatched values do not stay in the dead slot"
         );
     }
 
@@ -5457,5 +5690,438 @@ mod history_tests {
         app.redo_node(input).expect("redo");
         assert_eq!(calls.get(), 3);
         assert_eq!(seen.borrow().as_slice(), ["new", "old", "new"]);
+    }
+}
+
+#[cfg(test)]
+mod lineage_tests {
+    #![allow(unused_braces)]
+
+    use super::*;
+    use crate::{component, memo, signal, view};
+
+    fn text_of(app: &Runtime, label: &str) -> String {
+        app.presentation()
+            .expect("snapshot")
+            .find_label(label)
+            .expect("the input")
+            .text_value()
+            .unwrap_or_default()
+            .to_owned()
+    }
+
+    fn input_id(app: &Runtime, label: &str) -> NodeId {
+        app.presentation()
+            .expect("snapshot")
+            .find_label(label)
+            .expect("the input")
+            .id()
+    }
+
+    fn trace(app: &Runtime) -> Vec<TextTrace> {
+        app.state.borrow().text_trace.iter().copied().collect()
+    }
+
+    /// 处理器不写 `value` 绑定：写入推迟到之后的按钮命令。
+    #[component]
+    fn Deferred() -> MountResult<MountPlan> {
+        let draft = signal(String::from("a"));
+        let first = signal(String::new());
+        let second = signal(String::new());
+        let calls = signal(0u32);
+
+        view! {
+            <view>
+                <text-input
+                    aria:label="deferred"
+                    value={draft}
+                    on:input={move |value: String| {
+                        let count = calls.get();
+                        calls.set(count + 1);
+                        if count == 0 {
+                            first.set(value);
+                        } else {
+                            second.set(value);
+                        }
+                    }}
+                />
+                <button aria:label="first" on:click={move || draft.set(first.get())}>
+                    "Deliver first"
+                </button>
+                <button aria:label="second" on:click={move || draft.set(second.get())}>
+                    "Deliver second"
+                </button>
+            </view>
+        }
+    }
+
+    #[test]
+    fn a_late_settlement_of_an_older_edit_is_ignored() {
+        let mut app = Runtime::new();
+        app.mount(|| view! { <Deferred /> }).expect("mount");
+        let input = input_id(&app, "deferred");
+
+        app.set_caret_node(input, 1).expect("caret");
+        app.insert_text_node(input, "b").expect("first edit");
+        // 移动 caret 结束连续输入 run，让两次编辑各有一个撤销步。
+        app.set_caret_node(input, 2).expect("caret");
+        app.insert_text_node(input, "c").expect("second edit");
+        assert_eq!(text_of(&app, "deferred"), "abc");
+
+        app.click_label("first")
+            .expect("deliver the first edit's value");
+        assert_eq!(
+            text_of(&app, "deferred"),
+            "abc",
+            "the stale settlement must not roll the editor back"
+        );
+
+        app.click_label("second")
+            .expect("deliver the second edit's value");
+        assert_eq!(text_of(&app, "deferred"), "abc");
+
+        let events = trace(&app);
+        let origin = match events[0] {
+            TextTrace::Remount { origin } => origin,
+            other => panic!("the first event is the mount: {other:?}"),
+        };
+        assert_eq!(
+            events,
+            [
+                TextTrace::Remount { origin },
+                TextTrace::LocalEdit {
+                    origin,
+                    revision: 1,
+                },
+                TextTrace::LocalEdit {
+                    origin,
+                    revision: 2,
+                },
+                TextTrace::StaleSettlement {
+                    origin,
+                    current: 2,
+                    stale: 1,
+                },
+                TextTrace::Settlement {
+                    origin,
+                    revision: 2,
+                    normalized: false,
+                },
+            ],
+            "each delivery is classified once, in revision order"
+        );
+
+        app.undo_node(input)
+            .expect("the stale settlement kept the newest history");
+        assert_eq!(text_of(&app, "deferred"), "ab");
+    }
+
+    /// 处理器把值截断到两个字符：归一化后的提交值仍是这次编辑的结算。
+    #[component]
+    fn Capped() -> MountResult<MountPlan> {
+        let draft = signal(String::from("abc"));
+
+        view! {
+            <text-input
+                aria:label="cap"
+                value={draft}
+                on:input={move |value: String| draft.set(value.chars().take(2).collect())}
+            />
+        }
+    }
+
+    #[test]
+    fn a_normalizing_handler_settles_with_the_committed_value() {
+        let mut app = Runtime::new();
+        app.mount(|| view! { <Capped /> }).expect("mount");
+        let input = input_id(&app, "cap");
+
+        app.set_caret_node(input, 3).expect("caret");
+        app.insert_text_node(input, "Z").expect("edit");
+
+        let snapshot = app.presentation().expect("snapshot");
+        let field = snapshot.find_label("cap").expect("the input");
+        assert_eq!(field.text_value(), Some("ab"));
+        assert_eq!(
+            field.edit().expect("edit").caret(),
+            2,
+            "the caret is clamped to the committed value"
+        );
+
+        let events = trace(&app);
+        let origin = match events[0] {
+            TextTrace::Remount { origin } => origin,
+            other => panic!("the first event is the mount: {other:?}"),
+        };
+        assert_eq!(
+            events.last(),
+            Some(&TextTrace::Settlement {
+                origin,
+                revision: 1,
+                normalized: true,
+            }),
+            "the truncated value is the edit's settlement"
+        );
+    }
+
+    /// 处理器把一位上限写回编辑前的值：相等写入仍表示应用处理了这次编辑。
+    #[component]
+    fn CappedAtOne() -> MountResult<MountPlan> {
+        let draft = signal(String::from("a"));
+
+        view! {
+            <text-input
+                aria:label="same"
+                value={draft}
+                on:input={move |value: String| draft.set(value.chars().take(1).collect())}
+            />
+        }
+    }
+
+    #[test]
+    fn a_handler_that_writes_the_old_value_settles_the_edit() {
+        let mut app = Runtime::new();
+        app.mount(|| view! { <CappedAtOne /> }).expect("mount");
+        let input = input_id(&app, "same");
+
+        app.set_caret_node(input, 1).expect("caret");
+        app.insert_text_node(input, "b").expect("edit");
+        assert_eq!(
+            text_of(&app, "same"),
+            "a",
+            "a write of the old value still settles the edit"
+        );
+
+        let events = trace(&app);
+        let origin = match events[0] {
+            TextTrace::Remount { origin } => origin,
+            other => panic!("the first event is the mount: {other:?}"),
+        };
+        assert_eq!(
+            events.last(),
+            Some(&TextTrace::Settlement {
+                origin,
+                revision: 1,
+                normalized: true,
+            })
+        );
+
+        let recorded = events.len();
+        app.undo_node(input)
+            .expect("an edit with unchanged committed text records nothing");
+        assert_eq!(trace(&app).len(), recorded, "undo dispatched no edit");
+    }
+
+    #[component]
+    fn Toggle() -> MountResult<MountPlan> {
+        let visible = signal(true);
+        let draft = signal(String::from("abcd"));
+        let shown = memo(move || visible.get());
+
+        view! {
+            <view>
+                <Show when={shown}>
+                    <text-input
+                        aria:label="toggle"
+                        value={draft}
+                        on:input={move |value: String| draft.set(value)}
+                    />
+                </Show>
+                <button aria:label="hide-toggle" on:click={move || visible.set(false)}>
+                    "Hide"
+                </button>
+                <button aria:label="show-toggle" on:click={move || visible.set(true)}>
+                    "Show"
+                </button>
+            </view>
+        }
+    }
+
+    #[test]
+    fn a_same_key_remount_starts_a_new_origin_and_revision() {
+        let mut app = Runtime::new();
+        app.mount(|| view! { <Toggle /> }).expect("mount");
+        let first = input_id(&app, "toggle");
+        app.set_caret_node(first, 4).expect("caret");
+        app.insert_text_node(first, "X").expect("edit");
+
+        app.click_label("hide-toggle").expect("hide the input");
+        assert_eq!(app.node_status(first), NodeStatus::Stale);
+        app.click_label("show-toggle")
+            .expect("show the input again");
+        let second = input_id(&app, "toggle");
+        assert_ne!(first, second, "a remount is a new node identity");
+        let before_undo = trace(&app).len();
+        app.undo_node(second)
+            .expect("the remount starts with an empty history");
+        assert_eq!(trace(&app).len(), before_undo, "undo dispatched no edit");
+        app.set_caret_node(second, 0).expect("caret");
+        app.insert_text_node(second, "Y").expect("edit the remount");
+        assert_eq!(
+            app.insert_text_node(first, "Z"),
+            Err(DispatchError::StaleNode(first)),
+            "a delivery to the old mount is rejected"
+        );
+        assert_eq!(app.undo_node(first), Err(DispatchError::StaleNode(first)));
+
+        let events = trace(&app);
+        let origins: Vec<u64> = events
+            .iter()
+            .filter_map(|event| match event {
+                TextTrace::Remount { origin } => Some(*origin),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(origins.len(), 2, "each mount records its origin");
+        assert_ne!(origins[0], origins[1], "a remount gets a fresh origin");
+        assert!(
+            events.contains(&TextTrace::LocalEdit {
+                origin: origins[0],
+                revision: 1,
+            }),
+            "the first mount starts at revision one"
+        );
+        assert!(
+            events.contains(&TextTrace::LocalEdit {
+                origin: origins[1],
+                revision: 1,
+            }),
+            "the remount restarts revisions"
+        );
+        assert!(
+            events.contains(&TextTrace::Settlement {
+                origin: origins[1],
+                revision: 1,
+                normalized: false,
+            }),
+            "the remounted input settles its own edit"
+        );
+    }
+
+    /// 最新编辑先结算后，旧 revision 的晚到值不能被当成新的当前结算。
+    #[test]
+    fn a_settled_edit_keeps_older_late_values_stale() {
+        let mut app = Runtime::new();
+        app.mount(|| view! { <Deferred /> }).expect("mount");
+        let input = input_id(&app, "deferred");
+
+        app.set_caret_node(input, 1).expect("caret");
+        app.insert_text_node(input, "b").expect("first edit");
+        app.set_caret_node(input, 2).expect("caret");
+        app.insert_text_node(input, "c").expect("second edit");
+
+        app.click_label("second")
+            .expect("deliver the newest edit's value");
+        assert_eq!(text_of(&app, "deferred"), "abc");
+        app.click_label("first")
+            .expect("deliver the older edit's value");
+        assert_eq!(
+            text_of(&app, "deferred"),
+            "abc",
+            "a settled revision must stay stale"
+        );
+
+        let events = trace(&app);
+        let origin = match events[0] {
+            TextTrace::Remount { origin } => origin,
+            other => panic!("the first event is the mount: {other:?}"),
+        };
+        assert_eq!(
+            events.last(),
+            Some(&TextTrace::StaleSettlement {
+                origin,
+                current: 2,
+                stale: 1,
+            })
+        );
+
+        app.undo_node(input)
+            .expect("the stale delivery kept the history");
+        assert_eq!(text_of(&app, "deferred"), "ab");
+    }
+
+    /// Memo 值绑定读取 draft 与 cap；处理器只把 cap 写成相同值，推迟 draft。
+    #[component]
+    fn DeferredMemo() -> MountResult<MountPlan> {
+        let draft = signal(String::from("a"));
+        let cap = signal(10u32);
+        let shown = memo(move || {
+            draft
+                .get()
+                .chars()
+                .take(cap.get() as usize)
+                .collect::<String>()
+        });
+
+        view! {
+            <text-input
+                aria:label="deferred-memo"
+                value={shown}
+                on:input={move |_value: String| cap.set(cap.get())}
+            />
+        }
+    }
+
+    #[test]
+    fn a_deferred_memo_write_does_not_roll_back_the_edit() {
+        let mut app = Runtime::new();
+        app.mount(|| view! { <DeferredMemo /> }).expect("mount");
+        let input = input_id(&app, "deferred-memo");
+
+        app.set_caret_node(input, 1).expect("caret");
+        app.insert_text_node(input, "b").expect("edit");
+        assert_eq!(
+            text_of(&app, "deferred-memo"),
+            "ab",
+            "a written memo dependency is not the value write"
+        );
+
+        let events = trace(&app);
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, TextTrace::Settlement { .. })),
+            "an equal dependency write must not settle the edit"
+        );
+    }
+
+    /// Memo 绑定的计算值随处理器写入变化时仍按结算处理。
+    #[component]
+    fn MemoIdentity() -> MountResult<MountPlan> {
+        let draft = signal(String::from("a"));
+        let shown = memo(move || draft.get());
+
+        view! {
+            <text-input
+                aria:label="memo-identity"
+                value={shown}
+                on:input={move |value: String| draft.set(value)}
+            />
+        }
+    }
+
+    #[test]
+    fn a_memo_value_binding_settles_a_changed_value() {
+        let mut app = Runtime::new();
+        app.mount(|| view! { <MemoIdentity /> }).expect("mount");
+        let input = input_id(&app, "memo-identity");
+
+        app.set_caret_node(input, 1).expect("caret");
+        app.insert_text_node(input, "b").expect("edit");
+        assert_eq!(text_of(&app, "memo-identity"), "ab");
+
+        let events = trace(&app);
+        let origin = match events[0] {
+            TextTrace::Remount { origin } => origin,
+            other => panic!("the first event is the mount: {other:?}"),
+        };
+        assert_eq!(
+            events.last(),
+            Some(&TextTrace::Settlement {
+                origin,
+                revision: 1,
+                normalized: false,
+            })
+        );
     }
 }
