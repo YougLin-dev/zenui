@@ -55,26 +55,21 @@ jobs:
               - '**/*.md'
           list-files: json
 
+  # 平台无关的格式、lint 与 Linux 侧验收。Windows 的编译与测试拆到下面
+  # 的并行 job；这里只保留 Linux/macOS 两个 required leg。
   workspace:
     name: workspace (${{ matrix.os }})
     needs: changes
     runs-on: ${{ matrix.os }}
-    # trybuild 为每个 fixture 再构建一次 facade 及其依赖；Windows leg 还要
-    # 冷编译模板的 release 依赖，Linux leg 还要复制模板并构建 git scratch
-    # app，因此在原有 45 分钟上留出余量。
+    # trybuild 为每个 fixture 再构建一次 facade 及其依赖，Linux leg 还要
+    # 复制模板并构建 git scratch app，因此在原有 45 分钟上留出余量。
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        # 宿主测试按窗口 surface（DirectComposition 交换链）请求 DX12 适配器。
-        # Blacksmith Windows runner 上 D3D12/WARP 可用（无 surface 的 GPU
-        # 测试通过），但与窗口 surface 兼容的适配器请求失败（NoAdapter），
-        # 因此这一 leg 保留在 GitHub 托管的 windows-latest。
-        os: [blacksmith-4vcpu-ubuntu-2604, blacksmith-6vcpu-macos-15, windows-latest]
+        os: [blacksmith-4vcpu-ubuntu-2604, blacksmith-6vcpu-macos-15]
     env:
       CARGO_TERM_COLOR: always
-      # 模板是独立 workspace，但 Windows leg 与根 workspace 共享 target，
-      # 避免为同一批依赖再编译一次。
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
     steps:
       - name: Check out
@@ -98,7 +93,11 @@ jobs:
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: "."
-          cache-on-failure: true
+          cache-bin: "false"
+          cache-on-failure: "true"
+          # PR 缓存只对当前 PR 可见；只在 main 保存，避免每个 PR 各存一份
+          # 挤占仓库 10GB 上限。
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Format
         if: needs.changes.outputs.code_count != '0'
@@ -139,7 +138,7 @@ jobs:
 
       # 模板是「从空目录开始」的起点：复制到 checkout 之外，只把两个 path
       # 依赖指向 checkout，再构建/测试。Linux leg 复用根 workspace 的 target，
-      # 不重复一次冷构建；Windows 的模板构建仍在下面原地执行。
+      # 不重复一次冷构建；Windows 的模板构建在独立的 Windows job 中执行。
       - name: Template copy-out (Linux)
         if: runner.os == 'Linux' && needs.changes.outputs.code_count != '0'
         run: |
@@ -229,24 +228,174 @@ jobs:
           fi
           grep -F "revspec 'HEAD' not found" "$RUNNER_TEMP/rev-head.log"
 
-      # 模板有自己的 workspace、Cargo.lock 与工具链；隐藏 smoke 是 partial
-      # evidence（宿主在没有硬件适配器时回退 WARP），可见窗口验收仍需在
-      # Windows 11 实机执行。
+  # Windows 的串行 leg 拆成并行 job：编译/lint/release 不需要适配器，
+  # 放到 Blacksmith；只有隐藏窗口 + surface 的 WARP 测试留在 windows-latest。
+  # 拆分后各 job 不再共享 target，模板的冷编译变长，但它们都在并行分支上，
+  # 临界路径仍是 windows-test。
+  windows-lint:
+    name: windows-lint (blacksmith-4vcpu-windows-2025)
+    needs: changes
+    if: needs.changes.outputs.code_count != '0'
+    runs-on: blacksmith-4vcpu-windows-2025
+    timeout-minutes: 20
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      # CI 不需要本地调试符号；关闭 debuginfo 可缩短编译/链接并缩小缓存。
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install toolchain
+        run: |
+          cargo --version
+          rustc --version --verbose
+          rustup component add clippy rustfmt
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # 与 windows-template-lint 共用同一份 check 缓存；只有本 job 保存。
+          shared-key: windows-lint
+          workspaces: "."
+          cache-bin: "false"
+          cache-on-failure: "true"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  windows-test:
+    name: windows-test (windows-latest)
+    needs: changes
+    if: needs.changes.outputs.code_count != '0'
+    # 隐藏 host 请求与窗口 surface 兼容的 DX12 适配器；Blacksmith Windows
+    # 上该请求返回 NoAdapter（见 host.rs 与 ADR-0005），所以测试留在这里。
+    runs-on: windows-latest
+    timeout-minutes: 40
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install toolchain
+        run: |
+          cargo --version
+          rustc --version --verbose
+          rustup component add clippy rustfmt
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # 与 windows-template-test 共用同一份 dev/test 缓存；只有本 job 保存。
+          shared-key: windows-test
+          workspaces: "."
+          cache-bin: "false"
+          cache-on-failure: "true"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # compile-fail 套件只依赖公开 API，不依赖 Windows；Linux/macOS leg
+      # 仍完整运行 trybuild，这里跳过约 95 秒的嵌套构建。
+      - name: Test
+        run: cargo test --workspace --locked -- --skip public_macro_inputs_compile_or_emit_expected_diagnostics
+
+  windows-template-lint:
+    name: windows-template-lint (blacksmith-4vcpu-windows-2025)
+    needs: changes
+    if: needs.changes.outputs.code_count != '0'
+    runs-on: blacksmith-4vcpu-windows-2025
+    timeout-minutes: 20
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install toolchain
+        run: |
+          cargo --version
+          rustc --version --verbose
+          rustup component add clippy rustfmt
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: windows-lint
+          workspaces: "."
+          cache-bin: "false"
+          save-if: "false"
+
       - name: Template format
-        if: runner.os == 'Windows' && needs.changes.outputs.code_count != '0'
         run: cargo fmt --manifest-path templates/minimal-app/Cargo.toml --all -- --check
 
       - name: Template clippy
-        if: runner.os == 'Windows' && needs.changes.outputs.code_count != '0'
         run: cargo clippy --manifest-path templates/minimal-app/Cargo.toml --workspace --all-targets --locked -- -D warnings
 
+  windows-template-test:
+    name: windows-template-test (windows-latest)
+    needs: changes
+    if: needs.changes.outputs.code_count != '0'
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install toolchain
+        run: |
+          cargo --version
+          rustc --version --verbose
+          rustup component add clippy rustfmt
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: windows-test
+          workspaces: "."
+          cache-bin: "false"
+          save-if: "false"
+
       - name: Template test (drift + headless + hidden host)
-        if: runner.os == 'Windows' && needs.changes.outputs.code_count != '0'
         run: cargo test --manifest-path templates/minimal-app/Cargo.toml --workspace --locked
 
-      # release 构建必须留下 GUI 子系统的 exe：双击时不附带控制台。
+  # release 构建必须留下 GUI 子系统的 exe：双击时不附带控制台。
+  # release profile 与 dev/test 不共享产物，单独放在并行 job 不损失复用。
+  windows-template-release:
+    name: windows-template-release (blacksmith-4vcpu-windows-2025)
+    needs: changes
+    if: needs.changes.outputs.code_count != '0'
+    runs-on: blacksmith-4vcpu-windows-2025
+    timeout-minutes: 20
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install toolchain
+        run: |
+          cargo --version
+          rustc --version --verbose
+
       - name: Template release build
-        if: runner.os == 'Windows' && needs.changes.outputs.code_count != '0'
         shell: pwsh
         run: |
           cargo build --manifest-path templates/minimal-app/Cargo.toml --release --locked
@@ -257,6 +406,34 @@ jobs:
           $subsystem = [BitConverter]::ToUInt16($bytes, $pe + 0x5C)
           if ($subsystem -ne 2) { throw "release exe subsystem $subsystem, expected Windows GUI (2)" }
           Write-Output "release exe: $exe (subsystem $subsystem)"
+
+  # 保持 branch protection 里的 required context 名字不变；这个 gate 只有
+  # 在所有 Windows job 成功或被跳过时才通过。
+  windows:
+    name: workspace (windows-latest)
+    needs: [changes, windows-lint, windows-test, windows-template-lint, windows-template-test, windows-template-release]
+    if: always()
+    runs-on: blacksmith-4vcpu-ubuntu-2604
+    timeout-minutes: 5
+    steps:
+      - name: Verify the Windows jobs
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+
+          results = json.loads(os.environ["RESULTS"])
+          failed = {
+              name: job["result"]
+              for name, job in results.items()
+              if job["result"] not in ("success", "skipped")
+          }
+          if failed:
+              raise SystemExit(f"Windows jobs did not succeed: {failed}")
+          print("Windows jobs succeeded or were skipped")
+          PY
 
   prototypes:
     name: prototypes (${{ matrix.os }} / ${{ matrix.example }})
