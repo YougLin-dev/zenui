@@ -1,5 +1,5 @@
 commit	ad7538d
-date	2026-11-25 local (17:58-17:59)
+date	2026-11-25 local (17:58-18:19)
 os	Windows 11 Pro 10.0.26300 x64
 gpu	NVIDIA GeForce RTX 4060 Laptop GPU, driver 32.0.15.7283
 adapter	DX12 hardware RTX 4060, fallback=false (GpuAdapterInfo in stage-three-设备丢失-验收)
@@ -16,3 +16,6 @@ wheel	5x24 -> 1.9479834313187%; 10x120 -> 21.4278177445057%
 keys	End -> 100%; Home -> 0%; PageDown -> 18.2893999940478%
 textpattern	value "a中e\u0301z"; DocumentRange text read; caret selection; select-all text read; 1 bounding rect
 menu	window 576x379 frame / 560x320 client; File menu (Save Ctrl+S, Clear, Close); File > Clear -> status Cleared; View > Show status -> status Status hidden; Shift+F10 > Clear note -> status Note cleared
+drop	file E:\code\mine\zenui-220\drop-final.txt (2 lines); Explorer item "drop-final.txt"; real mouse drag (1481,305) -> (490,390); UIA rows "Drop final A"/"Drop final B"; screenshot notice "Imported 2 tasks", 3 remaining; WM_CLOSE exited
+tray	icon " ZenUI Tray" in overflow (2091,1455,40,40), panel 2074,1438,2308,1552; menu #32768 (2110,1341,2288,1475): Show window, Reset status, Hide window, Close window, Quit; menu Show window -> status "Restored from the tray"; menu Reset status -> status "Reset from the tray menu"; UIA Hide to tray -> hidden, left click restores; left click restores via runtime show and does not dispatch tray.show, so the status text stays "Hidden to the tray"; menu Quit -> process exited; menu screenshot fills the unrelated floating toolbar area with the menu background
+narrator	Narrator zh-CN; SetFocus "What needs to be done?" then Tab -> Add -> All -> Active; Narrator+Alt+X opened NarratorSpeechRecapDialog "语音回顾" (260,260,920,760); recap "ZenUI Todo 窗口, Add task 组, Add, 按钮." / "Filter 组, All, 按钮." / "Active, 按钮"; crop keeps only the three Todo lines, unrelated Narrator Home and other-application lines excluded; no audio claim; Narrator stopped after capture
