@@ -42,7 +42,7 @@ The single-screen hardware spike in this ticket did not observe a real device lo
 ### Evidence boundary
 
 - Host unit tests that set `device_lost` directly (`device_loss_rebuilds_every_window_surface`, `device_loss_preserves_the_applied_scroll_offset`) and the temporary `Device::destroy()` probe in [spike.txt](../实现/证据/device-loss/spike.txt) are synthetic. They exercise the rebuild and preservation paths, not a driver removal.
-- Real-hardware acceptance belongs to #214. Until it runs, README and verification pages must describe real device loss as unverified; this ADR does not turn the synthetic coverage into a native claim.
+- Real-hardware acceptance belongs to #214. The 2026-11-25 single-screen run attempted Win+Ctrl+Shift+B and a forced GPU hang; it observed a real `nvlddmkm` error event 153 but no TDR/reset or D3D12 device removal, so it claims no recovery. README and verification pages describe the attempt and this negative result; this ADR does not turn the synthetic coverage into a native claim. See [the device-loss attempt](../实现/stage-three-设备丢失-验收.md).
 
 ## Spike record
 
@@ -67,6 +67,6 @@ Date: 2026-11-25, 06:28:58–06:29:17 local. Windows 11 Pro 10.0.26300, one disp
 
 ## Consequences
 
-#211 implements the generation-guarded callback, the pending-loss message, the signal-gated `Validation` rule and the preservation path. #212 keeps damage until a successful present and prevents a spin while hidden. #213 adds the three-attempt bound, the latched `HostError::DeviceLost`, `Host::adapter_info()` and the WARP report. #214 records the real-hardware run; if it also observes no loss, the documentation says so and makes no recovery claim.
+#211 implements the generation-guarded callback, the pending-loss message, the signal-gated `Validation` rule and the preservation path. #212 keeps damage until a successful present and prevents a spin while hidden. #213 adds the three-attempt bound, the latched `HostError::DeviceLost`, `Host::adapter_info()` and the WARP report. #214 recorded the single-screen real-hardware run on 2026-11-25; it observed a driver error event (`nvlddmkm` 153) but no TDR/reset or device loss, so the documentation says so and makes no recovery claim ([record](../实现/stage-three-设备丢失-验收.md)).
 
 The SDK sentence at `docs/SDK/窗口与任务.md:320` that `Lost` / `Validation` both rebuild is stale today (the code already treats `Validation` as fatal) and is superseded by this classification; #211 corrects the SDK when the signal-gated rule lands. Multi-monitor and mixed-DPI device loss remain outside this ADR and stay with #63.

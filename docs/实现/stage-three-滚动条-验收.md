@@ -83,4 +83,4 @@
 - **可见运行（主证据）：** 真实 HWND、真实鼠标拖动/点击、真实滚轮与键盘消息、真实微软拼音、DX12 呈现；100% 与 150% 各一组截图和状态行，包含聚焦拖动保持焦点、组合中 Home 与轨道点击/翻页不编辑也不取消组合、Space 正常提交。
 - **隐藏 smoke（部分证据）：** `dragging_the_scrollbar_thumb_scrolls_the_shared_offset_and_clamps`、`a_scrollbar_track_click_pages_towards_the_clicked_side`、`the_scrollbar_wins_hit_priority_over_the_content_under_it`、`wheel_drag_and_keys_share_one_clamped_offset_without_stale_transients` 覆盖夹取、轨道方向、命中优先与拖动后的 hover/press 清理。它们运行在隐藏窗口与 CI 的 WARP/软件适配器上，不能替代可见验收。
 - **单元测试：** `pressing_the_scrollbar_pages_without_cancelling_a_composition` 覆盖滚动条命中不取消 IME 组合；`a_composing_editor_keeps_its_scroll_under_editing_keys` 覆盖组合中的 Home/End、方向键与 Backspace/Delete 不编辑、不显露、不滚动；`scrollbar_drag_offsets_follow_the_pointer_and_clamp` 覆盖拖动公式的夹取与无行程时保持偏移；渲染测试 `the_scrollbar_thumb_has_a_documented_minimum` 覆盖轨道容不下最小 thumb 或 thumb 会填满轨道时不绘制滚动条。
-- **未覆盖：** 触摸拖动与触控板惯性；滚动条 hover/按下配色（当前覆盖层没有专用状态色）；混合 DPI 多显示器与真实硬件设备丢失仍属 #63。列表虚拟化已由 #184 交付，见[窗口化 For 验收](stage-three-窗口化-for-验收.md)。
+- **未覆盖：** 触摸拖动与触控板惯性；滚动条 hover/按下配色（当前覆盖层没有专用状态色）；混合 DPI 多显示器与真实硬件设备丢失仍属 #63；实机丢失尝试未观察到丢失（[记录](stage-three-设备丢失-验收.md)）。列表虚拟化已由 #184 交付，见[窗口化 For 验收](stage-three-窗口化-for-验收.md)。

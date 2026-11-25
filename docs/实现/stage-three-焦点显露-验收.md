@@ -87,4 +87,4 @@
 - **可见运行（主证据）：** 真实 HWND、真实滚轮/键盘消息、真实微软拼音与 DX12 呈现；100% 与 150% 各一组截图和状态行。
 - **隐藏 smoke（部分证据）：** `tab_reveals_an_offscreen_focus_target_and_restores_the_top_window`（#184 后改名，覆盖随窗口化列表显露时把窗口带回顶部）与 `an_edit_after_wheel_scrolling_reveals_the_focused_input` 覆盖焦点/caret 显露与“滚动后下一次编辑再显露”，并在 CI 的 WARP/隐藏窗口里运行；它们不能替代可见验收。
 - **单元测试：** `reveal_offsets_are_minimal_vertical_moves` 覆盖上/下越界、完全可见、超高元素顶部优先、两端夹取与分数取整；`ime_anchors_follow_the_translated_caret_and_clamp_into_the_client_area` 与 `a_caret_that_leaves_the_viewport_hides_the_candidate` 覆盖候选锚点的 DPI 换算、客户区夹取与隐藏决策。
-- **未覆盖：** Shift+Tab（与 Tab 共用焦点遍历与显露路径，由隐藏 smoke 覆盖）；多行 preedit 的锚点与工作区夹取（demo 只有单行输入）；候选窗在 TSF IME 下的即时隐藏（见「候选窗边界」）；滚动条 #181/#182 与列表虚拟化已由后续工单交付，分别见对应验收页；混合 DPI 多显示器与真实硬件设备丢失仍属 #63。
+- **未覆盖：** Shift+Tab（与 Tab 共用焦点遍历与显露路径，由隐藏 smoke 覆盖）；多行 preedit 的锚点与工作区夹取（demo 只有单行输入）；候选窗在 TSF IME 下的即时隐藏（见「候选窗边界」）；滚动条 #181/#182 与列表虚拟化已由后续工单交付，分别见对应验收页；混合 DPI 多显示器与真实硬件设备丢失仍属 #63；实机丢失尝试未观察到丢失（[记录](stage-three-设备丢失-验收.md)）。

@@ -6,7 +6,7 @@ ZenUI 使用 Rust 编写原生桌面界面。它保留控件及其编辑状态�
 
 ## 当前能力
 
-ZenUI 处在开发阶段。阶段一的 target API、阶段二的 Windows 原生切片，以及阶段三的多窗口、关闭确认、应用会话策略与显式退出、原生打开/保存/文件夹对话框、整页滚动、焦点显露、覆盖层滚动条、窗口化 `For`、只读 UIA 树、UIA Invoke/Toggle/Value/SetFocus 动作、UIA 焦点/状态/结构事件、UIA TextPattern 与窗口根 ScrollPattern、原生菜单栏/快捷键/窗口级上下文菜单、应用托盘与文件拖放已可运行；节点级上下文菜单与跨平台支持仍在开发中。跨显示器混合 DPI 与实机 device loss 仍是 #63 的开放证据缺口。
+ZenUI 处在开发阶段。阶段一的 target API、阶段二的 Windows 原生切片，以及阶段三的多窗口、关闭确认、应用会话策略与显式退出、原生打开/保存/文件夹对话框、整页滚动、焦点显露、覆盖层滚动条、窗口化 `For`、只读 UIA 树、UIA Invoke/Toggle/Value/SetFocus 动作、UIA 焦点/状态/结构事件、UIA TextPattern 与窗口根 ScrollPattern、原生菜单栏/快捷键/窗口级上下文菜单、应用托盘与文件拖放已可运行；节点级上下文菜单与跨平台支持仍在开发中。跨显示器混合 DPI 仍是 #63 的开放证据缺口；实机 device loss 已在单屏可见窗口上尝试（Win+Ctrl+Shift+B 与同适配器 GPU 挂起），未观察到丢失，记录见 [设备丢失实机尝试](docs/实现/stage-three-设备丢失-验收.md)。
 
 仓库目前提供：
 
