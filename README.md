@@ -13,7 +13,7 @@ ZenUI 处在开发阶段。阶段一的 target API、阶段二的 Windows 原生
 - headless Runtime：模型、行集、代际句柄、Owner、Memo 和事务；
 - 阶段一 target API：Copy Signal/Memo/Store Field、mount-once 组件、`view!` 数据位、`Show`/`For` 与共享 RowSet；
 - headless 与原生窗口的 activation 和任务交付边界：app/window 所有权、Send worker、代际检查后的 UI continuation；窗口关闭取消其交付，共享模型仍可由 app 所有权任务提交；
-- Windows 宿主：每个存活窗口一个 HWND、Scene 与 DX12 surface，共享 device 和模型；原生输入、IME、DPI 与隐藏窗口 smoke（CI 回退 WARP）；
+- Windows 宿主：每个存活窗口一个 HWND、Scene 与 DX12 surface，共享 device 和模型；原生输入、IME、DPI 与隐藏窗口 smoke（CI 在没有硬件适配器时回退 WARP）；
 - 多窗口窗口目录：show/hide/close/reopen、关闭确认 epoch、父窗口输入挂起与声明的确认窗口；
 - 应用会话：启动前声明 `QuitOnLastClose`（默认）或 `StayResident`；`SessionCtx` 在命令处理器中排队恢复窗口与显式退出。常驻会话允许零窗口消息循环，原生宿主要求声明托盘，托盘恢复 primary 或已关闭窗口，Quit 关闭全部 activation 并释放待决关闭确认；
 - 原生打开/保存/文件夹对话框：窗口锚定、单选/多选、标题与类型过滤器、建议文件名与默认扩展名、取消/失败结果，以及显式的窗口或应用任务所有权；
@@ -54,7 +54,7 @@ target API 的公开行为测试位于根包 `tests/`，其中 `tests/tasks.rs` 
 ### SDK
 
 - [快速开始](docs/SDK/快速开始.md)：工具链、运行方式、工作区结构。
-- [从空目录开始](docs/SDK/从空目录开始.md)：在仓库外复制模板或使用 git 依赖，准备 Windows 构建环境并运行第一个窗口。
+- [从空目录开始](docs/SDK/从空目录开始.md)：在仓库外复制模板或使用 git 依赖，准备 Windows 构建环境、运行第一个窗口，并生成可双击运行的 release exe。
 - [界面与组件](docs/SDK/界面与组件.md)：组件、属性、条件、列表和 `view!`。
 - [数据与更新](docs/SDK/数据与更新.md)：Signal、Memo、Store、Field 和异步边界。
 - [窗口与任务](docs/SDK/窗口与任务.md)：窗口实例、关闭确认、对话框和任务归属。
@@ -92,6 +92,7 @@ target API 的公开行为测试位于根包 `tests/`，其中 `tests/tasks.rs` 
 - [Stage-three 剪贴板验收](docs/实现/stage-three-剪贴板-验收.md)：Ctrl+C/X/V、Notepad 双向互操作、应用内剪切与跨窗口粘贴、空/非文本剪贴板、组合 no-op、焦点保持与 100%/150% 可见证据。
 - [Stage-three 文件拖放验收](docs/实现/stage-three-文件拖放-验收.md)：真实资源管理器拖放的单文件/多文件、Unicode/非 BMP/长路径、文件夹、非文件、无处理器、关闭提示、模态选择器与关闭重开的 100%/150% 可见证据与边界。
 - [Stage-three 空目录启动验收](docs/实现/stage-three-空目录启动-验收.md)：仓库外模板副本的可见窗口、UIA 计数与 150% 证据；CI copy-out 与可见运行分开记录。
+- [Stage-three 发布打包验收](docs/实现/stage-three-发布打包-验收.md)：release exe 的 GUI 子系统、复制到另一目录后的可见运行与 UIA 计数。
 
 ## 界面语法
 
@@ -136,3 +137,9 @@ cargo test --manifest-path examples/macro_poc/Cargo.toml --workspace --locked
 ```
 
 开发约定见 [CONTRIBUTING.md](CONTRIBUTING.md)。
+
+## 许可证
+
+ZenUI 项目自身编写的代码与文档以 `MIT OR Apache-2.0` 双重许可发布，你可以任选其一使用。许可全文见 [LICENSE-MIT](LICENSE-MIT) 与 [LICENSE-APACHE](LICENSE-APACHE)。
+
+仓库中的第三方内容与资源保留各自许可，例如 `.agents/skills` 中的技能与 `examples/native_poc` 的 Tuffy 字体；上游声明见对应文件。

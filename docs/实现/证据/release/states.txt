@@ -1,0 +1,58 @@
+# 发布打包可见运行状态记录（#216）
+
+日期: 2026-11-25 15:18 与 15:48（本地时间），单屏 2560×1600，150%（144 DPI）。
+系统: Windows 11 Pro 10.0.26300 x64，交互式桌面会话。
+图形: NVIDIA GeForce RTX 4060 Laptop GPU，驱动 32.0.15.7283；宿主默认适配器
+（本机 #214 的 adapter_info 读数为 DX12、非 WARP；本轮未重复读取）。
+基线: `origin/main` 9c3caee；release 构建使用当前模板源码与 manifest。
+构建: `cargo build --release --manifest-path templates/minimal-app/Cargo.toml --locked`
+
+产物: `templates/minimal-app/target/release/minimal-app.exe`
+  size=15,716,864 bytes
+  sha256=2a4f31f37e9d6f03d1600cfae8a73d3211a79ba8a6b28e61544d071551f2e3b7
+  PE subsystem=2 (Windows GUI)；debug exe `templates/minimal-app/target/debug/minimal-app.exe` 的 subsystem=3 (Windows CUI)
+  Authenticode=NotSigned
+  resource directory RVA=0 size=0（无 icon、version 或嵌入 manifest）
+导入: `VCRUNTIME140.dll` 与 `api-ms-win-crt-{math,string,runtime,stdio,locale,heap}-l1-1-0.dll`；
+  没有 `MSVCP140.dll`、`VCRUNTIME140_1.dll`、`msvcrt.dll`，也没有直接导入 `ucrtbase.dll`。
+  `VCRUNTIME140.dll` 由 Visual C++ 2015–2022 Redistributable 提供；UCRT API set 由 Windows 10/11 提供。
+检查: `dumpbin -headers` / `dumpbin -dependents`；PowerShell 读取 PE 字节（e_lfanew + 0x5C）；
+  `Get-AuthenticodeSignature`；`sha256sum`。
+复制: `E:/code/mine/zenui-scratch/release-copy/minimal-app.exe`（sha256 相同）。
+截图: `PrintWindow(PW_CLIENTONLY | PW_RENDERFULLCONTENT)` 只读取应用客户区；
+不含桌面、标题栏、用户名或本机路径。
+UIA 名称: 计数标签是 `Count: N`；按钮的 Name 来自 `aria:label`，为
+`Increment counter`，可见文本为 `Increment`。
+
+## 运行 A：shell 启动，空工作目录（15:18）
+
+工作目录: `E:/code/mine/zenui-scratch/release-run-cwd`（空目录，不是仓库，也不是 exe 目录）。
+
+[15:18:33.236] app pid=47172 hwnd=306841532 title='ZenUI Starter' client=630x420 dpi=144 visible=True
+[15:18:33.264] before names=Count: 0 | Increment counter
+[15:18:33.310] captured 01-starter.png
+[15:18:33.316] invoked Increment counter through UIA
+[15:18:33.449] after names=Count: 1 | Increment counter visible=True
+[15:18:33.464] captured 02-incremented.png
+[15:18:33.670] closed through WM_CLOSE
+
+## 运行 B：ShellExecute open（双击路径）（15:48）
+
+[15:48:37.796] launched via Invoke-Item (ShellExecute open / double-click path) exe=E:\code\mine\zenui-scratch\release-copy\minimal-app.exe
+[15:48:37.800] app pid=33288 hwnd=656704 process_path=E:\code\mine\zenui-scratch\release-copy\minimal-app.exe match=True title='ZenUI Starter' client=630x420 dpi=144 visible=True
+[15:48:37.817] before names=Count: 0 | Increment counter
+[15:48:37.868] captured 03-explorer-starter.png
+[15:48:37.877] invoked Increment counter through UIA
+[15:48:38.006] after names=Count: 1 | Increment counter visible=True
+[15:48:38.022] captured 04-explorer-incremented.png
+[15:48:38.269] closed through WM_CLOSE
+
+## 结论
+
+release exe 的 PE subsystem 为 2（Windows GUI），debug 为 3（Windows CUI）。
+运行 A 把 exe 复制到另一目录、在空工作目录中启动，窗口与 UIA 计数正常（0→1），
+不需要相邻 asset 或字体文件。运行 B 用 ShellExecute 的 open verb 启动同一个副本
+（与资源管理器双击相同的 shell 路径），窗口句柄对应的进程路径与副本一致，
+计数同样从 0 变为 1。运行环境仍依赖系统提供的 `VCRUNTIME140.dll`
+（本机已由 VC++ Redistributable 提供）；exe 未签名；本轮从本地复制，
+没有 Mark-of-the-Web，因此没有触发 SmartScreen。
