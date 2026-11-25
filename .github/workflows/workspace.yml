@@ -17,7 +17,8 @@ jobs:
     name: workspace (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     # trybuild 为每个 fixture 再构建一次 facade 及其依赖；Windows leg 还要
-    # 冷编译模板的 release 依赖，因此在原有 45 分钟上留出余量。
+    # 冷编译模板的 release 依赖，Linux leg 还要复制模板并构建 git scratch
+    # app，因此在原有 45 分钟上留出余量。
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -56,6 +57,98 @@ jobs:
 
       - name: Test
         run: cargo test --workspace --locked
+
+      # 模板是「从空目录开始」的起点：复制到 checkout 之外，只把两个 path
+      # 依赖指向 checkout，再构建/测试。Linux leg 复用根 workspace 的 target，
+      # 不重复一次冷构建；Windows 的模板构建仍在下面原地执行。
+      - name: Template copy-out (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          copy="$RUNNER_TEMP/minimal-app-outside"
+          rm -rf "$copy"
+          cp -R templates/minimal-app "$copy"
+          rm -rf "$copy/target"
+          python3 --version
+          python3 - "$copy/Cargo.toml" "$GITHUB_WORKSPACE" <<'PY'
+          import pathlib
+          import sys
+
+          manifest = pathlib.Path(sys.argv[1])
+          root = sys.argv[2]
+          text = manifest.read_text()
+          replacements = {
+              'zenui = { path = "../.." }': f'zenui = {{ path = "{root}" }}',
+              'zenui-windows = { path = "../../crates/windows" }': (
+                  f'zenui-windows = {{ path = "{root}/crates/windows" }}'
+              ),
+          }
+          for old, new in replacements.items():
+              if old not in text:
+                  sys.exit(f"missing template dependency: {old}")
+              text = text.replace(old, new, 1)
+          manifest.write_text(text)
+          PY
+          grep -F "path = \"$GITHUB_WORKSPACE\"" "$copy/Cargo.toml"
+          grep -F "path = \"$GITHUB_WORKSPACE/crates/windows\"" "$copy/Cargo.toml"
+          cd "$copy"
+          cargo test --workspace --locked
+
+      # Cargo 的 git 依赖必须解析到具体修订：commit SHA、branch、tag 都可以，
+      # `rev = "HEAD"` 不是有效的 revspec。临时 branch/tag 建在 checkout 上，
+      # scratch app 用文件 URL 分别构建；HEAD 必须明确失败。
+      - name: Git dependency resolution (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          root="$GITHUB_WORKSPACE"
+          sha="$(git -C "$root" rev-parse HEAD)"
+          git -C "$root" branch -f zenui-onboarding-branch "$sha"
+          git -C "$root" tag -f zenui-onboarding-tag "$sha"
+          app="$RUNNER_TEMP/zenui-git-app"
+          head_app="$RUNNER_TEMP/zenui-head-app"
+          for dir in "$app" "$head_app"; do
+            rm -rf "$dir"
+            mkdir -p "$dir/src"
+            cp "$root/rust-toolchain.toml" "$dir/"
+            cat > "$dir/src/main.rs" <<'RS'
+          fn main() {
+              let _ = zenui::Runtime::new();
+          }
+          RS
+          done
+          write_manifest() {
+              local dir="$1"
+              local key="$2"
+              local value="$3"
+              cat > "$dir/Cargo.toml" <<EOF
+          [package]
+          name = "zenui-git-app"
+          version = "0.1.0"
+          edition = "2024"
+          publish = false
+
+          [dependencies]
+          zenui = { git = "file://$root", $key = "$value" }
+          zenui-windows = { git = "file://$root", $key = "$value" }
+
+          [profile.dev.package."*"]
+          opt-level = 3
+
+          [profile.dev.package.zenui-render]
+          opt-level = 2
+          EOF
+          }
+          for spec in "rev=$sha" "branch=zenui-onboarding-branch" "tag=zenui-onboarding-tag"; do
+              write_manifest "$app" "${spec%%=*}" "${spec#*=}"
+              (cd "$app" && cargo build)
+          done
+          write_manifest "$head_app" rev HEAD
+          if (cd "$head_app" && cargo build > "$RUNNER_TEMP/rev-head.log" 2>&1); then
+              echo "rev = HEAD unexpectedly resolved"
+              exit 1
+          fi
+          grep -F "revspec 'HEAD' not found" "$RUNNER_TEMP/rev-head.log"
 
       # 模板有自己的 workspace、Cargo.lock 与工具链；隐藏 WARP smoke 是
       # partial evidence，可见窗口验收仍需在 Windows 11 实机执行。

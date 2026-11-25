@@ -1,0 +1,31 @@
+# 空目录启动可见运行状态记录（#215）
+
+日期: 2026-11-25 14:12（本地时间），单屏 2560×1600，150%（144 DPI）。
+系统: Windows 11 Pro 10.0.26300 x64，交互式桌面会话。
+图形: NVIDIA GeForce RTX 4060 Laptop GPU，驱动 32.0.15.7283；宿主默认适配器
+（本机 #214 的 adapter_info 读数为 DX12、非 WARP；本轮未重复读取）。
+应用: `templates/minimal-app` 复制到仓库外（本机 `E:/code/mine/zenui-scratch/minimal-app`），
+两个 path 依赖改为 `E:/code/mine/zenui` 与 `E:/code/mine/zenui/crates/windows`，
+基线 `origin/main` d60299d；debug 构建，可执行文件位于同一 scratch 根下的
+`copy-target/debug/minimal-app.exe`。
+截图: `PrintWindow(PW_CLIENTONLY | PW_RENDERFULLCONTENT)` 只读取应用客户区；
+不含桌面、标题栏、用户名或本机路径。
+UIA 名称: 计数标签是 `Count: N`；按钮的 Name 来自 `aria:label`，为
+`Increment counter`，可见文本为 `Increment`。
+
+## 运行
+
+[14:12:53.843] app pid=37936 hwnd=7668390 title='ZenUI Starter' client=630x420 dpi=144 visible=True
+[14:12:53.969] before names=Count: 0 | Increment counter
+[14:12:54.121] captured 01-starter.png
+[14:12:54.138] invoked Increment counter through UIA
+[14:12:54.340] after names=Count: 1 | Increment counter visible=True
+[14:12:54.367] captured 02-incremented.png
+[14:12:54.565] closed through WM_CLOSE
+
+## 结论
+
+窗口标题为 `ZenUI Starter`，客户区 630×420 物理像素，150% 缩放；
+UIA `InvokePattern` 按下 `Increment` 按钮（Name 为 `Increment counter`）后，`Count: 0` 变为 `Count: 1`，
+窗口保持可见；`WM_CLOSE` 正常退出。应用源码与可执行文件都在仓库外，
+只把两个 path 依赖指向 checkout。

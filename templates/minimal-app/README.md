@@ -13,6 +13,8 @@ cargo run --manifest-path templates/minimal-app/Cargo.toml --locked
 
 这是独立 workspace，拥有自己的 `Cargo.lock` 与 `rust-toolchain.toml`。
 
+把模板复制到仓库外时，`Cargo.toml` 的两个 path 依赖要指向 checkout；完整的环境要求、git 依赖写法与冷构建预期见 [从空目录开始](../../docs/SDK/从空目录开始.md)。
+
 ## 检查
 
 ```sh
