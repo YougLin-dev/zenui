@@ -574,13 +574,16 @@ struct WindowHost {
     /// 下一次构建前把聚焦元素或 caret 显露到视口内；显式滚动会清除它。
     reveal_requested: bool,
     /// 指针、按压、模态或 caret 等瞬时状态变化需要重绘；它们不进入快照。
+    ///
+    /// 只有成功呈现才清除；`Timeout` / `Occluded` / `Lost` 与零尺寸保留它，
+    /// 下一次绘制重试同一份 damage。
     paint_requested: bool,
     /// 最近一次构建的呈现快照；未变化的窗口跳过重绘。
     ///
-    /// 场景构建发生在获取 surface 图像之前，所以 `Timeout` / `Occluded` 时
-    /// 这里可能比屏幕上的帧更新。
+    /// 场景构建发生在获取 surface 图像之前，所以跳过的帧可能让这里比屏幕上
+    /// 的帧更新；只有成功呈现才提交 `scene`。
     last_snapshot: Option<PresentationSnapshot>,
-    /// `last_snapshot` 对应的运行时呈现版本；版本未变时滚动与指针直接复用。
+    /// `last_snapshot` 对应的运行时呈现版本；只在同步快照缓存时前进。
     snapshot_revision: u64,
     /// 目录标题；UIA 根节点的名称。
     title: String,
@@ -659,6 +662,9 @@ pub struct Host {
     loss_epoch: u64,
     /// 本次恢复开始后是否已经成功呈现过一帧。
     presented_since_rebuild: bool,
+    /// 测试注入的 surface 状态队列；只存在于测试构建。
+    #[cfg(test)]
+    forced_surface_statuses: std::collections::VecDeque<wgpu::CurrentSurfaceTexture>,
     /// 窗口过程不能返回错误；消息循环在派发后取走并返回。
     deferred_error: Option<HostError>,
     /// 关闭协议改变了焦点/启用状态，消息循环在下次同步后重定向前台。
@@ -812,6 +818,8 @@ impl Host {
             device_generation: 1,
             loss_epoch: 0,
             presented_since_rebuild: false,
+            #[cfg(test)]
+            forced_surface_statuses: std::collections::VecDeque::new(),
             deferred_error: None,
             focus_after_sync: false,
             file_dialog_presenter: None,
@@ -1869,7 +1877,11 @@ impl Host {
         Ok(())
     }
 
-    /// 构建场景并呈现；返回快照是否可以被宿主缓存（surface 丢失或零尺寸时不缓存）。
+    /// 构建场景并呈现；返回本次是否成功呈现。
+    ///
+    /// 只有成功呈现才提交场景并返回 `Ok(true)`；`Timeout` / `Occluded` /
+    /// `Lost` 与零尺寸保留 `paint_requested` 并返回 `Ok(false)`，下一次
+    /// 绘制重试同一份 damage，屏幕上继续显示上一帧。
     ///
     /// 窗口化 `For` 的第一遍场景提供行带几何；需要更换挂载窗口时，宿主先按
     /// 焦点策略结束焦点，再应用窗口并用新快照重建一次。一帧最多两遍场景。
@@ -1891,6 +1903,8 @@ impl Host {
         self.ensure_surface(window)?;
         let (width, height) = client_size(window.hwnd())?;
         if width == 0 || height == 0 {
+            // 零尺寸没有可呈现的帧；保留 damage，尺寸恢复后再画。
+            window.paint_requested = true;
             window.accessibility.clear();
             return Ok(false);
         }
@@ -1909,13 +1923,14 @@ impl Host {
             .set_palette(palette_for(snapshot.appearance()));
         let mut reconfigured = false;
         loop {
-            let status = self.current_surface(window)?.get_current_texture();
+            let status = self.next_surface_status(window)?;
             let frame = match status {
                 wgpu::CurrentSurfaceTexture::Success(frame)
                 | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
                 wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
-                    window.paint_requested = false;
-                    return Ok(true);
+                    // 没有拿到可呈现的帧：保留 damage，下一次绘制重试。
+                    window.paint_requested = true;
+                    return Ok(false);
                 }
                 wgpu::CurrentSurfaceTexture::Outdated => {
                     if reconfigured {
@@ -1929,10 +1944,12 @@ impl Host {
                     continue;
                 }
                 wgpu::CurrentSurfaceTexture::Lost => {
+                    window.paint_requested = true;
                     self.surface_lost()?;
                     return Ok(false);
                 }
                 wgpu::CurrentSurfaceTexture::Validation => {
+                    window.paint_requested = true;
                     self.validation_status()?;
                     return Ok(false);
                 }
@@ -1959,6 +1976,18 @@ impl Host {
             self.position_ime(window, snapshot);
             return Ok(true);
         }
+    }
+
+    /// 取下一帧的 surface 状态；测试可注入一次状态而不经过真实交换链。
+    fn next_surface_status(
+        &mut self,
+        window: &WindowHost,
+    ) -> Result<wgpu::CurrentSurfaceTexture, HostError> {
+        #[cfg(test)]
+        if let Some(status) = self.forced_surface_statuses.pop_front() {
+            return Ok(status);
+        }
+        Ok(self.current_surface(window)?.get_current_texture())
     }
 
     /// 信号已置位时，`Validation` 是设备移除的级联错误；否则是 API misuse。
@@ -2858,10 +2887,10 @@ impl Host {
         }
         drop(mapped);
         buffer.unmap();
+        // 离屏读回不是呈现：不清除 damage，屏幕上仍是上一帧。场景与缓存
+        // 同步供输入与后续绘制使用，避免下一次呈现把同一快照当成新快照
+        // 并再次清空滚轮 residue。
         commit_scene(window, &snapshot, scene);
-        window.paint_requested = false;
-        // 这次读回构建了场景，缓存也要同步；否则下一次呈现会把同一快照
-        // 当成新快照并再次清空滚轮 residue。
         window.snapshot_revision = self.runtime.presentation_revision();
         window.last_snapshot = Some(snapshot);
         Ok(Frame {
@@ -6572,6 +6601,237 @@ mod tests {
         host.resize(MAIN, 320, 240).expect("restore size");
         let frame = host.read_frame(MAIN).expect("frame after restore");
         assert!(frame.width() > 0 && frame.height() > 0);
+    }
+
+    /// 已提交场景的粗略签名：元素几何与字形数量。
+    fn scene_signature(host: &Host) -> Vec<(f32, f32, f32, f32, usize)> {
+        host.scene(MAIN)
+            .expect("scene")
+            .elements()
+            .iter()
+            .map(|element| {
+                let rect = element.rect();
+                (
+                    rect.x,
+                    rect.y,
+                    rect.width,
+                    rect.height,
+                    element.text().iter().map(|run| run.glyphs().len()).sum(),
+                )
+            })
+            .collect()
+    }
+
+    fn assert_skipped_present_keeps_damage(status: wgpu::CurrentSurfaceTexture) {
+        let mut host = open_host();
+        host.runtime
+            .focus("What needs to be done?")
+            .expect("focus the draft");
+        host.render().expect("present the initial frame");
+        let before = scene_signature(&host);
+        let presented = host.windows.get(MAIN).expect("window").snapshot_revision;
+
+        host.runtime
+            .input("What needs to be done?", "A")
+            .expect("change the snapshot");
+        assert_ne!(
+            host.runtime.presentation_revision(),
+            presented,
+            "the runtime snapshot changed"
+        );
+
+        host.forced_surface_statuses.push_back(status);
+        host.render().expect("a skipped present is not an error");
+
+        let window = host.windows.get(MAIN).expect("window");
+        assert_eq!(
+            window.snapshot_revision, presented,
+            "the skipped render does not advance the cache revision"
+        );
+        assert!(window.paint_requested, "the skipped frame stays pending");
+        assert_eq!(
+            scene_signature(&host),
+            before,
+            "the presented scene stays on screen"
+        );
+
+        host.repaint_changed_windows()
+            .expect("the pending paint presents the new frame");
+        let window = host.windows.get(MAIN).expect("window");
+        assert_eq!(
+            window.snapshot_revision,
+            host.runtime.presentation_revision(),
+            "a successful present advances the revision"
+        );
+        assert!(!window.paint_requested, "a present clears the damage");
+        assert_ne!(scene_signature(&host), before, "the new frame is presented");
+    }
+
+    #[test]
+    fn a_timeout_present_keeps_the_scene_and_paint_pending() {
+        assert_skipped_present_keeps_damage(wgpu::CurrentSurfaceTexture::Timeout);
+    }
+
+    #[test]
+    fn an_occluded_present_keeps_the_scene_and_paint_pending() {
+        assert_skipped_present_keeps_damage(wgpu::CurrentSurfaceTexture::Occluded);
+    }
+
+    #[test]
+    fn a_lost_present_rebuilds_and_presents_the_pending_frame() {
+        let mut host = open_host();
+        host.runtime
+            .focus("What needs to be done?")
+            .expect("focus the draft");
+        host.render().expect("present the initial frame");
+        let before = scene_signature(&host);
+        let generation = host.device_generation;
+
+        host.runtime
+            .input("What needs to be done?", "A")
+            .expect("change the snapshot");
+        host.forced_surface_statuses
+            .push_back(wgpu::CurrentSurfaceTexture::Lost);
+        host.render()
+            .expect("the lost surface recovers and presents");
+
+        assert_eq!(host.device_generation, generation + 1);
+        assert!(!host.windows.get(MAIN).expect("window").paint_requested);
+        assert_ne!(
+            scene_signature(&host),
+            before,
+            "the rebuild presents the pending frame"
+        );
+    }
+
+    #[test]
+    fn a_zero_size_window_keeps_paint_pending() {
+        let mut host = open_host();
+        host.runtime
+            .focus("What needs to be done?")
+            .expect("focus the draft");
+        host.render().expect("present the initial frame");
+        let presented = host.windows.get(MAIN).expect("window").snapshot_revision;
+
+        host.runtime
+            .input("What needs to be done?", "A")
+            .expect("change the snapshot");
+        host.resize(MAIN, 0, 0).expect("zero resize");
+
+        let window = host.windows.get(MAIN).expect("window");
+        assert_eq!(
+            window.snapshot_revision, presented,
+            "no frame is presented at zero size"
+        );
+        assert!(window.paint_requested, "the zero-size frame stays pending");
+
+        host.resize(MAIN, 320, 240).expect("restore the size");
+        let window = host.windows.get(MAIN).expect("window");
+        assert_eq!(
+            window.snapshot_revision,
+            host.runtime.presentation_revision(),
+            "the restored window presents the pending frame"
+        );
+        assert!(
+            !window.paint_requested,
+            "the restore present clears the damage"
+        );
+    }
+
+    #[test]
+    fn a_readback_does_not_consume_the_skipped_damage() {
+        let mut host = open_host();
+        host.runtime
+            .focus("What needs to be done?")
+            .expect("focus the draft");
+        host.render().expect("present the initial frame");
+        let presented = host.windows.get(MAIN).expect("window").snapshot_revision;
+        host.runtime
+            .input("What needs to be done?", "A")
+            .expect("change the snapshot");
+
+        host.forced_surface_statuses
+            .push_back(wgpu::CurrentSurfaceTexture::Timeout);
+        host.render().expect("a skipped present is not an error");
+        assert_eq!(
+            host.windows.get(MAIN).expect("window").snapshot_revision,
+            presented
+        );
+        assert!(host.windows.get(MAIN).expect("window").paint_requested);
+
+        host.read_frame(MAIN)
+            .expect("read the pending frame offscreen");
+        let window = host.windows.get(MAIN).expect("window");
+        assert!(
+            window.paint_requested,
+            "an offscreen readback does not consume the damage"
+        );
+        assert_eq!(
+            window.snapshot_revision,
+            host.runtime.presentation_revision(),
+            "the readback syncs the build cache"
+        );
+
+        host.repaint_changed_windows()
+            .expect("the pending paint presents after the readback");
+        assert!(!host.windows.get(MAIN).expect("window").paint_requested);
+    }
+
+    #[test]
+    fn a_transient_paint_survives_a_skipped_present() {
+        let mut host = open_host();
+        host.render().expect("present the initial frame");
+        let (center, scale) = {
+            let scene = host.scene(MAIN).expect("scene");
+            let viewport = scene.viewport();
+            (
+                Point::new(viewport.width() / 2.0, viewport.height() / 2.0),
+                viewport.scale(),
+            )
+        };
+        let x = (center.x * scale) as i32;
+        let y = (center.y * scale) as i32;
+        let lparam = LPARAM((x as isize & 0xffff) | ((y as isize & 0xffff) << 16));
+
+        // 消息触发的重绘正好遇到遮挡：hover 请求保留到下一次绘制。
+        host.forced_surface_statuses
+            .push_back(wgpu::CurrentSurfaceTexture::Occluded);
+        // `send_msg` 会跑两遍重绘：窗口过程内一次，返回后再一次。
+        host.forced_surface_statuses
+            .push_back(wgpu::CurrentSurfaceTexture::Occluded);
+        send_msg(
+            &mut host,
+            MSG {
+                message: WM_MOUSEMOVE,
+                lParam: lparam,
+                ..Default::default()
+            },
+        );
+        assert!(
+            host.windows.get(MAIN).expect("window").paint_requested,
+            "the skipped hover stays pending"
+        );
+        assert!(
+            !host
+                .scene(MAIN)
+                .expect("scene")
+                .elements()
+                .iter()
+                .any(|element| element.hovered()),
+            "the hover is not committed before a present"
+        );
+
+        host.repaint_changed_windows()
+            .expect("the transient paint presents on the next pass");
+        assert!(!host.windows.get(MAIN).expect("window").paint_requested);
+        assert!(
+            host.scene(MAIN)
+                .expect("scene")
+                .elements()
+                .iter()
+                .any(|element| element.hovered()),
+            "the hover visual is presented"
+        );
     }
 
     #[test]
