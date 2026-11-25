@@ -1,0 +1,26 @@
+# #282 外部替换与组合可见证据
+
+日期: 2026-11-25
+基线: main f4c493f（#281 合并提交）加本工单的宿主 IME 同步修改，debug 构建
+探针: ZenUI Probe 282（仓库外临时探针，未提交）
+
+[23:21:29.261] probe launched (pid 26540)
+[23:21:30.212] window foreground: 85200212
+[23:21:30.633] clicked the editor center: text='' selection=''
+[23:21:31.153] first composition active: committed='' selection=''
+[23:21:31.171] screenshot 150-first-preedit.png
+[23:21:31.776] first candidate committed: text='你' selection=''
+[23:21:31.791] screenshot 150-committed.png
+[23:21:32.179] select all: text='你' selection='你'
+[23:21:33.252] preedit active: committed='你' selection=''
+[23:21:33.270] screenshot 150-preedit.png
+[23:21:33.272] trigger written; waiting for the external reset
+[23:21:33.655] after reset: text='external' selection='' rects='324,315,1,28'
+[23:21:33.670] screenshot 150-reset.png
+[23:21:34.074] after Enter: text='external' selection=''
+[23:21:34.091] screenshot 150-enter.png
+[23:21:34.582] after Ctrl+Z: text='external' selection=''
+[23:21:34.600] screenshot 150-undo.png
+[23:21:35.171] post-reset typing: text='externalx' selection='' rects='334,315,1,28'
+[23:21:35.188] screenshot 150-typed.png
+[23:21:35.342] probe exited

@@ -164,6 +164,10 @@ _Avoid_: rich text provider, text model (when meaning the committed value)
 在 caret/selection 上执行的平台无关编辑操作，例如插入、退格、删除；每次编辑派发一次 `on:input`。
 _Avoid_: input event, keystroke
 
+**Edit lineage**:
+一个已挂载文本输入自己的本地编辑血统：origin 取挂载代际（NodeId generation），revision 随每次本地编辑单调前进；血统同时记录在途派发的摘要、已结算水位线与上次观察的已提交值。刷新时用它把已提交值分类为这次编辑的结算（含 handler 规范化或截断的值）、旧 revision 的 stale settlement 或外部 reset。应用值仍是普通 `String`，origin 与 revision 不是 SDK 值类型；同 key 重新挂载得到新 origin、新 revision 与空历史。
+_Avoid_: TextValue, model revision, editor protocol value
+
 **Text edit history**:
 每个文本输入自己在运行时保存的有界撤销/重做历史：条目记录编辑前后的已提交值、caret、anchor 与归一化 selection；连续单字符输入按 run 合并（至多 64 个字符，空白并入前一个 run），移动、焦点变化、删除、多字符插入、整体替换、组合提交、撤销/重做与外部替换开启新步。撤销/重做通过一次 `on:input` 写回，模型仍是值的权威；精确恢复只对原样提交值的处理器成立。它不是应用层的业务撤销，也不跨输入共享。
 _Avoid_: application undo, model undo (when meaning text-input history), shared edit history
