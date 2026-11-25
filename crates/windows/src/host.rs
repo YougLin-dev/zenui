@@ -3,8 +3,8 @@ use std::error::Error;
 use std::ffi::c_void;
 use std::fmt;
 use std::num::NonZeroIsize;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use windows::Win32::Foundation::{
     ERROR_CLASS_ALREADY_EXISTS, GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE,
@@ -353,6 +353,165 @@ impl WakeState {
     }
 }
 
+/// 当前设备代的丢失状态；代际、丢失位与丢失序号必须一起读写。
+struct DeviceLossState {
+    generation: u64,
+    lost: bool,
+    /// 每次新的丢失递增；恢复只在序号未变时清除信号。
+    epoch: u64,
+}
+
+/// 当前设备代的丢失信号。
+///
+/// wgpu 的设备丢失回调在任意线程运行，只允许置位并投递一条合并消息；
+/// 回调不接触 Host、Runtime、surface 或 scene。代际号让旧设备的迟到回调
+/// 无法触发新设备的恢复。
+struct DeviceLossSignal {
+    state: Mutex<DeviceLossState>,
+    pending: AtomicBool,
+    /// 当前接收 `DEVICE_LOSS` 的 HWND 值；零表示没有可投递的窗口。
+    target: AtomicIsize,
+}
+
+impl DeviceLossSignal {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(DeviceLossState {
+                generation: 0,
+                lost: false,
+                epoch: 0,
+            }),
+            pending: AtomicBool::new(false),
+            target: AtomicIsize::new(0),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, DeviceLossState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn set_generation(&self, generation: u64) {
+        self.lock().generation = generation;
+        // 上一代的在途消息不再代表新设备；新回调会重新投递。
+        self.pending.store(false, Ordering::SeqCst);
+    }
+
+    fn raise(&self, generation: u64) {
+        let accepted = {
+            let mut state = self.lock();
+            if state.generation != generation {
+                false
+            } else {
+                state.lost = true;
+                state.epoch = state.epoch.wrapping_add(1);
+                true
+            }
+        };
+        if accepted {
+            self.post(generation);
+        }
+    }
+
+    fn mark_lost(&self) {
+        let mut state = self.lock();
+        state.lost = true;
+        state.epoch = state.epoch.wrapping_add(1);
+    }
+
+    fn epoch(&self) -> u64 {
+        self.lock().epoch
+    }
+
+    /// 投递一条合并后的恢复消息；没有存活目标时保留信号，等目标出现。
+    fn post(&self, generation: u64) {
+        if self.lock().generation != generation {
+            return;
+        }
+        if self.pending.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let Some(target) = self.target() else {
+            self.pending.store(false, Ordering::SeqCst);
+            return;
+        };
+        // 安全：PostMessageW 是线程安全的；失败只释放合并标志，信号仍在。
+        if unsafe {
+            PostMessageW(
+                Some(target),
+                host_message::DEVICE_LOSS,
+                WPARAM(generation as usize),
+                LPARAM(0),
+            )
+        }
+        .is_err()
+        {
+            self.pending.store(false, Ordering::SeqCst);
+        }
+    }
+
+    fn observed(&self) {
+        self.pending.store(false, Ordering::SeqCst);
+    }
+
+    /// 只有丢失序号仍等于 `epoch` 时清除；恢复期间的新丢失不会被吞掉。
+    fn clear_if(&self, epoch: u64) -> bool {
+        let mut state = self.lock();
+        if state.epoch != epoch {
+            return false;
+        }
+        state.lost = false;
+        self.observed();
+        true
+    }
+
+    fn is_lost(&self) -> bool {
+        self.lock().lost
+    }
+
+    fn set_target(&self, hwnd: Option<HWND>) -> bool {
+        let previous = self
+            .target
+            .swap(hwnd.map_or(0, |hwnd| hwnd.0 as isize), Ordering::SeqCst);
+        previous != self.target.load(Ordering::SeqCst)
+    }
+
+    fn target(&self) -> Option<HWND> {
+        let value = self.target.load(Ordering::SeqCst);
+        (value != 0).then_some(HWND(value as *mut core::ffi::c_void))
+    }
+}
+
+/// 为新 device 安装丢失回调，并让信号接受这一代。
+///
+/// 调用发生在 surface 配置与渲染器创建之前：staging 期间的丢失也必须进入
+/// 信号。信号代际先于宿主字段前进；重建失败时旧设备已经丢失，它的回调不再
+/// 承担新事件，下一次尝试会复用同一个代际。
+fn install_loss_callback(device: &wgpu::Device, loss: &Arc<DeviceLossSignal>, generation: u64) {
+    loss.set_generation(generation);
+    let loss = Arc::clone(loss);
+    device.set_device_lost_callback(move |_reason, _message| loss.raise(generation));
+}
+
+/// 设备丢失后的宿主阶段；丢失信号跨重建保留，阶段决定是否还欠一次呈现。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LossPhase {
+    /// 没有未处理的丢失。
+    Clear,
+    /// 信号已置位，等待下一次重建。
+    Pending,
+    /// 已重建但还没有成功呈现；此时不重复创建设备。
+    AwaitingPresent,
+}
+
+/// `add_window` 的结果；设备在重建期间又丢失时把请求留到下一次同步。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WindowAdd {
+    Added,
+    Deferred,
+}
+
 /// 一个窗口的原生菜单栏与同一代快捷键表。
 ///
 /// 两者共享命令 id 映射与 activation 生命周期：窗口关闭时一起释放，重新打开
@@ -490,8 +649,16 @@ pub struct Host {
     routing_suppressed: bool,
     /// 设备丢失后的一次恢复正在进行，避免递归重建。
     recovering: bool,
-    /// 渲染时发现 surface 丢失；消息处理结束后统一重建所有窗口。
-    device_lost: bool,
+    /// 当前设备代的丢失信号；wgpu 回调与宿主之间只通过它通信。
+    loss: Arc<DeviceLossSignal>,
+    /// 丢失信号的处理阶段；重建后仍需第一次成功呈现。
+    loss_phase: LossPhase,
+    /// 设备代际；每次新 device 递增，旧回调按它淘汰。
+    device_generation: u64,
+    /// `AwaitingPresent` 对应的丢失序号；呈现只清除同一序号的信号。
+    loss_epoch: u64,
+    /// 本次恢复开始后是否已经成功呈现过一帧。
+    presented_since_rebuild: bool,
     /// 窗口过程不能返回错误；消息循环在派发后取走并返回。
     deferred_error: Option<HostError>,
     /// 关闭协议改变了焦点/启用状态，消息循环在下次同步后重定向前台。
@@ -583,6 +750,10 @@ impl Host {
         });
         let surface = create_surface(&instance, hwnd, hinstance)?;
         let (adapter, device, queue) = request_backend(&instance, &surface)?;
+        // 回调在配置与渲染器创建之前安装：staging 期间的丢失也必须进入信号，
+        // 而不是在第一次取纹理时被当成 API misuse。
+        let loss = Arc::new(DeviceLossSignal::new());
+        install_loss_callback(&device, &loss, 1);
         let surface_config = surface_configuration(&adapter, &surface, hwnd)?;
         surface.configure(&device, &surface_config);
         let format = surface_config.format;
@@ -636,7 +807,11 @@ impl Host {
             dispatching: None,
             routing_suppressed: false,
             recovering: false,
-            device_lost: false,
+            loss,
+            loss_phase: LossPhase::Clear,
+            device_generation: 1,
+            loss_epoch: 0,
+            presented_since_rebuild: false,
             deferred_error: None,
             focus_after_sync: false,
             file_dialog_presenter: None,
@@ -663,12 +838,16 @@ impl Host {
             surface_config,
             blink_timer,
         ));
+        let mut deferred = false;
         for info in &infos {
-            if info.spec.key() != primary {
-                host.add_window(info)?;
+            if info.spec.key() != primary && host.add_window(info)? == WindowAdd::Deferred {
+                deferred = true;
+                break;
             }
         }
-        host.revision = host.runtime.window_revision();
+        if !deferred {
+            host.revision = host.runtime.window_revision();
+        }
         host.update_wake_target();
         host.install_tray()?;
         Ok(host)
@@ -1046,6 +1225,8 @@ impl Host {
         if host_message::ALL.contains(&message) {
             if message == host_message::DROP {
                 self.drain_drop_message(hwnd);
+            } else if message == host_message::DEVICE_LOSS {
+                self.handle_device_loss(wparam);
             } else if message == host_message::WAKE
                 && let Err(error) = self.deliver_tasks()
             {
@@ -1066,6 +1247,19 @@ impl Host {
             self.deferred_error.get_or_insert(error);
         }
         if let Err(error) = self.repaint_changed_windows() {
+            self.deferred_error.get_or_insert(error);
+        }
+    }
+
+    /// 处理设备丢失消息；代际不匹配或信号已被呈现清除时忽略。
+    fn handle_device_loss(&mut self, wparam: WPARAM) {
+        self.loss.observed();
+        let generation = wparam.0 as u64;
+        if generation != self.device_generation || !self.loss.is_lost() {
+            return;
+        }
+        self.loss_phase = LossPhase::Pending;
+        if let Err(error) = self.recover_device() {
             self.deferred_error.get_or_insert(error);
         }
     }
@@ -1685,6 +1879,15 @@ impl Host {
         snapshot: &mut PresentationSnapshot,
         snapshot_changed: bool,
     ) -> Result<bool, HostError> {
+        // 丢失回调先置位信号、再投递消息；消息处理前阶段仍是 `Clear`，
+        // `AwaitingPresent` 也可能因重建设备再次丢失而落后于丢失序号。
+        // 两种情况下这一帧都不能创建 surface，也不能呈现。
+        let stale_proving =
+            self.loss_phase == LossPhase::AwaitingPresent && self.loss.epoch() != self.loss_epoch;
+        if (self.loss_phase == LossPhase::Clear && self.loss.is_lost()) || stale_proving {
+            self.loss_phase = LossPhase::Pending;
+            return Ok(false);
+        }
         self.ensure_surface(window)?;
         let (width, height) = client_size(window.hwnd())?;
         if width == 0 || height == 0 {
@@ -1730,9 +1933,8 @@ impl Host {
                     return Ok(false);
                 }
                 wgpu::CurrentSurfaceTexture::Validation => {
-                    return Err(HostError::Surface(String::from(
-                        "the surface failed validation; rebuilding would mask an API misuse",
-                    )));
+                    self.validation_status()?;
+                    return Ok(false);
                 }
             };
             let view = frame.texture.create_view(&Default::default());
@@ -1746,11 +1948,28 @@ impl Host {
             }
             self.queue.submit([encoder.finish()]);
             self.queue.present(frame);
+            self.presented_since_rebuild = true;
+            if self.loss_phase == LossPhase::AwaitingPresent && self.loss.clear_if(self.loss_epoch)
+            {
+                self.loss_phase = LossPhase::Clear;
+                self.loss_epoch = 0;
+            }
             commit_scene(window, snapshot, scene);
             window.paint_requested = false;
             self.position_ime(window, snapshot);
             return Ok(true);
         }
+    }
+
+    /// 信号已置位时，`Validation` 是设备移除的级联错误；否则是 API misuse。
+    fn validation_status(&mut self) -> Result<(), HostError> {
+        if self.loss.is_lost() {
+            self.surface_lost()?;
+            return Ok(());
+        }
+        Err(HostError::Surface(String::from(
+            "the surface failed validation; rebuilding would mask an API misuse",
+        )))
     }
 
     /// 标记设备丢失；消息处理结束后由 [`Host::recover_device`] 统一重建。
@@ -1760,17 +1979,59 @@ impl Host {
                 "the surface stayed lost after rebuilding",
             )));
         }
-        self.device_lost = true;
+        self.loss.mark_lost();
+        self.loss_phase = LossPhase::Pending;
         Ok(())
     }
 
     /// 重新创建 device/queue/renderer 与每个窗口的 surface，然后重绘全部窗口。
+    ///
+    /// 丢失信号跨重建保留；只有新设备成功呈现至少一帧且恢复期间没有新的
+    /// 丢失/渲染失败时才清除。没有可见窗口时停在 `AwaitingPresent`，不会
+    /// 因为重复消息反复创建设备。
     fn recover_device(&mut self) -> Result<(), HostError> {
-        self.device_lost = false;
+        if self.loss_phase != LossPhase::Pending || self.recovering {
+            return Ok(());
+        }
+        let epoch = self.loss.epoch();
         self.recovering = true;
+        self.presented_since_rebuild = false;
         let result = self.rebuild_presentations().and_then(|()| self.render());
         self.recovering = false;
-        result
+        match result {
+            Ok(()) => {
+                if self.loss.epoch() != epoch {
+                    self.loss_phase = LossPhase::Pending;
+                } else if self.presented_since_rebuild {
+                    if self.loss.clear_if(epoch) {
+                        self.loss_phase = LossPhase::Clear;
+                        self.loss_epoch = 0;
+                    } else {
+                        self.loss_phase = LossPhase::AwaitingPresent;
+                        self.loss_epoch = epoch;
+                    }
+                } else {
+                    self.loss_phase = LossPhase::AwaitingPresent;
+                    self.loss_epoch = epoch;
+                }
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// 当前 device 代是否可以创建 surface。
+    ///
+    /// 丢失回调先置位信号、再投递消息；消息处理前阶段仍是 `Clear`，但那时
+    /// 的 device 已经失效。`AwaitingPresent` 只欠一次呈现，新窗口可以在已
+    /// 重建的 device 上建 surface；丢失序号前进后（重建后的设备又丢了）
+    /// 才再次禁止。
+    fn can_create_surface(&self) -> bool {
+        match self.loss_phase {
+            LossPhase::Clear => !self.loss.is_lost(),
+            LossPhase::Pending => false,
+            LossPhase::AwaitingPresent => self.loss.epoch() == self.loss_epoch,
+        }
     }
 
     /// 一次左键按下：文本输入在按下时聚焦并放置 caret；按钮与复选框只记录
@@ -3151,45 +3412,63 @@ impl Host {
     /// 消息会再次尝试重建。
     fn rebuild_presentations(&mut self) -> Result<(), HostError> {
         let Some(first_key) = self.windows.keys().next().copied() else {
+            // 零窗口的常驻宿主没有 surface 可绑定；仍换掉丢失的 device，
+            // 保持旧格式与 1×1 目标，窗口重开时再建 surface。
+            let (adapter, device, queue) = request_backend_without_surface(&self._instance)?;
+            let generation = self.device_generation.wrapping_add(1).max(1);
+            install_loss_callback(&device, &self.loss, generation);
+            let format = self.format;
+            let target = target_config(format, 1, 1)?;
+            let renderer =
+                GpuRenderer::from_parts(&device, &queue, target, RenderPalette::default());
+            self.adapter = adapter;
+            self.device = device;
+            self.queue = queue;
+            self.renderer = renderer;
+            self.renderer_target = target;
+            self.device_generation = generation;
             return Ok(());
         };
+        // 旧 surface 属于丢失的 device；先释放，允许同一 HWND 重建交换链。
         for window in self.windows.values_mut() {
             window.surface = None;
         }
         let first_hwnd = self.windows[&first_key].hwnd();
         let first_surface = create_surface(&self._instance, first_hwnd, self.hinstance)?;
         let (adapter, device, queue) = request_backend(&self._instance, &first_surface)?;
+        let generation = self.device_generation.wrapping_add(1).max(1);
+        install_loss_callback(&device, &self.loss, generation);
         let first_config = surface_configuration(&adapter, &first_surface, first_hwnd)?;
         first_surface.configure(&device, &first_config);
         let format = first_config.format;
         let target = target_config(format, first_config.width, first_config.height)?;
         let renderer = GpuRenderer::from_parts(&device, &queue, target, RenderPalette::default());
-        self.adapter = adapter;
-        self.device = device;
-        self.queue = queue;
-        self.format = format;
-        self.renderer = renderer;
-        self.renderer_target = target;
-        {
-            let window = self
-                .windows
-                .get_mut(first_key)
-                .expect("the first window stays live");
-            window.surface = Some(first_surface);
-            window.surface_config = first_config;
-        }
+        let mut staged = Vec::with_capacity(self.windows.len());
+        staged.push((first_key, first_surface, first_config));
         for key in self.windows.keys().copied().collect::<Vec<_>>() {
             if key == first_key {
                 continue;
             }
             let hwnd = self.windows[&key].hwnd();
             let surface = create_surface(&self._instance, hwnd, self.hinstance)?;
-            let config = surface_configuration(&self.adapter, &surface, hwnd)?;
-            surface.configure(&self.device, &config);
+            let config = surface_configuration(&adapter, &surface, hwnd)?;
+            surface.configure(&device, &config);
+            staged.push((key, surface, config));
+        }
+        // 全部窗口的 surface 都建好后才替换字段；失败时旧 device 仍在，但
+        // 丢失信号会阻止任何旧 surface 的创建或呈现。
+        self.adapter = adapter;
+        self.device = device;
+        self.queue = queue;
+        self.format = format;
+        self.renderer = renderer;
+        self.renderer_target = target;
+        for (key, surface, config) in staged {
             let window = self.windows.get_mut(key).expect("the window stays live");
             window.surface = Some(surface);
             window.surface_config = config;
         }
+        self.device_generation = generation;
         Ok(())
     }
 
@@ -3199,6 +3478,11 @@ impl Host {
             return Ok(());
         }
         if window.surface.is_none() {
+            if !self.can_create_surface() {
+                return Err(HostError::Surface(String::from(
+                    "the device is lost; a surface cannot be created on it",
+                )));
+            }
             let surface = create_surface(&self._instance, window.hwnd(), self.hinstance)?;
             let config = surface_configuration(&self.adapter, &surface, window.hwnd())?;
             surface.configure(&self.device, &config);
@@ -3358,7 +3642,7 @@ impl Host {
         let hwnd = window.hwnd();
         let result = self.without_routing(Some(hwnd), |host| action(host, &mut window));
         self.windows.insert(key, window);
-        if result.is_ok() && self.device_lost && !self.recovering {
+        if result.is_ok() && self.loss_phase == LossPhase::Pending && !self.recovering {
             self.recover_device()?;
         }
         result
@@ -3456,7 +3740,18 @@ impl Host {
         self.windows.insert(key, window);
     }
 
-    fn add_window(&mut self, info: &WindowInfo) -> Result<(), HostError> {
+    fn add_window(&mut self, info: &WindowInfo) -> Result<WindowAdd, HostError> {
+        if !self.can_create_surface() {
+            // 丢失信号可能先于 `DEVICE_LOSS` 消息置位，消息也可能随旧目标
+            // 丢弃；`AwaitingPresent` 后重建设备再次丢失时同样没有消息推动。
+            // 新窗口必须在有效设备上创建 surface，先补一次重建。
+            self.loss_phase = LossPhase::Pending;
+            self.recover_device()?;
+            if !self.can_create_surface() {
+                // 重建期间又发生丢失：信号保持置位，请求留到下一次同步重试。
+                return Ok(WindowAdd::Deferred);
+            }
+        }
         let menu = build_window_menu(&self.runtime, info.window)?;
         let (window, menu) = NativeWindow::new(info.spec, self.hinstance, menu)?;
         let menu = complete_window_menu(menu)?;
@@ -3466,6 +3761,19 @@ impl Host {
         let blink_timer = (blink_timer != 0).then_some(blink_timer);
         let surface = create_surface(&self._instance, hwnd, self.hinstance)?;
         let config = surface_configuration(&self.adapter, &surface, hwnd)?;
+        if config.format != self.format {
+            // 零窗口恢复时用旧格式建了过渡 renderer；窗口的 surface 格式可能
+            // 不同，必须在第一次绘制前换到新格式。
+            self.format = config.format;
+            let target = target_config(self.format, config.width, config.height)?;
+            self.renderer = GpuRenderer::from_parts(
+                &self.device,
+                &self.queue,
+                target,
+                RenderPalette::default(),
+            );
+            self.renderer_target = target;
+        }
         surface.configure(&self.device, &config);
         self.insert_window(WindowHost::new(
             window,
@@ -3476,7 +3784,7 @@ impl Host {
             config,
             blink_timer,
         ));
-        Ok(())
+        Ok(WindowAdd::Added)
     }
 
     fn remove_window(&mut self, key: &'static str) {
@@ -3523,13 +3831,19 @@ impl Host {
                     self.remove_window(key);
                 }
             }
+            let mut deferred = false;
             for info in &infos {
-                if !self.windows.contains_key(info.spec.key()) {
-                    self.add_window(info)?;
+                if !self.windows.contains_key(info.spec.key())
+                    && self.add_window(info)? == WindowAdd::Deferred
+                {
+                    deferred = true;
+                    break;
                 }
             }
-            // 只有全部窗口都就绪才提交修订号；失败时下一次同步会重试缺的窗口。
-            self.revision = revision;
+            // 只有全部窗口都就绪才提交修订号；失败或推迟时下一次同步会重试。
+            if !deferred {
+                self.revision = revision;
+            }
         }
         self.sync_visibility();
         self.sync_enabled()?;
@@ -3776,6 +4090,19 @@ impl Host {
                 .is_err()
         {
             self.wake.observed();
+        }
+        // 丢失消息也跟随当前目标；旧目标上的在途消息可能随窗口销毁而丢失，
+        // 因此换目标时释放合并标志，只在等待重建时向新目标重发。
+        let loss_target_changed = self.loss.set_target(target);
+        if loss_target_changed {
+            self.loss.observed();
+            // `AwaitingPresent` 若仍是同一丢失序号，只需要等首次呈现；
+            // 新序号才代表重建后的设备又丢了。
+            let needs_rebuild = self.loss_phase != LossPhase::AwaitingPresent
+                || self.loss.epoch() != self.loss_epoch;
+            if self.loss.is_lost() && needs_rebuild {
+                self.loss.post(self.device_generation);
+            }
         }
     }
 
@@ -4309,9 +4636,24 @@ fn request_backend(
     instance: &wgpu::Instance,
     surface: &wgpu::Surface<'_>,
 ) -> Result<(wgpu::Adapter, wgpu::Device, wgpu::Queue), HostError> {
+    request_backend_inner(instance, Some(surface))
+}
+
+/// 零窗口恢复没有 surface 可兼容；仍要换掉已丢失的 device，等窗口重开再建
+/// surface。适配器选择与有 surface 时相同。
+fn request_backend_without_surface(
+    instance: &wgpu::Instance,
+) -> Result<(wgpu::Adapter, wgpu::Device, wgpu::Queue), HostError> {
+    request_backend_inner(instance, None)
+}
+
+fn request_backend_inner(
+    instance: &wgpu::Instance,
+    surface: Option<&wgpu::Surface<'_>>,
+) -> Result<(wgpu::Adapter, wgpu::Device, wgpu::Queue), HostError> {
     let mut options = wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::HighPerformance,
-        compatible_surface: Some(surface),
+        compatible_surface: surface,
         force_fallback_adapter: false,
         ..Default::default()
     };
@@ -7577,6 +7919,24 @@ mod tests {
     }
 
     #[test]
+    fn a_new_loss_prevents_clearing_the_previous_epoch() {
+        let loss = DeviceLossSignal::new();
+        loss.set_generation(1);
+        loss.raise(1);
+        let epoch = loss.epoch();
+        assert!(loss.is_lost());
+
+        loss.mark_lost();
+        assert!(
+            !loss.clear_if(epoch),
+            "a newer loss is not cleared by the older recovery"
+        );
+        assert!(loss.is_lost());
+        assert!(loss.clear_if(loss.epoch()));
+        assert!(!loss.is_lost());
+    }
+
+    #[test]
     fn concurrent_wakes_claim_exactly_one_message() {
         let wake = Arc::new(wake_state());
         let barrier = Arc::new(std::sync::Barrier::new(3));
@@ -7626,6 +7986,42 @@ mod tests {
         let mut host = Host::open(runtime, HostConfig::hidden()).expect("open the task probe host");
         host.render().expect("render the task probe window");
         host
+    }
+
+    fn open_delivering_task_host() -> (Host, &'static AtomicUsize) {
+        let completed = leak(AtomicUsize::new(0));
+        let mut runtime = Runtime::new();
+        runtime
+            .declare_windows(move |catalog| {
+                catalog.window(
+                    WindowSpec::new(MAIN).primary().sized(320, 240),
+                    move |window| {
+                        let start = move || {
+                            let _ = window
+                                .task_scope()
+                                .spawn(|_| String::from("done"))
+                                .and_then(|task| {
+                                    task.on_done(move |_: String| {
+                                        completed.fetch_add(1, Ordering::SeqCst);
+                                        Ok(())
+                                    })
+                                });
+                        };
+                        view! {
+                            <view role="main">
+                                <button on:click={move || start()}>"Start task"</button>
+                            </view>
+                        }
+                    },
+                )?;
+                Ok(())
+            })
+            .expect("declare the delivering task window");
+        runtime.show(MAIN).expect("show the delivering task window");
+        let mut host =
+            Host::open(runtime, HostConfig::hidden()).expect("open the delivering task host");
+        host.render().expect("render the delivering task window");
+        (host, completed)
     }
 
     #[test]
@@ -7884,7 +8280,7 @@ mod tests {
         let before_main = host.read_frame("main").expect("main frame");
         let before_second = host.read_frame("second").expect("second frame");
 
-        host.device_lost = true;
+        host.surface_lost().expect("mark loss");
         host.recover_device().expect("rebuild every surface");
 
         let main = host.read_frame("main").expect("main frame after");
@@ -7918,7 +8314,7 @@ mod tests {
         host.render().expect("render at the scrolled offset");
         assert_eq!(host.scene(MAIN).expect("scene").scroll_offset(), 72);
 
-        host.device_lost = true;
+        host.surface_lost().expect("mark loss");
         host.recover_device().expect("rebuild every surface");
 
         assert_eq!(
@@ -7927,6 +8323,326 @@ mod tests {
                 .scroll_offset(),
             72,
             "a recreated surface keeps the applied offset"
+        );
+    }
+
+    #[test]
+    fn destroyed_device_recovers_once_and_preserves_ui_state() {
+        let mut host = open_host();
+        host.runtime
+            .focus("What needs to be done?")
+            .expect("focus the draft");
+        host.runtime
+            .input("What needs to be done?", "Recovery draft")
+            .expect("type the draft");
+        let node = host
+            .runtime
+            .presentation()
+            .expect("snapshot")
+            .focus()
+            .expect("the focused draft");
+        host.runtime
+            .set_selection_node(node, 1, 3)
+            .expect("selection");
+        host.runtime
+            .set_appearance(Appearance::Dark)
+            .expect("dark appearance");
+        host.render().expect("render before the loss");
+        let ids: Vec<_> = host
+            .scene(MAIN)
+            .expect("scene")
+            .elements()
+            .iter()
+            .map(|element| element.id())
+            .collect();
+        let before = host.read_frame(MAIN).expect("frame before the loss");
+        let generation = host.device_generation;
+
+        host.device.destroy();
+        let _ = host.device.poll(wgpu::PollType::wait_indefinitely());
+        host.render().expect("render after the device is destroyed");
+
+        assert_eq!(
+            host.device_generation,
+            generation + 1,
+            "one device generation is created"
+        );
+        assert_eq!(
+            host.loss_phase,
+            LossPhase::Clear,
+            "a successful present clears the loss"
+        );
+        assert!(!host.loss.is_lost(), "the loss signal is cleared");
+        assert!(
+            host.windows.values().all(|window| window.surface.is_some()),
+            "every live window gets a surface from the new device"
+        );
+        let snapshot = host.runtime.presentation().expect("snapshot after");
+        assert_eq!(snapshot.focus(), Some(node), "focus survives");
+        let draft = snapshot.node(node).expect("draft");
+        assert_eq!(draft.text_value(), Some("Recovery draft"), "draft survives");
+        let edit = draft.edit().expect("edit state");
+        assert_eq!(edit.selection(), Some((1, 3)), "selection survives");
+        assert_eq!(edit.caret(), 3, "caret survives");
+        assert_eq!(
+            snapshot.appearance(),
+            Appearance::Dark,
+            "appearance survives"
+        );
+        assert_eq!(
+            host.scene(MAIN)
+                .expect("scene after")
+                .elements()
+                .iter()
+                .map(|element| element.id())
+                .collect::<Vec<_>>(),
+            ids,
+            "Node IDs survive"
+        );
+        let after = host.read_frame(MAIN).expect("frame after the recovery");
+        assert_eq!(before.pixels(), after.pixels());
+
+        host.render().expect("render again");
+        assert_eq!(
+            host.device_generation,
+            generation + 1,
+            "recovery is not re-entered"
+        );
+
+        let before_char = host.read_frame(MAIN).expect("frame before typing");
+        send_msg(
+            &mut host,
+            MSG {
+                message: WM_CHAR,
+                wParam: WPARAM('X' as usize),
+                ..Default::default()
+            },
+        );
+        let after_char = host.read_frame(MAIN).expect("frame after typing");
+        assert_ne!(
+            before_char.pixels(),
+            after_char.pixels(),
+            "the rebuilt device renders a typed character"
+        );
+    }
+
+    #[test]
+    fn device_destroy_posts_the_loss_message_and_recovers_on_pump() {
+        let mut host = open_host();
+        host.render().expect("render before the loss");
+        let generation = host.device_generation;
+
+        host.device.destroy();
+        let _ = host.device.poll(wgpu::PollType::wait_indefinitely());
+        host.pump().expect("pump the pending loss message");
+
+        assert_eq!(
+            host.device_generation,
+            generation + 1,
+            "the callback message rebuilds the device"
+        );
+        assert!(
+            host.windows.values().all(|window| window.surface.is_some()),
+            "every live window gets a surface"
+        );
+        let frame = host.read_frame(MAIN).expect("frame after recovery");
+        assert!(!frame.pixels().is_empty());
+    }
+
+    #[test]
+    fn synthetic_lost_rebuilds_once_and_keeps_hidden_windows_hidden() {
+        let mut host = open_two_window_host();
+        let second = host.windows.get("second").expect("second").ctx;
+        assert!(host.runtime.window_visible(second));
+        let generation = host.device_generation;
+        assert!(
+            host.windows.values().all(|window| !window.native.shown),
+            "the hidden host starts with no shown native window"
+        );
+
+        host.surface_lost().expect("synthetic Lost status");
+        assert_eq!(host.loss_phase, LossPhase::Pending);
+        host.recover_device().expect("rebuild every surface");
+
+        assert_eq!(host.device_generation, generation + 1);
+        assert!(!host.show_windows, "hidden mode stays hidden");
+        assert!(
+            host.windows.values().all(|window| !window.native.shown),
+            "recovery does not show a hidden native window"
+        );
+        assert!(host.runtime.window_visible(second), "visibility survives");
+        assert!(
+            host.windows.values().all(|window| window.surface.is_some()),
+            "every live window has a new surface"
+        );
+
+        host.recover_device().expect("a second call is a no-op");
+        assert_eq!(host.device_generation, generation + 1);
+    }
+
+    #[test]
+    fn a_zero_window_loss_rebuilds_the_device_before_reopening() {
+        let mut host = open_host();
+        host.close(MAIN).expect("close the last window");
+        assert!(host.windows.is_empty());
+        let generation = host.device_generation;
+
+        host.surface_lost().expect("mark loss");
+        host.recover_device()
+            .expect("replace the device without a window");
+        assert_eq!(host.device_generation, generation + 1);
+        assert_eq!(host.loss_phase, LossPhase::AwaitingPresent);
+        assert!(host.loss.is_lost(), "no present has proved the device yet");
+
+        host.show(MAIN)
+            .expect("reopen the window on the new device");
+        assert!(
+            host.windows.values().all(|window| window.surface.is_some()),
+            "the reopened window gets a surface"
+        );
+        assert_eq!(
+            host.loss_phase,
+            LossPhase::Clear,
+            "the first present clears the loss"
+        );
+        assert!(!host.loss.is_lost());
+    }
+
+    #[test]
+    fn a_callback_loss_without_a_target_rebuilds_before_reopening() {
+        let mut host = open_host();
+        host.close(MAIN).expect("close the only window");
+        assert!(host.windows.is_empty());
+        let generation = host.device_generation;
+
+        host.device.destroy();
+        let _ = host.device.poll(wgpu::PollType::wait_indefinitely());
+        assert!(host.loss.is_lost(), "the callback sets the loss signal");
+        assert_eq!(
+            host.loss_phase,
+            LossPhase::Clear,
+            "no target can dispatch the pending message yet"
+        );
+
+        host.show(MAIN).expect("reopen the window");
+        assert_eq!(
+            host.device_generation,
+            generation + 1,
+            "the reopen replaces the lost device before creating a surface"
+        );
+        assert_eq!(host.loss_phase, LossPhase::Clear);
+        assert!(!host.loss.is_lost());
+        assert!(host.windows.values().all(|window| window.surface.is_some()));
+    }
+
+    #[test]
+    fn a_second_loss_after_recovery_rebuilds_before_reopening() {
+        let mut host = open_host();
+        host.close(MAIN).expect("close the only window");
+        host.surface_lost().expect("mark loss");
+        host.recover_device()
+            .expect("replace the device without a window");
+        assert_eq!(host.loss_phase, LossPhase::AwaitingPresent);
+        let generation = host.device_generation;
+
+        host.device.destroy();
+        let _ = host.device.poll(wgpu::PollType::wait_indefinitely());
+        assert!(host.loss.is_lost(), "the rebuilt device reports a loss");
+        assert_eq!(
+            host.loss_phase,
+            LossPhase::AwaitingPresent,
+            "no target promotes the phase before a show"
+        );
+
+        host.show(MAIN).expect("reopen the window");
+        assert_eq!(
+            host.device_generation,
+            generation + 1,
+            "the second loss is repaired before the surface is created"
+        );
+        assert_eq!(host.loss_phase, LossPhase::Clear);
+        assert!(!host.loss.is_lost());
+        assert!(host.windows.values().all(|window| window.surface.is_some()));
+    }
+
+    #[test]
+    fn validation_is_loss_only_with_the_current_signal() {
+        let mut host = open_host();
+        let error = host
+            .validation_status()
+            .expect_err("validation without a loss signal is fatal");
+        assert!(matches!(error, HostError::Surface(_)));
+
+        host.loss.mark_lost();
+        host.validation_status()
+            .expect("signal-set validation is treated as loss");
+        assert_eq!(host.loss_phase, LossPhase::Pending);
+        assert!(host.loss.is_lost());
+        let generation = host.device_generation;
+        host.recover_device()
+            .expect("rebuild after the validation loss");
+        assert_eq!(host.device_generation, generation + 1);
+    }
+
+    #[test]
+    fn an_old_device_callback_cannot_trigger_a_second_rebuild() {
+        let mut host = open_host();
+        let old_generation = host.device_generation;
+
+        host.surface_lost().expect("mark loss");
+        host.recover_device().expect("recover");
+        let new_generation = host.device_generation;
+        assert_eq!(new_generation, old_generation + 1);
+        assert_eq!(host.loss_phase, LossPhase::Clear);
+        assert!(!host.loss.is_lost());
+        let phase = host.loss_phase;
+
+        host.loss.raise(old_generation);
+        assert!(
+            !host.loss.is_lost(),
+            "a stale callback does not set the signal"
+        );
+        let hwnd = host.hwnd(MAIN).expect("a live window");
+        host.handle_message(
+            hwnd,
+            host_message::DEVICE_LOSS,
+            WPARAM(old_generation as usize),
+            LPARAM(0),
+        );
+        assert_eq!(host.device_generation, new_generation);
+        assert_eq!(host.loss_phase, phase, "a stale message changes nothing");
+        assert!(!host.loss.is_lost());
+    }
+
+    #[test]
+    fn recovery_keeps_worker_delivery_alive() {
+        let (mut host, completed) = open_delivering_task_host();
+        host.runtime
+            .click_text("Start task")
+            .expect("spawn a window-owned task");
+        host.runtime.wait_for_tasks();
+
+        host.surface_lost().expect("mark loss");
+        host.recover_device().expect("recover");
+        assert_eq!(
+            completed.load(Ordering::SeqCst),
+            0,
+            "the result waits for the host to deliver it"
+        );
+
+        let hwnd = host.hwnd(MAIN).expect("a live window");
+        host.handle_message(hwnd, host_message::WAKE, WPARAM(0), LPARAM(0));
+
+        assert_eq!(
+            completed.load(Ordering::SeqCst),
+            1,
+            "the host delivers the worker result after recovery"
+        );
+        assert!(!host.wake.is_pending(), "delivery observes the wake");
+        assert!(!host.show_windows, "the hidden window stays hidden");
+        assert!(
+            host.windows.values().all(|window| !window.native.shown),
+            "recovery does not show the hidden native window"
         );
     }
 
