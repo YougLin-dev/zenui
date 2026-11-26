@@ -51,6 +51,10 @@ pub(crate) struct OwnerRecord {
     parent: Option<u32>,
     children: Vec<u32>,
     resources: Vec<Resource>,
+    /// 本 owner 直接创建的挂载元素槽位；析构时清空并归还。
+    elements: Vec<usize>,
+    /// 本 owner 直接创建的组件槽位；析构时清空并归还。
+    components: Vec<usize>,
     disposed: bool,
 }
 
@@ -109,9 +113,13 @@ pub(crate) struct State {
     owners: BTreeMap<u32, OwnerRecord>,
     next_owner: u32,
     pub(crate) current_owner: Option<u32>,
-    events: Vec<Event>,
+    events: Vec<Option<Event>>,
     elements: Vec<MountedElement>,
     components: Vec<MountedComponent>,
+    /// 卸载后保留 NodeId tombstone 的槽位；新挂载复用并换新 generation。
+    free_elements: Vec<usize>,
+    free_components: Vec<usize>,
+    free_events: Vec<usize>,
     trees: BTreeMap<TreeKey, MountedTree>,
     app_setup: bool,
     window_factory_ran: bool,
@@ -216,6 +224,8 @@ impl State {
                 parent: None,
                 children: Vec::new(),
                 resources: Vec::new(),
+                elements: Vec::new(),
+                components: Vec::new(),
                 disposed: false,
             },
         );
@@ -238,6 +248,9 @@ impl State {
             events: Vec::new(),
             elements: Vec::new(),
             components: Vec::new(),
+            free_elements: Vec::new(),
+            free_components: Vec::new(),
+            free_events: Vec::new(),
             trees: BTreeMap::new(),
             app_setup: false,
             window_factory_ran: false,
@@ -297,14 +310,90 @@ impl State {
     }
 
     /// 每次元素挂载分配新的 generation；旧挂载的身份不会命中重新挂载的元素。
-    fn mint_node(&mut self) -> NodeId {
+    fn mint_node_at(&mut self, slot: usize) -> NodeId {
         let id = NodeId::mint(
             self.id,
-            u32::try_from(self.elements.len()).expect("node identity exhausted"),
+            u32::try_from(slot).expect("node identity exhausted"),
             self.next_node_mount,
         );
         self.next_node_mount += 1;
         id
+    }
+
+    /// 预留一个元素槽位并登记到 owner；`place_element` 完成挂载。
+    fn reserve_element(&mut self, owner: u32) -> usize {
+        let slot = self.free_elements.pop().unwrap_or(self.elements.len());
+        if let Some(record) = self.owners.get_mut(&owner) {
+            record.elements.push(slot);
+        }
+        slot
+    }
+
+    fn place_element(&mut self, slot: usize, element: MountedElement) {
+        if slot == self.elements.len() {
+            self.elements.push(element);
+        } else {
+            debug_assert!(slot < self.elements.len(), "element slots are pinned");
+            self.elements[slot] = element;
+        }
+    }
+
+    /// 预留一个组件槽位并登记到 owner；组件 id 就是槽位。
+    fn reserve_component(&mut self, owner: u32) -> usize {
+        let slot = self.free_components.pop().unwrap_or(self.components.len());
+        if let Some(record) = self.owners.get_mut(&owner) {
+            record.components.push(slot);
+        }
+        slot
+    }
+
+    fn place_component(&mut self, slot: usize, component: MountedComponent) {
+        if slot == self.components.len() {
+            self.components.push(component);
+        } else {
+            debug_assert!(slot < self.components.len(), "component slots are pinned");
+            self.components[slot] = component;
+        }
+    }
+
+    fn reserve_event(&mut self, event: Event) -> usize {
+        let slot = self.free_events.pop().unwrap_or(self.events.len());
+        if slot == self.events.len() {
+            self.events.push(Some(event));
+        } else {
+            self.events[slot] = Some(event);
+        }
+        slot
+    }
+
+    /// 卸载元素：只留 NodeId 供 stale 判定，其余 payload 全部释放。
+    fn retire_element(&mut self, slot: usize) {
+        let Some(element) = self.elements.get_mut(slot) else {
+            return;
+        };
+        let id = element.id;
+        let tag = element.tag;
+        *element = MountedElement {
+            id,
+            tag,
+            owner: 0,
+            attrs: Vec::new(),
+            class_styles: &[],
+            inline_styles: Vec::new(),
+            events: Vec::new(),
+            local: LocalState::None,
+            children: Vec::new(),
+        };
+        self.free_elements.push(slot);
+    }
+
+    fn retire_component(&mut self, slot: usize) {
+        let Some(component) = self.components.get_mut(slot) else {
+            return;
+        };
+        component.owner = 0;
+        component.children = Vec::new();
+        self.free_components.push(slot);
     }
 
     fn tree(&self, key: TreeKey) -> Option<&MountedTree> {
@@ -499,6 +588,8 @@ impl State {
                 parent,
                 children: Vec::new(),
                 resources: Vec::new(),
+                elements: Vec::new(),
+                components: Vec::new(),
                 disposed: false,
             },
         );
@@ -520,8 +611,10 @@ impl State {
             return;
         }
         record.disposed = true;
-        let children = record.children.clone();
+        let children = std::mem::take(&mut record.children);
         let resources = std::mem::take(&mut record.resources);
+        let elements = std::mem::take(&mut record.elements);
+        let components = std::mem::take(&mut record.components);
         let parent = record.parent;
 
         // 随 owner 释放的行带请求不会再有宿主读取；同时丢弃，避免窗口化
@@ -535,10 +628,21 @@ impl State {
         for child in children {
             self.dispose_owner(child);
         }
-        if let Some(parent) = parent
-            && let Some(record) = self.owners.get_mut(&parent)
-        {
-            record.children.retain(|child| *child != id);
+        // 槽位只保留 NodeId tombstone：旧 NodeId 仍是 Stale，新挂载换
+        // generation 后复用槽位，挂载次数不再决定常驻内存。
+        for slot in elements {
+            self.retire_element(slot);
+        }
+        for slot in components {
+            self.retire_component(slot);
+        }
+        if id != 0 {
+            if let Some(parent) = parent
+                && let Some(record) = self.owners.get_mut(&parent)
+            {
+                record.children.retain(|child| *child != id);
+            }
+            self.owners.remove(&id);
         }
     }
 
@@ -560,7 +664,8 @@ impl State {
                 }
                 Resource::Event(event) => {
                     if let Some(cell) = self.events.get_mut(event) {
-                        *cell = Event::Click(Box::new(|| {}));
+                        *cell = None;
+                        self.free_events.push(event);
                     }
                 }
             }
@@ -962,7 +1067,11 @@ impl State {
     }
 
     fn put_event(&mut self, id: usize, event: Event) {
-        self.events[id] = event;
+        // 派发期间元素可能已被卸载并复用槽位；只有槽位仍为空时才放回，
+        // 否则交给新挂载的处理器。
+        if self.events.get(id).is_some_and(Option::is_none) {
+            self.events[id] = Some(event);
+        }
     }
 
     fn update_local(&mut self, element: usize, value: LocalUpdate) {
@@ -1143,10 +1252,12 @@ impl State {
         let element = &self.elements[element];
         matches!(element.tag, "button" | "text-input" | "checkbox")
             || element.events.iter().any(|id| {
-                matches!(
-                    event_kind(&self.events[*id]),
-                    EventKind::Focus | EventKind::Blur
-                )
+                self.events
+                    .get(*id)
+                    .and_then(Option::as_ref)
+                    .is_some_and(|event| {
+                        matches!(event_kind(event), EventKind::Focus | EventKind::Blur)
+                    })
             })
     }
 
@@ -1201,11 +1312,13 @@ impl State {
             .events
             .iter()
             .copied()
-            .find(|id| event_kind(&self.events[*id]) == kind)?;
-        Some((
-            event,
-            std::mem::replace(&mut self.events[event], Event::Click(Box::new(|| {}))),
-        ))
+            .find(|id| {
+                self.events
+                    .get(*id)
+                    .and_then(Option::as_ref)
+                    .is_some_and(|event| event_kind(event) == kind)
+            })?;
+        Some((event, self.events.get_mut(event)?.take()?))
     }
 }
 
@@ -1888,27 +2001,30 @@ fn rows_height(row_height: Length, rows: usize) -> Length {
 /// 为窗口化 For 创建上下两个零高 spacer；高度由每次刷新按窗口更新。
 fn ensure_spacers(state: &mut State, owner: u32) -> (usize, usize) {
     let mut make = || {
-        let id = state.mint_node();
-        let slot = state.elements.len();
-        state.elements.push(MountedElement {
-            id,
-            tag: "view",
-            owner,
-            attrs: vec![MountedAttr {
-                name: "role",
-                value: AttrValue::Text(TextSlot::Static("spacer")),
-                current: Some(AttrCurrent::Text(String::from("spacer"))),
-            }],
-            class_styles: &[],
-            inline_styles: vec![MountedInlineStyle {
-                property: Property::Height,
-                slot: StyleSlot::Length(ValueSlot::Static(Length::px(0.0))),
-                current: Some(StyleValue::Length(Length::px(0.0))),
-            }],
-            events: Vec::new(),
-            local: LocalState::None,
-            children: Vec::new(),
-        });
+        let slot = state.reserve_element(owner);
+        let id = state.mint_node_at(slot);
+        state.place_element(
+            slot,
+            MountedElement {
+                id,
+                tag: "view",
+                owner,
+                attrs: vec![MountedAttr {
+                    name: "role",
+                    value: AttrValue::Text(TextSlot::Static("spacer")),
+                    current: Some(AttrCurrent::Text(String::from("spacer"))),
+                }],
+                class_styles: &[],
+                inline_styles: vec![MountedInlineStyle {
+                    property: Property::Height,
+                    slot: StyleSlot::Length(ValueSlot::Static(Length::px(0.0))),
+                    current: Some(StyleValue::Length(Length::px(0.0))),
+                }],
+                events: Vec::new(),
+                local: LocalState::None,
+                children: Vec::new(),
+            },
+        );
         slot
     };
     (make(), make())
@@ -3480,8 +3596,7 @@ impl Runtime {
                                 current: None,
                             }),
                             Attr::Event(event) => {
-                                let id = state.events.len();
-                                state.events.push(event);
+                                let id = state.reserve_event(event);
                                 events.push(id);
                                 if let Some(record) = state.owners.get_mut(&owner) {
                                     record.resources.push(Resource::Event(id));
@@ -3489,7 +3604,8 @@ impl Runtime {
                             }
                         }
                     }
-                    let id = state.mint_node();
+                    let slot = state.reserve_element(owner);
+                    let id = state.mint_node_at(slot);
                     // 每次挂载（包括同 key 重挂载）都建立新的编辑 origin；
                     // 旧挂载的 Node ID 是 StaleNode，旧派发无法命中新编辑器。
                     let local = match tag {
@@ -3501,7 +3617,6 @@ impl Runtime {
                         "checkbox" => LocalState::Checkbox { checked: false },
                         _ => LocalState::None,
                     };
-                    let slot = state.elements.len();
                     let inline_styles = plan
                         .inline_styles
                         .into_iter()
@@ -3511,17 +3626,20 @@ impl Runtime {
                             current: None,
                         })
                         .collect();
-                    state.elements.push(MountedElement {
-                        id,
-                        tag,
-                        owner,
-                        attrs,
-                        class_styles: plan.class_styles,
-                        inline_styles,
-                        events,
-                        local,
-                        children,
-                    });
+                    state.place_element(
+                        slot,
+                        MountedElement {
+                            id,
+                            tag,
+                            owner,
+                            attrs,
+                            class_styles: plan.class_styles,
+                            inline_styles,
+                            events,
+                            local,
+                            children,
+                        },
+                    );
                     slot
                 });
                 Ok(MountedNode::Element(id))
@@ -3561,9 +3679,9 @@ impl Runtime {
                 };
                 let id = with_state(|state| {
                     *state.setup_counts.entry(label).or_default() += 1;
-                    let id = state.components.len();
-                    state.components.push(MountedComponent { owner, children });
-                    id
+                    let slot = state.reserve_component(owner);
+                    state.place_component(slot, MountedComponent { owner, children });
+                    slot
                 });
                 Ok(MountedNode::Component(id))
             }
@@ -5428,7 +5546,10 @@ fn collect_element(state: &State, id: usize, out: &mut Vec<SnapshotNode>) {
 fn snapshot_actions(state: &State, element: &MountedElement) -> SnapshotActions {
     let mut actions = SnapshotActions::default();
     for id in &element.events {
-        match event_kind(&state.events[*id]) {
+        let Some(event) = state.events.get(*id).and_then(Option::as_ref) else {
+            continue;
+        };
+        match event_kind(event) {
             EventKind::Click => actions.insert(SnapshotAction::Click),
             EventKind::Change => actions.insert(SnapshotAction::Change),
             EventKind::Input => actions.insert(SnapshotAction::Input),
@@ -5645,27 +5766,19 @@ mod history_tests {
         app.click_label("hide-toggle").expect("unmount the input");
 
         let state = app.state.borrow();
-        let LocalState::TextInput(editor) = &state.elements[input.slot() as usize].local else {
-            panic!("the slot was a text input");
-        };
+        let slot = &state.elements[input.slot() as usize];
+        assert_eq!(slot.id, input, "the dead slot keeps the stale NodeId");
         assert!(
-            editor.history.undo.is_empty(),
-            "the undo stack was released"
+            matches!(slot.local, LocalState::None),
+            "the dead slot releases its text input"
         );
         assert!(
-            editor.history.redo.is_empty(),
-            "the redo stack was released"
-        );
-        assert_eq!(editor.history.undo_bytes, 0);
-        assert_eq!(editor.history.redo_bytes, 0);
-        assert_eq!(editor.value, "", "the editor text was released");
-        assert!(
-            editor.lineage.observed.is_none(),
-            "the observed value does not stay in the dead slot"
+            slot.attrs.is_empty() && slot.events.is_empty() && slot.children.is_empty(),
+            "the dead slot releases its payload"
         );
         assert!(
-            editor.lineage.in_flight.is_empty(),
-            "dispatched values do not stay in the dead slot"
+            state.free_elements.contains(&(input.slot() as usize)),
+            "the dead slot is available for reuse"
         );
     }
 
@@ -6222,6 +6335,128 @@ mod lineage_tests {
                 origin,
                 revision: 0,
             })
+        );
+    }
+}
+
+#[cfg(test)]
+mod recycling_tests {
+    #![allow(unused_braces)]
+
+    use super::*;
+    use crate::prelude::*;
+
+    /// 一行一个组件、一个元素与一个 click handler：覆盖元素、组件与事件槽位。
+    #[component]
+    fn RecycledRow(id: TodoId, store: Store) -> MountResult<MountPlan> {
+        let title = store.title(id).read_once()?;
+        let label = format!("Row {title}");
+        view! {
+            <view style:height={px(20.0)}>
+                <button aria:label={once(label)} on:click={move || {}}>"row"</button>
+            </view>
+        }
+    }
+
+    #[component]
+    fn RecycledList(store: Store) -> MountResult<MountPlan> {
+        let rows = memo(move || store.rows(Filter::All));
+        let seed = move || {
+            let mut transaction = Transaction::new();
+            for index in 0..200 {
+                transaction = transaction.write(store.insert(format!("r{index}")));
+            }
+            transaction.finish().expect("seed the rows");
+        };
+        view! {
+            <view role="main">
+                <button aria:label="Seed" on:click={move || seed()}>"Seed"</button>
+                <view class="gap-0">
+                    <For each={rows} key={|id: TodoId| id} row-height={px(20.0)}>
+                        {move |id: TodoId| view! { <RecycledRow id={id} store={store} /> }}
+                    </For>
+                </view>
+            </view>
+        }
+    }
+
+    fn fixture() -> (Runtime, WindowCtx, u64) {
+        let mut app = Runtime::new();
+        let store = app.setup(Store::new).expect("application setup");
+        app.declare_windows(move |catalog| {
+            catalog.window(
+                WindowSpec::new("main").primary().sized(900, 700),
+                move |_| view! { <RecycledList store={store} /> },
+            )
+        })
+        .expect("declare the window");
+        let window = app.show("main").expect("show the window");
+        app.click_label("Seed").expect("seed the rows");
+        let band = app.presentation_of(window).expect("snapshot").row_bands()[0].key();
+        (app, window, band)
+    }
+
+    /// 当前所有挂载存储的长度；槽位复用时这些长度不随挂载次数增长。
+    fn store_lengths(app: &Runtime) -> (usize, usize, usize, usize) {
+        let state = app.state.borrow();
+        (
+            state.elements.len(),
+            state.components.len(),
+            state.events.len(),
+            state.owners.len(),
+        )
+    }
+
+    #[test]
+    fn windowed_remounts_recycle_slots_and_keep_stale_ids() {
+        let (mut app, window, band) = fixture();
+        let baseline = store_lengths(&app);
+        let first = app
+            .presentation_of(window)
+            .expect("snapshot")
+            .find_label("Row r0")
+            .expect("row zero")
+            .id();
+
+        // 两个窗口尺寸来回切换：挂载与卸载交错，槽位只应稳定在第一个
+        // 生命周期内的峰值，而不是随切换次数增长。
+        for _ in 0..40 {
+            assert!(
+                app.set_row_window(window, band, 40, 10)
+                    .expect("shrink the row window")
+            );
+            assert!(
+                app.set_row_window(window, band, 0, 32)
+                    .expect("restore the row window")
+            );
+        }
+        let steady = store_lengths(&app);
+        assert_eq!(
+            app.node_status(first),
+            NodeStatus::Stale,
+            "the first row was unmounted and remounted with a new identity"
+        );
+        for _ in 0..40 {
+            assert!(
+                app.set_row_window(window, band, 40, 10)
+                    .expect("shrink the row window")
+            );
+            assert!(
+                app.set_row_window(window, band, 0, 32)
+                    .expect("restore the row window")
+            );
+        }
+        assert_eq!(
+            store_lengths(&app),
+            steady,
+            "repeated remounts reuse the same slots"
+        );
+        assert!(
+            steady.0 <= baseline.0 + 32
+                && steady.1 <= baseline.1 + 16
+                && steady.2 <= baseline.2 + 16
+                && steady.3 <= baseline.3 + 16,
+            "the steady state stays near the live window: baseline {baseline:?}, steady {steady:?}"
         );
     }
 }
