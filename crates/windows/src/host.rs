@@ -2,20 +2,23 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::ffi::c_void;
 use std::fmt;
+use std::mem::size_of;
 use std::num::NonZeroIsize;
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Foundation::{
-    ERROR_CLASS_ALREADY_EXISTS, GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE,
-    WPARAM,
+    ERROR_CLASS_ALREADY_EXISTS, ERROR_SUCCESS, GetLastError, HINSTANCE, HWND, LPARAM, LRESULT,
+    POINT, RECT, SIZE, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, ClientToScreen, EndPaint, PAINTSTRUCT, ValidateRect,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
 use windows::Win32::UI::Accessibility::{
-    IRawElementProviderSimple, UiaReturnRawElementProvider, UiaRootObjectId,
+    HCF_HIGHCONTRASTON, HIGHCONTRASTW, IRawElementProviderSimple, UiaReturnRawElementProvider,
+    UiaRootObjectId,
 };
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows::Win32::UI::HiDpi::{
@@ -39,13 +42,13 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetForegroundWindow, GetMenu, GetMenuItemCount, GetMenuItemID, GetMessageW, GetWindowLongPtrW,
     HACCEL, HICON, HMENU, IDC_ARROW, IDI_APPLICATION, IsIconic, IsZoomed, KillTimer, LoadCursorW,
     LoadIconW, MF_BYCOMMAND, MF_CHECKED, MF_ENABLED, MF_GRAYED, MF_UNCHECKED, MSG, PM_REMOVE,
-    PeekMessageW, PostMessageW, RegisterClassExW, RegisterWindowMessageW, SPI_GETWHEELSCROLLLINES,
-    SW_HIDE, SW_RESTORE, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER,
-    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SetForegroundWindow, SetTimer, SetWindowLongPtrW,
-    SetWindowPos, ShowWindow, SystemParametersInfoW, TranslateAcceleratorW, TranslateMessage,
-    WINDOW_EX_STYLE, WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY,
-    WM_DPICHANGED, WM_ENTERMENULOOP, WM_GETDPISCALEDSIZE, WM_GETOBJECT, WM_IME_CHAR,
-    WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_STARTCOMPOSITION, WM_INITMENU,
+    PeekMessageW, PostMessageW, RegisterClassExW, RegisterWindowMessageW, SPI_GETHIGHCONTRAST,
+    SPI_GETWHEELSCROLLLINES, SW_HIDE, SW_RESTORE, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOZORDER, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SetForegroundWindow, SetTimer,
+    SetWindowLongPtrW, SetWindowPos, ShowWindow, SystemParametersInfoW, TranslateAcceleratorW,
+    TranslateMessage, WINDOW_EX_STYLE, WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE, WM_COMMAND,
+    WM_CONTEXTMENU, WM_DESTROY, WM_DPICHANGED, WM_ENTERMENULOOP, WM_GETDPISCALEDSIZE, WM_GETOBJECT,
+    WM_IME_CHAR, WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_STARTCOMPOSITION, WM_INITMENU,
     WM_INITMENUPOPUP, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEHWHEEL,
     WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NULL, WM_PAINT, WM_SETTINGCHANGE, WM_SIZE, WM_SYSKEYDOWN,
     WM_TIMER, WNDCLASSEXW, WS_OVERLAPPEDWINDOW, WS_POPUP,
@@ -227,6 +230,91 @@ fn wheel_lines_from(lines: u32) -> WheelLines {
 const CARET_BLINK_TIMER: usize = 1;
 const CARET_BLINK_MS: u32 = 530;
 
+/// Windows 系统外观偏好：高对比度与辅助功能文本缩放。
+///
+/// 这是宿主输入，不是应用状态，也不进入呈现快照或应用事务。文本缩放的有效
+/// 范围是 100–225；越界值在构造时回退到 100。文本缩放不是显示 DPI：显示器
+/// 缩放仍由窗口 viewport 的 scale 承担。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SystemPreferences {
+    high_contrast: bool,
+    text_scale_percent: u16,
+}
+
+impl SystemPreferences {
+    /// 构造偏好；`text_scale_percent` 不在 100–225 时使用 100。
+    pub const fn new(high_contrast: bool, text_scale_percent: u16) -> Self {
+        Self {
+            high_contrast,
+            text_scale_percent: match text_scale_percent {
+                100..=225 => text_scale_percent,
+                _ => 100,
+            },
+        }
+    }
+
+    /// 系统是否启用高对比度。
+    pub const fn high_contrast(self) -> bool {
+        self.high_contrast
+    }
+
+    /// 文本缩放百分比，始终在 100–225 之间。
+    pub const fn text_scale_percent(self) -> u16 {
+        self.text_scale_percent
+    }
+}
+
+impl Default for SystemPreferences {
+    /// 高对比度关闭、文本缩放 100%；隐藏宿主与缺失系统值时使用。
+    fn default() -> Self {
+        Self::new(false, 100)
+    }
+}
+
+/// 采样当前 Windows 偏好；读取失败或值缺失时使用默认值。
+fn sample_system_preferences() -> SystemPreferences {
+    SystemPreferences::new(high_contrast_enabled(), text_scale_percent())
+}
+
+fn high_contrast_enabled() -> bool {
+    let mut high_contrast = HIGHCONTRASTW {
+        cbSize: size_of::<HIGHCONTRASTW>() as u32,
+        ..Default::default()
+    };
+    // 安全：cbSize 与缓冲区一致，API 只写入这个结构。
+    let result = unsafe {
+        SystemParametersInfoW(
+            SPI_GETHIGHCONTRAST,
+            high_contrast.cbSize,
+            Some((&mut high_contrast as *mut HIGHCONTRASTW).cast()),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS::default(),
+        )
+    };
+    result.is_ok() && high_contrast.dwFlags.contains(HCF_HIGHCONTRASTON)
+}
+
+fn text_scale_percent() -> u16 {
+    let mut value = 0u32;
+    let mut size = size_of::<u32>() as u32;
+    // 安全：键名与值名是静态字符串，输出缓冲区与长度匹配。
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            w!(r"Software\Microsoft\Accessibility"),
+            w!("TextScaleFactor"),
+            RRF_RT_REG_DWORD,
+            None,
+            Some((&mut value as *mut u32).cast()),
+            Some(&mut size),
+        )
+    };
+    if status == ERROR_SUCCESS && size == size_of::<u32>() as u32 {
+        u16::try_from(value).unwrap_or(100)
+    } else {
+        100
+    }
+}
+
 /// 打开宿主的进程级选项；每个窗口的标题与尺寸来自窗口目录。
 #[derive(Clone, Debug)]
 pub struct HostConfig {
@@ -236,6 +324,8 @@ pub struct HostConfig {
     pub appearance: Appearance,
     /// 固定字体与分词语料；`None` 沿用系统字体集合。
     pub text_assets: Option<TextAssets>,
+    /// 初始系统偏好；`None` 时可见宿主采样当前系统，隐藏宿主使用默认值。
+    pub system_preferences: Option<SystemPreferences>,
 }
 
 impl HostConfig {
@@ -245,6 +335,7 @@ impl HostConfig {
             visible: true,
             appearance: Appearance::Light,
             text_assets: None,
+            system_preferences: None,
         }
     }
 
@@ -254,6 +345,7 @@ impl HostConfig {
             visible: false,
             appearance: Appearance::Light,
             text_assets: None,
+            system_preferences: None,
         }
     }
 
@@ -267,6 +359,14 @@ impl HostConfig {
     #[must_use]
     pub fn with_text_assets(mut self, assets: TextAssets) -> Self {
         self.text_assets = Some(assets);
+        self
+    }
+
+    /// 使用指定的系统偏好，而不是在可见宿主启动时采样。
+    ///
+    /// 隐藏宿主默认使用 [`SystemPreferences::default`]，不读取真实系统设置。
+    pub const fn with_system_preferences(mut self, preferences: SystemPreferences) -> Self {
+        self.system_preferences = Some(preferences);
         self
     }
 }
@@ -683,6 +783,11 @@ pub struct Host {
     revision: u64,
     /// 隐藏模式只创建 native 窗口，不调用 `ShowWindow`。
     show_windows: bool,
+    /// 宿主当前采用的 Windows 系统偏好；可见宿主在启动与设置变化时采样。
+    system_preferences: SystemPreferences,
+    /// 测试注入的设置变化采样；真实宿主直接读取系统。
+    #[cfg(test)]
+    settings_sample: Option<SystemPreferences>,
     /// 仅在 `run`/`pump` 派发期间指向 self；窗口过程通过 GWLP_USERDATA 取回宿主。
     dispatching: Option<*mut Host>,
     /// 宿主正在执行借出动作；此时的同步窗口消息不得再次进入窗口过程。
@@ -771,6 +876,15 @@ impl Host {
         runtime
             .set_appearance(config.appearance)
             .map_err(HostError::Runtime)?;
+        // 可见宿主在启动时采样真实偏好；隐藏宿主只接受注入值，避免测试
+        // 依赖或改动运行机器的辅助功能设置。
+        let system_preferences = config.system_preferences.unwrap_or_else(|| {
+            if config.visible {
+                sample_system_preferences()
+            } else {
+                SystemPreferences::default()
+            }
+        });
         // 资产在创建任何原生窗口之前注册并校验；坏资产是启动错误，不是绘制错误。
         let scene_cache = match config.text_assets {
             Some(assets) => SceneCache::with_text_assets(assets).map_err(HostError::TextAssets)?,
@@ -867,6 +981,9 @@ impl Host {
             hwnds: BTreeMap::new(),
             revision: 0,
             show_windows: config.visible,
+            system_preferences,
+            #[cfg(test)]
+            settings_sample: None,
             dispatching: None,
             routing_suppressed: false,
             recovering: false,
@@ -942,6 +1059,41 @@ impl Host {
     /// 不参与渲染能力协商。
     pub fn adapter_info(&self) -> GpuAdapterInfo {
         adapter_info_of(&self.adapter)
+    }
+
+    /// 宿主当前采用的系统偏好。
+    ///
+    /// 可见宿主在启动与 `WM_SETTINGCHANGE` 时采样；隐藏宿主默认不读取系统设置。
+    pub const fn system_preferences(&self) -> SystemPreferences {
+        self.system_preferences
+    }
+
+    /// 替换宿主的系统偏好；变化让所有存活窗口在下一帧重绘。
+    ///
+    /// 偏好属于宿主输入，不修改应用模型、不触发 `on:input`，也不改变呈现版本。
+    pub fn set_system_preferences(&mut self, preferences: SystemPreferences) {
+        self.refresh_system_preferences(preferences);
+    }
+
+    fn refresh_system_preferences(&mut self, preferences: SystemPreferences) -> bool {
+        if self.system_preferences == preferences {
+            return false;
+        }
+        self.system_preferences = preferences;
+        for window in self.windows.values_mut() {
+            window.paint_requested = true;
+        }
+        true
+    }
+
+    fn current_system_preferences(&self) -> SystemPreferences {
+        #[cfg(test)]
+        {
+            if let Some(preferences) = self.settings_sample {
+                return preferences;
+            }
+        }
+        sample_system_preferences()
     }
 
     /// 指定窗口当前已提交的呈现描述；嵌入方与测试可据此按 Node ID 或标签定位。
@@ -1537,6 +1689,10 @@ impl Host {
             // 滚轮行数按 activation 缓存；系统广播设置变化时重新读取，
             // 值变化会丢弃未应用的 residue。
             window.wheel.set_lines(system_wheel_lines());
+            // 高对比度与文本缩放也随广播变化；当前窗口已从 map 取出，单独标记。
+            if self.refresh_system_preferences(self.current_system_preferences()) {
+                window.paint_requested = true;
+            }
             return Ok(());
         }
         if window.close_requested || !self.runtime.window_accepts_input(window.ctx) {
@@ -9581,6 +9737,101 @@ mod tests {
         zenui_demo::open_todo_window(&mut runtime).expect("open the todo window");
         zenui_demo::seed(&mut runtime).expect("seed the todo rows");
         Host::open(runtime, HostConfig::hidden()).expect("open host")
+    }
+
+    #[test]
+    fn sampling_system_preferences_returns_a_valid_scale() {
+        let preferences = sample_system_preferences();
+        assert!(
+            (100..=225).contains(&preferences.text_scale_percent()),
+            "the sampled scale is always in the supported range"
+        );
+    }
+
+    #[test]
+    fn system_preferences_fall_back_to_100_percent_outside_the_supported_range() {
+        assert_eq!(
+            SystemPreferences::new(true, 99),
+            SystemPreferences::new(true, 100),
+            "below the range falls back to 100%"
+        );
+        assert_eq!(
+            SystemPreferences::new(true, 226),
+            SystemPreferences::new(true, 100),
+            "above the range falls back to 100%"
+        );
+        let preferences = SystemPreferences::new(true, 225);
+        assert!(preferences.high_contrast());
+        assert_eq!(preferences.text_scale_percent(), 225);
+        assert_eq!(
+            SystemPreferences::default(),
+            SystemPreferences::new(false, 100)
+        );
+    }
+
+    #[test]
+    fn injected_system_preferences_repaint_without_a_model_transaction() {
+        let mut runtime = Runtime::new();
+        zenui_demo::open_todo_window(&mut runtime).expect("open the todo window");
+        let mut host = Host::open(
+            runtime,
+            HostConfig::hidden().with_system_preferences(SystemPreferences::new(true, 150)),
+        )
+        .expect("open host");
+        assert_eq!(
+            host.system_preferences(),
+            SystemPreferences::new(true, 150),
+            "the injected startup value replaces sampling"
+        );
+        host.windows.get_mut(MAIN).expect("window").paint_requested = false;
+        let revision = host.runtime.presentation_revision();
+        host.set_system_preferences(SystemPreferences::new(false, 225));
+        assert_eq!(
+            host.system_preferences(),
+            SystemPreferences::new(false, 225)
+        );
+        assert!(
+            host.windows.get(MAIN).expect("window").paint_requested,
+            "a preference change requests a repaint"
+        );
+        assert_eq!(
+            host.runtime.presentation_revision(),
+            revision,
+            "preferences do not enter the presentation snapshot"
+        );
+    }
+
+    #[test]
+    fn a_settings_broadcast_resamples_and_repaints_only_on_change() {
+        let mut host = open_host();
+        let current = host.system_preferences();
+        host.windows.get_mut(MAIN).expect("window").paint_requested = false;
+        host.settings_sample = Some(current);
+        host.with_window(MAIN, |host, window| {
+            host.handle_window_message(window, WM_SETTINGCHANGE, WPARAM(0), LPARAM(0))
+        })
+        .expect("unchanged settings");
+        assert!(
+            !host.windows.get(MAIN).expect("window").paint_requested,
+            "an unchanged sample does not request a repaint"
+        );
+
+        host.settings_sample = Some(SystemPreferences::new(true, 200));
+        let revision = host.runtime.presentation_revision();
+        host.with_window(MAIN, |host, window| {
+            host.handle_window_message(window, WM_SETTINGCHANGE, WPARAM(0), LPARAM(0))
+        })
+        .expect("changed settings");
+        assert_eq!(host.system_preferences(), SystemPreferences::new(true, 200));
+        assert!(
+            host.windows.get(MAIN).expect("window").paint_requested,
+            "a changed sample requests a repaint"
+        );
+        assert_eq!(
+            host.runtime.presentation_revision(),
+            revision,
+            "a settings change does not touch the presentation snapshot"
+        );
     }
 
     /// 测试期记录器：`&'static` 是 Copy，事件闭包重复构造时不会把 view 的
