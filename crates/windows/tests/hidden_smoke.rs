@@ -523,6 +523,39 @@ fn clicking_a_checkbox_toggles_its_visual_state() {
 }
 
 #[test]
+fn clicking_the_add_button_submits_the_form_once() {
+    let mut host = open_host();
+    host.render().expect("render the initial frame");
+    let (_, input, scale) = center_label(&host, MAIN, "What needs to be done?");
+    post_click(&host, input, scale);
+    host.pump().expect("focus the draft");
+    post_char(&host, 'Z');
+    host.pump().expect("type into the draft");
+    assert_eq!(checkbox_ids(&host).len(), 2);
+
+    let (add, scale) = button_at(&host, 0);
+    post_click(&host, add, scale);
+    host.pump().expect("activate the Add submit button");
+    assert_eq!(
+        checkbox_ids(&host).len(),
+        3,
+        "the submit button adds exactly one row"
+    );
+    assert_eq!(
+        host.presentation(MAIN)
+            .expect("snapshot")
+            .find_label("What needs to be done?")
+            .expect("draft")
+            .text_value(),
+        Some(""),
+        "on:submit clears the draft once"
+    );
+
+    post_close(&host);
+    host.run().expect("process the close");
+}
+
+#[test]
 fn clicking_the_active_filter_hides_completed_items() {
     let mut host = open_host();
     host.render().expect("render the initial frame");

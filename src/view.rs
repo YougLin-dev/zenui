@@ -432,7 +432,7 @@ pub enum Event {
     Click(Box<dyn FnMut() -> HandlerOutcome>),
     Input(Box<dyn FnMut(String) -> HandlerOutcome>),
     Change(Box<dyn FnMut(bool)>),
-    Submit(Box<dyn FnMut(SubmitEvent)>),
+    Submit(Box<dyn FnMut(&mut SubmitEvent) -> HandlerOutcome>),
     KeyDown(Box<dyn FnMut(&mut KeyEvent) -> HandlerOutcome>),
     KeyDownCapture(Box<dyn FnMut(&mut KeyEvent) -> HandlerOutcome>),
     KeyDownBubble(Box<dyn FnMut(&mut KeyEvent) -> HandlerOutcome>),
@@ -711,8 +711,13 @@ pub fn on_change(handler: impl FnMut(bool) + 'static) -> Attr {
     Attr::Event(Event::Change(Box::new(handler)))
 }
 
-pub fn on_submit(handler: impl FnMut(SubmitEvent) + 'static) -> Attr {
-    Attr::Event(Event::Submit(Box::new(handler)))
+pub fn on_submit<R>(mut handler: impl FnMut(&mut SubmitEvent) -> R + 'static) -> Attr
+where
+    R: IntoHandlerOutcome,
+{
+    Attr::Event(Event::Submit(Box::new(move |event| {
+        handler(event).into_handler_outcome()
+    })))
 }
 
 pub fn on_keydown<R>(mut handler: impl FnMut(&mut KeyEvent) -> R + 'static) -> Attr
@@ -768,12 +773,23 @@ pub fn on_composition_cancel(handler: impl FnMut(CompositionEvent) + 'static) ->
 
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub struct SubmitEvent {
+    consumed: bool,
     prevented: bool,
 }
 
 impl SubmitEvent {
+    /// 停止后续处理；submit 本身没有后续默认动作，consume 用于统一的 turn flow。
+    pub fn consume(&mut self) {
+        self.consumed = true;
+    }
+
+    /// 文档化的 no-op：submit 没有可以被跳过的后续默认动作。
     pub fn prevent_default(&mut self) {
         self.prevented = true;
+    }
+
+    pub const fn is_consumed(self) -> bool {
+        self.consumed
     }
 
     pub const fn is_prevented(self) -> bool {

@@ -313,6 +313,14 @@ impl TurnReport {
     fn mark_changed(&mut self) {
         self.changed = true;
     }
+
+    /// 合并一个嵌套默认动作的报告：错误、flow 与 changed 都要回到外层 turn。
+    fn absorb(&mut self, other: Self) {
+        self.errors.extend(other.errors);
+        self.changed |= other.changed;
+        self.outcome.consumed |= other.outcome.consumed;
+        self.outcome.prevent_default |= other.outcome.prevent_default;
+    }
 }
 
 const HIDDEN_TARGET: &str = "target window is hidden";
@@ -1339,6 +1347,33 @@ impl State {
             })
     }
 
+    /// 已提交的文本属性；`type` 等标记只读取当前值。
+    fn element_attr_text(&self, element: usize, name: &str) -> Option<&str> {
+        self.element_attrs(element)
+            .iter()
+            .find(|attr| attr.name == name)
+            .and_then(|attr| attr.current.as_ref())
+            .and_then(|current| match current {
+                AttrCurrent::Text(text) => Some(text.as_str()),
+                AttrCurrent::Bool(_) => None,
+            })
+    }
+
+    fn has_event(&self, element: usize, kind: EventKind) -> bool {
+        self.element_events(element).iter().any(|id| {
+            self.events
+                .get(*id)
+                .and_then(Option::as_ref)
+                .is_some_and(|event| event_kind(event) == kind)
+        })
+    }
+
+    /// `type="submit"` 的按钮由 click/Enter 默认提交最近 form。
+    fn is_submit_button(&self, element: usize) -> bool {
+        self.element_tag(element) == "button"
+            && self.element_attr_text(element, "type") == Some("submit")
+    }
+
     /// 元素自己是否挂载了普通 click handler。
     fn has_click_handler(&self, element: usize) -> bool {
         self.element_events(element).iter().any(|id| {
@@ -1374,7 +1409,7 @@ impl State {
                 if !live {
                     return Err(DispatchError::StaleNode(hit));
                 }
-                if self.has_click_handler(payload) {
+                if self.has_click_handler(payload) || self.is_submit_button(payload) {
                     return Ok(Some(payload));
                 }
                 if self.is_interactive_control(payload) {
@@ -5762,6 +5797,44 @@ impl Runtime {
         })
     }
 
+    /// 路由后的激活：先运行最近 click handler，再执行 `type=submit` 表单默认。
+    fn activate_element(&mut self, element: usize) -> Result<TurnReport, DispatchError> {
+        let node = with_state(|state| state.elements[element].id);
+        let has_click = with_state(|state| state.has_click_handler(element));
+        let mut report = if has_click {
+            self.click_node(node)?
+        } else {
+            TurnReport::default()
+        };
+        if report.is_ok()
+            && let Some(element) = with_state(|state| state.element_for_node(node).ok())
+        {
+            self.apply_click_default(element, &mut report)?;
+        }
+        Ok(report)
+    }
+
+    /// `type=submit` 按钮的 click 默认：提交最近 form 一次。
+    fn apply_click_default(
+        &mut self,
+        element: usize,
+        report: &mut TurnReport,
+    ) -> Result<(), DispatchError> {
+        if !with_state(|state| state.is_submit_button(element)) {
+            return Ok(());
+        }
+        let Some(form) = with_state(|state| state.ancestor_form(element)) else {
+            return Ok(());
+        };
+        if !with_state(|state| state.has_event(form, EventKind::Submit)) {
+            return Ok(());
+        }
+        let form = with_state(|state| state.elements[form].id);
+        let submitted = self.submit_node(form)?;
+        report.absorb(submitted);
+        Ok(())
+    }
+
     /// 路由一个 typed Intent；窗口/activation 目标先校验再询问处理器。
     pub fn dispatch_intent(&mut self, intent: Intent) -> Result<TurnReport, DispatchError> {
         match intent.payload() {
@@ -5780,10 +5853,7 @@ impl Runtime {
                     with_state(|state| state.element_for_node(node))?;
                     let target = with_state(|state| state.closest_click_target(node))?;
                     match target {
-                        Some(element) => {
-                            let id = with_state(|state| state.elements[element].id);
-                            self.click_node(id)
-                        }
+                        Some(element) => self.activate_element(element),
                         None => Ok(TurnReport::default()),
                     }
                 })
@@ -6081,9 +6151,11 @@ impl Runtime {
                 let tag = with_state(|state| state.element_tag(element));
                 match (key, tag) {
                     (Key::Enter | Key::Space, "button") => {
-                        if with_state(|state| state.has_click_handler(element)) {
-                            let click = self.click_node(id)?;
-                            report.errors.extend(click.errors);
+                        if with_state(|state| {
+                            state.has_click_handler(element) || state.is_submit_button(element)
+                        }) {
+                            let activated = self.activate_element(element)?;
+                            report.absorb(activated);
                             report.mark_changed();
                         }
                     }
@@ -6103,7 +6175,8 @@ impl Runtime {
                                 })
                             });
                             if has_change {
-                                self.change_node(id, next)?;
+                                let change = self.change_node(id, next)?;
+                                report.absorb(change);
                             } else {
                                 with_state(|state| {
                                     state.update_local(element, LocalUpdate::Change(next))
@@ -6116,17 +6189,11 @@ impl Runtime {
                         let form = with_state(|state| state.ancestor_form(element));
                         if let Some(form) = form {
                             let form_id = with_state(|state| state.elements[form].id);
-                            let has_submit = with_state(|state| {
-                                state.element_events(form).iter().any(|event| {
-                                    state
-                                        .events
-                                        .get(*event)
-                                        .and_then(Option::as_ref)
-                                        .is_some_and(|event| event_kind(event) == EventKind::Submit)
-                                })
-                            });
+                            let has_submit =
+                                with_state(|state| state.has_event(form, EventKind::Submit));
                             if has_submit {
-                                self.submit_node(form_id)?;
+                                let submitted = self.submit_node(form_id)?;
+                                report.absorb(submitted);
                                 report.mark_changed();
                             }
                         }
@@ -6985,7 +7052,7 @@ impl Runtime {
         })
     }
 
-    pub fn submit(&mut self, label: &str) -> Result<(), MountError> {
+    pub fn submit(&mut self, label: &str) -> Result<TurnReport, MountError> {
         self.dispatch_label(
             FindTarget::Label(label.to_owned()),
             "submit target not found",
@@ -6994,21 +7061,25 @@ impl Runtime {
         )
     }
 
-    /// 按 Node ID 派发 submit。
-    pub fn submit_node(&mut self, node: NodeId) -> Result<(), DispatchError> {
+    /// 按 Node ID 派发一次 submit；handler 的 `Err`/panic 进入 turn 报告。
+    pub fn submit_node(&mut self, node: NodeId) -> Result<TurnReport, DispatchError> {
         let state = self.state.clone();
         context::install(&state, || {
             let element = with_state(|state| state.element_for_node(node))?;
             let (event_id, event) =
                 self.take_node_event(node, element, EventKind::Submit, NodeOperation::Submit)?;
-            let panic = invoke_event(event_id, event, |event| {
-                if let Event::Submit(handler) = event {
-                    handler(SubmitEvent::default());
-                }
-            })
-            .err();
+            let mut submit_event = SubmitEvent::default();
+            let outcome = invoke_event(event_id, event, |event| match event {
+                Event::Submit(handler) => handler(&mut submit_event),
+                _ => HandlerOutcome::Ok,
+            });
+            let mut report = TurnReport::default();
+            record_handler_outcome(outcome, &mut report);
             with_state(|state| state.phase = Phase::Idle);
-            self.finish_event(panic)
+            self.finish_command().map_err(DispatchError::Command)?;
+            report.set_outcome(submit_event.is_consumed(), submit_event.is_prevented());
+            report.mark_changed();
+            Ok(report)
         })
     }
 
