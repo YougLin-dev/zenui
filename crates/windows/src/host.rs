@@ -5944,7 +5944,7 @@ mod tests {
     use std::rc::Rc;
     use std::sync::Mutex;
     use std::sync::atomic::AtomicUsize;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use windows::Win32::Graphics::Gdi::ClientToScreen;
     use windows::Win32::System::Com::SAFEARRAY;
     use windows::Win32::System::Ole::{
@@ -13957,6 +13957,478 @@ mod tests {
         assert!(
             host.counters.presents > before.presents,
             "a changed snapshot presents"
+        );
+    }
+
+    /// 长跑的一行采样；字段与外部 GPU 采样按时间戳对齐。
+    #[derive(Clone, Copy, Debug)]
+    struct SoakSample {
+        elapsed: Duration,
+        working_set: usize,
+        private_bytes: usize,
+        handles: u32,
+        scene_builds: usize,
+        presents: usize,
+        snapshots: u64,
+        remaining: u32,
+    }
+
+    /// 当前进程的工作集、私有提交与句柄数；只读取，不关闭进程伪句柄。
+    fn soak_process_metrics() -> (usize, usize, u32) {
+        use windows::Win32::System::ProcessStatus::{
+            GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+        };
+        use windows::Win32::System::Threading::{GetCurrentProcess, GetProcessHandleCount};
+
+        let size = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+        let mut memory = PROCESS_MEMORY_COUNTERS {
+            cb: size,
+            ..Default::default()
+        };
+        let process = unsafe { GetCurrentProcess() };
+        // 安全：当前进程伪句柄无需关闭；计数结构由本栈帧独占。
+        unsafe { GetProcessMemoryInfo(process, &mut memory, size) }
+            .expect("read the process memory counters");
+        let mut handles = 0;
+        // 安全：同上。
+        unsafe { GetProcessHandleCount(process, &mut handles) }
+            .expect("read the process handle count");
+        (memory.WorkingSetSize, memory.PagefileUsage, handles)
+    }
+
+    /// 从可访问性树读取 “N remaining”；它与画面来自同一份已提交快照。
+    fn soak_remaining(host: &Host) -> u32 {
+        host.accessibility_tree(MAIN)
+            .expect("the visible window publishes its tree")
+            .iter()
+            .find_map(|node| node.name().strip_suffix(" remaining")?.parse().ok())
+            .expect("the remaining counter is in the tree")
+    }
+
+    fn soak_render_and_count(host: &mut Host) -> u32 {
+        host.render().expect("render the changed window");
+        soak_remaining(host)
+    }
+
+    fn soak_sample(host: &Host, started: Instant) -> SoakSample {
+        let (working_set, private_bytes, handles) = soak_process_metrics();
+        SoakSample {
+            elapsed: started.elapsed(),
+            working_set,
+            private_bytes,
+            handles,
+            scene_builds: host.counters.scene_builds,
+            presents: host.counters.presents,
+            snapshots: host.runtime.presentation_builds(),
+            remaining: soak_remaining(host),
+        }
+    }
+
+    fn soak_print(label: &str, sample: SoakSample) {
+        println!(
+            "soak {label} t={:.1}s ws={}KB private={}KB handles={} scene_builds={} presents={} snapshots={} remaining={}",
+            sample.elapsed.as_secs_f64(),
+            sample.working_set / 1024,
+            sample.private_bytes / 1024,
+            sample.handles,
+            sample.scene_builds,
+            sample.presents,
+            sample.snapshots,
+            sample.remaining
+        );
+    }
+
+    /// 设置 `ZENUI_SOAK_TRACE=1` 时逐步打印内存，定位长跑中的增长来源。
+    fn soak_trace(step: &str) {
+        if std::env::var_os("ZENUI_SOAK_TRACE").is_none() {
+            return;
+        }
+        let (working_set, private_bytes, handles) = soak_process_metrics();
+        println!(
+            "soak trace {step} ws={}KB private={}KB handles={handles}",
+            working_set / 1024,
+            private_bytes / 1024
+        );
+    }
+
+    /// 等到任务结果真正投递并重绘；返回时的计数必须与预期一致。
+    fn soak_wait_for_remaining(host: &mut Host, expected: u32) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let remaining = soak_render_and_count(host);
+            if remaining == expected {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "a task delivery did not settle: expected {expected} remaining, saw {remaining}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+            host.pump().expect("pump the delivery");
+        }
+    }
+
+    /// 一个约 10 秒的脚本周期：键入、组合、添加、异步任务、主题、10k 滚动、
+    /// 详情窗口的创建/销毁与主窗口隐藏/显示。
+    ///
+    /// 返回把本周期新增任务计入后的预期剩余数。
+    fn soak_cycle(host: &mut Host, cycle: u64, rows: u32, mut expected: u32) -> u32 {
+        // 真实 WM_CHAR 字符走窗口过程 → 聚焦编辑器的插入路径。
+        host.runtime
+            .focus("What needs to be done?")
+            .expect("focus the draft");
+        for character in format!("Soak note {cycle}").chars() {
+            send_msg(
+                host,
+                MSG {
+                    message: WM_CHAR,
+                    wParam: WPARAM(character as usize),
+                    ..Default::default()
+                },
+            );
+        }
+        // 每 4 个周期走一次 preedit → 提交；与真实 IME 共用运行时组合路径。
+        if cycle % 4 == 1 {
+            let node = host
+                .runtime
+                .presentation()
+                .expect("snapshot")
+                .find_label("What needs to be done?")
+                .expect("draft")
+                .id();
+            with_main(host, |host, window| host.ime_start(window));
+            with_main(host, |host, window| {
+                host.apply_ime_composition(
+                    window,
+                    node,
+                    request(false, true),
+                    None,
+                    Some(String::from("zhong")),
+                )
+            });
+            with_main(host, |host, window| {
+                host.apply_ime_composition(
+                    window,
+                    node,
+                    request(true, false),
+                    Some(String::from("中文")),
+                    None,
+                )
+            });
+        }
+        if cycle % 5 == 4 {
+            host.runtime.submit("Add task").expect("add the typed row");
+            expected += 1;
+        } else {
+            host.runtime
+                .input("What needs to be done?", "")
+                .expect("clear the draft");
+        }
+        soak_trace("text");
+        if cycle.is_multiple_of(2) {
+            host.runtime.click_text("Theme").expect("toggle the theme");
+            soak_trace("theme");
+        }
+        if cycle.is_multiple_of(3) {
+            host.runtime
+                .click_text("Load sample")
+                .expect("start the sample task");
+            host.runtime.wait_for_tasks();
+            expected += 2;
+            soak_wait_for_remaining(host, expected);
+            soak_trace("task");
+        }
+        // 10k 行列表：UIA 跳到底部再回顶部，滚轮在两端移动虚拟化窗口。
+        host.render().expect("render before scrolling");
+        soak_trace("pre-scroll");
+        let scroll = scroll_pattern(host);
+        unsafe { scroll.SetScrollPercent(UIA_ScrollPatternNoScroll, 100.0) }
+            .expect("queue the end jump");
+        host.pump().expect("drain the end jump");
+        soak_trace("end-jump");
+        let scene = host.scene(MAIN).expect("the scrolled scene");
+        assert_eq!(
+            scene.scroll_offset(),
+            scene.max_scroll_offset(),
+            "the percent jump reaches the end of the list"
+        );
+        let minimum = i64::from(rows.saturating_sub(100)) * 37;
+        assert!(
+            i64::from(scene.scroll_offset()) >= minimum,
+            "the list really holds {rows} rows: offset {} < {minimum}",
+            scene.scroll_offset()
+        );
+        for _ in 0..3 {
+            send_msg(
+                host,
+                MSG {
+                    message: WM_MOUSEWHEEL,
+                    wParam: WPARAM(((120i16 as u16) as usize) << 16),
+                    ..Default::default()
+                },
+            );
+        }
+        soak_trace("end-wheel");
+        unsafe { scroll.SetScrollPercent(UIA_ScrollPatternNoScroll, 0.0) }
+            .expect("queue the top jump");
+        host.pump().expect("drain the top jump");
+        soak_trace("top-jump");
+        for _ in 0..3 {
+            send_msg(
+                host,
+                MSG {
+                    message: WM_MOUSEWHEEL,
+                    wParam: WPARAM(((-120i16 as u16) as usize) << 16),
+                    ..Default::default()
+                },
+            );
+        }
+        unsafe { scroll.SetScrollPercent(UIA_ScrollPatternNoScroll, 0.0) }
+            .expect("return to the top");
+        host.pump().expect("drain the top return");
+        soak_trace("top-wheel");
+
+        if cycle % 7 == 6 {
+            host.runtime
+                .click_label("Open details")
+                .expect("open the details window");
+            // 直接运行时派发不会经过窗口过程；用真实唤醒消息结算窗口请求。
+            send_msg(
+                host,
+                MSG {
+                    message: host_message::WAKE,
+                    ..Default::default()
+                },
+            );
+            assert!(
+                host.hwnd(zenui_demo::DETAILS_WINDOW).is_some(),
+                "the details window opens"
+            );
+            soak_trace("details-open");
+            host.render().expect("paint the details window");
+            soak_trace("details-render");
+            send_msg_in(
+                host,
+                zenui_demo::DETAILS_WINDOW,
+                MSG {
+                    message: WM_CLOSE,
+                    ..Default::default()
+                },
+            );
+            assert!(
+                host.hwnd(zenui_demo::DETAILS_WINDOW).is_none(),
+                "the details window closes without a prompt"
+            );
+            soak_trace("details-close");
+        }
+
+        if cycle % 6 == 5 {
+            // 任务在可见窗口上启动，唤醒却在隐藏期间到达；隐藏窗口不再发布
+            // 可访问性树，因此投递在 pump 中结算、显示后立即核对计数。
+            host.runtime
+                .click_text("Load sample")
+                .expect("start a task before hiding");
+            expected += 2;
+            host.runtime.wait_for_tasks();
+            host.hide(MAIN).expect("hide the window");
+            host.pump().expect("pump the delivery while hidden");
+            std::thread::sleep(Duration::from_millis(300));
+            host.pump().expect("pump the late delivery while hidden");
+            host.show(MAIN).expect("show the window");
+            host.pump().expect("pump after showing");
+            soak_wait_for_remaining(host, expected);
+            soak_trace("hide-show");
+        }
+
+        let remaining = soak_render_and_count(host);
+        assert_eq!(
+            remaining, expected,
+            "the model stayed consistent in cycle {cycle}"
+        );
+        assert!(
+            host.accessibility_tree(MAIN)
+                .expect("tree")
+                .find_name("Error")
+                .is_none(),
+            "cycle {cycle} reported no task error"
+        );
+        expected
+    }
+
+    /// 30 分钟可见长跑；默认忽略，CI 不运行。
+    ///
+    /// 运行方式（结果输出到文件，外部同时采样 GPU）：
+    ///
+    /// ```text
+    /// ZENUI_SOAK_MINUTES=30 cargo test -p zenui-windows --lib -- \
+    ///     --ignored --nocapture --test-threads=1 a_bounded_visible_soak
+    /// ```
+    ///
+    /// 每分钟输出一行 `soak sample ...`。断言覆盖：任务计数与投递一致、
+    /// 散热后的静置窗口零重建、工作集/私有提交/句柄的有界增长。
+    #[test]
+    #[ignore = "a visible 30-minute soak is a local acceptance run"]
+    fn a_bounded_visible_soak_stays_flat() {
+        use windows::Win32::System::Power::{
+            ES_CONTINUOUS, ES_DISPLAY_REQUIRED, ES_SYSTEM_REQUIRED, SetThreadExecutionState,
+        };
+
+        /// 长跑期间保持系统与显示唤醒；退出时恢复连续状态。
+        struct KeepAwake;
+        impl Drop for KeepAwake {
+            fn drop(&mut self) {
+                // 安全：只恢复本线程的连续执行状态。
+                unsafe {
+                    SetThreadExecutionState(ES_CONTINUOUS);
+                }
+            }
+        }
+
+        let minutes: u64 = std::env::var("ZENUI_SOAK_MINUTES")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(30);
+        let rows: u32 = std::env::var("ZENUI_SOAK_ROWS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(10_000);
+        assert!(minutes >= 1, "the soak needs a minute to sample");
+
+        // 安全：只改变本线程的执行状态；Drop 恢复。
+        unsafe {
+            SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED);
+        }
+        let _awake = KeepAwake;
+
+        let mut runtime = Runtime::new();
+        zenui_demo::open_todo_window(&mut runtime).expect("open the todo window");
+        zenui_demo::seed(&mut runtime).expect("seed the todo rows");
+        let seeded = Instant::now();
+        for index in 0..rows {
+            runtime
+                .input("What needs to be done?", &format!("Soak row {index}"))
+                .expect("fill the draft");
+            runtime.submit("Add task").expect("add a row");
+            if (index + 1) % 2_000 == 0 {
+                println!(
+                    "soak seed {}/{} at {:.1}s",
+                    index + 1,
+                    rows,
+                    seeded.elapsed().as_secs_f64()
+                );
+            }
+        }
+
+        let mut host = Host::open(runtime, HostConfig::visible()).expect("open the visible host");
+        // 种子有 2 行、其中 1 行已完成；之后每行都未完成。
+        let mut expected = 1 + rows;
+        host.render().expect("paint the first frame");
+        println!(
+            "soak start pid={} rows={} minutes={}",
+            std::process::id(),
+            rows,
+            minutes
+        );
+        assert_eq!(
+            soak_render_and_count(&mut host),
+            expected,
+            "the seeded model is on screen"
+        );
+
+        // 先排掉系统在首次显示时排队的 WM_PAINT，再记录静置基线。
+        host.pump().expect("drain the startup paint");
+        std::thread::sleep(Duration::from_millis(300));
+        host.pump().expect("drain the late startup paint");
+        host.render().expect("paint the settled frame");
+        host.pump().expect("settle the repaint");
+        // 启动后静置：没有焦点编辑器时不允许任何后台重建或呈现。
+        let before = host.counters;
+        std::thread::sleep(Duration::from_millis(1200));
+        host.pump().expect("pump the idle window");
+        assert_eq!(
+            host.counters, before,
+            "a freshly opened visible window idles without rebuilding"
+        );
+
+        let started = Instant::now();
+        let total = Duration::from_secs(minutes * 60);
+        let mut next_sample = Duration::from_secs(60);
+        let mut cycle = 0;
+        let mut samples = Vec::new();
+        soak_print("sample", soak_sample(&host, started));
+        while started.elapsed() < total {
+            let cycle_started = Instant::now();
+            expected = soak_cycle(&mut host, cycle, rows, expected);
+            cycle += 1;
+            let elapsed = cycle_started.elapsed();
+            if elapsed < Duration::from_secs(10) {
+                // 留出真实用户在两批操作之间的等待时间，也是空闲上限的探针。
+                std::thread::sleep(Duration::from_secs(10) - elapsed);
+                host.pump().expect("pump between cycles");
+            }
+            if started.elapsed() >= next_sample {
+                let sample = soak_sample(&host, started);
+                soak_print("sample", sample);
+                samples.push(sample);
+                next_sample += Duration::from_secs(60);
+            }
+        }
+
+        // 收尾：移出编辑器焦点，排掉失焦帧排队的 WM_PAINT，再静置确认没有
+        // 闪烁之外的后台重绘。
+        host.runtime.blur().expect("blur the draft");
+        host.render().expect("the settled frame");
+        host.pump().expect("drain the blur paint");
+        // 一次闪烁周期会呈现清除 caret 的最后一帧；之后再记录静置基线。
+        std::thread::sleep(Duration::from_millis(1200));
+        host.pump().expect("drain the caret erasure");
+        let before = host.counters;
+        let snapshots = host.runtime.presentation_builds();
+        std::thread::sleep(Duration::from_millis(1500));
+        host.pump().expect("pump the quiet window");
+        assert_eq!(
+            host.counters, before,
+            "the soaked window stopped rebuilding once idle"
+        );
+        assert_eq!(
+            host.runtime.presentation_builds(),
+            snapshots,
+            "no stale delivery rebuilt the presentation once idle"
+        );
+        let quiet = soak_sample(&host, started);
+        soak_print("quiet", quiet);
+        samples.push(quiet);
+        assert_eq!(quiet.remaining, expected, "the final model is consistent");
+
+        let first = samples.first().copied().expect("a start sample");
+        let last = samples[samples.len() - 1];
+        let middle = samples[samples.len() / 2];
+        let working_growth = last.working_set.saturating_sub(first.working_set);
+        let private_growth = last.private_bytes.saturating_sub(first.private_bytes);
+        let handle_growth = last.handles.saturating_sub(first.handles);
+        let late_growth = last.working_set.saturating_sub(middle.working_set);
+        println!(
+            "soak summary cycles={cycle} working_growth={}KB private_growth={}KB late_working_growth={}KB handle_growth={}",
+            working_growth / 1024,
+            private_growth / 1024,
+            late_growth / 1024,
+            handle_growth
+        );
+        assert!(
+            working_growth <= 64 * 1024 * 1024,
+            "the working set grew by {working_growth} bytes over the run"
+        );
+        assert!(
+            private_growth <= 64 * 1024 * 1024,
+            "private commit grew by {private_growth} bytes over the run"
+        );
+        assert!(
+            late_growth <= 32 * 1024 * 1024,
+            "the second half grew by {late_growth} bytes"
+        );
+        assert!(
+            handle_growth <= 32,
+            "the process gained {handle_growth} handles over the run"
         );
     }
 
