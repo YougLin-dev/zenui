@@ -10,6 +10,7 @@ pub enum Property {
     PaddingY,
     Gap,
     FlexDirection,
+    FlexWrap,
     AlignItems,
     JustifyContent,
     Width,
@@ -208,6 +209,7 @@ pub enum StyleValue {
     Points(i32),
     Row,
     Column,
+    Wrap,
     CenterItems,
     SpaceBetween,
     FullWidth,
@@ -362,6 +364,7 @@ fn parse_token(token: &str) -> Result<Vec<StyleDeclaration>, &'static str> {
     match token {
         "flex-row" => push(Property::FlexDirection, StyleValue::Row),
         "flex-col" => push(Property::FlexDirection, StyleValue::Column),
+        "flex-wrap" => push(Property::FlexWrap, StyleValue::Wrap),
         "items-center" => push(Property::AlignItems, StyleValue::CenterItems),
         "justify-between" => push(Property::JustifyContent, StyleValue::SpaceBetween),
         "w-full" => push(Property::Width, StyleValue::FullWidth),
@@ -480,14 +483,16 @@ mod tests {
 
     #[test]
     fn layout_utilities_map_to_their_properties() {
-        let parsed =
-            parse_class_literal("flex-row flex-col items-center justify-between w-full flex-1")
-                .expect("parse");
+        let parsed = parse_class_literal(
+            "flex-row flex-col flex-wrap items-center justify-between w-full flex-1",
+        )
+        .expect("parse");
         assert_eq!(
             parsed,
             vec![
                 declaration(Property::FlexDirection, StyleValue::Row),
                 declaration(Property::FlexDirection, StyleValue::Column),
+                declaration(Property::FlexWrap, StyleValue::Wrap),
                 declaration(Property::AlignItems, StyleValue::CenterItems),
                 declaration(Property::JustifyContent, StyleValue::SpaceBetween),
                 declaration(Property::Width, StyleValue::FullWidth),

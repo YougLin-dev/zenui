@@ -78,6 +78,38 @@ fn long_toolbar_labels_stay_inside_their_buttons() {
 }
 
 #[test]
+fn a_narrow_toolbar_wraps_instead_of_clipping() {
+    let app = runtime();
+    let snapshot = app.presentation().expect("snapshot");
+    let width = 420.0;
+    let scene = build_scene(&snapshot, width);
+
+    let mut rows = std::collections::BTreeSet::new();
+    for label in [
+        "Reverse",
+        "Clear done",
+        "Load sample",
+        "Import file",
+        "Theme",
+        "Details",
+    ] {
+        let rect = scene
+            .node(by_text(&snapshot, "button", label))
+            .expect("toolbar button")
+            .rect();
+        assert!(
+            rect.x >= 0.0 && rect.right() <= width + 0.5,
+            "{label} is clipped at {width}: {rect:?}"
+        );
+        rows.insert(rect.y.round() as i32);
+    }
+    assert!(
+        rows.len() > 1,
+        "the toolbar wraps onto multiple rows, saw {rows:?}"
+    );
+}
+
+#[test]
 fn a_long_value_stays_inside_its_input() {
     let mut app = runtime();
     let value = "word ".repeat(40);
