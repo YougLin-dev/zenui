@@ -3315,6 +3315,9 @@ impl Host {
                 char::from_u32(u32::from(unit))
             }
         };
+        // 高代理项已经提前返回并保留令牌；其余任何 WM_CHAR 都消费令牌，
+        // 未匹配时按规范清除，避免迟到字符被旧按键误伤。
+        let suppression = window.char_suppression.take();
         let Some(character) = character else {
             return Ok(());
         };
@@ -3322,7 +3325,6 @@ impl Host {
             return Ok(());
         }
         let scan_code = scan_code(lparam);
-        let suppression = window.char_suppression.take();
         let snapshot = self
             .runtime
             .presentation_of(window.ctx)
