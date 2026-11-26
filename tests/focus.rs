@@ -912,8 +912,13 @@ fn a_panicking_focus_handler_restores_the_event_slot() {
     let mut app = Runtime::new();
     app.mount(|| view! { <PanicOnFocus /> }).expect("mount");
 
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| app.focus("panel")));
-    assert!(outcome.is_err(), "the handler panic unwinds the command");
+    let error = app
+        .focus("panel")
+        .expect_err("the handler panic is contained");
+    match error {
+        MountError::Panic(panic) => assert_eq!(panic.message(), "boom"),
+        other => panic!("expected a contained panic, got {other:?}"),
+    }
 
     assert_eq!(
         app.focused().map(|focus| focus.tag),

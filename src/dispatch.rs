@@ -2,6 +2,8 @@
 
 use std::fmt;
 
+use zenui_core::PanicInfo;
+
 use crate::presentation::NodeId;
 use crate::view::MountError;
 
@@ -85,6 +87,8 @@ pub enum DispatchError {
     },
     /// handler 或随后的界面刷新失败。
     Command(MountError),
+    /// handler panic 已被 contain；事件槽与 phase 已恢复，可以继续派发。
+    Panic(PanicInfo),
 }
 
 impl fmt::Display for DispatchError {
@@ -108,6 +112,7 @@ impl fmt::Display for DispatchError {
                 reason,
             } => write!(f, "node {node:?} rejected {}: {reason}", operation.as_str()),
             Self::Command(error) => write!(f, "{error}"),
+            Self::Panic(panic) => write!(f, "{panic}"),
         }
     }
 }
@@ -116,6 +121,7 @@ impl std::error::Error for DispatchError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Command(error) => Some(error),
+            Self::Panic(panic) => Some(panic),
             _ => None,
         }
     }

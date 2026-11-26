@@ -7,7 +7,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
 
-use zenui_core::{Counters, RowSet};
+use zenui_core::{Counters, PanicInfo, RowSet, catch_panic};
 use zenui_style::{Length, Property, StyleValue};
 
 use crate::context::{self, ContextFault, DepKey, Phase, with_state};
@@ -660,6 +660,7 @@ impl State {
                         cell.compute = None;
                         cell.value = None;
                         cell.dirty = true;
+                        cell.poisoned = None;
                     }
                 }
                 Resource::Event(event) => {
@@ -2081,15 +2082,224 @@ enum FindTarget {
 }
 
 /// factory 在挂载期间创建的资源归 slot/分支自己的 Owner，而不是上一个组件。
+///
+/// 恢复通过 RAII guard 完成：factory panic 时 `current_owner` 也回到调用前的值。
 fn with_owner<R>(owner: u32, f: impl FnOnce() -> R) -> R {
-    let previous = with_state(|state| {
-        let previous = state.current_owner;
-        state.current_owner = Some(owner);
-        previous
-    });
-    let result = f();
-    with_state(|state| state.current_owner = previous);
-    result
+    let _guard = OwnerGuard::enter(owner);
+    f()
+}
+
+struct OwnerGuard {
+    previous: Option<u32>,
+}
+
+impl OwnerGuard {
+    fn enter(owner: u32) -> Self {
+        let previous = with_state(|state| {
+            let previous = state.current_owner;
+            state.current_owner = Some(owner);
+            previous
+        });
+        Self { previous }
+    }
+}
+
+impl Drop for OwnerGuard {
+    fn drop(&mut self) {
+        with_state(|state| state.current_owner = self.previous);
+    }
+}
+
+/// 进入一个阶段并在退出（包括 unwind）时恢复之前的阶段。
+struct PhaseGuard {
+    previous: Phase,
+}
+
+impl PhaseGuard {
+    fn enter(phase: Phase) -> Self {
+        let previous = with_state(|state| {
+            let previous = state.phase;
+            state.phase = phase;
+            previous
+        });
+        Self { previous }
+    }
+}
+
+impl Drop for PhaseGuard {
+    fn drop(&mut self) {
+        with_state(|state| state.phase = self.previous);
+    }
+}
+
+/// 刷新期间临时借出一棵树；无论正常返回还是 unwind 都把树放回。
+struct TreeRefreshGuard {
+    key: TreeKey,
+    tree: Option<MountedTree>,
+    previous_phase: Phase,
+}
+
+impl TreeRefreshGuard {
+    fn new(key: TreeKey, tree: MountedTree, previous_phase: Phase) -> Self {
+        Self {
+            key,
+            tree: Some(tree),
+            previous_phase,
+        }
+    }
+
+    fn nodes(&mut self) -> &mut Vec<MountedNode> {
+        &mut self
+            .tree
+            .as_mut()
+            .expect("tree refresh guard owns the tree")
+            .nodes
+    }
+
+    fn restore(mut self) {
+        if let Some(tree) = self.tree.take() {
+            with_state(|state| state.put_tree(self.key, tree));
+        }
+    }
+}
+
+impl Drop for TreeRefreshGuard {
+    fn drop(&mut self) {
+        if let Some(tree) = self.tree.take() {
+            with_state(|state| {
+                state.put_tree(self.key, tree);
+                state.refresh_focus = None;
+                state.window_focus_dropped = None;
+                state.phase = self.previous_phase;
+            });
+        }
+    }
+}
+
+/// 求值元素属性期间临时借出 attrs 与 inline styles；unwind 时原样放回。
+struct ElementScratchGuard {
+    id: usize,
+    attrs: Option<Vec<MountedAttr>>,
+    styles: Option<Vec<MountedInlineStyle>>,
+}
+
+impl ElementScratchGuard {
+    fn take(id: usize) -> Self {
+        let (attrs, styles) = with_state(|state| {
+            let element = &mut state.elements[id];
+            (
+                std::mem::take(&mut element.attrs),
+                std::mem::take(&mut element.inline_styles),
+            )
+        });
+        Self {
+            id,
+            attrs: Some(attrs),
+            styles: Some(styles),
+        }
+    }
+
+    fn attrs_mut(&mut self) -> &mut Vec<MountedAttr> {
+        self.attrs.as_mut().expect("element attrs are taken")
+    }
+
+    fn styles_mut(&mut self) -> &mut Vec<MountedInlineStyle> {
+        self.styles.as_mut().expect("element styles are taken")
+    }
+
+    fn take_attrs(&mut self) -> Vec<MountedAttr> {
+        self.attrs.take().expect("element attrs are taken")
+    }
+
+    fn take_styles(&mut self) -> Vec<MountedInlineStyle> {
+        self.styles.take().expect("element styles are taken")
+    }
+}
+
+impl Drop for ElementScratchGuard {
+    fn drop(&mut self) {
+        if self.attrs.is_none() && self.styles.is_none() {
+            return;
+        }
+        with_state(|state| {
+            if let Some(element) = state.elements.get_mut(self.id) {
+                if let Some(attrs) = self.attrs.take() {
+                    element.attrs = attrs;
+                }
+                if let Some(styles) = self.styles.take() {
+                    element.inline_styles = styles;
+                }
+            }
+        });
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ChildrenOwner {
+    Element(usize),
+    Component(usize),
+}
+
+/// 刷新子节点期间临时借出 children；unwind 时放回，旧结构不会丢。
+struct ChildrenGuard {
+    owner: ChildrenOwner,
+    children: Option<Vec<MountedNode>>,
+}
+
+impl ChildrenGuard {
+    fn take(owner: ChildrenOwner) -> Self {
+        let children = with_state(|state| match owner {
+            ChildrenOwner::Element(id) => std::mem::take(&mut state.elements[id].children),
+            ChildrenOwner::Component(id) => std::mem::take(&mut state.components[id].children),
+        });
+        Self {
+            owner,
+            children: Some(children),
+        }
+    }
+
+    fn children_mut(&mut self) -> &mut Vec<MountedNode> {
+        self.children.as_mut().expect("children are taken")
+    }
+
+    fn restore(mut self) {
+        if let Some(children) = self.children.take() {
+            with_state(|state| match self.owner {
+                ChildrenOwner::Element(id) => state.elements[id].children = children,
+                ChildrenOwner::Component(id) => state.components[id].children = children,
+            });
+        }
+    }
+}
+
+impl Drop for ChildrenGuard {
+    fn drop(&mut self) {
+        if let Some(children) = self.children.take() {
+            with_state(|state| match self.owner {
+                ChildrenOwner::Element(id) => {
+                    if let Some(element) = state.elements.get_mut(id) {
+                        element.children = children;
+                    }
+                }
+                ChildrenOwner::Component(id) => {
+                    if let Some(component) = state.components.get_mut(id) {
+                        component.children = children;
+                    }
+                }
+            });
+        }
+    }
+}
+
+/// 事件槽的 `take → catch → put`：handler panic 时槽位也必须回到运行时。
+fn invoke_event(
+    event_id: usize,
+    mut event: Event,
+    invoke: impl FnOnce(&mut Event),
+) -> Result<(), PanicInfo> {
+    let outcome = catch_panic(|| invoke(&mut event));
+    with_state(|state| state.put_event(event_id, event));
+    outcome
 }
 
 fn find_element(state: &State, nodes: &[MountedNode], target: &FindTarget) -> Option<usize> {
@@ -2175,12 +2385,17 @@ impl Runtime {
         let state = self.state.clone();
         context::install(&state, || {
             with_state(|state| state.fault = None);
-            let value = with_owner(0, || {
-                with_state(|state| state.phase = Phase::Setup);
-                let value = setup();
-                with_state(|state| state.phase = Phase::Idle);
-                value
+            let outcome = with_owner(0, || {
+                let _phase = PhaseGuard::enter(Phase::Setup);
+                catch_panic(setup)
             });
+            let value = match outcome {
+                Ok(value) => value,
+                Err(panic) => {
+                    with_state(State::release_root_resources);
+                    return Err(MountError::Panic(panic));
+                }
+            };
             if let Some(fault) = with_state(|state| state.fault.take()) {
                 with_state(State::release_root_resources);
                 return Err(State::context_error(fault));
@@ -2205,11 +2420,15 @@ impl Runtime {
         let state = self.state.clone();
         context::install(&state, || {
             with_state(|state| state.fault = None);
-            let plan = match with_owner(0, root) {
-                Ok(plan) => plan,
-                Err(error) => {
+            let plan = match with_owner(0, || catch_panic(root)) {
+                Ok(Ok(plan)) => plan,
+                Ok(Err(error)) => {
                     with_state(State::release_root_resources);
                     return Err(error);
+                }
+                Err(panic) => {
+                    with_state(State::release_root_resources);
+                    return Err(MountError::Panic(panic));
                 }
             };
             let mut tree = match self.mount_plan(plan, 0) {
@@ -2568,22 +2787,19 @@ impl Runtime {
             with_state(|state| state.fault = None);
             let (activation, owner) = with_state(|state| state.begin_window(key));
             let window = WindowCtx::new(state.borrow().id, key, activation, owner);
-            let previous = with_state(|state| {
-                let previous = (state.current_owner, state.phase);
-                state.current_owner = Some(owner);
-                state.phase = Phase::Setup;
-                previous
-            });
-            let plan = factory(window);
-            with_state(|state| {
-                state.current_owner = previous.0;
-                state.phase = previous.1;
+            let plan = with_owner(owner, || {
+                let _phase = PhaseGuard::enter(Phase::Setup);
+                catch_panic(|| factory(window))
             });
             let plan = match plan {
-                Ok(plan) => plan,
-                Err(error) => {
+                Ok(Ok(plan)) => plan,
+                Ok(Err(error)) => {
                     self.abort_open(key, activation, owner, None);
                     return Err(WindowError::Mount(error));
+                }
+                Err(panic) => {
+                    self.abort_open(key, activation, owner, None);
+                    return Err(WindowError::Mount(MountError::Panic(panic)));
                 }
             };
             if let Some(id) = with_state(|state| state.missing_command_handler(key)) {
@@ -3436,8 +3652,9 @@ impl Runtime {
     fn refresh_tree_once(&mut self, key: TreeKey) -> Result<(), MountError> {
         let state = self.state.clone();
         context::install(&state, || {
-            let taken = with_state(|state| {
+            let (taken, previous_phase) = with_state(|state| {
                 state.fault = None;
+                let previous_phase = state.phase;
                 state.phase = Phase::Binding;
                 let focused = state.focused_in(key);
                 // 窗口化 For 在刷新里据此判断聚焦行是否仍在挂载窗口内。
@@ -3446,15 +3663,24 @@ impl Runtime {
                 if let Some(entry) = state.tree_mut(key) {
                     entry.settle_before = settle_before;
                 }
-                state.take_tree(key)
+                (state.take_tree(key), previous_phase)
             });
-            let Some(mut tree) = taken else {
+            let Some(tree) = taken else {
                 with_state(|state| state.refresh_focus = None);
                 return Ok(());
             };
-            let result = self.refresh_nodes(&mut tree.nodes);
+            let mut guard = TreeRefreshGuard::new(key, tree, previous_phase);
+            let result = catch_panic(std::panic::AssertUnwindSafe(|| {
+                self.refresh_nodes(guard.nodes())
+            }));
+            guard.restore();
+            // 刷新中的 panic（例如毒化且没有最后值的 memo 被文本槽读取）
+            // 不能穿过公开入口；树已经放回，旧结构仍可继续使用。
+            let result = match result {
+                Ok(result) => result,
+                Err(panic) => Err(MountError::Panic(panic)),
+            };
             let fault = with_state(|state| {
-                state.put_tree(key, tree);
                 state.refresh_focus = None;
                 // 焦点行被滚动窗口卸载时直接清除焦点；它不能结算到相邻行，
                 // 那会把 Tab 的语义变成一次隐式焦点跳转（ADR-0011）。
@@ -3464,7 +3690,7 @@ impl Runtime {
                 {
                     state.set_focused_in(key, None);
                 }
-                state.phase = Phase::Idle;
+                state.phase = previous_phase;
                 state.fault
             });
             result?;
@@ -3529,18 +3755,29 @@ impl Runtime {
             state.fault = None;
             state.write_error = None;
         });
+        let mut panic = None;
         if settlement.blur_old {
             with_state(|state| state.set_focused_in(key, None));
-            self.fire_blur(settlement.old, FocusCause::Settlement);
+            if let Err(info) = self.fire_blur(settlement.old, FocusCause::Settlement) {
+                panic = Some(info);
+            }
         }
         match (keep_target, settlement.target) {
             (true, Some(target)) => {
                 with_state(|state| state.set_focused_in(key, Some(target)));
-                self.fire_focus(target, FocusCause::Settlement);
+                if panic.is_none()
+                    && let Err(info) = self.fire_focus(target, FocusCause::Settlement)
+                {
+                    panic = Some(info);
+                }
             }
             _ => with_state(|state| state.set_focused_in(key, None)),
         }
         with_state(|state| state.phase = Phase::Idle);
+        if let Some(panic) = panic {
+            let _ = self.finish_command();
+            return Err(MountError::Panic(panic));
+        }
         if let Some(fault) = with_state(|state| state.fault) {
             return Err(State::context_error(fault));
         }
@@ -3554,10 +3791,20 @@ impl Runtime {
         let mut nodes = Vec::with_capacity(plan.nodes.len());
         for node in plan.nodes {
             let result = match node {
-                PlanNode::Children(children) => with_owner(parent, || children.mount())
-                    .and_then(|plan| self.mount_plan(plan, parent)),
-                PlanNode::Factory(factory) => with_owner(parent, || factory.mount())
-                    .and_then(|plan| self.mount_plan(plan, parent)),
+                PlanNode::Children(children) => {
+                    match with_owner(parent, || catch_panic(|| children.mount())) {
+                        Ok(Ok(plan)) => self.mount_plan(plan, parent),
+                        Ok(Err(error)) => Err(error),
+                        Err(panic) => Err(MountError::Panic(panic)),
+                    }
+                }
+                PlanNode::Factory(factory) => {
+                    match with_owner(parent, || catch_panic(|| factory.mount())) {
+                        Ok(Ok(plan)) => self.mount_plan(plan, parent),
+                        Ok(Err(error)) => Err(error),
+                        Err(panic) => Err(MountError::Panic(panic)),
+                    }
+                }
                 node => self.mount_node(node, parent).map(|node| vec![node]),
             };
             match result {
@@ -3652,23 +3899,20 @@ impl Runtime {
             PlanNode::Component(plan) => {
                 let label = plan.label;
                 let owner = with_state(|state| state.create_owner(Some(parent)));
-                let previous = with_state(|state| {
-                    let previous = (state.current_owner, state.phase);
-                    state.current_owner = Some(owner);
-                    state.phase = Phase::Setup;
-                    previous
+                let mounted = with_owner(owner, || {
+                    let _phase = PhaseGuard::enter(Phase::Setup);
+                    catch_panic(plan.mount)
                 });
-                let mounted = (plan.mount)();
-                let fault = with_state(|state| {
-                    state.current_owner = previous.0;
-                    state.phase = previous.1;
-                    state.fault.take()
-                });
+                let fault = with_state(|state| state.fault.take());
                 let plan = match mounted {
-                    Ok(plan) => plan,
-                    Err(error) => {
+                    Ok(Ok(plan)) => plan,
+                    Ok(Err(error)) => {
                         with_state(|state| state.dispose_owner(owner));
                         return Err(error);
+                    }
+                    Err(panic) => {
+                        with_state(|state| state.dispose_owner(owner));
+                        return Err(MountError::Panic(panic));
                     }
                 };
                 if let Some(fault) = fault {
@@ -3773,17 +4017,15 @@ impl Runtime {
             }
             MountedNode::Element(id) => {
                 self.refresh_element(*id);
-                let mut children =
-                    with_state(|state| std::mem::take(&mut state.elements[*id].children));
-                let result = self.refresh_nodes(&mut children);
-                with_state(|state| state.elements[*id].children = children);
+                let mut guard = ChildrenGuard::take(ChildrenOwner::Element(*id));
+                let result = self.refresh_nodes(guard.children_mut());
+                guard.restore();
                 result
             }
             MountedNode::Component(id) => {
-                let mut children =
-                    with_state(|state| std::mem::take(&mut state.components[*id].children));
-                let result = self.refresh_nodes(&mut children);
-                with_state(|state| state.components[*id].children = children);
+                let mut guard = ChildrenGuard::take(ChildrenOwner::Component(*id));
+                let result = self.refresh_nodes(guard.children_mut());
+                guard.restore();
                 result
             }
             MountedNode::Show(show) => self.refresh_show(show),
@@ -3792,8 +4034,10 @@ impl Runtime {
     }
 
     fn refresh_element(&mut self, id: usize) {
-        let mut attrs = with_state(|state| std::mem::take(&mut state.elements[id].attrs));
-        for attr in &mut attrs {
+        // 属性求值会读取用户 memo；panic 时 guard 把旧 attrs/styles 放回元素，
+        // 已提交界面因此保持完整。
+        let mut scratch = ElementScratchGuard::take(id);
+        for attr in scratch.attrs_mut() {
             attr.current = match &attr.value {
                 AttrValue::Text(slot) => Some(AttrCurrent::Text(slot.evaluate())),
                 AttrValue::Bool(slot) => Some(AttrCurrent::Bool(slot.evaluate())),
@@ -3805,23 +4049,22 @@ impl Runtime {
                 }
             };
         }
-        let mut styles = with_state(|state| std::mem::take(&mut state.elements[id].inline_styles));
-        for style in &mut styles {
+        for style in scratch.styles_mut() {
             style.current = Some(style.slot.evaluate());
         }
         // 值绑定的写入代数要在同一份新属性上读取，且不能嵌套借用 State。
-        let committed = attrs
-            .iter()
-            .find(|attr| attr.name == "value")
-            .and_then(|attr| attr.current.as_ref())
-            .and_then(|current| match current {
-                AttrCurrent::Text(text) => Some(text.as_str()),
-                AttrCurrent::Bool(_) => None,
-            })
-            .unwrap_or_default()
-            .to_owned();
-        with_state(|state| {
-            // 属性已经取出；绑定代数必须从这份新属性读取。
+        let (committed, epoch) = with_state(|state| {
+            let attrs = scratch.attrs_mut();
+            let committed = attrs
+                .iter()
+                .find(|attr| attr.name == "value")
+                .and_then(|attr| attr.current.as_ref())
+                .and_then(|current| match current {
+                    AttrCurrent::Text(text) => Some(text.as_str()),
+                    AttrCurrent::Bool(_) => None,
+                })
+                .unwrap_or_default()
+                .to_owned();
             let epoch = attrs
                 .iter()
                 .find(|attr| attr.name == "value")
@@ -3829,6 +4072,11 @@ impl Runtime {
                     AttrValue::Text(slot) => slot.epoch(state),
                     AttrValue::Bool(_) | AttrValue::ResultBool(_) => None,
                 });
+            (committed, epoch)
+        });
+        with_state(|state| {
+            let attrs = scratch.take_attrs();
+            let styles = scratch.take_styles();
             let event = {
                 let element = &mut state.elements[id];
                 if let LocalState::Checkbox { checked } = &mut element.local
@@ -3853,7 +4101,11 @@ impl Runtime {
     }
 
     fn refresh_show(&mut self, show: &mut MountedShow) -> Result<(), MountError> {
-        let active = show.when.get();
+        // `when` 的求值可能读到毒化且没有最后值的 memo；旧分支保持挂载。
+        let active = match catch_panic(|| show.when.get()) {
+            Ok(active) => active,
+            Err(panic) => return Err(MountError::Panic(panic)),
+        };
         let wanted = if active {
             Some(true)
         } else if show.fallback.is_some() {
@@ -3876,11 +4128,15 @@ impl Runtime {
                 } else {
                     show.fallback.as_ref().expect("fallback is present")
                 };
-                let plan = match with_owner(owner, || factory.mount()) {
-                    Ok(plan) => plan,
-                    Err(error) => {
+                let plan = match with_owner(owner, || catch_panic(|| factory.mount())) {
+                    Ok(Ok(plan)) => plan,
+                    Ok(Err(error)) => {
                         with_state(|state| state.dispose_owner(owner));
                         return Err(error);
+                    }
+                    Err(panic) => {
+                        with_state(|state| state.dispose_owner(owner));
+                        return Err(MountError::Panic(panic));
                     }
                 };
                 let children = match self.mount_plan(plan, owner) {
@@ -3899,6 +4155,27 @@ impl Runtime {
             None => None,
         };
 
+        // 先刷新拟议分支；失败时释放它并保留旧分支，结构提交是最后一步。
+        let mut replacement = replacement;
+        if let Some(branch) = &mut replacement {
+            let result = catch_panic(std::panic::AssertUnwindSafe(|| {
+                self.refresh_nodes(&mut branch.children)
+            }));
+            let failure = match result {
+                Ok(Ok(())) => None,
+                Ok(Err(error)) => Some(error),
+                Err(panic) => Some(MountError::Panic(panic)),
+            };
+            if let Some(error) = failure {
+                with_state(|state| {
+                    clear_history_in_nodes(state, &branch.children);
+                    state.dispose_owner(branch.owner);
+                    state.unmounts += 1;
+                });
+                return Err(error);
+            }
+        }
+
         if let Some(branch) = &show.active {
             with_state(|state| clear_history_in_nodes(state, &branch.children));
         }
@@ -3909,14 +4186,15 @@ impl Runtime {
             });
         }
         show.active = replacement;
-        if let Some(branch) = &mut show.active {
-            self.refresh_nodes(&mut branch.children)?;
-        }
         Ok(())
     }
 
     fn refresh_for(&mut self, for_node: &mut MountedFor) -> Result<(), MountError> {
-        let rows: RowSet = for_node.each.get();
+        // 源求值失败时旧行与旧窗口保持不变。
+        let rows: RowSet = match catch_panic(|| for_node.each.get()) {
+            Ok(rows) => rows,
+            Err(panic) => return Err(MountError::Panic(panic)),
+        };
         // 完整的 keyed 顺序只在 row set 投影变化时重建：重复键在窗口化之前
         // 就拒绝，窗口只影响挂载哪些行，绝不改变行顺序（ADR-0011）。key 只应
         // 依赖行身份，因此同一份投影可以复用映射结果；窗口更新是 O(窗口)。
@@ -3929,7 +4207,11 @@ impl Runtime {
             let mut seen = BTreeSet::new();
             for key in rows.iter() {
                 let todo = TodoId::from_key(key);
-                let mapped = (for_node.key)(todo);
+                // key 选择器是用户代码；panic 时不改写已提交的行映射。
+                let mapped = match catch_panic(|| (for_node.key)(todo)) {
+                    Ok(mapped) => mapped,
+                    Err(panic) => return Err(MountError::Panic(panic)),
+                };
                 if !seen.insert(mapped) {
                     return Err(MountError::DuplicateKey);
                 }
@@ -3994,12 +4276,17 @@ impl Runtime {
                 continue;
             }
             let owner = with_state(|state| state.create_owner(Some(for_node.owner)));
-            let plan = match with_owner(owner, || (for_node.item)(todo)) {
-                Ok(plan) => plan,
-                Err(error) => {
+            let plan = match with_owner(owner, || catch_panic(|| (for_node.item)(todo))) {
+                Ok(Ok(plan)) => plan,
+                Ok(Err(error)) => {
                     with_state(|state| state.dispose_owner(owner));
                     self.release_items(&mut fresh);
                     return Err(error);
+                }
+                Err(panic) => {
+                    with_state(|state| state.dispose_owner(owner));
+                    self.release_items(&mut fresh);
+                    return Err(MountError::Panic(panic));
                 }
             };
             let children = match self.mount_plan(plan, owner) {
@@ -4093,16 +4380,16 @@ impl Runtime {
         let state = self.state.clone();
         context::install(&state, || {
             let element = with_state(|state| state.element_for_node(node))?;
-            let (event_id, mut event) =
+            let (event_id, event) =
                 self.take_node_event(node, element, EventKind::Click, NodeOperation::Click)?;
-            if let Event::Click(handler) = &mut event {
-                handler();
-            }
-            with_state(|state| {
-                state.put_event(event_id, event);
-                state.phase = Phase::Idle;
-            });
-            self.finish_command().map_err(DispatchError::Command)
+            let panic = invoke_event(event_id, event, |event| {
+                if let Event::Click(handler) = event {
+                    handler();
+                }
+            })
+            .err();
+            with_state(|state| state.phase = Phase::Idle);
+            self.finish_event(panic)
         })
     }
 
@@ -4145,6 +4432,7 @@ impl Runtime {
             DispatchError::WrongKind { .. } => MountError::Component(wrong_kind),
             DispatchError::Rejected { reason, .. } => MountError::Component(reason),
             DispatchError::Command(error) => error,
+            DispatchError::Panic(panic) => MountError::Panic(panic),
         })
     }
 
@@ -4173,7 +4461,7 @@ impl Runtime {
             if with_state(|state| state.elements[element].local.is_composing()) {
                 return Err(MountError::Component("text input is composing"));
             }
-            let Some((event_id, mut event)) =
+            let Some((event_id, event)) =
                 with_state(|state| state.take_element_event(element, EventKind::Input))
             else {
                 return Err(MountError::Component("input target not found"));
@@ -4187,14 +4475,14 @@ impl Runtime {
                 }
                 state.update_local(element, LocalUpdate::Input(value.to_owned()));
             });
-            if let Event::Input(handler) = &mut event {
-                handler(value.to_owned());
-            }
-            with_state(|state| {
-                state.put_event(event_id, event);
-                state.phase = Phase::Idle;
-            });
-            self.finish_command()
+            let panic = invoke_event(event_id, event, |event| {
+                if let Event::Input(handler) = event {
+                    handler(value.to_owned());
+                }
+            })
+            .err();
+            with_state(|state| state.phase = Phase::Idle);
+            self.finish_event_mount(panic)
         })
     }
 
@@ -4333,8 +4621,7 @@ impl Runtime {
             value: new_value,
             caret: next_caret,
         } = outcome;
-        let (event_id, mut event) =
-            self.take_node_event(node, element, EventKind::Input, operation)?;
+        let (event_id, event) = self.take_node_event(node, element, EventKind::Input, operation)?;
         with_state(|state| {
             if let LocalState::TextInput(editor) = &mut state.elements[element].local {
                 editor.caret = next_caret;
@@ -4344,23 +4631,27 @@ impl Runtime {
             state.dispatch_text_edit(element, &new_value, epoch);
         });
         with_state(State::bump_presentation);
-        // handler unwind 不能把占位事件或 Event 阶段留在槽位里。
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            if let Event::Input(handler) = &mut event {
+        // 事件槽与 Event 阶段必须在 handler panic 时也恢复；abort_text_dispatch
+        // 撤销这次尚未结算的本地编辑。
+        let panic = invoke_event(event_id, event, |event| {
+            if let Event::Input(handler) = event {
                 handler(new_value);
             }
-        }));
-        with_state(|state| {
-            state.put_event(event_id, event);
-            state.phase = Phase::Idle;
-        });
-        if let Err(payload) = outcome {
+        })
+        .err();
+        with_state(|state| state.phase = Phase::Idle);
+        if panic.is_some() {
             with_state(|state| abort_text_dispatch(state, element));
-            std::panic::resume_unwind(payload);
         }
-        if let Err(error) = self.finish_command() {
+        if panic.is_none()
+            && let Err(error) = self.finish_command()
+        {
             with_state(|state| abort_text_dispatch(state, element));
             return Err(DispatchError::Command(error));
+        }
+        if let Some(panic) = panic {
+            let _ = self.finish_command();
+            return Err(DispatchError::Panic(panic));
         }
         with_state(|state| clamp_local_edit(state, element));
         self.record_text_edit(element, before, kind);
@@ -4437,7 +4728,7 @@ impl Runtime {
                 HistoryDirection::Undo => entry.before.clone(),
                 HistoryDirection::Redo => entry.after.clone(),
             };
-            let (event_id, mut event) =
+            let (event_id, event) =
                 self.take_node_event(node, element, EventKind::Input, operation)?;
             let epoch = with_state(|state| state.elements[element].value_epoch(state));
             let length = target.value.chars().count();
@@ -4457,23 +4748,25 @@ impl Runtime {
                 state.dispatch_text_edit(element, &target.value, epoch);
             });
             with_state(State::bump_presentation);
-            // handler unwind 不能把占位事件或 Event 阶段留在槽位里。
-            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                if let Event::Input(handler) = &mut event {
+            let panic = invoke_event(event_id, event, |event| {
+                if let Event::Input(handler) = event {
                     handler(target.value);
                 }
-            }));
-            with_state(|state| {
-                state.put_event(event_id, event);
-                state.phase = Phase::Idle;
-            });
-            if let Err(payload) = outcome {
+            })
+            .err();
+            with_state(|state| state.phase = Phase::Idle);
+            if panic.is_some() {
                 with_state(|state| abort_text_dispatch(state, element));
-                std::panic::resume_unwind(payload);
             }
-            if let Err(error) = self.finish_command() {
+            if panic.is_none()
+                && let Err(error) = self.finish_command()
+            {
                 with_state(|state| abort_text_dispatch(state, element));
                 return Err(DispatchError::Command(error));
+            }
+            if let Some(panic) = panic {
+                let _ = self.finish_command();
+                return Err(DispatchError::Panic(panic));
             }
             with_state(|state| {
                 clamp_local_edit(state, element);
@@ -4540,17 +4833,19 @@ impl Runtime {
             })?;
             with_state(State::bump_presentation);
             self.enter_event_phase();
-            self.dispatch_element_event(element, EventKind::CompositionStart, |event| {
-                if let Event::CompositionStart(handler) = event {
-                    handler(CompositionEvent::new(
-                        CompositionPhase::Start,
-                        String::new(),
-                        caret,
-                        selection,
-                    ));
-                }
-            });
-            self.leave_event_phase().map_err(DispatchError::Command)
+            let panic = self
+                .dispatch_element_event(element, EventKind::CompositionStart, |event| {
+                    if let Event::CompositionStart(handler) = event {
+                        handler(CompositionEvent::new(
+                            CompositionPhase::Start,
+                            String::new(),
+                            caret,
+                            selection,
+                        ));
+                    }
+                })
+                .err();
+            self.finish_event(panic)
         })
     }
 
@@ -4596,17 +4891,19 @@ impl Runtime {
             })?;
             with_state(State::bump_presentation);
             self.enter_event_phase();
-            self.dispatch_element_event(element, EventKind::CompositionUpdate, |event| {
-                if let Event::CompositionUpdate(handler) = event {
-                    handler(CompositionEvent::new(
-                        CompositionPhase::Update,
-                        preedit.to_owned(),
-                        caret,
-                        selection,
-                    ));
-                }
-            });
-            self.leave_event_phase().map_err(DispatchError::Command)
+            let panic = self
+                .dispatch_element_event(element, EventKind::CompositionUpdate, |event| {
+                    if let Event::CompositionUpdate(handler) = event {
+                        handler(CompositionEvent::new(
+                            CompositionPhase::Update,
+                            preedit.to_owned(),
+                            caret,
+                            selection,
+                        ));
+                    }
+                })
+                .err();
+            self.finish_event(panic)
         })
     }
 
@@ -4634,7 +4931,18 @@ impl Runtime {
                 state.require_composing_text_input(node, element, NodeOperation::CompositionCommit)
             })?;
             self.enter_event_phase();
-            let before = self.commit_composition(node, element, text)?;
+            let before = match self.commit_composition(node, element, text) {
+                Ok(before) => before,
+                Err(DispatchError::Panic(panic)) => {
+                    with_state(|state| abort_text_dispatch(state, element));
+                    let _ = self.finish_command();
+                    return Err(DispatchError::Panic(panic));
+                }
+                Err(error) => {
+                    with_state(|state| state.phase = Phase::Idle);
+                    return Err(error);
+                }
+            };
             if let Err(error) = self.leave_event_phase() {
                 with_state(|state| abort_text_dispatch(state, element));
                 return Err(DispatchError::Command(error));
@@ -4668,8 +4976,14 @@ impl Runtime {
                 state.require_composing_text_input(node, element, NodeOperation::CompositionCancel)
             })?;
             self.enter_event_phase();
-            self.cancel_composition(node, element)?;
-            self.leave_event_phase().map_err(DispatchError::Command)
+            match self.cancel_composition(node, element) {
+                Ok(()) => self.finish_event(None),
+                Err(DispatchError::Panic(panic)) => self.finish_event(Some(panic)),
+                Err(error) => {
+                    with_state(|state| state.phase = Phase::Idle);
+                    Err(error)
+                }
+            }
         })
     }
 
@@ -4720,21 +5034,29 @@ impl Runtime {
         })?;
         with_state(|state| state.dispatch_text_edit(element, &new_text, epoch));
         with_state(State::bump_presentation);
-        self.dispatch_element_event(element, EventKind::CompositionEnd, |event| {
-            if let Event::CompositionEnd(handler) = event {
-                handler(CompositionEvent::new(
-                    CompositionPhase::End,
-                    text.to_owned(),
-                    caret,
-                    None,
-                ));
-            }
-        });
-        self.dispatch_element_event(element, EventKind::Input, |event| {
+        if let Err(panic) =
+            self.dispatch_element_event(element, EventKind::CompositionEnd, |event| {
+                if let Event::CompositionEnd(handler) = event {
+                    handler(CompositionEvent::new(
+                        CompositionPhase::End,
+                        text.to_owned(),
+                        caret,
+                        None,
+                    ));
+                }
+            })
+        {
+            with_state(|state| state.phase = Phase::Idle);
+            return Err(DispatchError::Panic(panic));
+        }
+        if let Err(panic) = self.dispatch_element_event(element, EventKind::Input, |event| {
             if let Event::Input(handler) = event {
                 handler(new_text.clone());
             }
-        });
+        }) {
+            with_state(|state| state.phase = Phase::Idle);
+            return Err(DispatchError::Panic(panic));
+        }
         Ok(Some(before))
     }
 
@@ -4768,8 +5090,8 @@ impl Runtime {
                     selection,
                 ));
             }
-        });
-        Ok(())
+        })
+        .map_err(DispatchError::Panic)
     }
 
     pub fn change(&mut self, label: &str, value: bool) -> Result<(), MountError> {
@@ -4786,17 +5108,17 @@ impl Runtime {
         let state = self.state.clone();
         context::install(&state, || {
             let element = with_state(|state| state.element_for_node(node))?;
-            let (event_id, mut event) =
+            let (event_id, event) =
                 self.take_node_event(node, element, EventKind::Change, NodeOperation::Change)?;
             with_state(|state| state.update_local(element, LocalUpdate::Change(value)));
-            if let Event::Change(handler) = &mut event {
-                handler(value);
-            }
-            with_state(|state| {
-                state.put_event(event_id, event);
-                state.phase = Phase::Idle;
-            });
-            self.finish_command().map_err(DispatchError::Command)
+            let panic = invoke_event(event_id, event, |event| {
+                if let Event::Change(handler) = event {
+                    handler(value);
+                }
+            })
+            .err();
+            with_state(|state| state.phase = Phase::Idle);
+            self.finish_event(panic)
         })
     }
 
@@ -4814,16 +5136,16 @@ impl Runtime {
         let state = self.state.clone();
         context::install(&state, || {
             let element = with_state(|state| state.element_for_node(node))?;
-            let (event_id, mut event) =
+            let (event_id, event) =
                 self.take_node_event(node, element, EventKind::Submit, NodeOperation::Submit)?;
-            if let Event::Submit(handler) = &mut event {
-                handler(SubmitEvent::default());
-            }
-            with_state(|state| {
-                state.put_event(event_id, event);
-                state.phase = Phase::Idle;
-            });
-            self.finish_command().map_err(DispatchError::Command)
+            let panic = invoke_event(event_id, event, |event| {
+                if let Event::Submit(handler) = event {
+                    handler(SubmitEvent::default());
+                }
+            })
+            .err();
+            with_state(|state| state.phase = Phase::Idle);
+            self.finish_event(panic)
         })
     }
 
@@ -4852,22 +5174,28 @@ impl Runtime {
                     }
                     Key::Escape => {
                         self.enter_event_phase();
-                        self.cancel_composition(node, element)?;
-                        return self.leave_event_phase().map_err(DispatchError::Command);
+                        return match self.cancel_composition(node, element) {
+                            Ok(()) => self.finish_event(None),
+                            Err(DispatchError::Panic(panic)) => self.finish_event(Some(panic)),
+                            Err(error) => {
+                                with_state(|state| state.phase = Phase::Idle);
+                                Err(error)
+                            }
+                        };
                     }
                     Key::Other => {}
                 }
             }
-            let (event_id, mut event) =
+            let (event_id, event) =
                 self.take_node_event(node, element, EventKind::KeyDown, NodeOperation::KeyDown)?;
-            if let Event::KeyDown(handler) = &mut event {
-                handler(KeyEvent::new(key));
-            }
-            with_state(|state| {
-                state.put_event(event_id, event);
-                state.phase = Phase::Idle;
-            });
-            self.finish_command().map_err(DispatchError::Command)
+            let panic = invoke_event(event_id, event, |event| {
+                if let Event::KeyDown(handler) = event {
+                    handler(KeyEvent::new(key));
+                }
+            })
+            .err();
+            with_state(|state| state.phase = Phase::Idle);
+            self.finish_event(panic)
         })
     }
 
@@ -5027,52 +5355,57 @@ impl Runtime {
             state.fault = None;
             state.write_error = None;
         });
+        let mut panic = None;
         if let Some(old) = current {
             with_state(|state| state.set_focused_in(tree, None));
-            if with_state(|state| state.element_is_mounted(old)) {
-                self.fire_blur(old, FocusCause::Command);
+            if with_state(|state| state.element_is_mounted(old))
+                && let Err(info) = self.fire_blur(old, FocusCause::Command)
+            {
+                panic = Some(info);
             }
         }
         if let Some(target) = target {
             with_state(|state| state.set_focused_in(tree, Some(target)));
-            self.fire_focus(target, FocusCause::Command);
+            if panic.is_none()
+                && let Err(info) = self.fire_focus(target, FocusCause::Command)
+            {
+                panic = Some(info);
+            }
         }
         with_state(|state| state.phase = Phase::Idle);
-        self.finish_command()
+        self.finish_event_mount(panic)
     }
 
-    fn fire_blur(&mut self, element: usize, cause: FocusCause) {
+    fn fire_blur(&mut self, element: usize, cause: FocusCause) -> Result<(), PanicInfo> {
         self.dispatch_element_event(element, EventKind::Blur, |event| {
             if let Event::Blur(handler) = event {
                 handler(BlurEvent::new(cause));
             }
-        });
+        })
     }
 
-    fn fire_focus(&mut self, element: usize, cause: FocusCause) {
+    fn fire_focus(&mut self, element: usize, cause: FocusCause) -> Result<(), PanicInfo> {
         self.dispatch_element_event(element, EventKind::Focus, |event| {
             if let Event::Focus(handler) = event {
                 handler(FocusEvent::new(cause));
             }
-        });
+        })
     }
 
+    /// 取事件槽、运行 handler、无条件放回；panic 收敛为诊断。
     fn dispatch_element_event(
         &mut self,
         element: usize,
         kind: EventKind,
         invoke: impl FnOnce(&mut Event),
-    ) {
+    ) -> Result<(), PanicInfo> {
         let Some((id, mut event)) = with_state(|state| state.take_element_event(element, kind))
         else {
-            return;
+            return Ok(());
         };
-        // handler unwind 不能把占位事件留在槽位里；恢复后再继续展开。
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| invoke(&mut event)));
+        let outcome = catch_panic(|| invoke(&mut event));
         with_state(|state| state.put_event(id, event));
-        if let Err(payload) = outcome {
-            std::panic::resume_unwind(payload);
-        }
+        outcome
     }
 
     fn enter_event_phase(&self) {
@@ -5091,6 +5424,29 @@ impl Runtime {
     fn finish_command(&mut self) -> Result<(), MountError> {
         self.finish_command_without_ui()?;
         self.refresh()
+    }
+
+    /// 事件 handler 结束后的统一收尾。
+    ///
+    /// panic 是主诊断：先把 phase 恢复为 Idle，并尽力刷新 panic 前已经提交的
+    /// 写入；次生刷新错误不覆盖 panic。事件槽已经由 `invoke_event` 放回。
+    fn finish_event(&mut self, panic: Option<PanicInfo>) -> Result<(), DispatchError> {
+        let Some(panic) = panic else {
+            return self.finish_command().map_err(DispatchError::Command);
+        };
+        with_state(|state| state.phase = Phase::Idle);
+        let _ = self.finish_command();
+        Err(DispatchError::Panic(panic))
+    }
+
+    /// [`Runtime::finish_event`] 的 `MountError` 版本；label 助手直接返回它。
+    fn finish_event_mount(&mut self, panic: Option<PanicInfo>) -> Result<(), MountError> {
+        let Some(panic) = panic else {
+            return self.finish_command();
+        };
+        with_state(|state| state.phase = Phase::Idle);
+        let _ = self.finish_command();
+        Err(MountError::Panic(panic))
     }
 
     /// 没有挂载界面时的命令收尾：只报告 handler 的 fault 与写错误。

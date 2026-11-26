@@ -9,6 +9,7 @@ pub mod handle;
 mod layout;
 pub mod metrics;
 pub mod owner;
+mod panic;
 mod query;
 pub mod runtime;
 pub mod store;
@@ -22,6 +23,7 @@ pub use handle::{
 };
 pub use metrics::Counters;
 pub use owner::{OwnerError, OwnerTree};
+pub use panic::{PanicInfo, catch_panic};
 pub use query::{Filter, RowSet};
 pub use runtime::Runtime;
 pub use store::{Row, RowId, Store, StoreError};

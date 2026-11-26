@@ -2,8 +2,12 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use crate::handle::OwnerId;
+use crate::panic::{PanicInfo, catch_panic};
 
 type Cleanup = Box<dyn FnOnce()>;
+
+/// 保留最近多少次 cleanup panic；诊断不随释放次数无界增长。
+const CLEANUP_PANIC_LOG: usize = 32;
 
 #[derive(Debug)]
 pub enum OwnerError {
@@ -49,6 +53,7 @@ pub struct OwnerTree {
     next: u32,
     live: usize,
     cleanup_runs: u64,
+    cleanup_panics: Vec<PanicInfo>,
 }
 
 impl OwnerTree {
@@ -70,6 +75,7 @@ impl OwnerTree {
             next: 1,
             live: 1,
             cleanup_runs: 0,
+            cleanup_panics: Vec::new(),
         }
     }
 
@@ -166,7 +172,14 @@ impl OwnerTree {
                 let mut cleanups = std::mem::take(&mut node.cleanups);
                 cleanups.reverse();
                 for cleanup in cleanups {
-                    cleanup();
+                    // 一个 cleanup 的 panic 不能中止同一 owner 的其余释放；
+                    // 记录诊断后继续，最后仍移除节点、解开父级链接。
+                    if let Err(panic) = catch_panic(cleanup) {
+                        if self.cleanup_panics.len() == CLEANUP_PANIC_LOG {
+                            self.cleanup_panics.remove(0);
+                        }
+                        self.cleanup_panics.push(panic);
+                    }
                     self.cleanup_runs += 1;
                 }
 
@@ -219,6 +232,13 @@ impl OwnerTree {
     pub const fn cleanup_runs(&self) -> u64 {
         self.cleanup_runs
     }
+
+    /// 最近有界数量的 cleanup panic，按捕获顺序排列。
+    ///
+    /// 释放本身继续执行；调用方在释放后读取这些诊断并作为 typed error 上报。
+    pub fn cleanup_panics(&self) -> &[PanicInfo] {
+        &self.cleanup_panics
+    }
 }
 
 impl Default for OwnerTree {
@@ -232,6 +252,7 @@ impl fmt::Debug for OwnerTree {
         f.debug_struct("OwnerTree")
             .field("live", &self.live)
             .field("cleanup_runs", &self.cleanup_runs)
+            .field("cleanup_panics", &self.cleanup_panics.len())
             .finish()
     }
 }
@@ -381,6 +402,34 @@ mod tests {
             owners.child_of(scope),
             Err(OwnerError::AlreadyDisposed(_))
         ));
+    }
+
+    #[test]
+    fn a_panicking_cleanup_does_not_abort_the_rest_of_disposal() {
+        let mut owners = OwnerTree::new();
+        let scope = owners.child_of(owners.root()).expect("child");
+        let runs = Rc::new(RefCell::new(0));
+
+        // 先注册 panic 的 cleanup，再注册正常 cleanup；逆序执行时正常回调先运行，
+        // 随后 panic 被捕获，owner 仍然完成释放。
+        owners
+            .on_cleanup(scope, Box::new(|| panic!("cleanup boom")))
+            .unwrap();
+        let counter = Rc::clone(&runs);
+        owners
+            .on_cleanup(scope, Box::new(move || *counter.borrow_mut() += 1))
+            .unwrap();
+
+        owners.dispose(scope);
+
+        assert_eq!(*runs.borrow(), 1, "the later cleanup still ran");
+        assert_eq!(owners.cleanup_runs(), 2);
+        let panics = owners.cleanup_panics();
+        assert_eq!(panics.len(), 1);
+        assert_eq!(panics[0].message(), "cleanup boom");
+        assert!(owners.is_disposed(scope));
+        assert_eq!(owners.live(), 1, "root survives");
+        assert_eq!(owners.storage_len(), 1, "the owner leaves storage");
     }
 
     #[test]
