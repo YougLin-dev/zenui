@@ -65,6 +65,26 @@ impl<T> Clone for Signal<T> {
     }
 }
 
+impl<T> Signal<T> {
+    /// 绑定槽保存的是来源引用；求值时按引用还原同一句柄。
+    pub(crate) fn from_source(source: crate::node::SourceRef) -> Self {
+        Self {
+            runtime: source.runtime,
+            id: source.id,
+            _marker: PhantomData,
+            _not_send: PhantomData,
+        }
+    }
+
+    /// 绑定槽的来源描述；只携带 runtime 身份与槽位。
+    pub(crate) fn source(self) -> crate::node::SourceRef {
+        crate::node::SourceRef {
+            runtime: self.runtime,
+            id: self.id,
+        }
+    }
+}
+
 impl<T: ReactiveValue> Signal<T> {
     pub fn get(self) -> T {
         match with_state_of(self.runtime, |state| state.try_read_signal(self.id, true)) {
@@ -83,12 +103,6 @@ impl<T: ReactiveValue> Signal<T> {
 
     pub fn set(self, value: T) {
         with_state_of(self.runtime, |state| state.write_signal(self.id, value));
-    }
-
-    /// 应用写入代数；相等写入同样推进。文本编辑器据此辨认处理器是否写入过
-    /// 值绑定，而不是把“写入相同值”与“没有写入”混为一谈。
-    pub(crate) fn write_epoch(self, state: &crate::runtime::State) -> u64 {
-        state.signals[state.signal_index(self.id)].writes
     }
 
     /// 只读作用域：内部的 setter 与模型事务在改动前被拒绝。
@@ -137,21 +151,26 @@ impl<T> Clone for Memo<T> {
 }
 
 impl<T> Memo<T> {
-    /// memo 的运行时槽位；绑定 liveness 遍历用。
-    pub(crate) fn memo_id(self) -> u32 {
-        self.id
+    /// 绑定槽保存的是来源引用；求值时按引用还原同一句柄。
+    pub(crate) fn from_source(source: crate::node::SourceRef) -> Self {
+        Self {
+            runtime: source.runtime,
+            id: source.id,
+            _marker: PhantomData,
+            _not_send: PhantomData,
+        }
+    }
+
+    /// 绑定槽的来源描述；只携带 runtime 身份与槽位。
+    pub(crate) fn source(self) -> crate::node::SourceRef {
+        crate::node::SourceRef {
+            runtime: self.runtime,
+            id: self.id,
+        }
     }
 }
 
 impl<T: ReactiveValue> Memo<T> {
-    /// 值绑定的写入代数：只有计算值变化才推进。
-    ///
-    /// 相等写入（包括归一化后写回原值）无法与“把写入推迟到之后的命令”
-    /// 区分，因此不结算；编辑器保留本地文本，等模型值变化或外部替换。
-    pub(crate) fn write_epoch(self, state: &crate::runtime::State) -> u64 {
-        state.memos[state.memo_index(self.id)].revision
-    }
-
     pub fn get(self) -> T {
         match self.read_result(true) {
             Ok(value) => value,
@@ -593,6 +612,20 @@ impl crate::runtime::State {
             .get(&DepKey::Field(id, kind))
             .copied()
             .unwrap_or(0)
+    }
+
+    /// 绑定槽来源的写入代数；已释放或不存在的槽按 0 处理。
+    pub(crate) fn source_write_epoch(&self, source: crate::node::SourceRef) -> u64 {
+        self.signals
+            .get(source.id as usize)
+            .map_or(0, |cell| cell.writes)
+    }
+
+    /// 绑定槽来源 memo 的已提交 revision；相等重算不推进。
+    pub(crate) fn source_memo_revision(&self, source: crate::node::SourceRef) -> u64 {
+        self.memos
+            .get(source.id as usize)
+            .map_or(0, |cell| cell.revision)
     }
 
     fn invalidate_dependents(&mut self, key: DepKey) {

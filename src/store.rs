@@ -138,6 +138,20 @@ impl<T> Field<T> {
             _not_send: PhantomData,
         }
     }
+
+    /// 绑定槽只保存字段键；求值时按键还原同一句柄。
+    pub(crate) const fn from_key(key: crate::node::FieldKey) -> Self {
+        Self::new(key.runtime, key.id, key.kind)
+    }
+
+    /// 绑定槽的字段键；值类型由持有槽的类型决定。
+    pub(crate) const fn field_key(self) -> crate::node::FieldKey {
+        crate::node::FieldKey {
+            runtime: self.runtime,
+            id: self.id,
+            kind: self.kind,
+        }
+    }
 }
 
 impl<T> Field<T>
