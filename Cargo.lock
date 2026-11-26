@@ -2452,6 +2452,8 @@ name = "zenui-render"
 version = "0.1.0"
 dependencies = [
  "glifo",
+ "icu_provider",
+ "icu_segmenter",
  "parley",
  "pollster",
  "taffy",

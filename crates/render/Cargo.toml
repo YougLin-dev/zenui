@@ -17,4 +17,8 @@ zenui = { path = "../.." }
 zenui-style = { path = "../style" }
 
 [dev-dependencies]
+# 分词 spike：版本必须与 parley 的 `icu_segmenter ~2.3.0` / `icu_provider 2.3.0`
+# 要求兼容，否则 `DictionaryProvider` 的 blanket 实现不再匹配。
+icu_provider = { version = "2.3.0", default-features = false }
+icu_segmenter = { version = "~2.3.0", default-features = false, features = ["compiled_data"] }
 zenui-demo = { path = "../demo" }
