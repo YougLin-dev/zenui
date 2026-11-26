@@ -1,14 +1,20 @@
 //! Parley 文本整形、测量与 caret/selection 几何。
 
+use std::borrow::Cow;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use parley::layout::ContentWidths;
 use parley::layout::PositionedLayoutItem;
-use parley::{Affinity, Cursor, FontContext, Layout, LayoutContext, Selection, StyleProperty};
+use parley::{
+    Affinity, Cursor, DictionaryProvider, FontContext, FontFamily, FontFamilyName, Layout,
+    LayoutContext, Selection, StyleProperty,
+};
 use taffy::prelude::{AvailableSpace, Size as TaffySize};
 
 use crate::geometry::{Point, Rect};
 use crate::scene::{PositionedGlyph, TextRun};
+use crate::text_assets::{TextAssetError, TextAssets};
 
 /// 正文与控件的默认字号；所有几何使用逻辑像素。
 pub(crate) const FONT_SIZE: f32 = 14.0;
@@ -65,6 +71,10 @@ impl CharRange {
 pub(crate) struct TextShaper {
     fonts: FontContext,
     layouts: LayoutContext<()>,
+    /// 配置资产时的家族列表；`None` 表示沿用集合的默认家族。
+    family: Option<Vec<FontFamilyName<'static>>>,
+    /// 应用提供的分词语料；`None` 表示使用编译进二进制的词典。
+    dictionary: Option<Arc<dyn DictionaryProvider>>,
     /// 未断行 layout 与内容宽度；键包含文本、字号与字重。
     metrics: HashMap<TextKey, TextMetrics>,
     /// 已按宽度断行的 layout；重复场景构建直接克隆，不重新整形。
@@ -138,9 +148,29 @@ const MEASURE_LIMIT: usize = 65536;
 
 impl TextShaper {
     pub(crate) fn new() -> Self {
+        Self::from_fonts(FontContext::new(), None, None)
+    }
+
+    /// 注册并校验应用资产；失败发生在构造期，不会推迟到绘制。
+    pub(crate) fn with_assets(assets: TextAssets) -> Result<Self, TextAssetError> {
+        let fonts = assets.into_fonts()?;
+        Ok(Self::from_fonts(
+            fonts.context,
+            Some(fonts.families),
+            fonts.dictionary,
+        ))
+    }
+
+    fn from_fonts(
+        fonts: FontContext,
+        family: Option<Vec<FontFamilyName<'static>>>,
+        dictionary: Option<Arc<dyn DictionaryProvider>>,
+    ) -> Self {
         Self {
-            fonts: FontContext::new(),
+            fonts,
             layouts: LayoutContext::new(),
+            family,
+            dictionary,
             metrics: HashMap::new(),
             shaped: HashMap::new(),
             measured: HashMap::new(),
@@ -148,8 +178,20 @@ impl TextShaper {
     }
 
     fn build(&mut self, text: &str, style: TextStyle) -> Layout<()> {
-        let Self { fonts, layouts, .. } = self;
+        let Self {
+            fonts,
+            layouts,
+            family,
+            dictionary,
+            ..
+        } = self;
         let mut builder = layouts.ranged_builder(fonts, text, 1.0, true);
+        if let Some(family) = family {
+            builder.push_default(FontFamily::List(Cow::Borrowed(family.as_slice())));
+        }
+        if let Some(dictionary) = dictionary.as_deref() {
+            builder.set_dictionary_provider(Some(dictionary));
+        }
         builder.push_default(StyleProperty::FontSize(style.size));
         builder.push_default(StyleProperty::FontWeight(parley::FontWeight::new(
             f32::from(style.weight),

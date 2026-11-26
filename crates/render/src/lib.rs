@@ -16,6 +16,7 @@ pub mod gpu;
 mod scene;
 mod scrollbar;
 mod text;
+mod text_assets;
 
 pub use error::SceneError;
 pub use geometry::{Point, Rect, Viewport};
@@ -26,4 +27,5 @@ pub use scene::{
     SceneEnv, SceneRowBand, TextRun, Visual,
 };
 pub use scrollbar::Scrollbar;
+pub use text_assets::{FontAsset, TextAssetError, TextAssets};
 pub use wgpu;
