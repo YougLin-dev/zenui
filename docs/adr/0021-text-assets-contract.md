@@ -18,6 +18,8 @@ Each layout pushes `FontFamily::List(primary + fallbacks)` in order. With `syste
 
 `SceneCache::new()` and `Default` keep the system-font path and the collection's default family. `Scene::build` and `Scene::build_with` still create a default cache per call; applications that configure assets pass their cache to `Scene::build_cached`.
 
+The Windows host accepts the same value through `HostConfig::with_text_assets`. `Host::open` constructs the scene cache before it shows the primary window or creates any native window; a rejected configuration returns `HostError::TextAssets` and leaves no HWND behind. Hosts without assets keep the system-font cache.
+
 ## Considered options
 
 - **System fonts plus explicitly named families**: no blobs and a family list only. Rejected: the application cannot guarantee a family on a clean machine, and a missing family is exactly what the contract must diagnose.
