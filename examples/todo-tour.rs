@@ -354,7 +354,7 @@ fn TodoApp(
                 </text>
             </Show>
 
-            <form class="flex gap-2" on:submit={move |event: SubmitEvent| {
+            <form class="flex gap-2" on:submit={move |event: &mut SubmitEvent| {
                 event.prevent_default();
                 add()
             }}>

@@ -26,7 +26,7 @@ fn Demo() -> MountResult<MountPlan> {
 
     view! {
         <view role="main">
-            <form aria:label="Add task" on:submit={move |_event: SubmitEvent| add()}>
+            <form aria:label="Add task" on:submit={move |_event: &mut SubmitEvent| add()}>
                 <text-input
                     value={draft}
                     aria:label="Draft"

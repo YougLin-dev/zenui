@@ -546,8 +546,7 @@ pub fn TodoApp(window: WindowCtx, state: TodoState) -> MountResult<MountPlan> {
             <text class="text-sm dark:text-muted">{remaining_txt}</text>
             <form
                 aria:label="Add task"
-                on:submit={move |event: SubmitEvent| {
-                    let mut event = event;
+                on:submit={move |event: &mut SubmitEvent| {
                     event.prevent_default();
                     add();
                 }}
@@ -560,7 +559,7 @@ pub fn TodoApp(window: WindowCtx, state: TodoState) -> MountResult<MountPlan> {
                 />
                 <button
                     class="px-4 py-2 bg-accent text-inverse rounded-md font-semibold"
-                    on:click={move || add()}
+                    type="submit"
                 >"Add"</button>
             </form>
             <view role="group" aria:label="Filter">

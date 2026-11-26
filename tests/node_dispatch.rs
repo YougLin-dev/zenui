@@ -126,7 +126,7 @@ fn Controls(clicks: Rc<Cell<u32>>, keys: Rc<Cell<u32>>) -> MountResult<MountPlan
             />
             <text-input aria:label="silent" />
             <checkbox aria:label="silent-check" />
-            <form aria:label="form" on:submit={move |_event: SubmitEvent| {
+            <form aria:label="form" on:submit={move |_event: &mut SubmitEvent| {
                 status.set(String::from("submitted"));
             }}>
                 <button aria:label="inner">"Inner"</button>
