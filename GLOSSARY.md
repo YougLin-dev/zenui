@@ -117,8 +117,12 @@ _Avoid_: css class, utility string
 _Avoid_: pseudo-class, selector
 
 **Appearance**:
-应用的 `Light`/`Dark` 外观，属于已提交状态，随快照参与相等性并影响调色板与 `dark:`；不跟随操作系统设置。
+应用的 `Light`/`Dark` 外观，属于已提交状态，随快照参与相等性并影响调色板与 `dark:`；不跟随操作系统设置。系统高对比度开启时，宿主用高对比度调色板覆盖角色颜色。
 _Avoid_: theme (when meaning the OS mode), color scheme
+
+**System preferences**:
+宿主采样的 Windows 高对比度与辅助功能文本缩放，属于宿主输入，不进入快照或应用事务；高对比度覆盖角色调色板，文本缩放放大字号与 `em` 几何。
+_Avoid_: accessibility theme, font scale (when meaning the OS setting)
 
 **Resolved style**:
 场景构建时由 intrinsic 默认、class 与 inline 声明合并后的值，供布局、文本整形与绘制共用。
