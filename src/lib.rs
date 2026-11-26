@@ -51,6 +51,7 @@ pub use window::{
     CatalogError, CloseError, ClosePolicy, CloseRequest, DropError, DropEvent, WindowCatalog,
     WindowCtx, WindowError, WindowInfo, WindowRole, WindowSpec,
 };
+pub use zenui_core::PanicInfo;
 pub use zenui_macro::{component, view};
 pub use zenui_style as style;
 pub use zenui_style::{
@@ -67,14 +68,14 @@ pub mod prelude {
         FileDialogOutcome, FileDialogRequest, FileDialogRequestError, FileFilter, FocusCause,
         FocusEvent, FocusInfo, Key, KeyEvent, Length, LengthUnit, Memo, MenuCommand,
         MenuCommandState, MenuItem, MenuShortcut, MenuSpec, MenuStateError, MountError, MountPlan,
-        MountResult, NodeId, NodeOperation, NodeStatus, Once, Opacity, PresentationSnapshot,
-        Property, Runtime, SessionCtx, SessionError, SessionPolicy, ShortcutError, ShortcutKey,
-        Signal, SnapshotAction, SnapshotActions, SnapshotAttr, SnapshotElement, SnapshotNode,
-        SnapshotRowBand, SnapshotSemantics, SnapshotValue, Store, StyleDeclaration, StyleOrigin,
-        StyleValue, Submenu, SubmitEvent, Task, TaskError, TaskScope, TaskStatus, TaskToken,
-        TextEditState, TodoId, Transaction, TrayError, TraySpec, WindowCatalog, WindowCtx,
-        WindowError, WindowInfo, WindowRole, WindowSpec, WriteError, WriteOp, component, em, memo,
-        once, px, signal, view,
+        MountResult, NodeId, NodeOperation, NodeStatus, Once, Opacity, PanicInfo,
+        PresentationSnapshot, Property, Runtime, SessionCtx, SessionError, SessionPolicy,
+        ShortcutError, ShortcutKey, Signal, SnapshotAction, SnapshotActions, SnapshotAttr,
+        SnapshotElement, SnapshotNode, SnapshotRowBand, SnapshotSemantics, SnapshotValue, Store,
+        StyleDeclaration, StyleOrigin, StyleValue, Submenu, SubmitEvent, Task, TaskError,
+        TaskScope, TaskStatus, TaskToken, TextEditState, TodoId, Transaction, TrayError, TraySpec,
+        WindowCatalog, WindowCtx, WindowError, WindowInfo, WindowRole, WindowSpec, WriteError,
+        WriteOp, component, em, memo, once, px, signal, view,
     };
     pub use zenui_core::Filter;
 }

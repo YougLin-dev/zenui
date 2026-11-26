@@ -4,6 +4,7 @@ use crate::graph::MemoGraph;
 use crate::handle::RuntimeId;
 use crate::layout::LayoutMap;
 use crate::owner::OwnerTree;
+use crate::panic::PanicInfo;
 use crate::query::{Filter, QueryCache, RowSet};
 use crate::store::Store;
 use crate::txn::{Fatal, Nodes, Publication, Tx, Txn};
@@ -112,6 +113,11 @@ impl Runtime {
 
     pub const fn cleanup_runs(&self) -> u64 {
         self.owners.cleanup_runs()
+    }
+
+    /// 最近有界数量的 cleanup panic；释放已经完成，调用方可据此上报诊断。
+    pub fn cleanup_panics(&self) -> &[PanicInfo] {
+        self.owners.cleanup_panics()
     }
 
     pub const fn next_view(&self) -> u32 {

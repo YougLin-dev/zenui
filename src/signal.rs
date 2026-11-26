@@ -4,6 +4,8 @@ use std::fmt;
 use std::marker::PhantomData;
 use std::rc::Rc;
 
+use zenui_core::{PanicInfo, catch_panic};
+
 use crate::context::{DepKey, Phase, release_read_only, with_state, with_state_of};
 
 pub struct Signal<T> {
@@ -90,26 +92,56 @@ impl<T: Clone + PartialEq + 'static> Memo<T> {
     }
 
     pub fn get(self) -> T {
-        let ready = with_state_of(self.runtime, |state| {
+        if let Some(value) = self.read_ready() {
+            return value;
+        }
+        let (compute, previous) = with_state_of(self.runtime, |state| state.begin_memo(self.id));
+        match catch_panic(&compute) {
+            Ok(value) => {
+                with_state_of(self.runtime, |state| {
+                    state.finish_memo::<T>(self.id, value, previous, compute)
+                });
+                with_state_of(self.runtime, |state| {
+                    if state.phase == Phase::Memo {
+                        state.note_dep(DepKey::Memo(self.id));
+                    }
+                    state.memo_value(self.id)
+                })
+            }
+            Err(panic) => {
+                with_state_of(self.runtime, |state| {
+                    state.abort_memo(self.id, panic.clone(), previous, compute);
+                });
+                // 毒化但仍有最后已提交值时返回它；没有最后值时 read_ready 以
+                // 明确的契约 panic 终止（同 owner 内的无效读取）。
+                self.read_ready().unwrap_or_else(|| {
+                    panic!(
+                        "memo {} is poisoned and has no committed value: {panic}",
+                        self.id
+                    )
+                })
+            }
+        }
+    }
+
+    /// 该 memo 最近一次被捕获的 compute panic。
+    ///
+    /// 毒化只影响这个 memo：依赖变化或成功重算会清除它。读取仍遵循
+    /// [`Memo::get`] 的最后值规则，本方法是这个切片的 typed 诊断出口。
+    pub fn last_panic(self) -> Option<PanicInfo> {
+        with_state_of(self.runtime, |state| {
+            state.memos[state.memo_index(self.id)].poisoned.clone()
+        })
+    }
+
+    /// 已在缓存中的值；依赖变化后为 `None`，需要重新计算。
+    fn read_ready(self) -> Option<T> {
+        with_state_of(self.runtime, |state| {
             let value = state.memo_ready::<T>(self.id);
             if value.is_some() && state.phase == Phase::Memo {
                 state.note_dep(DepKey::Memo(self.id));
             }
             value
-        });
-        if let Some(value) = ready {
-            return value;
-        }
-        let (compute, previous) = with_state_of(self.runtime, |state| state.begin_memo(self.id));
-        let value = compute();
-        with_state_of(self.runtime, |state| {
-            state.finish_memo::<T>(self.id, value, previous, compute)
-        });
-        with_state_of(self.runtime, |state| {
-            if state.phase == Phase::Memo {
-                state.note_dep(DepKey::Memo(self.id));
-            }
-            state.memo_value(self.id)
         })
     }
 }
@@ -182,6 +214,8 @@ pub(crate) struct MemoCell {
     pub(crate) dirty: bool,
     pub(crate) computing: bool,
     pub(crate) disposed: bool,
+    /// compute panic 的诊断；依赖变化后清除，成功重算也会覆盖。
+    pub(crate) poisoned: Option<PanicInfo>,
 }
 
 impl MemoCell {
@@ -194,6 +228,7 @@ impl MemoCell {
             dirty: true,
             computing: false,
             disposed: false,
+            poisoned: None,
         }
     }
 }
@@ -270,6 +305,14 @@ impl crate::runtime::State {
         if cell.computing {
             panic!("memo {id} was read while computing (cycle)");
         }
+        if let Some(panic) = &cell.poisoned {
+            // 毒化后不重试 compute：只有依赖变化能清除 poison。仍有最后值时
+            // 返回它，界面因此保持最后一次已提交状态。
+            if let Some(value) = &cell.value {
+                return Some((*value.clone().downcast::<T>().expect("memo value type")).clone());
+            }
+            panic!("memo {id} is poisoned: {panic}");
+        }
         if cell.dirty {
             return None;
         }
@@ -316,6 +359,7 @@ impl crate::runtime::State {
         cell.computing = false;
         cell.dirty = false;
         cell.compute = Some(compute);
+        cell.poisoned = None;
         let value: T = *value.downcast::<T>().expect("memo value type");
         let changed = match &cell.value {
             Some(current) => *current.clone().downcast::<T>().expect("memo value type") != value,
@@ -340,6 +384,32 @@ impl crate::runtime::State {
         }
     }
 
+    /// compute panic 后恢复求值栈与 phase，并把 memo 标为毒化。
+    ///
+    /// 恢复 compute 闭包让依赖变化后可以重新求值；最后已提交值保留在
+    /// `value` 中，[`Memo::get`] 在毒化期间返回它。
+    pub(crate) fn abort_memo(
+        &mut self,
+        id: u32,
+        panic: PanicInfo,
+        previous_phase: Phase,
+        compute: Box<dyn Fn() -> Box<dyn Any>>,
+    ) {
+        self.phase = previous_phase;
+        if matches!(self.computing.last(), Some((top, _)) if *top == id) {
+            self.computing.pop();
+        } else {
+            // 防御性恢复：嵌套 panic 可能已经弹出更深的栈项；不要留下该 memo。
+            self.computing.retain(|(memo, _)| *memo != id);
+        }
+        let index = self.memo_index(id);
+        let cell = &mut self.memos[index];
+        cell.computing = false;
+        cell.dirty = true;
+        cell.compute = Some(compute);
+        cell.poisoned = Some(panic);
+    }
+
     pub(crate) fn note_dep(&mut self, key: DepKey) {
         if let Some((_, deps)) = self.computing.last_mut() {
             deps.push(key);
@@ -354,10 +424,18 @@ impl crate::runtime::State {
         let dependents: BTreeSet<u32> = self.reverse.get(&key).cloned().unwrap_or_default();
         for memo in dependents {
             let index = self.memo_index(memo);
-            if self.memos[index].disposed || self.memos[index].dirty {
+            if self.memos[index].disposed || self.memos[index].computing {
                 continue;
             }
-            if self.memos[index].computing {
+            // 依赖变化是毒化的唯一解药：清除 poison 并允许下一次读取重算。
+            // 即使它已经是 dirty（毒化时就是 dirty），也要继续标脏下游，因为
+            // 毒化本身没有传播过失效。
+            if self.memos[index].poisoned.take().is_some() {
+                self.memos[index].dirty = true;
+                self.invalidate_dependents(DepKey::Memo(memo));
+                continue;
+            }
+            if self.memos[index].dirty {
                 continue;
             }
             self.memos[index].dirty = true;

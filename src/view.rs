@@ -1,6 +1,6 @@
 use std::fmt;
 
-use zenui_core::RowSet;
+use zenui_core::{PanicInfo, RowSet};
 
 use zenui_style::{Color, Length, Opacity, Property, StyleDeclaration, StyleValue};
 
@@ -23,6 +23,10 @@ pub enum MountError {
     Delivery(&'static str),
     Component(&'static str),
     Setup(&'static str),
+    /// 用户闭包 panic 已被 contain；运行时状态已恢复，调用方可继续。
+    ///
+    /// containment 依赖 `panic = "unwind"` 构建。
+    Panic(PanicInfo),
 }
 
 impl MountError {
@@ -44,6 +48,7 @@ impl fmt::Display for MountError {
             Self::Delivery(message) => f.write_str(message),
             Self::Component(label) => write!(f, "component {label} rejected its mount"),
             Self::Setup(message) => f.write_str(message),
+            Self::Panic(panic) => write!(f, "{panic}"),
         }
     }
 }
