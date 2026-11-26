@@ -3,24 +3,32 @@ use std::fmt;
 
 use zenui_style::{Length, StyleDeclaration};
 
+use crate::node::{NodeRef, PresentationKey};
+
 /// Presentation snapshot 中一个已提交元素的稳定身份。
 ///
-/// Slot 在挂载时分配且不复用；generation 是这次元素挂载的序号。两者连同来源
-/// Runtime 共同构成身份，因此重新挂载得到的不会是旧身份。
+/// Runtime 身份 + arena 槽位 + generation 共同构成身份；槽位复用会推进
+/// generation，因此重新挂载得到的不会是旧身份。
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NodeId {
     runtime: u32,
-    slot: u32,
-    generation: u64,
+    node: NodeRef,
 }
 
+const _: () = assert!(std::mem::size_of::<NodeId>() == 16);
+
 impl NodeId {
-    pub(crate) const fn mint(runtime: u32, slot: u32, generation: u64) -> Self {
-        Self {
-            runtime,
-            slot,
-            generation,
-        }
+    pub(crate) const fn mint(runtime: u32, node: NodeRef) -> Self {
+        Self { runtime, node }
+    }
+
+    pub(crate) const fn node(self) -> NodeRef {
+        self.node
+    }
+
+    /// 呈现层使用的公开 key；文本等非元素节点只有 key，没有 `NodeId`。
+    pub const fn presentation_key(self) -> PresentationKey {
+        PresentationKey::from_node(self.node)
     }
 
     pub(crate) const fn runtime_id(self) -> u32 {
@@ -28,17 +36,17 @@ impl NodeId {
     }
 
     pub(crate) const fn slot(self) -> u32 {
-        self.slot
+        self.node.slot()
     }
 
     pub(crate) const fn generation(self) -> u64 {
-        self.generation
+        self.node.generation() as u64
     }
 }
 
 impl fmt::Debug for NodeId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "NodeId({})", self.slot)
+        write!(f, "NodeId({})", self.slot())
     }
 }
 
@@ -459,7 +467,7 @@ impl SnapshotValue {
 impl fmt::Display for PresentationSnapshot {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.focus {
-            Some(id) => writeln!(f, "focus=#{}", id.slot)?,
+            Some(id) => writeln!(f, "focus=#{}", id.slot())?,
             None => writeln!(f, "focus=-")?,
         }
         for node in &self.roots {
@@ -509,10 +517,11 @@ mod tests {
         NodeId, SnapshotAction, SnapshotActions, SnapshotAttr, SnapshotElement, SnapshotSemantics,
         SnapshotValue,
     };
+    use crate::node::NodeRef;
 
     fn element(semantics: SnapshotSemantics) -> SnapshotElement {
         SnapshotElement {
-            id: NodeId::mint(1, 0, 0),
+            id: NodeId::mint(1, NodeRef::new(0, 1).expect("test node")),
             tag: "view",
             attrs: Vec::new(),
             styles: Cow::Borrowed(&[]),
