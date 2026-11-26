@@ -238,6 +238,7 @@ fn explicit_quit_releases_a_pending_close_confirmation() {
                         window
                             .request_show("confirm")
                             .expect("show the confirmation window");
+                        CloseOutcome::Pending
                     })
                     .expect("register the close handler");
                 view! {

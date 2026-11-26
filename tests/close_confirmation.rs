@@ -17,6 +17,8 @@ enum HandlerMode {
     DoNothing,
     Panic,
     Missing,
+    OutcomeAllow,
+    OutcomeDeny,
 }
 
 struct ConfirmHarness {
@@ -24,6 +26,7 @@ struct ConfirmHarness {
     main: WindowCtx,
     close_runs: Rc<Cell<u32>>,
     last_request: Rc<RefCell<Option<CloseRequest>>>,
+    last_source: Rc<RefCell<Option<CloseSource>>>,
     stale_request: Rc<RefCell<Option<CloseRequest>>>,
     stale_result: StaleReply,
     double_result: DoubleReply,
@@ -34,12 +37,14 @@ fn open(mode: HandlerMode) -> ConfirmHarness {
     let draft = app.setup(|| signal(String::new())).expect("app setup");
     let close_runs = Rc::new(Cell::new(0));
     let last_request: Rc<RefCell<Option<CloseRequest>>> = Rc::new(RefCell::new(None));
+    let last_source: Rc<RefCell<Option<CloseSource>>> = Rc::new(RefCell::new(None));
     let stale_request: Rc<RefCell<Option<CloseRequest>>> = Rc::new(RefCell::new(None));
     let stale_result: StaleReply = Rc::new(RefCell::new(None));
     let double_result: DoubleReply = Rc::new(RefCell::new(None));
 
     let main_runs = close_runs.clone();
     let main_last = last_request.clone();
+    let main_source = last_source.clone();
     let confirm_stale = stale_request.clone();
     let confirm_stale_result = stale_result.clone();
     let confirm_double_result = double_result.clone();
@@ -52,23 +57,30 @@ fn open(mode: HandlerMode) -> ConfirmHarness {
                 if !matches!(mode, HandlerMode::Missing) {
                     let runs = main_runs.clone();
                     let last = main_last.clone();
+                    let source = main_source.clone();
                     window
-                        .on_close(move |request| {
+                        .on_close(move |event| {
                             runs.set(runs.get() + 1);
-                            *last.borrow_mut() = Some(request);
+                            *last.borrow_mut() = Some(event.request());
+                            *source.borrow_mut() = Some(event.source());
                             match mode {
-                                HandlerMode::ShowConfirmation => window
-                                    .request_show("confirm")
-                                    .expect("show the confirmation window"),
+                                HandlerMode::ShowConfirmation => {
+                                    window
+                                        .request_show("confirm")
+                                        .expect("show the confirmation window");
+                                }
                                 HandlerMode::AllowImmediately => {
-                                    request.allow().expect("allow immediately");
+                                    event.request().allow().expect("allow immediately");
                                 }
                                 HandlerMode::DenyImmediately => {
-                                    request.deny().expect("deny immediately");
+                                    event.request().deny().expect("deny immediately");
                                 }
                                 HandlerMode::Panic => panic!("the close handler failed"),
+                                HandlerMode::OutcomeAllow => return CloseOutcome::Allow,
+                                HandlerMode::OutcomeDeny => return CloseOutcome::Deny,
                                 HandlerMode::DoNothing | HandlerMode::Missing => {}
                             }
+                            CloseOutcome::Pending
                         })
                         .expect("register the close handler");
                 }
@@ -154,6 +166,7 @@ fn open(mode: HandlerMode) -> ConfirmHarness {
         main,
         close_runs,
         last_request,
+        last_source,
         stale_request,
         stale_result,
         double_result,
@@ -550,7 +563,10 @@ fn immediate_policy_closes_without_invoking_the_handler() {
         catalog.window(WindowSpec::new("main").primary(), move |window| {
             let counter = counter.clone();
             window
-                .on_close(move |_| counter.set(counter.get() + 1))
+                .on_close(move |_| {
+                    counter.set(counter.get() + 1);
+                    CloseOutcome::Allow
+                })
                 .expect("register the close handler");
             view! { <view /> }
         })?;
@@ -572,7 +588,9 @@ fn a_confirm_window_without_a_declared_confirmation_reports_it() {
                 .primary()
                 .close_policy(ClosePolicy::Confirm),
             |window| {
-                window.on_close(|_| {}).expect("register the close handler");
+                window
+                    .on_close(|_| CloseOutcome::Allow)
+                    .expect("register the close handler");
                 view! { <view /> }
             },
         )?;
@@ -627,8 +645,10 @@ fn a_window_registers_one_close_handler_per_activation() {
     let probe = second.clone();
     app.declare_windows(move |catalog| {
         catalog.window(WindowSpec::new("main").primary(), move |window| {
-            window.on_close(|_| {}).expect("first registration");
-            *probe.borrow_mut() = Some(window.on_close(|_| {}));
+            window
+                .on_close(|_| CloseOutcome::Allow)
+                .expect("first registration");
+            *probe.borrow_mut() = Some(window.on_close(|_| CloseOutcome::Allow));
             view! { <view /> }
         })?;
         Ok(())
@@ -684,11 +704,12 @@ fn a_reply_after_another_path_closed_the_parent_is_stale() {
             move |window| {
                 let pending = main_pending.clone();
                 window
-                    .on_close(move |request| {
-                        *pending.borrow_mut() = Some(request);
+                    .on_close(move |event| {
+                        *pending.borrow_mut() = Some(event.request());
                         window
                             .request_show("confirm")
                             .expect("show the confirmation window");
+                        CloseOutcome::Pending
                     })
                     .expect("register the close handler");
                 view! { <view /> }
@@ -743,4 +764,106 @@ fn a_reply_after_another_path_closed_the_parent_is_stale() {
         "a reply after the parent closed by another path is rejected"
     );
     assert_eq!(app.windows().len(), 1);
+}
+
+#[test]
+fn close_outcomes_settle_allow_and_deny_without_explicit_replies() {
+    let mut allow = open(HandlerMode::OutcomeAllow);
+    allow.app.request_close(allow.main).expect("allow outcome");
+    assert!(!allow.app.window_alive(allow.main));
+    assert_eq!(allow.close_runs.get(), 1);
+
+    let mut deny = open(HandlerMode::OutcomeDeny);
+    deny.app.request_close(deny.main).expect("deny outcome");
+    assert!(deny.app.window_alive(deny.main));
+    assert!(deny.app.window_accepts_input(deny.main));
+    assert!(deny.confirmation().is_none());
+    assert_eq!(deny.close_runs.get(), 1);
+}
+
+#[test]
+fn close_source_reflects_the_entry_point() {
+    for source in [
+        CloseSource::SystemMenu,
+        CloseSource::AltF4,
+        CloseSource::Command,
+        CloseSource::Programmatic,
+        CloseSource::ConfirmationWindow,
+    ] {
+        let mut harness = open(HandlerMode::ShowConfirmation);
+        harness
+            .app
+            .request_close_from(harness.main, source)
+            .expect("request the close");
+        assert_eq!(*harness.last_source.borrow(), Some(source));
+        assert!(harness.confirmation().is_some());
+        harness.app.click_label("Deny").expect("deny the close");
+        harness
+            .app
+            .apply_window_requests()
+            .expect("settle the deny");
+        assert!(harness.app.window_alive(harness.main));
+    }
+}
+
+#[test]
+fn a_close_queued_from_a_command_handler_reports_the_command_source() {
+    let source: Rc<RefCell<Option<CloseSource>>> = Rc::new(RefCell::new(None));
+    let handler_source = source.clone();
+    let mut app = Runtime::new();
+    app.on_app_command("app.close", move |event| {
+        let window = event.window().expect("the app command has a target");
+        window.request_close().expect("queue the close");
+    })
+    .expect("register the app close command");
+    app.declare_windows(|catalog| {
+        catalog.window(
+            WindowSpec::new("main")
+                .primary()
+                .close_policy(ClosePolicy::Confirm),
+            move |window| {
+                let source = handler_source.clone();
+                window
+                    .on_close(move |event| {
+                        *source.borrow_mut() = Some(event.source());
+                        window
+                            .request_show("confirm")
+                            .expect("show the confirmation");
+                        CloseOutcome::Pending
+                    })
+                    .expect("register the close handler");
+                view! { <view /> }
+            },
+        )?;
+        catalog.window(
+            WindowSpec::new("confirm").confirmation_for("main"),
+            |window| {
+                window
+                    .close_request()
+                    .expect("read the pending request")
+                    .expect("a request exists");
+                view! { <view /> }
+            },
+        )?;
+        Ok(())
+    })
+    .expect("declare the windows");
+    let main = app.show("main").expect("show main");
+
+    app.dispatch_app_command("app.close", CommandSource::MenuBar, Some(main))
+        .expect("dispatch the close command");
+    app.apply_window_requests()
+        .expect("settle the close request");
+    assert_eq!(*source.borrow(), Some(CloseSource::Command));
+    assert!(app.window_alive(main));
+    assert!(!app.window_accepts_input(main));
+
+    let confirmation = app
+        .windows()
+        .into_iter()
+        .find(|info| info.spec.key() == "confirm")
+        .map(|info| info.window)
+        .expect("the confirmation is open");
+    app.close_window(confirmation).expect("deny the close");
+    assert!(app.window_accepts_input(main));
 }

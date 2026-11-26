@@ -46,16 +46,16 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetForegroundWindow, GetMenu, GetMenuItemCount, GetMenuItemID, GetMessageW, GetWindowLongPtrW,
     HACCEL, HICON, HMENU, IDC_ARROW, IDI_APPLICATION, IsIconic, IsZoomed, KillTimer, LoadCursorW,
     LoadIconW, MF_BYCOMMAND, MF_CHECKED, MF_ENABLED, MF_GRAYED, MF_UNCHECKED, MSG, PM_REMOVE,
-    PeekMessageW, PostMessageW, RegisterClassExW, RegisterWindowMessageW, SPI_GETHIGHCONTRAST,
-    SPI_GETWHEELSCROLLLINES, SW_HIDE, SW_RESTORE, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOZORDER, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SetForegroundWindow, SetTimer,
+    PeekMessageW, PostMessageW, RegisterClassExW, RegisterWindowMessageW, SC_CLOSE,
+    SPI_GETHIGHCONTRAST, SPI_GETWHEELSCROLLLINES, SW_HIDE, SW_RESTORE, SW_SHOW, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOZORDER, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SetForegroundWindow, SetTimer,
     SetWindowLongPtrW, SetWindowPos, ShowWindow, SystemParametersInfoW, TranslateAcceleratorW,
     TranslateMessage, WINDOW_EX_STYLE, WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE, WM_COMMAND,
     WM_CONTEXTMENU, WM_DESTROY, WM_DPICHANGED, WM_ENTERMENULOOP, WM_GETDPISCALEDSIZE, WM_GETOBJECT,
     WM_IME_CHAR, WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_STARTCOMPOSITION, WM_INITMENU,
     WM_INITMENUPOPUP, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEHWHEEL,
-    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NULL, WM_PAINT, WM_SETTINGCHANGE, WM_SIZE, WM_SYSKEYDOWN,
-    WM_TIMER, WNDCLASSEXW, WS_OVERLAPPEDWINDOW, WS_POPUP,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NULL, WM_PAINT, WM_SETTINGCHANGE, WM_SIZE, WM_SYSCOMMAND,
+    WM_SYSKEYDOWN, WM_TIMER, WNDCLASSEXW, WS_OVERLAPPEDWINDOW, WS_POPUP,
 };
 
 use windows::core::{HSTRING, w};
@@ -1829,14 +1829,24 @@ impl Host {
     /// Immediate 结束 activation，消息循环随后销毁 HWND；Confirm 建立 epoch
     /// 并显示确认窗口，父窗口保持存活但在下一轮同步中禁用。确认窗口自己的
     /// X 由运行时解释为 Deny。
-    fn close_from_window(&mut self, hwnd: HWND) {
+    fn close_from_window(&mut self, hwnd: HWND, source: CloseSource) {
         let Some(key) = self.key_for(hwnd) else {
             return;
         };
         let Some(ctx) = self.windows.get(key).map(|window| window.ctx) else {
             return;
         };
-        match self.runtime.request_close(ctx) {
+        // 确认窗口自己的关闭/回复使用独立来源；父窗口 handler 的来源保持不变。
+        let source = if self
+            .runtime
+            .confirmation_request(ctx)
+            .is_ok_and(|request| request.is_some())
+        {
+            CloseSource::ConfirmationWindow
+        } else {
+            source
+        };
+        match self.runtime.request_close_from(ctx, source) {
             Ok(()) => {
                 if !self.runtime.window_alive(ctx)
                     && let Some(window) = self.windows.get_mut(key)
@@ -5993,10 +6003,25 @@ unsafe extern "system" fn wndproc(
             }
             result
         }
+        WM_SYSCOMMAND if (wparam.0 & 0xFFF0) == SC_CLOSE as usize => {
+            // Alt+F4 与系统菜单都走 SC_CLOSE；Alt 仍按下时归类为 Alt+F4。
+            // 安全：GetKeyState 只查询本线程最近一条输入消息的修饰键状态。
+            let source = if unsafe { GetKeyState(i32::from(VK_MENU.0)) } < 0 {
+                CloseSource::AltF4
+            } else {
+                CloseSource::SystemMenu
+            };
+            unsafe { with_host(hwnd, |host| host.close_from_window(hwnd, source)) };
+            LRESULT(0)
+        }
         WM_CLOSE => {
             // 安全：派发期间不持有宿主引用；结束该窗口的 activation。
             // HWND 由消息循环在派发返回后同步销毁，最后一个窗口关闭时循环退出。
-            unsafe { with_host(hwnd, |host| host.close_from_window(hwnd)) };
+            unsafe {
+                with_host(hwnd, |host| {
+                    host.close_from_window(hwnd, CloseSource::Programmatic);
+                })
+            };
             LRESULT(0)
         }
         WM_CONTEXTMENU => {
@@ -8683,11 +8708,65 @@ mod tests {
     }
 
     #[test]
+    fn sc_close_reports_the_system_menu_source() {
+        let source: Rc<RefCell<Option<CloseSource>>> = Rc::new(RefCell::new(None));
+        let recorded = source.clone();
+        let mut runtime = Runtime::new();
+        runtime
+            .declare_windows(move |catalog| {
+                catalog.window(
+                    WindowSpec::new(MAIN)
+                        .primary()
+                        .close_policy(ClosePolicy::Confirm),
+                    move |window| {
+                        let recorded = recorded.clone();
+                        window
+                            .on_close(move |event| {
+                                *recorded.borrow_mut() = Some(event.source());
+                                window
+                                    .request_show("confirm")
+                                    .expect("show the confirmation");
+                                CloseOutcome::Pending
+                            })
+                            .expect("register the close handler");
+                        view! { <view /> }
+                    },
+                )?;
+                catalog.window(
+                    WindowSpec::new("confirm").confirmation_for(MAIN),
+                    |window| {
+                        window
+                            .close_request()
+                            .expect("read the pending request")
+                            .expect("a request exists");
+                        view! { <view /> }
+                    },
+                )?;
+                Ok(())
+            })
+            .expect("declare the windows");
+        runtime.show(MAIN).expect("show the window");
+        let mut host = Host::open(runtime, HostConfig::hidden()).expect("open host");
+        host.render().expect("render the parent");
+
+        send_msg(
+            &mut host,
+            MSG {
+                message: WM_SYSCOMMAND,
+                wParam: WPARAM(SC_CLOSE as usize),
+                ..Default::default()
+            },
+        );
+        assert_eq!(*source.borrow(), Some(CloseSource::SystemMenu));
+        assert!(!host.windows[MAIN].enabled, "the parent is close-suspended");
+    }
+
+    #[test]
     fn a_closed_host_ignores_later_paint_and_input() {
         let mut host = open_host();
         host.render().expect("initial render");
         let hwnd = host.hwnd(MAIN).expect("a live window");
-        host.close_from_window(hwnd);
+        host.close_from_window(hwnd, CloseSource::Programmatic);
         assert!(host.windows[MAIN].close_requested);
 
         // 关闭后 runtime 已释放 activation；再绘制或输入若没被跳过会记录错误。
@@ -10267,6 +10346,7 @@ mod tests {
                         window
                             .on_close(move |_| {
                                 window.request_show(CONFIRM).expect("show the confirmation");
+                                CloseOutcome::Pending
                             })
                             .expect("register the close handler");
                         let draft = signal(String::new());
@@ -12929,6 +13009,7 @@ mod tests {
                                 window
                                     .request_show("confirm")
                                     .expect("show the confirmation");
+                                CloseOutcome::Pending
                             })
                             .expect("register the close handler");
                         view! { <view /> }

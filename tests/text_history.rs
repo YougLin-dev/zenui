@@ -1166,6 +1166,7 @@ fn undo_rejects_a_window_awaiting_close_confirmation() {
                         window
                             .request_show("confirm")
                             .expect("show the confirmation");
+                        CloseOutcome::Pending
                     })
                     .expect("register the close handler");
                 view! {

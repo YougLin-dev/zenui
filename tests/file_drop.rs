@@ -223,6 +223,7 @@ fn drop_files_rejects_suspended_windows_before_the_handler() {
                             .request_show("confirm")
                             .expect("show the confirmation");
                         let _ = request;
+                        CloseOutcome::Pending
                     })
                     .expect("register the close handler");
                 let runs = runs_factory.clone();

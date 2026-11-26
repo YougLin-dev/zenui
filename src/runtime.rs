@@ -38,9 +38,9 @@ use crate::view::{
     MountPlan, MountResult, PlanNode, ResultBoolValue, StyleSlot, SubmitEvent, TextSlot, ValueSlot,
 };
 use crate::window::{
-    CatalogEntry, CatalogError, CloseError, CloseHandler, ClosePolicy, CloseReply, CloseRequest,
-    DropError, DropEvent, DropHandler, WindowAction, WindowCatalog, WindowCtx, WindowError,
-    WindowInfo, WindowRecord, WindowRequest, WindowRole,
+    CatalogEntry, CatalogError, CloseError, CloseEvent, CloseHandler, CloseOutcome, ClosePolicy,
+    CloseReply, CloseRequest, CloseSource, DropError, DropEvent, DropHandler, WindowAction,
+    WindowCatalog, WindowCtx, WindowError, WindowInfo, WindowRecord, WindowRequest, WindowRole,
 };
 
 /// 路由型输入的来源；指针、键盘、菜单等共享同一套目标校验与错误通道。
@@ -789,6 +789,8 @@ pub(crate) struct State {
     drop_handlers: BTreeMap<&'static str, DropHandler>,
     /// 每个 activation 的窗口根 keydown fallback。
     keydown_handlers: BTreeMap<&'static str, WindowKeyDownHandler>,
+    /// 命令 handler 内排队关闭请求时继承的关闭来源。
+    active_close_source: Option<CloseSource>,
     /// 每个 activation 在 factory 中注册的命令处理器，随窗口关闭释放。
     command_handlers: BTreeMap<&'static str, BTreeMap<&'static str, CommandHandler>>,
     /// 应用级命令处理器；不随窗口关闭释放，运行时启动后拒绝注册。
@@ -979,6 +981,7 @@ impl State {
             close_handlers: BTreeMap::new(),
             drop_handlers: BTreeMap::new(),
             keydown_handlers: BTreeMap::new(),
+            active_close_source: None,
             command_handlers: BTreeMap::new(),
             app_command_handlers: BTreeMap::new(),
             tray: None,
@@ -1851,6 +1854,11 @@ impl State {
     }
 
     /// 记录 UI 处理期的窗口请求；只允许来自仍存活窗口的 Event/Delivery 处理器。
+    /// 当前命令 handler 内发起的关闭来源；普通 UI 回调是程序化关闭。
+    pub(crate) fn close_request_source(&self) -> Option<CloseSource> {
+        self.active_close_source
+    }
+
     pub(crate) fn queue_window_request(
         &mut self,
         request: WindowRequest,
@@ -4095,11 +4103,20 @@ impl Runtime {
         })
     }
 
+    /// 走目录声明的关闭策略；程序化关闭的来源是 [`CloseSource::Programmatic`]。
+    pub fn request_close(&mut self, window: WindowCtx) -> Result<(), WindowError> {
+        self.request_close_from(window, CloseSource::Programmatic)
+    }
+
     /// 走目录声明的关闭策略：Immediate 直接释放；Confirm 建立或复用 epoch。
     ///
     /// 隐藏的 Confirm 窗口先恢复可见，再走关闭协议，避免不可见的确认提示；
     /// 确认窗口在待决 epoch 中的关闭请求等价于 Deny。
-    pub fn request_close(&mut self, window: WindowCtx) -> Result<(), WindowError> {
+    pub fn request_close_from(
+        &mut self,
+        window: WindowCtx,
+        source: CloseSource,
+    ) -> Result<(), WindowError> {
         let state = self.state.clone();
         if window.runtime != state.borrow().id {
             return Err(WindowError::WrongRuntime);
@@ -4134,7 +4151,7 @@ impl Runtime {
                     self.show(confirmation)?;
                     return Ok(());
                 }
-                return self.begin_confirm_close(window);
+                return self.begin_confirm_close(window, source);
             }
             self.close_window_now(window)
         })
@@ -4376,14 +4393,18 @@ impl Runtime {
         event: CommandEvent,
     ) -> Result<(), CommandError> {
         let previous = with_state(|state| {
-            let previous = state.phase;
+            let previous = (state.phase, state.active_close_source);
             state.phase = Phase::Event;
+            state.active_close_source = Some(CloseSource::Command);
             state.fault = None;
             state.write_error = None;
             previous
         });
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(event)));
-        with_state(|state| state.phase = previous);
+        with_state(|state| {
+            state.phase = previous.0;
+            state.active_close_source = previous.1;
+        });
         if outcome.is_err() {
             return Err(CommandError::HandlerPanicked(id));
         }
@@ -4560,7 +4581,10 @@ impl Runtime {
         match request.action {
             WindowAction::Show(key) => self.show(key).map(|_| ()),
             WindowAction::Hide => self.hide(request.from),
-            WindowAction::Close => self.request_close(request.from),
+            WindowAction::Close => self.request_close_from(
+                request.from,
+                request.close_source.unwrap_or(CloseSource::Programmatic),
+            ),
         }
     }
 
@@ -4568,7 +4592,11 @@ impl Runtime {
     ///
     /// handler 通过 `request_show` 显示目录声明的确认窗口；这里立即结算这些
     /// show 请求并验证确认窗口可见，失败时绝不回退为 Allow。
-    fn begin_confirm_close(&mut self, window: WindowCtx) -> Result<(), WindowError> {
+    fn begin_confirm_close(
+        &mut self,
+        window: WindowCtx,
+        source: CloseSource,
+    ) -> Result<(), WindowError> {
         let state = self.state.clone();
         context::install(&state, || {
             let handler = self
@@ -4608,10 +4636,15 @@ impl Runtime {
                 CloseRequest::new(state.id, window, epoch)
             };
             let queued_before = self.state.borrow().window_requests.len();
-            self.invoke_close_handler(window, &handler, request, queued_before)?;
+            let outcome = self.invoke_close_handler(
+                window,
+                &handler,
+                CloseEvent::new(request, source),
+                queued_before,
+            )?;
 
-            // 处理器可以直接 allow/deny（例如草稿为空时立即关闭），无需显示确认
-            // 窗口；这次决定在本次 request_close 内结算。
+            // 显式 `request.allow()/deny()` 优先于返回值；关闭 turn 内排队的
+            // 确认窗口 show 随决定一起失效。
             if let Some(reply) = self.take_handler_reply(window, request, confirmation) {
                 return match reply {
                     CloseReply::Allow => self.release_close_group(window.key),
@@ -4619,20 +4652,41 @@ impl Runtime {
                 };
             }
 
-            let settled = self.settle_show_requests();
-            let shown = with_state(|state| state.window_is_visible(confirmation));
-            if let Err(error) = settled {
-                self.abort_close_epoch(window.key, queued_before);
-                self.close_visible_confirmation(confirmation);
-                return Err(error);
+            match outcome {
+                CloseOutcome::Allow => {
+                    self.discard_confirmation_requests(confirmation);
+                    self.release_close_group(window.key)
+                }
+                CloseOutcome::Deny => {
+                    self.discard_confirmation_requests(confirmation);
+                    self.deny_close(window)
+                }
+                CloseOutcome::Pending => {
+                    let settled = self.settle_show_requests();
+                    let shown = with_state(|state| state.window_is_visible(confirmation));
+                    if let Err(error) = settled {
+                        self.abort_close_epoch(window.key, queued_before);
+                        self.close_visible_confirmation(confirmation);
+                        return Err(error);
+                    }
+                    if !shown {
+                        // Pending 但没有可见确认窗口：fail closed，按 Deny 结算。
+                        self.deny_close(window)?;
+                        return Err(WindowError::Close(CloseError::ConfirmationNotShown));
+                    }
+                    Ok(())
+                }
             }
-            if !shown {
-                self.abort_close_epoch(window.key, queued_before);
-                self.close_visible_confirmation(confirmation);
-                return Err(WindowError::Close(CloseError::ConfirmationNotShown));
-            }
-            Ok(())
         })
+    }
+
+    /// 丢弃 handler 为确认窗口排队的 show；已经显式回复时不再打开它。
+    fn discard_confirmation_requests(&mut self, confirmation: &'static str) {
+        with_state(|state| {
+            state.window_requests.retain(
+                |queued| !matches!(queued.action, WindowAction::Show(key) if key == confirmation),
+            );
+        });
     }
 
     /// 在 Event 阶段调用 close handler；panic 时撤销 epoch 并报告失败。
@@ -4640,23 +4694,23 @@ impl Runtime {
         &mut self,
         window: WindowCtx,
         handler: &CloseHandler,
-        request: CloseRequest,
+        event: CloseEvent,
         queued_before: usize,
-    ) -> Result<(), WindowError> {
+    ) -> Result<CloseOutcome, WindowError> {
         let previous_phase = with_state(|state| {
             let previous = state.phase;
             state.phase = Phase::Event;
             previous
         });
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            handler(request);
-        }));
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(event)));
         with_state(|state| state.phase = previous_phase);
-        if outcome.is_err() {
-            self.abort_close_epoch(window.key, queued_before);
-            return Err(WindowError::Close(CloseError::HandlerPanicked));
+        match outcome {
+            Ok(outcome) => Ok(outcome),
+            Err(_) => {
+                self.abort_close_epoch(window.key, queued_before);
+                Err(WindowError::Close(CloseError::HandlerPanicked))
+            }
         }
-        Ok(())
     }
 
     /// 取走处理器在调用期间排队的立即回复，并丢弃它要求显示的陈旧确认窗口。
