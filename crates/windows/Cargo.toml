@@ -6,6 +6,10 @@ publish = false
 description = "Win32 host with a DX12 surface for ZenUI presentation snapshots"
 license = "MIT OR Apache-2.0"
 
+[dependencies]
+# 文本资产类型跨平台转发；模板在非 Windows 上也要能加载并校验资产。
+zenui-render = { path = "../render" }
+
 [target.'cfg(windows)'.dependencies]
 pollster = "=0.4.0"
 wgpu = "=30.0.2"
@@ -34,7 +38,6 @@ windows = { version = "=0.62.2", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 zenui = { path = "../.." }
-zenui-render = { path = "../render" }
 
 [dev-dependencies]
 zenui-demo = { path = "../demo" }
