@@ -617,6 +617,9 @@ struct WindowHost {
     /// 测试期计入的 `ImmNotifyIME` 取消次数；真实宿主只调用系统 API。
     #[cfg(test)]
     ime_cancel_notifications: usize,
+    /// 测试期代替 `GetForegroundWindow`；隐藏窗口无法成为前台窗口。
+    #[cfg(test)]
+    foreground: Option<bool>,
 }
 
 impl WindowHost {
@@ -648,6 +651,14 @@ struct FileDialogWork {
     restore: bool,
     hwnd: HWND,
     options: FileDialogOptions,
+}
+
+/// 测试期渲染计数；空闲窗口不应重建场景或呈现（caret 闪烁只呈现缓存场景）。
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct RenderCounters {
+    scene_builds: usize,
+    presents: usize,
 }
 
 /// Win32 宿主：一个 Runtime、一个消息循环，每个存活窗口一个 HWND/Surface/Scene。
@@ -700,6 +711,9 @@ pub struct Host {
     /// 测试注入的 surface 状态队列；只存在于测试构建。
     #[cfg(test)]
     forced_surface_statuses: std::collections::VecDeque<wgpu::CurrentSurfaceTexture>,
+    /// 测试期场景构建与呈现次数；真实宿主不需要这组计数。
+    #[cfg(test)]
+    counters: RenderCounters,
     /// 测试注入的重建失败次数；只存在于测试构建。
     #[cfg(test)]
     injected_rebuild_failures: usize,
@@ -867,6 +881,8 @@ impl Host {
             latched_loss: None,
             #[cfg(test)]
             forced_surface_statuses: std::collections::VecDeque::new(),
+            #[cfg(test)]
+            counters: RenderCounters::default(),
             #[cfg(test)]
             injected_rebuild_failures: 0,
             deferred_error: None,
@@ -1671,7 +1687,13 @@ impl Host {
                 focused_composition(snapshot),
             )
         })?;
+        // 隐藏窗口无法成为前台窗口；测试可以注入前台状态覆盖真实查询。
+        #[cfg(test)]
+        let foreground = window
+            .foreground
+            .unwrap_or_else(|| unsafe { GetForegroundWindow() } == window.hwnd());
         // 安全：只读取前台窗口句柄用于比较。
+        #[cfg(not(test))]
         let foreground = unsafe { GetForegroundWindow() } == window.hwnd();
         let visible = blinked(window.caret_visible, focused, composing, foreground);
         if visible == window.caret_visible {
@@ -2043,6 +2065,10 @@ impl Host {
             }
             self.queue.submit([encoder.finish()]);
             self.queue.present(frame);
+            #[cfg(test)]
+            {
+                self.counters.presents += 1;
+            }
             self.presented_since_rebuild = true;
             if self.loss_phase == LossPhase::AwaitingPresent && self.loss.clear_if(self.loss_epoch)
             {
@@ -3726,6 +3752,10 @@ impl Host {
         height: u32,
         snapshot_changed: bool,
     ) -> Result<Scene, HostError> {
+        #[cfg(test)]
+        {
+            self.counters.scene_builds += 1;
+        }
         // 安全：HWND 在窗口条目析构前有效。
         let dpi = unsafe { GetDpiForWindow(window.hwnd()) };
         let scale = if dpi == 0 { 1.0 } else { dpi as f32 / 96.0 };
@@ -4426,6 +4456,8 @@ impl WindowHost {
             os_composition: None,
             #[cfg(test)]
             ime_cancel_notifications: 0,
+            #[cfg(test)]
+            foreground: None,
         }
     }
 
@@ -5912,6 +5944,7 @@ mod tests {
     use std::rc::Rc;
     use std::sync::Mutex;
     use std::sync::atomic::AtomicUsize;
+    use std::time::Duration;
     use windows::Win32::Graphics::Gdi::ClientToScreen;
     use windows::Win32::System::Com::SAFEARRAY;
     use windows::Win32::System::Ole::{
@@ -13872,6 +13905,59 @@ mod tests {
             }
         }
         assert!(runs > 0, "the demo window has text runs");
+    }
+
+    #[test]
+    fn an_idle_unfocused_window_neither_rebuilds_nor_presents() {
+        let mut host = open_host();
+        host.render().expect("the first frame");
+        let before = host.counters;
+        std::thread::sleep(Duration::from_millis(1200));
+        host.pump().expect("pump idle messages");
+        assert_eq!(host.counters, before, "an idle window schedules no work");
+    }
+
+    #[test]
+    fn an_idle_focused_window_presents_only_caret_blinks() {
+        let mut host = open_host();
+        host.runtime.focus("What needs to be done?").expect("focus");
+        with_main(&mut host, |_, window| {
+            window.foreground = Some(true);
+            Ok(())
+        });
+        host.render().expect("the first frame");
+        let before = host.counters;
+        std::thread::sleep(Duration::from_millis(1200));
+        host.pump().expect("pump idle messages");
+        let presents = host.counters.presents - before.presents;
+        assert!(
+            presents <= 3,
+            "only caret blinks present while idle, got {presents} presents"
+        );
+        assert_eq!(
+            host.counters.scene_builds - before.scene_builds,
+            presents,
+            "each caret blink builds from the cached snapshot and presents once"
+        );
+    }
+
+    #[test]
+    fn a_rendered_change_rebuilds_and_presents() {
+        let mut host = open_host();
+        host.render().expect("the first frame");
+        let before = host.counters;
+        host.runtime
+            .input("What needs to be done?", "idle probe")
+            .expect("type into the draft");
+        host.render().expect("the changed frame");
+        assert!(
+            host.counters.scene_builds > before.scene_builds,
+            "a changed snapshot rebuilds the scene"
+        );
+        assert!(
+            host.counters.presents > before.presents,
+            "a changed snapshot presents"
+        );
     }
 
     #[test]
