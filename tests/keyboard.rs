@@ -1,6 +1,6 @@
 #![allow(unused_braces)]
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use zenui::prelude::*;
@@ -304,4 +304,92 @@ fn window_keydown_is_the_fallback_without_focus() {
         .expect("window escape turn");
     assert!(report.outcome().consumed());
     assert_eq!(*log.borrow(), ["window", "window"]);
+}
+
+#[test]
+fn a_window_keydown_panic_is_a_typed_turn_error_and_the_slot_stays_usable() {
+    let calls = Rc::new(Cell::new(0));
+    let mut app = Runtime::new();
+    app.declare_windows({
+        let calls = calls.clone();
+        move |catalog| {
+            catalog.window(WindowSpec::new("main").primary(), move |window| {
+                let calls = calls.clone();
+                window
+                    .on_keydown(move |_event: &mut KeyEvent| {
+                        calls.set(calls.get() + 1);
+                        panic!("window keydown boom");
+                    })
+                    .expect("register the panicking keydown");
+                view! { <view><text>"main"</text></view> }
+            })
+        }
+    })
+    .expect("declare the window");
+    let window = app.show("main").expect("show the window");
+
+    for expected in [1, 2] {
+        let report = app
+            .dispatch_intent(Intent::keydown_window(
+                window,
+                Key::Enter,
+                Modifiers::default(),
+            ))
+            .expect("the panic is contained in the turn");
+        assert!(matches!(
+            report.errors(),
+            [TurnError::HandlerPanicked(panic)] if panic.message() == "window keydown boom"
+        ));
+        assert_eq!(calls.get(), expected, "the handler slot is reusable");
+    }
+}
+
+#[test]
+fn reopening_a_window_requires_fresh_keydown_registration() {
+    let calls = Rc::new(Cell::new(0));
+    let first = Rc::new(Cell::new(true));
+    let mut app = Runtime::new();
+    app.declare_windows({
+        let calls = calls.clone();
+        let first = first.clone();
+        move |catalog| {
+            let calls = calls.clone();
+            let first = first.clone();
+            catalog.window(WindowSpec::new("main").primary(), move |window| {
+                if first.replace(false) {
+                    let calls = calls.clone();
+                    window
+                        .on_keydown(move |_event: &mut KeyEvent| {
+                            calls.set(calls.get() + 1);
+                            HandlerOutcome::Ok
+                        })
+                        .expect("register the first activation's handler");
+                }
+                view! { <view><text>"main"</text></view> }
+            })
+        }
+    })
+    .expect("declare the window");
+    let window = app.show("main").expect("show the window");
+    app.dispatch_intent(Intent::keydown_window(
+        window,
+        Key::Enter,
+        Modifiers::default(),
+    ))
+    .expect("first activation keydown");
+    assert_eq!(calls.get(), 1);
+
+    app.close_window(window).expect("close the window");
+    let reopened = app.show("main").expect("reopen the window");
+    app.dispatch_intent(Intent::keydown_window(
+        reopened,
+        Key::Enter,
+        Modifiers::default(),
+    ))
+    .expect("second activation keydown");
+    assert_eq!(
+        calls.get(),
+        1,
+        "closing released the old activation's keydown handler"
+    );
 }
