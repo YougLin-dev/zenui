@@ -1,12 +1,15 @@
-//! UI 节点身份与 arena 扩展层。
+//! UI 节点身份与固定布局原语。
 //!
-//! 本切片在现有 mounted-node 存储旁边建立统一的节点身份：每个元素、文本、
-//! 组件、Show 与 For 节点都在 [`NodeArena`] 中有一个槽位和 generation。
-//! 公开元素身份 [`crate::NodeId`] 内部由 [`NodeRef`] 组成，呈现层使用
-//! [`PresentationKey`]；旧的 payload 存储保持不变，契约切片再把它们迁入。
+//! [`NodeRef`] 是内部节点身份，公开元素身份 [`crate::NodeId`] 与呈现身份
+//! [`PresentationKey`] 都由它派生。`SlotArena` 维护节点槽位、generation 与
+//! 父子兄弟链；payload 与辅助列表由 runtime 的 `NodeArena`/`AuxArenas`
+//! 按 [`NodeSlot::payload`] 和 [`AuxHandles`] 存放。
 
 use std::fmt;
 use std::num::NonZeroU64;
+use std::sync::Arc;
+
+use crate::presentation::SnapshotNode;
 
 /// 一棵已提交树的稳定键；单调分配、不复用。
 #[repr(transparent)]
@@ -74,12 +77,6 @@ impl PresentationKey {
         Self(node.raw())
     }
 
-    /// 只用于验证编码的往返测试；呈现层只持有 opaque 值。
-    #[cfg(test)]
-    pub(crate) const fn node(self) -> Option<NodeRef> {
-        NodeRef::from_raw(self.0)
-    }
-
     /// 用于诊断的稳定数值；不承诺对应内部槽位布局。
     pub const fn raw(self) -> u64 {
         self.0
@@ -116,22 +113,45 @@ impl DirtyFlags {
 }
 
 /// 一个已分配 UI 节点；payload 指向该 kind 自己的密集 arena。
+///
+/// 字段顺序固定为 64 B（§4.1）：3×u32 + kind/dirty + 2 B padding +
+/// 6×8 B 指针。`snapshot` 留给持久化快照切片（#342），本切片保持 `None`。
+#[repr(C)]
 #[derive(Debug)]
 pub(crate) struct NodeSlot {
     pub(crate) payload: u32,
+    pub(crate) generation: u32,
     pub(crate) tree: TreeKey,
-    pub(crate) kind: NodeKindTag,
-    /// 脏路径在契约切片（#327）接入；本切片先固定字段与默认值。
-    #[expect(
-        dead_code,
-        reason = "the dirty path lands with the arena contract (#327)"
-    )]
+    /// `None` 表示槽位空闲；generation 仍保留以拒绝旧引用。
+    pub(crate) kind: Option<NodeKindTag>,
+    /// 脏路径在后续切片接入；本切片先固定字段与默认值。
     pub(crate) dirty: DirtyFlags,
     pub(crate) parent: Option<NodeRef>,
     pub(crate) first_child: Option<NodeRef>,
     pub(crate) last_child: Option<NodeRef>,
     pub(crate) prev_sibling: Option<NodeRef>,
     pub(crate) next_sibling: Option<NodeRef>,
+    pub(crate) snapshot: Option<Arc<SnapshotNode>>,
+}
+
+const _: () = assert!(std::mem::size_of::<NodeSlot>() == 64);
+
+impl NodeSlot {
+    const fn vacant() -> Self {
+        Self {
+            payload: NO_PAYLOAD,
+            generation: 1,
+            tree: TreeKey::from_raw(0),
+            kind: None,
+            dirty: DirtyFlags::NONE,
+            parent: None,
+            first_child: None,
+            last_child: None,
+            prev_sibling: None,
+            next_sibling: None,
+            snapshot: None,
+        }
+    }
 }
 
 pub(crate) const NO_PAYLOAD: u32 = u32::MAX;
@@ -173,125 +193,20 @@ impl fmt::Display for NodeError {
 
 impl std::error::Error for NodeError {}
 
-struct Arena<T> {
-    values: Vec<Option<T>>,
-    generations: Vec<u32>,
+/// 节点槽位、generation 与父子兄弟链的唯一权威。
+pub(crate) struct SlotArena {
+    slots: Vec<NodeSlot>,
     free: Vec<u32>,
     live: usize,
 }
 
-impl<T> Arena<T> {
-    const fn new() -> Self {
+impl SlotArena {
+    pub(crate) const fn new() -> Self {
         Self {
-            values: Vec::new(),
-            generations: Vec::new(),
+            slots: Vec::new(),
             free: Vec::new(),
             live: 0,
         }
-    }
-
-    fn reserve(&mut self) -> (u32, u32) {
-        match self.free.pop() {
-            Some(slot) => (slot, self.generations[slot as usize]),
-            None => {
-                let slot = u32::try_from(self.values.len()).expect("node arena exhausted");
-                self.values.push(None);
-                self.generations.push(1);
-                (slot, 1)
-            }
-        }
-    }
-
-    fn fill(&mut self, slot: u32, value: T) {
-        self.values[slot as usize] = Some(value);
-        self.live += 1;
-    }
-
-    fn get(&self, slot: u32, generation: u32) -> Result<&T, NodeError> {
-        let Some(entry) = self.values.get(slot as usize) else {
-            return Err(NodeError::UnknownSlot { slot });
-        };
-        let Some(value) = entry.as_ref() else {
-            return Err(NodeError::Vacant { slot });
-        };
-        if self.generations[slot as usize] != generation {
-            return Err(NodeError::StaleGeneration {
-                slot,
-                live: self.generations[slot as usize],
-                found: generation,
-            });
-        }
-        Ok(value)
-    }
-
-    fn get_mut(&mut self, slot: u32, generation: u32) -> Result<&mut T, NodeError> {
-        let Some(entry) = self.values.get_mut(slot as usize) else {
-            return Err(NodeError::UnknownSlot { slot });
-        };
-        let Some(value) = entry.as_mut() else {
-            return Err(NodeError::Vacant { slot });
-        };
-        if self.generations[slot as usize] != generation {
-            return Err(NodeError::StaleGeneration {
-                slot,
-                live: self.generations[slot as usize],
-                found: generation,
-            });
-        }
-        Ok(value)
-    }
-
-    fn release(&mut self, slot: u32) -> bool {
-        let Some(entry) = self.values.get_mut(slot as usize) else {
-            return false;
-        };
-        if entry.take().is_none() {
-            return false;
-        }
-        self.live -= 1;
-        let generation = self.generations[slot as usize];
-        if generation == u32::MAX {
-            // 代际耗尽：该槽退休，不再复用。
-            return true;
-        }
-        self.generations[slot as usize] = generation + 1;
-        self.free.push(slot);
-        true
-    }
-
-    fn len(&self) -> usize {
-        self.values.len()
-    }
-
-    const fn live(&self) -> usize {
-        self.live
-    }
-}
-
-/// 统一 UI 节点 arena；payload 仍指向旧的 mounted-node 存储。
-pub(crate) struct NodeArena {
-    slots: Arena<NodeSlot>,
-    next_tree: u32,
-    aux: AuxArenas,
-}
-
-impl NodeArena {
-    pub(crate) const fn new() -> Self {
-        Self {
-            slots: Arena::new(),
-            next_tree: 0,
-            aux: AuxArenas::new(),
-        }
-    }
-
-    /// 分配一棵树的稳定键；耗尽时是 fatal 开发期错误。
-    pub(crate) fn allocate_tree(&mut self) -> TreeKey {
-        let key = TreeKey::from_raw(self.next_tree);
-        self.next_tree = self
-            .next_tree
-            .checked_add(1)
-            .expect("tree key space exhausted");
-        key
     }
 
     /// 插入节点并把 child 链到 `parent` 的末尾。
@@ -302,18 +217,26 @@ impl NodeArena {
         tree: TreeKey,
         parent: Option<NodeRef>,
     ) -> Result<NodeRef, NodeError> {
-        if let Some(parent) = parent {
-            self.get(parent)?;
-        }
-        let (slot, generation) = self.slots.reserve();
-        let node = NodeRef::new(slot, generation).expect("arena generations start at 1");
-        let mut previous_sibling = None;
         if let Some(parent_ref) = parent {
-            let parent_slot = self.get_mut(parent_ref)?;
+            let parent_slot = self.get(parent_ref)?;
             debug_assert_eq!(
                 parent_slot.tree, tree,
                 "a child node must belong to its parent's tree"
             );
+        }
+        let slot = match self.free.pop() {
+            Some(slot) => slot,
+            None => {
+                let slot = u32::try_from(self.slots.len()).expect("node arena exhausted");
+                self.slots.push(NodeSlot::vacant());
+                slot
+            }
+        };
+        let generation = self.slots[slot as usize].generation;
+        let node = NodeRef::new(slot, generation).expect("arena generations start at 1");
+        let mut previous_sibling = None;
+        if let Some(parent_ref) = parent {
+            let parent_slot = self.get_mut(parent_ref)?;
             previous_sibling = parent_slot.last_child;
             parent_slot.last_child = Some(node);
             if parent_slot.first_child.is_none() {
@@ -325,29 +248,68 @@ impl NodeArena {
         {
             previous_slot.next_sibling = Some(node);
         }
-        self.slots.fill(
-            slot,
-            NodeSlot {
-                payload,
-                tree,
-                kind,
-                dirty: DirtyFlags::NONE,
-                parent,
-                first_child: None,
-                last_child: None,
-                prev_sibling: previous_sibling,
-                next_sibling: None,
-            },
-        );
+        self.slots[slot as usize] = NodeSlot {
+            payload,
+            generation,
+            tree,
+            kind: Some(kind),
+            dirty: DirtyFlags::NONE,
+            parent,
+            first_child: None,
+            last_child: None,
+            prev_sibling: previous_sibling,
+            next_sibling: None,
+            snapshot: None,
+        };
+        self.live += 1;
         Ok(node)
     }
 
     pub(crate) fn get(&self, node: NodeRef) -> Result<&NodeSlot, NodeError> {
-        self.slots.get(node.slot(), node.generation())
+        let slot = self.slot(node)?;
+        if slot.kind.is_none() {
+            return Err(NodeError::Vacant { slot: node.slot() });
+        }
+        Ok(slot)
     }
 
     pub(crate) fn get_mut(&mut self, node: NodeRef) -> Result<&mut NodeSlot, NodeError> {
-        self.slots.get_mut(node.slot(), node.generation())
+        let generation = node.generation();
+        let slot = self.slot_mut(node)?;
+        if slot.kind.is_none() {
+            return Err(NodeError::Vacant { slot: node.slot() });
+        }
+        debug_assert_eq!(slot.generation, generation);
+        Ok(slot)
+    }
+
+    fn slot(&self, node: NodeRef) -> Result<&NodeSlot, NodeError> {
+        let Some(slot) = self.slots.get(node.slot() as usize) else {
+            return Err(NodeError::UnknownSlot { slot: node.slot() });
+        };
+        if slot.generation != node.generation() {
+            return Err(NodeError::StaleGeneration {
+                slot: node.slot(),
+                live: slot.generation,
+                found: node.generation(),
+            });
+        }
+        Ok(slot)
+    }
+
+    fn slot_mut(&mut self, node: NodeRef) -> Result<&mut NodeSlot, NodeError> {
+        let slot = node.slot();
+        let Some(entry) = self.slots.get_mut(slot as usize) else {
+            return Err(NodeError::UnknownSlot { slot });
+        };
+        if entry.generation != node.generation() {
+            return Err(NodeError::StaleGeneration {
+                slot,
+                live: entry.generation,
+                found: node.generation(),
+            });
+        }
+        Ok(entry)
     }
 
     pub(crate) fn require_kind(
@@ -356,13 +318,13 @@ impl NodeArena {
         kind: NodeKindTag,
     ) -> Result<&NodeSlot, NodeError> {
         let slot = self.get(node)?;
-        if slot.kind == kind {
-            Ok(slot)
-        } else {
-            Err(NodeError::WrongKind {
+        match slot.kind {
+            Some(found) if found == kind => Ok(slot),
+            Some(found) => Err(NodeError::WrongKind {
                 expected: kind,
-                found: slot.kind,
-            })
+                found,
+            }),
+            None => Err(NodeError::Vacant { slot: node.slot() }),
         }
     }
 
@@ -373,28 +335,24 @@ impl NodeArena {
 
     /// 释放节点并解除它与父/兄弟的链接；重复释放无操作。
     pub(crate) fn release(&mut self, node: NodeRef) {
-        let Ok(slot) = self.slots.get(node.slot(), node.generation()) else {
+        let Ok(slot) = self.get(node) else {
             return;
         };
         let parent = slot.parent;
         let previous = slot.prev_sibling;
         let next = slot.next_sibling;
-        let first = slot.first_child;
-        if first.is_some() && parent.is_none() {
-            // 子节点仍在；它们由各自的 owner 释放，链在释放时修复。
-        }
         if let Some(previous) = previous
-            && let Ok(previous_slot) = self.slots.get_mut(previous.slot(), previous.generation())
+            && let Ok(previous_slot) = self.get_mut(previous)
         {
             previous_slot.next_sibling = next;
         }
         if let Some(next) = next
-            && let Ok(next_slot) = self.slots.get_mut(next.slot(), next.generation())
+            && let Ok(next_slot) = self.get_mut(next)
         {
             next_slot.prev_sibling = previous;
         }
         if let Some(parent) = parent
-            && let Ok(parent_slot) = self.slots.get_mut(parent.slot(), parent.generation())
+            && let Ok(parent_slot) = self.get_mut(parent)
         {
             if parent_slot.first_child == Some(node) {
                 parent_slot.first_child = next;
@@ -403,7 +361,24 @@ impl NodeArena {
                 parent_slot.last_child = previous;
             }
         }
-        self.slots.release(node.slot());
+        let index = node.slot() as usize;
+        let generation = self.slots[index].generation;
+        self.slots[index].kind = None;
+        self.slots[index].payload = NO_PAYLOAD;
+        self.slots[index].dirty = DirtyFlags::NONE;
+        self.slots[index].parent = None;
+        self.slots[index].first_child = None;
+        self.slots[index].last_child = None;
+        self.slots[index].prev_sibling = None;
+        self.slots[index].next_sibling = None;
+        self.slots[index].snapshot = None;
+        self.live -= 1;
+        if generation == u32::MAX {
+            // 代际耗尽：该槽退休，不再复用。
+            return;
+        }
+        self.slots[index].generation = generation + 1;
+        self.free.push(node.slot());
     }
 
     /// 槽位编号是否曾被分配；用于把已释放身份判为 stale 而不是 unknown。
@@ -411,26 +386,82 @@ impl NodeArena {
         (node.slot() as usize) < self.slots.len()
     }
 
-    pub(crate) fn live(&self) -> usize {
-        self.slots.live()
+    pub(crate) const fn live(&self) -> usize {
+        self.live
     }
 
     pub(crate) fn storage_len(&self) -> usize {
         self.slots.len()
     }
+}
 
-    pub(crate) fn reserve_element_aux(&mut self) -> AuxHandles {
-        self.aux.reserve()
+/// 按句柄索引的密集 payload arena；句柄由调用方按 kind 保存。
+pub(crate) struct Pool<T> {
+    values: Vec<Option<T>>,
+    free: Vec<u32>,
+    live: usize,
+}
+
+impl<T> Pool<T> {
+    pub(crate) const fn new() -> Self {
+        Self {
+            values: Vec::new(),
+            free: Vec::new(),
+            live: 0,
+        }
     }
 
-    pub(crate) fn release_element_aux(&mut self, handles: AuxHandles) {
-        self.aux.release(handles);
+    pub(crate) fn reserve(&mut self, value: T) -> u32 {
+        match self.free.pop() {
+            Some(slot) => {
+                self.values[slot as usize] = Some(value);
+                self.live += 1;
+                slot
+            }
+            None => {
+                let slot = u32::try_from(self.values.len()).expect("payload arena exhausted");
+                self.values.push(Some(value));
+                self.live += 1;
+                slot
+            }
+        }
     }
 
-    /// 当前存活的辅助句柄总数；测试用它验证元素卸载时的释放。
+    pub(crate) fn get(&self, slot: u32) -> Option<&T> {
+        self.values.get(slot as usize).and_then(Option::as_ref)
+    }
+
+    pub(crate) fn get_mut(&mut self, slot: u32) -> Option<&mut T> {
+        self.values.get_mut(slot as usize).and_then(Option::as_mut)
+    }
+
+    pub(crate) fn release(&mut self, slot: u32) -> Option<T> {
+        let value = self.values.get_mut(slot as usize)?.take()?;
+        self.live -= 1;
+        self.free.push(slot);
+        Some(value)
+    }
+
+    /// 临时借出 payload 而不归还槽位；刷新期间使用，guard 负责放回。
+    pub(crate) fn take(&mut self, slot: u32) -> Option<T> {
+        self.values.get_mut(slot as usize)?.take()
+    }
+
+    pub(crate) fn put(&mut self, slot: u32, value: T) {
+        debug_assert!(
+            self.values.get(slot as usize).is_some_and(Option::is_none),
+            "a taken payload slot is vacant"
+        );
+        self.values[slot as usize] = Some(value);
+    }
+
+    pub(crate) const fn live(&self) -> usize {
+        self.live
+    }
+
     #[cfg(test)]
-    pub(crate) const fn aux_live(&self) -> usize {
-        self.aux.live()
+    pub(crate) fn storage_len(&self) -> usize {
+        self.values.len()
     }
 }
 
@@ -441,7 +472,13 @@ macro_rules! list_id {
             pub(crate) struct $name(u32);
 
             impl $name {
-                pub(crate) const NONE: Self = Self(u32::MAX);
+                pub(crate) const fn from_raw(raw: u32) -> Self {
+                    Self(raw)
+                }
+
+                pub(crate) const fn raw(self) -> u32 {
+                    self.0
+                }
             }
         )+
     };
@@ -456,7 +493,7 @@ list_id!(
     SemanticsId,
 );
 
-/// 一个元素在辅助 arena 中的句柄集合；本切片的列表内容仍留在旧存储里。
+/// 一个元素在辅助 arena 中的句柄集合。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct AuxHandles {
     pub(crate) attrs: AttrListId,
@@ -468,158 +505,106 @@ pub(crate) struct AuxHandles {
     pub(crate) semantics: SemanticsId,
 }
 
-impl AuxHandles {
-    pub(crate) const NONE: Self = Self {
-        attrs: AttrListId::NONE,
-        class_styles: StyleListId::NONE,
-        inline_styles: StyleListId::NONE,
-        events: EventListId::NONE,
-        edit: EditStateId::NONE,
-        bindings: BindingListId::NONE,
-        semantics: SemanticsId::NONE,
-    };
-}
+/// 注册表内的 tag 下标；字符串本身由 runtime 的注册表持有。
+#[repr(transparent)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct TagId(u16);
 
-struct ListArena {
-    used: Vec<bool>,
-    free: Vec<u32>,
-    live: usize,
-}
-
-impl ListArena {
-    const fn new() -> Self {
-        Self {
-            used: Vec::new(),
-            free: Vec::new(),
-            live: 0,
-        }
+impl TagId {
+    pub(crate) fn from_index(index: usize) -> Self {
+        Self(u16::try_from(index).expect("tag registry exhausted"))
     }
 
-    fn reserve(&mut self) -> u32 {
-        match self.free.pop() {
-            Some(slot) => {
-                self.used[slot as usize] = true;
-                self.live += 1;
-                slot
-            }
-            None => {
-                let slot = u32::try_from(self.used.len()).expect("aux arena exhausted");
-                self.used.push(true);
-                self.live += 1;
-                slot
-            }
-        }
-    }
-
-    fn release(&mut self, slot: u32) {
-        let Some(used) = self.used.get_mut(slot as usize) else {
-            return;
-        };
-        if *used {
-            *used = false;
-            self.live -= 1;
-            self.free.push(slot);
-        }
-    }
-
-    const fn live(&self) -> usize {
-        self.live
+    pub(crate) const fn raw(self) -> u16 {
+        self.0
     }
 }
 
-/// 按树拥有的辅助 arena；列表、编辑与语义数据在契约切片迁入。
-pub(crate) struct AuxArenas {
-    attrs: ListArena,
-    class_styles: ListArena,
-    inline_styles: ListArena,
-    events: ListArena,
-    edits: ListArena,
-    binding_lists: ListArena,
-    semantics: ListArena,
+/// 元素标志位；本切片只有默认值，后续切片按位扩展。
+#[repr(transparent)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct ElementFlags(u8);
+
+impl ElementFlags {
+    pub(crate) const NONE: Self = Self(0);
 }
 
-impl AuxArenas {
-    const fn new() -> Self {
-        Self {
-            attrs: ListArena::new(),
-            class_styles: ListArena::new(),
-            inline_styles: ListArena::new(),
-            events: ListArena::new(),
-            edits: ListArena::new(),
-            binding_lists: ListArena::new(),
-            semantics: ListArena::new(),
-        }
-    }
-
-    fn reserve(&mut self) -> AuxHandles {
-        AuxHandles {
-            attrs: AttrListId(self.attrs.reserve()),
-            class_styles: StyleListId(self.class_styles.reserve()),
-            inline_styles: StyleListId(self.inline_styles.reserve()),
-            events: EventListId(self.events.reserve()),
-            edit: EditStateId(self.edits.reserve()),
-            bindings: BindingListId(self.binding_lists.reserve()),
-            semantics: SemanticsId(self.semantics.reserve()),
-        }
-    }
-
-    fn release(&mut self, handles: AuxHandles) {
-        self.attrs.release(handles.attrs.0);
-        self.class_styles.release(handles.class_styles.0);
-        self.inline_styles.release(handles.inline_styles.0);
-        self.events.release(handles.events.0);
-        self.edits.release(handles.edit.0);
-        self.binding_lists.release(handles.bindings.0);
-        self.semantics.release(handles.semantics.0);
-    }
-
-    pub(crate) const fn live(&self) -> usize {
-        self.attrs.live()
-            + self.class_styles.live()
-            + self.inline_styles.live()
-            + self.events.live()
-            + self.edits.live()
-            + self.binding_lists.live()
-            + self.semantics.live()
-    }
+/// 元素 payload：只存 tag、flags、owner 与外部 arena 句柄（≤96 B）。
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct ElementData {
+    pub(crate) tag: TagId,
+    pub(crate) flags: ElementFlags,
+    pub(crate) owner: u32,
+    pub(crate) aux: AuxHandles,
 }
 
-impl fmt::Debug for NodeArena {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("NodeArena")
-            .field("live", &self.live())
-            .field("storage", &self.storage_len())
-            .field("aux_live", &self.aux.live())
-            .finish()
-    }
+const _: () = assert!(std::mem::size_of::<ElementData>() <= 96);
+
+/// 绑定消费者的打包引用；绑定表与边 arena 在 #336 接入。
+///
+/// 固定 16 B：NodeRef 8 B + PartId 2 B + kind/padding。
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct ConsumerRef {
+    node: NodeRef,
+    part: u16,
+    kind: ConsumerKind,
 }
+
+#[repr(u8)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[expect(
+    dead_code,
+    reason = "binding edges are wired by the binding-table slice (#336)"
+)]
+enum ConsumerKind {
+    Binding = 0,
+    Structural = 1,
+}
+
+const _: () = assert!(std::mem::size_of::<ConsumerRef>() == 16);
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
+    fn fixed_layouts_match_the_arena_contract() {
+        assert_eq!(std::mem::size_of::<NodeSlot>(), 64);
+        assert!(std::mem::size_of::<ElementData>() <= 96);
+        assert_eq!(std::mem::size_of::<ConsumerRef>(), 16);
+        assert_eq!(std::mem::size_of::<Option<NodeRef>>(), 8);
+        assert_eq!(std::mem::size_of::<PresentationKey>(), 8);
+    }
+
+    #[test]
     fn node_ref_and_presentation_key_round_trip() {
         let node = NodeRef::new(7, 3).expect("nonzero generation");
         assert_eq!(node.slot(), 7);
         assert_eq!(node.generation(), 3);
-        assert_eq!(NodeRef::from_raw(node.raw()), Some(node));
+        #[cfg(test)]
+        {
+            assert_eq!(NodeRef::from_raw(node.raw()), Some(node));
+        }
         assert_eq!(NodeRef::new(0, 0), None);
 
         let key = PresentationKey::from_node(node);
         assert_eq!(key.raw(), node.raw());
-        assert_eq!(key.node(), Some(node));
     }
 
     #[test]
     fn a_recycled_slot_rejects_the_old_generation() {
-        let mut arena = NodeArena::new();
-        let tree = arena.allocate_tree();
+        let mut arena = SlotArena::new();
+        let tree = TreeKey::from_raw(0);
         let first = arena
             .insert(NodeKindTag::Text, NO_PAYLOAD, tree, None)
             .expect("insert");
         arena.release(first);
-        assert!(matches!(arena.get(first), Err(NodeError::Vacant { .. })));
+        assert!(matches!(
+            arena.get(first),
+            Err(NodeError::StaleGeneration { .. })
+        ));
 
         let second = arena
             .insert(NodeKindTag::Text, NO_PAYLOAD, tree, None)
@@ -637,8 +622,8 @@ mod tests {
 
     #[test]
     fn parent_and_sibling_links_are_maintained() {
-        let mut arena = NodeArena::new();
-        let tree = arena.allocate_tree();
+        let mut arena = SlotArena::new();
+        let tree = TreeKey::from_raw(0);
         let parent = arena
             .insert(NodeKindTag::Element, 0, tree, None)
             .expect("parent");
@@ -662,28 +647,17 @@ mod tests {
     }
 
     #[test]
-    fn tree_keys_are_monotonic_and_not_reused() {
-        let mut arena = NodeArena::new();
-        let first = arena.allocate_tree();
-        let second = arena.allocate_tree();
-        let third = arena.allocate_tree();
-        assert!(
-            first < second && second < third,
-            "tree keys increase monotonically"
-        );
-    }
+    fn payload_pool_recycles_a_slot_without_reusing_a_live_handle() {
+        let mut pool = Pool::new();
+        let first = pool.reserve(String::from("first"));
+        assert_eq!(pool.get(first).map(String::as_str), Some("first"));
+        assert_eq!(pool.release(first).as_deref(), Some("first"));
+        assert!(pool.get(first).is_none());
+        assert_eq!(pool.live(), 0);
 
-    #[test]
-    fn auxiliary_handles_are_allocated_and_released_per_element() {
-        let mut arena = NodeArena::new();
-        let first = arena.reserve_element_aux();
-        assert_ne!(first.attrs, AttrListId::NONE);
-        assert_eq!(arena.aux.live(), 7);
-        arena.release_element_aux(first);
-        assert_eq!(arena.aux.live(), 0);
-
-        let second = arena.reserve_element_aux();
-        assert_eq!(first.attrs, second.attrs, "the handle slot is reused");
-        arena.release_element_aux(second);
+        let second = pool.reserve(String::from("second"));
+        assert_eq!(first, second, "the payload slot is reused");
+        assert_eq!(pool.get(second).map(String::as_str), Some("second"));
+        assert_eq!(pool.storage_len(), 1);
     }
 }

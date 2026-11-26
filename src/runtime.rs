@@ -1,6 +1,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -16,7 +17,10 @@ use crate::menu::{
     CommandError, CommandEvent, CommandHandler, CommandSource, MenuCommand, MenuCommandState,
     MenuSpec, MenuStateError, MenuStateHandler,
 };
-use crate::node::{AuxHandles, NO_PAYLOAD, NodeArena, NodeKindTag, NodeRef, TreeKey};
+use crate::node::{
+    AttrListId, AuxHandles, BindingListId, EditStateId, ElementData, ElementFlags, EventListId,
+    NO_PAYLOAD, NodeKindTag, NodeRef, Pool, SemanticsId, SlotArena, StyleListId, TagId, TreeKey,
+};
 use crate::presentation::{
     Appearance, NodeId, NodeStatus, PresentationSnapshot, SnapshotAction, SnapshotActions,
     SnapshotAttr, SnapshotElement, SnapshotNode, SnapshotRowBand, SnapshotSemantics, SnapshotValue,
@@ -61,6 +65,350 @@ pub(crate) struct OwnerRecord {
     disposed: bool,
 }
 
+/// 统一 UI 节点 arena：节点身份、元素 payload、tag 注册表与辅助列表。
+pub(crate) struct NodeArena {
+    slots: SlotArena,
+    next_tree: u32,
+    tags: Vec<&'static str>,
+    tag_ids: BTreeMap<&'static str, TagId>,
+    /// 与元素槽位一一对应；NodeSlot.payload 就是这里的下标。
+    elements: Vec<Option<ElementData>>,
+    texts: Pool<TextData>,
+    shows: Pool<ShowData>,
+    forces: Pool<ForData>,
+    aux: AuxArenas,
+}
+
+impl NodeArena {
+    fn new() -> Self {
+        Self {
+            slots: SlotArena::new(),
+            next_tree: 1,
+            tags: Vec::new(),
+            tag_ids: BTreeMap::new(),
+            elements: Vec::new(),
+            texts: Pool::new(),
+            shows: Pool::new(),
+            forces: Pool::new(),
+            aux: AuxArenas::new(),
+        }
+    }
+
+    /// 分配一棵树的稳定键；耗尽时是 fatal 开发期错误。
+    fn allocate_tree(&mut self) -> TreeKey {
+        let key = TreeKey::from_raw(self.next_tree);
+        self.next_tree = self
+            .next_tree
+            .checked_add(1)
+            .expect("tree key space exhausted");
+        key
+    }
+
+    fn insert(
+        &mut self,
+        kind: NodeKindTag,
+        payload: u32,
+        tree: TreeKey,
+        parent: Option<NodeRef>,
+    ) -> Result<NodeRef, crate::node::NodeError> {
+        self.slots.insert(kind, payload, tree, parent)
+    }
+
+    fn get(&self, node: NodeRef) -> Result<&crate::node::NodeSlot, crate::node::NodeError> {
+        self.slots.get(node)
+    }
+
+    fn require_kind(
+        &self,
+        node: NodeRef,
+        kind: NodeKindTag,
+    ) -> Result<&crate::node::NodeSlot, crate::node::NodeError> {
+        self.slots.require_kind(node, kind)
+    }
+
+    fn set_payload(&mut self, node: NodeRef, payload: u32) -> Result<(), crate::node::NodeError> {
+        self.slots.set_payload(node, payload)
+    }
+
+    /// 释放节点身份、它的元素 payload 与辅助列表；重复释放无操作。
+    fn release(&mut self, node: NodeRef) {
+        if let Ok(slot) = self.slots.get(node) {
+            let kind = slot.kind;
+            let payload = slot.payload;
+            match kind {
+                Some(NodeKindTag::Element) => {
+                    if let Some(data) = self
+                        .elements
+                        .get_mut(payload as usize)
+                        .and_then(Option::take)
+                    {
+                        self.aux.release(data.aux);
+                    }
+                }
+                Some(NodeKindTag::Text) => {
+                    self.texts.release(payload);
+                }
+                Some(NodeKindTag::Show) => {
+                    self.shows.release(payload);
+                }
+                Some(NodeKindTag::For) => {
+                    self.forces.release(payload);
+                }
+                _ => {}
+            }
+        }
+        self.slots.release(node);
+    }
+
+    fn reserve_text(&mut self, data: TextData) -> u32 {
+        self.texts.reserve(data)
+    }
+
+    fn text(&self, payload: u32) -> &TextData {
+        self.texts
+            .get(payload)
+            .expect("a live text node has a text payload")
+    }
+
+    fn text_mut(&mut self, payload: u32) -> &mut TextData {
+        self.texts
+            .get_mut(payload)
+            .expect("a live text node has a text payload")
+    }
+
+    fn reserve_show(&mut self, data: ShowData) -> u32 {
+        self.shows.reserve(data)
+    }
+
+    fn show(&self, payload: u32) -> &ShowData {
+        self.shows
+            .get(payload)
+            .expect("a live Show node has a Show payload")
+    }
+
+    fn take_show(&mut self, payload: u32) -> ShowData {
+        self.shows
+            .take(payload)
+            .expect("a live Show node has a Show payload")
+    }
+
+    fn put_show(&mut self, payload: u32, data: ShowData) {
+        self.shows.put(payload, data);
+    }
+
+    fn reserve_for(&mut self, data: ForData) -> u32 {
+        self.forces.reserve(data)
+    }
+
+    fn for_node(&self, payload: u32) -> &ForData {
+        self.forces
+            .get(payload)
+            .expect("a live For node has a For payload")
+    }
+
+    fn take_for(&mut self, payload: u32) -> ForData {
+        self.forces
+            .take(payload)
+            .expect("a live For node has a For payload")
+    }
+
+    fn put_for(&mut self, payload: u32, data: ForData) {
+        self.forces.put(payload, data);
+    }
+
+    fn slot_exists(&self, node: NodeRef) -> bool {
+        self.slots.slot_exists(node)
+    }
+
+    fn live(&self) -> usize {
+        self.slots.live()
+    }
+
+    fn storage_len(&self) -> usize {
+        self.slots.storage_len()
+    }
+
+    fn intern_tag(&mut self, tag: &'static str) -> TagId {
+        if let Some(id) = self.tag_ids.get(tag) {
+            return *id;
+        }
+        let id = TagId::from_index(self.tags.len());
+        self.tags.push(tag);
+        self.tag_ids.insert(tag, id);
+        id
+    }
+
+    fn tag(&self, id: TagId) -> &'static str {
+        self.tags
+            .get(id.raw() as usize)
+            .copied()
+            .expect("tag ids come from this registry")
+    }
+
+    fn place_element_data(&mut self, slot: usize, data: ElementData) {
+        if slot == self.elements.len() {
+            self.elements.push(Some(data));
+        } else {
+            debug_assert!(slot < self.elements.len(), "element slots are pinned");
+            self.elements[slot] = Some(data);
+        }
+    }
+
+    fn element_data(&self, slot: usize) -> Option<&ElementData> {
+        self.elements.get(slot).and_then(Option::as_ref)
+    }
+
+    fn reserve_element_aux(&mut self, seed: AuxSeed) -> AuxHandles {
+        self.aux.reserve(seed)
+    }
+
+    fn attrs(&self, id: AttrListId) -> &[MountedAttr] {
+        self.aux.attrs.get(id.raw()).map_or(&[], Vec::as_slice)
+    }
+
+    fn attrs_mut(&mut self, id: AttrListId) -> &mut Vec<MountedAttr> {
+        self.aux
+            .attrs
+            .get_mut(id.raw())
+            .expect("element attr handles stay live until the element is retired")
+    }
+
+    fn class_styles(&self, id: StyleListId) -> &'static [zenui_style::StyleDeclaration] {
+        self.aux.class_styles.get(id.raw()).copied().unwrap_or(&[])
+    }
+
+    fn inline_styles(&self, id: StyleListId) -> &[MountedInlineStyle] {
+        self.aux
+            .inline_styles
+            .get(id.raw())
+            .map_or(&[], Vec::as_slice)
+    }
+
+    fn inline_styles_mut(&mut self, id: StyleListId) -> &mut Vec<MountedInlineStyle> {
+        self.aux
+            .inline_styles
+            .get_mut(id.raw())
+            .expect("element inline-style handles stay live until the element is retired")
+    }
+
+    fn events(&self, id: EventListId) -> &[usize] {
+        self.aux.events.get(id.raw()).map_or(&[], Vec::as_slice)
+    }
+
+    fn edit(&self, id: EditStateId) -> &LocalState {
+        self.aux
+            .edits
+            .get(id.raw())
+            .expect("element edit handles stay live")
+    }
+
+    fn edit_mut(&mut self, id: EditStateId) -> &mut LocalState {
+        self.aux
+            .edits
+            .get_mut(id.raw())
+            .expect("element edit handles stay live")
+    }
+
+    fn semantics(&self, id: SemanticsId) -> SnapshotSemantics {
+        self.aux
+            .semantics
+            .get(id.raw())
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// 当前存活的辅助句柄总数；测试用它验证元素卸载时的释放。
+    #[cfg(test)]
+    fn aux_live(&self) -> usize {
+        self.aux.live()
+    }
+}
+
+/// 文本节点的 payload：求值来源与已提交文本。
+struct TextData {
+    source: TextSlot,
+    value: String,
+}
+
+/// 元素挂载时一次性写入辅助 arena 的初始列表。
+struct AuxSeed {
+    attrs: Vec<MountedAttr>,
+    class_styles: &'static [zenui_style::StyleDeclaration],
+    inline_styles: Vec<MountedInlineStyle>,
+    events: Vec<usize>,
+    edit: LocalState,
+    semantics: SnapshotSemantics,
+}
+
+/// 绑定列表在绑定表切片（#336）填充；本切片只确保句柄与释放路径存在。
+struct BindingList;
+
+struct AuxArenas {
+    attrs: Pool<Vec<MountedAttr>>,
+    class_styles: Pool<&'static [zenui_style::StyleDeclaration]>,
+    inline_styles: Pool<Vec<MountedInlineStyle>>,
+    events: Pool<Vec<usize>>,
+    edits: Pool<LocalState>,
+    binding_lists: Pool<BindingList>,
+    semantics: Pool<SnapshotSemantics>,
+}
+
+impl AuxArenas {
+    const fn new() -> Self {
+        Self {
+            attrs: Pool::new(),
+            class_styles: Pool::new(),
+            inline_styles: Pool::new(),
+            events: Pool::new(),
+            edits: Pool::new(),
+            binding_lists: Pool::new(),
+            semantics: Pool::new(),
+        }
+    }
+
+    fn reserve(&mut self, seed: AuxSeed) -> AuxHandles {
+        AuxHandles {
+            attrs: AttrListId::from_raw(self.attrs.reserve(seed.attrs)),
+            class_styles: StyleListId::from_raw(self.class_styles.reserve(seed.class_styles)),
+            inline_styles: StyleListId::from_raw(self.inline_styles.reserve(seed.inline_styles)),
+            events: EventListId::from_raw(self.events.reserve(seed.events)),
+            edit: EditStateId::from_raw(self.edits.reserve(seed.edit)),
+            bindings: BindingListId::from_raw(self.binding_lists.reserve(BindingList)),
+            semantics: SemanticsId::from_raw(self.semantics.reserve(seed.semantics)),
+        }
+    }
+
+    fn release(&mut self, handles: AuxHandles) {
+        self.attrs.release(handles.attrs.raw());
+        self.class_styles.release(handles.class_styles.raw());
+        self.inline_styles.release(handles.inline_styles.raw());
+        self.events.release(handles.events.raw());
+        self.edits.release(handles.edit.raw());
+        self.binding_lists.release(handles.bindings.raw());
+        self.semantics.release(handles.semantics.raw());
+    }
+
+    fn live(&self) -> usize {
+        self.attrs.live()
+            + self.class_styles.live()
+            + self.inline_styles.live()
+            + self.events.live()
+            + self.edits.live()
+            + self.binding_lists.live()
+            + self.semantics.live()
+    }
+}
+
+impl fmt::Debug for NodeArena {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NodeArena")
+            .field("live", &self.live())
+            .field("storage", &self.storage_len())
+            .field("aux_live", &self.aux.live())
+            .finish()
+    }
+}
+
 static NEXT_RUNTIME: AtomicU32 = AtomicU32::new(1);
 
 /// 一棵已提交树的身份：headless 根，或目录中的窗口键。
@@ -75,6 +423,8 @@ struct MountedTree {
     nodes: Vec<MountedNode>,
     owner: u32,
     focused: Option<usize>,
+    /// 焦点元素的 tag；元素卸载后仍用于同 tag 焦点接任。
+    focused_tag: Option<&'static str>,
     settle_before: Option<Vec<usize>>,
     /// 只在这棵树出现有效呈现变化时取新值；不同树互不影响。
     revision: u64,
@@ -111,6 +461,8 @@ pub(crate) struct State {
     nodes: NodeArena,
     /// runtime 树槽位到 arena 树键的映射。
     arena_trees: BTreeMap<TreeSlot, TreeKey>,
+    /// 反向映射：从节点槽位的 TreeKey 解析回 runtime 树槽位。
+    arena_tree_slots: BTreeMap<TreeKey, TreeSlot>,
     /// 树 revision 的唯一分配器；每个树只在自身变化时取新值。
     next_tree_revision: u64,
     /// 自上次刷新以来出现可见变化的树；树在刷新期间被临时取出，
@@ -256,6 +608,37 @@ impl RefreshReport {
     }
 }
 
+/// 原生控件与显式 focus/blur 处理器决定元素的固有可聚焦性。
+fn inherent_focusable(state: &State, tag: &str, events: &[usize]) -> bool {
+    matches!(tag, "button" | "text-input" | "checkbox")
+        || events.iter().any(|id| {
+            state
+                .events
+                .get(*id)
+                .and_then(Option::as_ref)
+                .is_some_and(|event| {
+                    matches!(event_kind(event), EventKind::Focus | EventKind::Blur)
+                })
+        })
+}
+
+/// 已挂载的用户动作集合；焦点/组合等运行时事件不在此投影里。
+fn actions_for_events(state: &State, events: &[usize]) -> SnapshotActions {
+    let mut actions = SnapshotActions::default();
+    for id in events {
+        let Some(event) = state.events.get(*id).and_then(Option::as_ref) else {
+            continue;
+        };
+        match event_kind(event) {
+            EventKind::Click => actions.insert(SnapshotAction::Click),
+            EventKind::Change => actions.insert(SnapshotAction::Change),
+            EventKind::Input => actions.insert(SnapshotAction::Input),
+            _ => {}
+        }
+    }
+    actions
+}
+
 impl State {
     fn new() -> Self {
         let mut owners = BTreeMap::new();
@@ -276,6 +659,7 @@ impl State {
             building_tree: None,
             nodes: NodeArena::new(),
             arena_trees: BTreeMap::new(),
+            arena_tree_slots: BTreeMap::new(),
             next_tree_revision: 1,
             dirty_trees: BTreeSet::new(),
             changed_trees: BTreeSet::new(),
@@ -346,7 +730,7 @@ impl State {
     /// 把编辑器文本推进到派发值并记录这次本地编辑。
     fn dispatch_text_edit(&mut self, element: usize, value: &str, epoch: Option<u64>) {
         let trace = {
-            let LocalState::TextInput(editor) = &mut self.elements[element].local else {
+            let LocalState::TextInput(editor) = self.element_local_mut(element) else {
                 unreachable!("dispatch requires a mounted text input");
             };
             editor.dispatch(value, epoch)
@@ -373,8 +757,7 @@ impl State {
         slot
     }
 
-    fn place_element(&mut self, slot: usize, mut element: MountedElement) {
-        element.tree = self.building_tree;
+    fn place_element(&mut self, slot: usize, element: MountedElement) {
         if slot == self.elements.len() {
             self.elements.push(element);
         } else {
@@ -411,26 +794,14 @@ impl State {
         slot
     }
 
-    /// 卸载元素：只留 NodeId 供 stale 判定，其余 payload 全部释放。
+    /// 卸载元素：只留 NodeId 供 stale 判定；payload 已随节点释放。
     fn retire_element(&mut self, slot: usize) {
         let Some(element) = self.elements.get_mut(slot) else {
             return;
         };
         let id = element.id;
-        let tag = element.tag;
-        let aux = element.aux;
-        self.nodes.release_element_aux(aux);
         *element = MountedElement {
             id,
-            tag,
-            owner: 0,
-            tree: None,
-            aux: AuxHandles::NONE,
-            attrs: Vec::new(),
-            class_styles: &[],
-            inline_styles: Vec::new(),
-            events: Vec::new(),
-            local: LocalState::None,
             children: Vec::new(),
         };
         self.free_elements.push(slot);
@@ -590,7 +961,123 @@ impl State {
     }
 
     fn tree_for_element(&self, element: usize) -> Option<TreeSlot> {
-        self.elements.get(element).and_then(|element| element.tree)
+        let node = self.elements.get(element)?.id.node();
+        let slot = self.nodes.get(node).ok()?;
+        self.arena_tree_slots.get(&slot.tree).copied()
+    }
+
+    fn element_data(&self, element: usize) -> &ElementData {
+        let payload = self
+            .element_payload(element)
+            .expect("a mounted element has a live arena payload");
+        self.nodes
+            .element_data(payload)
+            .expect("a mounted element has live element data")
+    }
+
+    fn element_payload(&self, element: usize) -> Option<usize> {
+        let node = self.elements.get(element)?.id.node();
+        let slot = self.nodes.get(node).ok()?;
+        Some(slot.payload as usize)
+    }
+
+    fn element_tag(&self, element: usize) -> &'static str {
+        self.element_tag_opt(element)
+            .expect("a mounted element has a tag")
+    }
+
+    fn element_tag_opt(&self, element: usize) -> Option<&'static str> {
+        let payload = self.element_payload(element)?;
+        self.nodes
+            .element_data(payload)
+            .map(|data| self.nodes.tag(data.tag))
+    }
+
+    fn element_owner(&self, element: usize) -> u32 {
+        self.element_data(element).owner
+    }
+
+    fn element_aux(&self, element: usize) -> AuxHandles {
+        self.element_data(element).aux
+    }
+
+    fn element_aux_opt(&self, element: usize) -> Option<AuxHandles> {
+        let node = self.elements.get(element)?.id.node();
+        let slot = self.nodes.get(node).ok()?;
+        self.nodes
+            .element_data(slot.payload as usize)
+            .map(|data| data.aux)
+    }
+
+    fn element_attrs(&self, element: usize) -> &[MountedAttr] {
+        self.nodes.attrs(self.element_aux(element).attrs)
+    }
+
+    fn element_attrs_mut(&mut self, element: usize) -> &mut Vec<MountedAttr> {
+        let aux = self.element_aux(element);
+        self.nodes.attrs_mut(aux.attrs)
+    }
+
+    fn element_class_styles(&self, element: usize) -> &'static [zenui_style::StyleDeclaration] {
+        self.nodes
+            .class_styles(self.element_aux(element).class_styles)
+    }
+
+    fn element_inline_styles(&self, element: usize) -> &[MountedInlineStyle] {
+        self.nodes
+            .inline_styles(self.element_aux(element).inline_styles)
+    }
+
+    fn element_inline_styles_mut(&mut self, element: usize) -> &mut Vec<MountedInlineStyle> {
+        let aux = self.element_aux(element);
+        self.nodes.inline_styles_mut(aux.inline_styles)
+    }
+
+    fn element_events(&self, element: usize) -> &[usize] {
+        self.nodes.events(self.element_aux(element).events)
+    }
+
+    fn element_local(&self, element: usize) -> &LocalState {
+        self.nodes.edit(self.element_aux(element).edit)
+    }
+
+    fn element_local_mut(&mut self, element: usize) -> &mut LocalState {
+        let aux = self.element_aux(element);
+        self.nodes.edit_mut(aux.edit)
+    }
+
+    fn element_semantics(&self, element: usize) -> SnapshotSemantics {
+        self.nodes.semantics(self.element_aux(element).semantics)
+    }
+
+    fn element_label_text(&self, element: usize) -> Option<&str> {
+        self.element_attrs(element)
+            .iter()
+            .find(|attr| attr.name == "aria:label")
+            .and_then(|attr| attr.current.as_ref())
+            .and_then(|current| match current {
+                AttrCurrent::Text(text) => Some(text.as_str()),
+                AttrCurrent::Bool(_) => None,
+            })
+    }
+
+    fn element_is_disabled(&self, element: usize) -> bool {
+        self.element_attrs(element)
+            .iter()
+            .find(|attr| attr.name == "disabled")
+            .and_then(|attr| attr.current.as_ref())
+            .is_some_and(|current| matches!(current, AttrCurrent::Bool(true)))
+    }
+
+    /// `value` 绑定的写入代数；静态值或缺失绑定返回 `None`。
+    fn element_value_epoch(&self, element: usize) -> Option<u64> {
+        self.element_attrs(element)
+            .iter()
+            .find(|attr| attr.name == "value")
+            .and_then(|attr| match &attr.value {
+                AttrValue::Text(slot) => slot.epoch(self),
+                AttrValue::Bool(_) | AttrValue::ResultBool(_) => None,
+            })
     }
 
     /// 取得或分配一棵树的 arena 键；同一个 runtime 树槽位在存续期间保持稳定。
@@ -600,6 +1087,7 @@ impl State {
         }
         let key = self.nodes.allocate_tree();
         self.arena_trees.insert(slot, key);
+        self.arena_tree_slots.insert(key, slot);
         key
     }
 
@@ -648,11 +1136,13 @@ impl State {
     }
 
     fn set_focused_in(&mut self, key: TreeSlot, focused: Option<usize>) {
+        let tag = focused.and_then(|element| self.element_tag_opt(element));
         let changed = self.tree_mut(key).is_some_and(|tree| {
             if tree.focused == focused {
                 return false;
             }
             tree.focused = focused;
+            tree.focused_tag = tag;
             true
         });
         if !changed {
@@ -660,8 +1150,10 @@ impl State {
         }
         self.mark_tree_changed(key);
         // 焦点变化结束所有输入的连续输入 run。
-        for element in &mut self.elements {
-            if let LocalState::TextInput(editor) = &mut element.local {
+        for element in 0..self.elements.len() {
+            if self.element_aux_opt(element).is_some()
+                && let LocalState::TextInput(editor) = self.element_local_mut(element)
+            {
                 editor.history.break_run();
             }
         }
@@ -1203,7 +1695,7 @@ impl State {
     }
 
     fn update_local(&mut self, element: usize, value: LocalUpdate) {
-        match (&mut self.elements[element].local, value) {
+        match (self.element_local_mut(element), value) {
             (LocalState::TextInput(editor), LocalUpdate::Input(value)) => {
                 let length = value.chars().count();
                 editor.value = value;
@@ -1223,7 +1715,7 @@ impl State {
 
     fn text_input(&self, target: &FindTarget) -> Option<usize> {
         let element = self.find_element(target)?;
-        match &self.elements[element].local {
+        match self.element_local(element) {
             LocalState::TextInput(editor) => Some(editor.caret),
             _ => None,
         }
@@ -1236,7 +1728,7 @@ impl State {
         element: usize,
         operation: NodeOperation,
     ) -> Result<(), DispatchError> {
-        if matches!(self.elements[element].local, LocalState::TextInput(_)) {
+        if matches!(self.element_local(element), LocalState::TextInput(_)) {
             Ok(())
         } else {
             Err(DispatchError::WrongKind { node, operation })
@@ -1251,7 +1743,7 @@ impl State {
         operation: NodeOperation,
     ) -> Result<(), DispatchError> {
         self.require_text_input(node, element, operation)?;
-        if self.elements[element].is_disabled() {
+        if self.element_is_disabled(element) {
             return Err(DispatchError::Rejected {
                 node,
                 operation,
@@ -1269,7 +1761,7 @@ impl State {
         operation: NodeOperation,
     ) -> Result<(), DispatchError> {
         self.require_enabled_text_input(node, element, operation)?;
-        if self.elements[element].local.is_composing() {
+        if self.element_local(element).is_composing() {
             return Err(DispatchError::Rejected {
                 node,
                 operation,
@@ -1286,7 +1778,7 @@ impl State {
         element: usize,
         operation: NodeOperation,
     ) -> Result<(), DispatchError> {
-        if self.elements[element].local.is_composing() {
+        if self.element_local(element).is_composing() {
             Ok(())
         } else {
             Err(DispatchError::Rejected {
@@ -1372,7 +1864,7 @@ impl State {
         if !self.element_accepts_input(element) {
             return false;
         }
-        let LocalState::TextInput(editor) = &mut self.elements[element].local else {
+        let LocalState::TextInput(editor) = self.element_local_mut(element) else {
             return false;
         };
         if editor.is_composing() {
@@ -1395,21 +1887,16 @@ impl State {
 
     /// 原生控件与显式挂接 focus/blur 的元素参与遍历；禁用元素不参与接任或 Tab 顺序。
     fn is_focusable(&self, element: usize) -> bool {
-        !self.elements[element].is_disabled() && self.element_is_inherently_focusable(element)
+        !self.element_is_disabled(element) && self.element_is_inherently_focusable(element)
     }
 
     /// 元素本身的键盘可聚焦语义；`disabled` 与可见性由调用方另行组合。
     fn element_is_inherently_focusable(&self, element: usize) -> bool {
-        let element = &self.elements[element];
-        matches!(element.tag, "button" | "text-input" | "checkbox")
-            || element.events.iter().any(|id| {
-                self.events
-                    .get(*id)
-                    .and_then(Option::as_ref)
-                    .is_some_and(|event| {
-                        matches!(event_kind(event), EventKind::Focus | EventKind::Blur)
-                    })
-            })
+        inherent_focusable(
+            self,
+            self.element_tag(element),
+            self.element_events(element),
+        )
     }
 
     /// Tab/方向键共用的确定性前序：控件先于自己的子树，Show 只看活动分支，For 按业务顺序。
@@ -1445,8 +1932,14 @@ impl State {
         if after.contains(&old) {
             return None;
         }
-        let before = self.tree_mut(key)?.settle_before.take().unwrap_or_default();
-        let target = focus_replacement(self, &before, &after, old);
+        let (before, tag) = {
+            let tree = self.tree_mut(key)?;
+            (
+                tree.settle_before.take().unwrap_or_default(),
+                tree.focused_tag,
+            )
+        };
+        let target = focus_replacement(self, &before, &after, old, tag);
         Some(FocusSettlement {
             old,
             blur_old: self.element_is_mounted(old),
@@ -1455,48 +1948,26 @@ impl State {
     }
 
     fn take_element_event(&mut self, element: usize, kind: EventKind) -> Option<(usize, Event)> {
-        let event = self
-            .elements
-            .get(element)?
-            .events
-            .iter()
-            .copied()
-            .find(|id| {
-                self.events
-                    .get(*id)
-                    .and_then(Option::as_ref)
-                    .is_some_and(|event| event_kind(event) == kind)
-            })?;
+        let event = self.element_events(element).iter().copied().find(|id| {
+            self.events
+                .get(*id)
+                .and_then(Option::as_ref)
+                .is_some_and(|event| event_kind(event) == kind)
+        })?;
         Some((event, self.events.get_mut(event)?.take()?))
     }
 }
 
 pub enum MountedNode {
-    Text(MountedText),
+    Text(u32),
     Element(usize),
     Component(usize),
-    Show(MountedShow),
-    For(MountedFor),
-}
-
-pub struct MountedText {
-    slot: TextSlot,
-    value: String,
+    Show(u32),
+    For(u32),
 }
 
 pub struct MountedElement {
     id: NodeId,
-    tag: &'static str,
-    owner: u32,
-    /// 元素所属的已提交树；挂载时由构建上下文写入，释放后为 `None`。
-    tree: Option<TreeSlot>,
-    /// 该元素在辅助 arena 中的句柄；列表内容仍留在旧存储里。
-    aux: AuxHandles,
-    attrs: Vec<MountedAttr>,
-    class_styles: &'static [zenui_style::StyleDeclaration],
-    inline_styles: Vec<MountedInlineStyle>,
-    events: Vec<usize>,
-    local: LocalState,
     children: Vec<MountedNode>,
 }
 
@@ -1504,42 +1975,6 @@ struct MountedInlineStyle {
     property: zenui_style::Property,
     slot: StyleSlot,
     current: Option<zenui_style::StyleValue>,
-}
-
-impl MountedElement {
-    fn label(&self) -> Option<String> {
-        self.label_text().map(ToOwned::to_owned)
-    }
-
-    fn label_text(&self) -> Option<&str> {
-        self.attrs
-            .iter()
-            .find(|attr| attr.name == "aria:label")
-            .and_then(|attr| attr.current.as_ref())
-            .and_then(|current| match current {
-                AttrCurrent::Text(text) => Some(text.as_str()),
-                AttrCurrent::Bool(_) => None,
-            })
-    }
-
-    /// `value` 绑定的写入代数；静态值或缺失绑定返回 `None`。
-    fn value_epoch(&self, state: &State) -> Option<u64> {
-        self.attrs
-            .iter()
-            .find(|attr| attr.name == "value")
-            .and_then(|attr| match &attr.value {
-                AttrValue::Text(slot) => slot.epoch(state),
-                AttrValue::Bool(_) | AttrValue::ResultBool(_) => None,
-            })
-    }
-
-    fn is_disabled(&self) -> bool {
-        self.attrs
-            .iter()
-            .find(|attr| attr.name == "disabled")
-            .and_then(|attr| attr.current.as_ref())
-            .is_some_and(|current| matches!(current, AttrCurrent::Bool(true)))
-    }
 }
 
 pub struct MountedAttr {
@@ -2069,8 +2504,8 @@ fn trim_history(stack: &mut VecDeque<TextEntry>, bytes: &mut usize) {
     }
 }
 
-fn text_snapshot(element: &MountedElement) -> Option<TextSnapshot> {
-    let LocalState::TextInput(editor) = &element.local else {
+fn text_snapshot(local: &LocalState) -> Option<TextSnapshot> {
+    let LocalState::TextInput(editor) = local else {
         return None;
     };
     Some(TextSnapshot {
@@ -2097,7 +2532,7 @@ pub struct MountedComponent {
     children: Vec<MountedNode>,
 }
 
-pub struct MountedShow {
+struct ShowData {
     owner: u32,
     node: NodeRef,
     when: Memo<bool>,
@@ -2112,7 +2547,7 @@ pub struct MountedBranch {
     children: Vec<MountedNode>,
 }
 
-pub struct MountedFor {
+struct ForData {
     owner: u32,
     node: NodeRef,
     each: Memo<RowSet>,
@@ -2158,28 +2593,36 @@ fn ensure_spacers(state: &mut State, owner: u32, parent: Option<NodeRef>) -> (us
     let mut make = || {
         let slot = state.reserve_element(owner);
         let id = state.mint_element_node(slot, owner, parent);
-        let aux = state.nodes.reserve_element_aux();
+        let aux = state.nodes.reserve_element_aux(AuxSeed {
+            attrs: vec![MountedAttr {
+                name: "role",
+                value: AttrValue::Text(TextSlot::Static("spacer")),
+                current: Some(AttrCurrent::Text(String::from("spacer"))),
+            }],
+            class_styles: &[],
+            inline_styles: vec![MountedInlineStyle {
+                property: Property::Height,
+                slot: StyleSlot::Length(ValueSlot::Static(Length::px(0.0))),
+                current: Some(StyleValue::Length(Length::px(0.0))),
+            }],
+            events: Vec::new(),
+            edit: LocalState::None,
+            semantics: SnapshotSemantics::new(false, SnapshotActions::default()),
+        });
+        let tag = state.nodes.intern_tag("view");
+        state.nodes.place_element_data(
+            slot,
+            ElementData {
+                tag,
+                flags: ElementFlags::NONE,
+                owner,
+                aux,
+            },
+        );
         state.place_element(
             slot,
             MountedElement {
                 id,
-                tag: "view",
-                owner,
-                tree: None,
-                aux,
-                attrs: vec![MountedAttr {
-                    name: "role",
-                    value: AttrValue::Text(TextSlot::Static("spacer")),
-                    current: Some(AttrCurrent::Text(String::from("spacer"))),
-                }],
-                class_styles: &[],
-                inline_styles: vec![MountedInlineStyle {
-                    property: Property::Height,
-                    slot: StyleSlot::Length(ValueSlot::Static(Length::px(0.0))),
-                    current: Some(StyleValue::Length(Length::px(0.0))),
-                }],
-                events: Vec::new(),
-                local: LocalState::None,
                 children: Vec::new(),
             },
         );
@@ -2192,9 +2635,8 @@ fn ensure_spacers(state: &mut State, owner: u32, parent: Option<NodeRef>) -> (us
 fn set_spacer_height(state: &mut State, spacer: usize, rows: usize, row_height: Length) {
     let height = rows_height(row_height, rows);
     let changed = {
-        let element = &mut state.elements[spacer];
-        let Some(style) = element
-            .inline_styles
+        let Some(style) = state
+            .element_inline_styles_mut(spacer)
             .iter_mut()
             .find(|style| style.property == Property::Height)
         else {
@@ -2383,21 +2825,22 @@ impl Drop for TreeRefreshGuard {
 /// 求值元素属性期间临时借出 attrs 与 inline styles；unwind 时原样放回。
 struct ElementScratchGuard {
     id: usize,
+    aux: AuxHandles,
     attrs: Option<Vec<MountedAttr>>,
     styles: Option<Vec<MountedInlineStyle>>,
 }
 
 impl ElementScratchGuard {
     fn take(id: usize) -> Self {
-        let (attrs, styles) = with_state(|state| {
-            let element = &mut state.elements[id];
-            (
-                std::mem::take(&mut element.attrs),
-                std::mem::take(&mut element.inline_styles),
-            )
+        let (aux, attrs, styles) = with_state(|state| {
+            let aux = state.element_aux(id);
+            let attrs = std::mem::take(state.nodes.attrs_mut(aux.attrs));
+            let styles = std::mem::take(state.nodes.inline_styles_mut(aux.inline_styles));
+            (aux, attrs, styles)
         });
         Self {
             id,
+            aux,
             attrs: Some(attrs),
             styles: Some(styles),
         }
@@ -2426,15 +2869,56 @@ impl Drop for ElementScratchGuard {
             return;
         }
         with_state(|state| {
-            if let Some(element) = state.elements.get_mut(self.id) {
-                if let Some(attrs) = self.attrs.take() {
-                    element.attrs = attrs;
-                }
-                if let Some(styles) = self.styles.take() {
-                    element.inline_styles = styles;
-                }
+            if state.element_aux_opt(self.id) != Some(self.aux) {
+                return;
+            }
+            if let Some(attrs) = self.attrs.take() {
+                *state.nodes.attrs_mut(self.aux.attrs) = attrs;
+            }
+            if let Some(styles) = self.styles.take() {
+                *state.nodes.inline_styles_mut(self.aux.inline_styles) = styles;
             }
         });
+    }
+}
+
+/// 刷新期间临时借出 Show payload；返回或 unwind 时放回同一个槽位。
+struct ShowPayloadGuard {
+    payload: u32,
+    data: Option<ShowData>,
+}
+
+impl ShowPayloadGuard {
+    fn data_mut(&mut self) -> &mut ShowData {
+        self.data.as_mut().expect("the Show payload is taken")
+    }
+}
+
+impl Drop for ShowPayloadGuard {
+    fn drop(&mut self) {
+        if let Some(data) = self.data.take() {
+            with_state(|state| state.nodes.put_show(self.payload, data));
+        }
+    }
+}
+
+/// 刷新期间临时借出 For payload；返回或 unwind 时放回同一个槽位。
+struct ForPayloadGuard {
+    payload: u32,
+    data: Option<ForData>,
+}
+
+impl ForPayloadGuard {
+    fn data_mut(&mut self) -> &mut ForData {
+        self.data.as_mut().expect("the For payload is taken")
+    }
+}
+
+impl Drop for ForPayloadGuard {
+    fn drop(&mut self) {
+        if let Some(data) = self.data.take() {
+            with_state(|state| state.nodes.put_for(self.payload, data));
+        }
     }
 }
 
@@ -2513,12 +2997,16 @@ fn find_element(state: &State, nodes: &[MountedNode], target: &FindTarget) -> Op
             MountedNode::Element(id) => {
                 let element = &state.elements[*id];
                 let matches = match target {
-                    FindTarget::Label(label) => {
-                        element.label_text().is_some_and(|value| value == label)
-                    }
-                    FindTarget::Text(text) => element.children.iter().any(
-                        |child| matches!(child, MountedNode::Text(node) if node.value == *text),
-                    ),
+                    FindTarget::Label(label) => state
+                        .element_label_text(*id)
+                        .is_some_and(|value| value == label),
+                    FindTarget::Text(text) => element.children.iter().any(|child| {
+                        matches!(
+                            child,
+                            MountedNode::Text(node)
+                                if state.nodes.text(*node).value == *text
+                        )
+                    }),
                 };
                 if matches {
                     return Some(*id);
@@ -2532,14 +3020,16 @@ fn find_element(state: &State, nodes: &[MountedNode], target: &FindTarget) -> Op
                     return Some(found);
                 }
             }
-            MountedNode::Show(show) => {
+            MountedNode::Show(payload) => {
+                let show = state.nodes.show(*payload);
                 if let Some(branch) = &show.active
                     && let Some(found) = find_element(state, &branch.children, target)
                 {
                     return Some(found);
                 }
             }
-            MountedNode::For(for_node) => {
+            MountedNode::For(payload) => {
+                let for_node = state.nodes.for_node(*payload);
                 for key in &for_node.order {
                     if let Some(item) = for_node.items.get(key)
                         && let Some(found) = find_element(state, &item.children, target)
@@ -2654,6 +3144,7 @@ impl Runtime {
                         nodes: tree,
                         owner: 0,
                         focused: None,
+                        focused_tag: None,
                         settle_before: None,
                         revision: 0,
                     },
@@ -3036,6 +3527,7 @@ impl Runtime {
                         nodes: tree,
                         owner,
                         focused: None,
+                        focused_tag: None,
                         settle_before: None,
                         revision: 0,
                     },
@@ -4078,11 +4570,19 @@ impl Runtime {
     ) -> Result<MountedNode, MountError> {
         match node {
             PlanNode::Text(slot) => {
-                with_state(|state| state.register_node(NodeKindTag::Text, parent, parent_node));
-                Ok(MountedNode::Text(MountedText {
-                    value: String::new(),
-                    slot,
-                }))
+                let payload = with_state(|state| {
+                    let node = state.register_node(NodeKindTag::Text, parent, parent_node);
+                    let payload = state.nodes.reserve_text(TextData {
+                        source: slot,
+                        value: String::new(),
+                    });
+                    state
+                        .nodes
+                        .set_payload(node, payload)
+                        .expect("the text node is live");
+                    payload
+                });
+                Ok(MountedNode::Text(payload))
             }
             PlanNode::Children(_) | PlanNode::Factory(_) => {
                 unreachable!("slots are spliced by mount_plan")
@@ -4130,7 +4630,6 @@ impl Runtime {
                             u32::try_from(slot).expect("node identity exhausted"),
                         )
                         .expect("the element node is live");
-                    let aux = state.nodes.reserve_element_aux();
                     // 每次挂载（包括同 key 重挂载）都建立新的编辑 origin；
                     // 旧挂载的 Node ID 是 StaleNode，旧派发无法命中新编辑器。
                     let local = match tag {
@@ -4151,22 +4650,29 @@ impl Runtime {
                             current: None,
                         })
                         .collect();
-                    state.place_element(
+                    let semantics = SnapshotSemantics::new(
+                        inherent_focusable(state, tag, &events),
+                        actions_for_events(state, &events),
+                    );
+                    let aux = state.nodes.reserve_element_aux(AuxSeed {
+                        attrs,
+                        class_styles: plan.class_styles,
+                        inline_styles,
+                        events,
+                        edit: local,
+                        semantics,
+                    });
+                    let tag_id = state.nodes.intern_tag(tag);
+                    state.nodes.place_element_data(
                         slot,
-                        MountedElement {
-                            id,
-                            tag,
+                        ElementData {
+                            tag: tag_id,
+                            flags: ElementFlags::NONE,
                             owner,
-                            tree: None,
                             aux,
-                            attrs,
-                            class_styles: plan.class_styles,
-                            inline_styles,
-                            events,
-                            local,
-                            children,
                         },
                     );
+                    state.place_element(slot, MountedElement { id, children });
                     slot
                 });
                 Ok(MountedNode::Element(id))
@@ -4223,19 +4729,26 @@ impl Runtime {
                 let owner = with_state(|state| state.create_owner(Some(parent)));
                 let show_node =
                     with_state(|state| state.register_node(NodeKindTag::Show, owner, parent_node));
-                let mut node = MountedShow {
-                    owner,
-                    node: show_node,
-                    when: plan.when,
-                    then: plan.then,
-                    fallback: plan.fallback,
-                    active: None,
-                };
-                if let Err(error) = self.refresh_show(&mut node) {
+                let payload = with_state(|state| {
+                    let payload = state.nodes.reserve_show(ShowData {
+                        owner,
+                        node: show_node,
+                        when: plan.when,
+                        then: plan.then,
+                        fallback: plan.fallback,
+                        active: None,
+                    });
+                    state
+                        .nodes
+                        .set_payload(show_node, payload)
+                        .expect("the Show node is live");
+                    payload
+                });
+                if let Err(error) = self.refresh_show(payload) {
                     with_state(|state| state.dispose_owner(owner));
                     return Err(error);
                 }
-                Ok(MountedNode::Show(node))
+                Ok(MountedNode::Show(payload))
             }
             PlanNode::For(plan) => {
                 let owner = with_state(|state| state.create_owner(Some(parent)));
@@ -4247,28 +4760,35 @@ impl Runtime {
                     state.owner_bands.entry(owner).or_default().push(band);
                     band
                 });
-                let mut node = MountedFor {
-                    owner,
-                    node: for_node,
-                    each: plan.each,
-                    key: plan.key,
-                    item: plan.item,
-                    row_height: plan.row_height,
-                    band,
-                    total_rows: 0,
-                    first_row: 0,
-                    spacers: None,
-                    rows: None,
-                    entries: Vec::new(),
-                    row_of: BTreeMap::new(),
-                    items: BTreeMap::new(),
-                    order: Vec::new(),
-                };
-                if let Err(error) = self.refresh_for(&mut node) {
+                let payload = with_state(|state| {
+                    let payload = state.nodes.reserve_for(ForData {
+                        owner,
+                        node: for_node,
+                        each: plan.each,
+                        key: plan.key,
+                        item: plan.item,
+                        row_height: plan.row_height,
+                        band,
+                        total_rows: 0,
+                        first_row: 0,
+                        spacers: None,
+                        rows: None,
+                        entries: Vec::new(),
+                        row_of: BTreeMap::new(),
+                        items: BTreeMap::new(),
+                        order: Vec::new(),
+                    });
+                    state
+                        .nodes
+                        .set_payload(for_node, payload)
+                        .expect("the For node is live");
+                    payload
+                });
+                if let Err(error) = self.refresh_for(payload) {
                     with_state(|state| state.dispose_owner(owner));
                     return Err(error);
                 }
-                Ok(MountedNode::For(node))
+                Ok(MountedNode::For(payload))
             }
         }
     }
@@ -4279,10 +4799,10 @@ impl Runtime {
         for node in nodes {
             let owner = with_state(|state| match node {
                 MountedNode::Text(_) => None,
-                MountedNode::Element(id) => Some(state.elements[id].owner),
+                MountedNode::Element(id) => Some(state.element_owner(id)),
                 MountedNode::Component(id) => Some(state.components[id].owner),
-                MountedNode::Show(show) => Some(show.owner),
-                MountedNode::For(for_node) => Some(for_node.owner),
+                MountedNode::Show(payload) => Some(state.nodes.show(payload).owner),
+                MountedNode::For(payload) => Some(state.nodes.for_node(payload).owner),
             });
             if let Some(owner) = owner {
                 with_state(|state| {
@@ -4302,12 +4822,23 @@ impl Runtime {
 
     fn refresh_node(&mut self, node: &mut MountedNode) -> Result<(), MountError> {
         match node {
-            MountedNode::Text(text) => {
-                let next = text.slot.evaluate();
-                if text.value != next {
-                    text.value = next;
-                    with_state(State::mark_building_tree_changed);
-                }
+            MountedNode::Text(payload) => {
+                let source = with_state(|state| state.nodes.text(*payload).source.clone());
+                let next = source.evaluate();
+                with_state(|state| {
+                    let changed = {
+                        let text = state.nodes.text_mut(*payload);
+                        if text.value == next {
+                            false
+                        } else {
+                            text.value = next;
+                            true
+                        }
+                    };
+                    if changed {
+                        state.mark_building_tree_changed();
+                    }
+                });
                 Ok(())
             }
             MountedNode::Element(id) => {
@@ -4323,8 +4854,8 @@ impl Runtime {
                 guard.restore();
                 result
             }
-            MountedNode::Show(show) => self.refresh_show(show),
-            MountedNode::For(for_node) => self.refresh_for(for_node),
+            MountedNode::Show(payload) => self.refresh_show(*payload),
+            MountedNode::For(payload) => self.refresh_for(*payload),
         }
     }
 
@@ -4384,8 +4915,7 @@ impl Runtime {
             let styles = scratch.take_styles();
             let mut local_changed = false;
             let event = {
-                let element = &mut state.elements[id];
-                if let LocalState::Checkbox { checked } = &mut element.local
+                if let LocalState::Checkbox { checked } = state.element_local_mut(id)
                     && let Some(AttrCurrent::Bool(value)) = attrs
                         .iter()
                         .find(|attr| attr.name == "checked")
@@ -4395,9 +4925,9 @@ impl Runtime {
                     *checked = value;
                     local_changed = true;
                 }
-                element.attrs = attrs;
-                element.inline_styles = styles;
-                match &mut element.local {
+                *state.element_attrs_mut(id) = attrs;
+                *state.element_inline_styles_mut(id) = styles;
+                match state.element_local_mut(id) {
                     LocalState::TextInput(editor) => editor.observe(&committed, epoch),
                     _ => None,
                 }
@@ -4420,7 +4950,13 @@ impl Runtime {
         });
     }
 
-    fn refresh_show(&mut self, show: &mut MountedShow) -> Result<(), MountError> {
+    fn refresh_show(&mut self, payload: u32) -> Result<(), MountError> {
+        let data = with_state(|state| state.nodes.take_show(payload));
+        let mut guard = ShowPayloadGuard {
+            payload,
+            data: Some(data),
+        };
+        let show = guard.data_mut();
         // `when` 的求值可能读到毒化且没有最后值的 memo；旧分支保持挂载。
         let active = match catch_panic(|| show.when.get()) {
             Ok(active) => active,
@@ -4513,7 +5049,13 @@ impl Runtime {
         Ok(())
     }
 
-    fn refresh_for(&mut self, for_node: &mut MountedFor) -> Result<(), MountError> {
+    fn refresh_for(&mut self, payload: u32) -> Result<(), MountError> {
+        let data = with_state(|state| state.nodes.take_for(payload));
+        let mut guard = ForPayloadGuard {
+            payload,
+            data: Some(data),
+        };
+        let for_node = guard.data_mut();
         // 源求值失败时旧行与旧窗口保持不变。
         let rows: RowSet = match catch_panic(|| for_node.each.get()) {
             Ok(rows) => rows,
@@ -4794,7 +5336,7 @@ impl Runtime {
             if !with_state(|state| state.element_accepts_input(element)) {
                 return Err(MountError::Component(SUSPENDED_TARGET));
             }
-            if with_state(|state| state.elements[element].local.is_composing()) {
+            if with_state(|state| state.element_local(element).is_composing()) {
                 return Err(MountError::Component("text input is composing"));
             }
             let Some((event_id, event)) =
@@ -4806,7 +5348,7 @@ impl Runtime {
                 state.phase = Phase::Event;
                 state.fault = None;
                 state.write_error = None;
-                if let LocalState::TextInput(editor) = &mut state.elements[element].local {
+                if let LocalState::TextInput(editor) = state.element_local_mut(element) {
                     editor.history.clear();
                 }
                 state.update_local(element, LocalUpdate::Input(value.to_owned()));
@@ -4902,7 +5444,7 @@ impl Runtime {
         let mut state = self.state.borrow_mut();
         let element = state.element_for_node(node)?;
         state.require_editable_text_input(node, element, operation)?;
-        let length = text_length(&state.elements[element]);
+        let length = text_length(state.element_local(element));
         let (anchor, focus) = match movement {
             Movement::Caret(offset) => {
                 let offset = offset.min(length);
@@ -4911,8 +5453,8 @@ impl Runtime {
             Movement::Selection(anchor, focus) => (anchor.min(length), focus.min(length)),
             Movement::SelectAll => (0, length),
         };
-        set_local_selection(&mut state.elements[element].local, anchor, focus);
-        if let LocalState::TextInput(editor) = &mut state.elements[element].local {
+        set_local_selection(state.element_local_mut(element), anchor, focus);
+        if let LocalState::TextInput(editor) = state.element_local_mut(element) {
             editor.history.break_run();
         }
         let key = state.tree_for_element(element);
@@ -4933,7 +5475,7 @@ impl Runtime {
     ) -> Result<(), DispatchError> {
         with_state(|state| state.require_editable_text_input(node, element, operation))?;
         let (before, caret, selection) = with_state(|state| {
-            let LocalState::TextInput(editor) = &state.elements[element].local else {
+            let LocalState::TextInput(editor) = state.element_local(element) else {
                 unreachable!("require_editable_text_input validated the input");
             };
             let before = TextSnapshot {
@@ -4944,7 +5486,7 @@ impl Runtime {
             };
             (before, editor.caret, editor.selection)
         });
-        let epoch = with_state(|state| state.elements[element].value_epoch(state));
+        let epoch = with_state(|state| state.element_value_epoch(element));
         let kind = match edit {
             Edit::Insert(text) => {
                 let mut scalars = text.chars();
@@ -4964,7 +5506,7 @@ impl Runtime {
         } = outcome;
         let (event_id, event) = self.take_node_event(node, element, EventKind::Input, operation)?;
         with_state(|state| {
-            if let LocalState::TextInput(editor) = &mut state.elements[element].local {
+            if let LocalState::TextInput(editor) = state.element_local_mut(element) {
                 editor.caret = next_caret;
                 editor.anchor = next_caret;
                 editor.selection = None;
@@ -5007,10 +5549,10 @@ impl Runtime {
             if !state.element_is_mounted(element) {
                 return;
             }
-            let Some(after) = text_snapshot(&state.elements[element]) else {
+            let Some(after) = text_snapshot(state.element_local(element)) else {
                 return;
             };
-            let LocalState::TextInput(editor) = &mut state.elements[element].local else {
+            let LocalState::TextInput(editor) = state.element_local_mut(element) else {
                 return;
             };
             editor.history.record(before, after, kind);
@@ -5046,13 +5588,13 @@ impl Runtime {
             with_state(|state| state.require_editable_text_input(node, element, operation))?;
             // 撤销/重做后继续输入必须开启新的 run，不能并入更早的条目。
             with_state(|state| {
-                let LocalState::TextInput(editor) = &mut state.elements[element].local else {
+                let LocalState::TextInput(editor) = state.element_local_mut(element) else {
                     unreachable!("require_editable_text_input validated the input");
                 };
                 editor.history.break_run();
             });
             let entry = with_state(|state| {
-                let LocalState::TextInput(editor) = &state.elements[element].local else {
+                let LocalState::TextInput(editor) = state.element_local(element) else {
                     unreachable!("require_editable_text_input validated the input");
                 };
                 match direction {
@@ -5070,7 +5612,7 @@ impl Runtime {
             };
             let (event_id, event) =
                 self.take_node_event(node, element, EventKind::Input, operation)?;
-            let epoch = with_state(|state| state.elements[element].value_epoch(state));
+            let epoch = with_state(|state| state.element_value_epoch(element));
             let length = target.value.chars().count();
             let (caret, anchor, selection) = (
                 target.caret.min(length),
@@ -5080,7 +5622,7 @@ impl Runtime {
                     .map(|(start, end)| text_edit::normalized_range(start, end, length)),
             );
             with_state(|state| {
-                if let LocalState::TextInput(editor) = &mut state.elements[element].local {
+                if let LocalState::TextInput(editor) = state.element_local_mut(element) {
                     editor.caret = caret;
                     editor.anchor = anchor;
                     editor.selection = selection;
@@ -5112,7 +5654,7 @@ impl Runtime {
                 if !state.element_is_mounted(element) {
                     return;
                 }
-                let LocalState::TextInput(editor) = &mut state.elements[element].local else {
+                let LocalState::TextInput(editor) = state.element_local_mut(element) else {
                     return;
                 };
                 match direction {
@@ -5151,7 +5693,7 @@ impl Runtime {
                 state.require_enabled_text_input(node, element, NodeOperation::CompositionStart)
             })?;
             let (caret, selection) = with_state(|state| {
-                let LocalState::TextInput(editor) = &mut state.elements[element].local else {
+                let LocalState::TextInput(editor) = state.element_local_mut(element) else {
                     unreachable!("require_enabled_text_input validated the input");
                 };
                 if editor.is_composing() {
@@ -5211,7 +5753,7 @@ impl Runtime {
                 state.require_enabled_text_input(node, element, NodeOperation::CompositionUpdate)
             })?;
             let (caret, selection) = with_state(|state| {
-                let LocalState::TextInput(editor) = &mut state.elements[element].local else {
+                let LocalState::TextInput(editor) = state.element_local_mut(element) else {
                     unreachable!("require_enabled_text_input validated the input");
                 };
                 let Some(composition) = editor.composition.as_mut() else {
@@ -5334,7 +5876,7 @@ impl Runtime {
     ) -> Result<Option<TextSnapshot>, DispatchError> {
         // 组合期间外部 value 可能已更新；候选插入编辑器当前文本并按长度夹取组合区间。
         let current_text = with_state(|state| {
-            let LocalState::TextInput(editor) = &state.elements[element].local else {
+            let LocalState::TextInput(editor) = state.element_local(element) else {
                 return Err(DispatchError::WrongKind {
                     node,
                     operation: NodeOperation::CompositionCommit,
@@ -5342,9 +5884,9 @@ impl Runtime {
             };
             Ok::<_, DispatchError>(editor.value.clone())
         })?;
-        let epoch = with_state(|state| state.elements[element].value_epoch(state));
+        let epoch = with_state(|state| state.element_value_epoch(element));
         let (before, new_text, caret) = with_state(|state| {
-            let LocalState::TextInput(editor) = &mut state.elements[element].local else {
+            let LocalState::TextInput(editor) = state.element_local_mut(element) else {
                 return Err(DispatchError::WrongKind {
                     node,
                     operation: NodeOperation::CompositionCommit,
@@ -5400,7 +5942,7 @@ impl Runtime {
 
     fn cancel_composition(&mut self, node: NodeId, element: usize) -> Result<(), DispatchError> {
         let (discarded, caret, selection) = with_state(|state| {
-            let LocalState::TextInput(editor) = &mut state.elements[element].local else {
+            let LocalState::TextInput(editor) = state.element_local_mut(element) else {
                 return Err(DispatchError::WrongKind {
                     node,
                     operation: NodeOperation::CompositionCancel,
@@ -5504,7 +6046,7 @@ impl Runtime {
         let state = self.state.clone();
         context::install(&state, || {
             let element = with_state(|state| state.element_for_node(node))?;
-            if with_state(|state| state.elements[element].local.is_composing()) {
+            if with_state(|state| state.element_local(element).is_composing()) {
                 match key {
                     Key::Enter => {
                         // 确认候选属于 IME；这里只保证按键不会进入表单提交或用户 handler。
@@ -5901,7 +6443,7 @@ impl Runtime {
     pub fn preedit(&self, label: &str) -> Option<String> {
         let state = self.state.borrow();
         let element = state.find_element(&FindTarget::Label(label.to_owned()))?;
-        match &state.elements[element].local {
+        match state.element_local(element) {
             LocalState::TextInput(editor) => editor
                 .composition
                 .as_ref()
@@ -5927,18 +6469,18 @@ impl Runtime {
 
     pub fn focused(&self) -> Option<FocusInfo> {
         let state = self.state.borrow();
-        let element = &state.elements[state.presented_focus()?];
+        let element = state.presented_focus()?;
         Some(FocusInfo {
-            tag: element.tag,
-            label: element.label(),
+            tag: state.element_tag(element),
+            label: state.element_label_text(element).map(ToOwned::to_owned),
         })
     }
 
     pub fn checked(&self, label: &str) -> Option<bool> {
         let state = self.state.borrow();
         let element = state.find_element(&FindTarget::Label(label.to_owned()))?;
-        match state.elements[element].local {
-            LocalState::Checkbox { checked } => Some(checked),
+        match state.element_local(element) {
+            LocalState::Checkbox { checked } => Some(*checked),
             _ => None,
         }
     }
@@ -6006,11 +6548,14 @@ fn contains_element(state: &State, nodes: &[MountedNode], wanted: usize) -> bool
         MountedNode::Component(id) => {
             contains_element(state, &state.components[*id].children, wanted)
         }
-        MountedNode::Show(show) => show
-            .active
-            .as_ref()
-            .is_some_and(|branch| contains_element(state, &branch.children, wanted)),
-        MountedNode::For(for_node) => {
+        MountedNode::Show(payload) => {
+            let show = state.nodes.show(*payload);
+            show.active
+                .as_ref()
+                .is_some_and(|branch| contains_element(state, &branch.children, wanted))
+        }
+        MountedNode::For(payload) => {
+            let for_node = state.nodes.for_node(*payload);
             if for_node
                 .spacers
                 .is_some_and(|(top, bottom)| top == wanted || bottom == wanted)
@@ -6032,11 +6577,14 @@ fn contains_band(state: &State, nodes: &[MountedNode], band: u64) -> bool {
         MountedNode::Text(_) => false,
         MountedNode::Element(id) => contains_band(state, &state.elements[*id].children, band),
         MountedNode::Component(id) => contains_band(state, &state.components[*id].children, band),
-        MountedNode::Show(show) => show
-            .active
-            .as_ref()
-            .is_some_and(|branch| contains_band(state, &branch.children, band)),
-        MountedNode::For(for_node) => {
+        MountedNode::Show(payload) => {
+            let show = state.nodes.show(*payload);
+            show.active
+                .as_ref()
+                .is_some_and(|branch| contains_band(state, &branch.children, band))
+        }
+        MountedNode::For(payload) => {
+            let for_node = state.nodes.for_node(*payload);
             for_node.band == band
                 || for_node.order.iter().any(|key| {
                     for_node
@@ -6053,11 +6601,12 @@ fn focus_replacement(
     before: &[usize],
     after: &[usize],
     old: usize,
+    tag: Option<&'static str>,
 ) -> Option<usize> {
     let index = before.iter().position(|id| *id == old)?;
-    let tag = state.elements[old].tag;
+    let tag = tag?;
     let live: BTreeSet<usize> = after.iter().copied().collect();
-    let same_tag = |id: &usize| live.contains(id) && state.elements[*id].tag == tag;
+    let same_tag = |id: &usize| live.contains(id) && state.element_tag(*id) == tag;
     before[index + 1..]
         .iter()
         .find(|id| same_tag(id))
@@ -6084,15 +6633,15 @@ fn focus_replacement(
         })
 }
 
-fn text_length(element: &MountedElement) -> usize {
-    match &element.local {
+fn text_length(local: &LocalState) -> usize {
+    match local {
         LocalState::TextInput(editor) => editor.value.chars().count(),
         _ => 0,
     }
 }
 
 fn abort_text_dispatch(state: &mut State, element: usize) {
-    if let LocalState::TextInput(editor) = &mut state.elements[element].local {
+    if let LocalState::TextInput(editor) = state.element_local_mut(element) {
         editor.lineage.abort_dispatch();
     }
 }
@@ -6102,7 +6651,7 @@ fn clear_history_in_nodes(state: &mut State, nodes: &[MountedNode]) {
     let mut elements = Vec::new();
     collect_elements(state, nodes, &mut elements);
     for element in elements {
-        if let LocalState::TextInput(editor) = &mut state.elements[element].local {
+        if let LocalState::TextInput(editor) = state.element_local_mut(element) {
             editor.reset();
         }
     }
@@ -6110,7 +6659,7 @@ fn clear_history_in_nodes(state: &mut State, nodes: &[MountedNode]) {
 
 /// handler 可能改写了值；刷新后把本地 caret/selection 夹回新值范围。
 fn clamp_local_edit(state: &mut State, element: usize) {
-    if let LocalState::TextInput(editor) = &mut state.elements[element].local {
+    if let LocalState::TextInput(editor) = state.element_local_mut(element) {
         editor.clamp_offsets();
     }
 }
@@ -6134,12 +6683,14 @@ fn collect_elements(state: &State, nodes: &[MountedNode], order: &mut Vec<usize>
             MountedNode::Component(id) => {
                 collect_elements(state, &state.components[*id].children, order);
             }
-            MountedNode::Show(show) => {
+            MountedNode::Show(payload) => {
+                let show = state.nodes.show(*payload);
                 if let Some(branch) = &show.active {
                     collect_elements(state, &branch.children, order);
                 }
             }
-            MountedNode::For(for_node) => {
+            MountedNode::For(payload) => {
+                let for_node = state.nodes.for_node(*payload);
                 if let Some((top, _)) = for_node.spacers {
                     order.push(top);
                 }
@@ -6169,12 +6720,14 @@ fn collect_focusable(state: &State, nodes: &[MountedNode], order: &mut Vec<usize
             MountedNode::Component(id) => {
                 collect_focusable(state, &state.components[*id].children, order);
             }
-            MountedNode::Show(show) => {
+            MountedNode::Show(payload) => {
+                let show = state.nodes.show(*payload);
                 if let Some(branch) = &show.active {
                     collect_focusable(state, &branch.children, order);
                 }
             }
-            MountedNode::For(for_node) => {
+            MountedNode::For(payload) => {
+                let for_node = state.nodes.for_node(*payload);
                 for key in &for_node.order {
                     if let Some(item) = for_node.items.get(key) {
                         collect_focusable(state, &item.children, order);
@@ -6189,17 +6742,21 @@ fn collect_focusable(state: &State, nodes: &[MountedNode], order: &mut Vec<usize
 fn collect_snapshot(state: &State, nodes: &[MountedNode], out: &mut Vec<SnapshotNode>) {
     for node in nodes {
         match node {
-            MountedNode::Text(text) => out.push(SnapshotNode::Text(text.value.clone())),
+            MountedNode::Text(payload) => {
+                out.push(SnapshotNode::Text(state.nodes.text(*payload).value.clone()));
+            }
             MountedNode::Element(id) => collect_element(state, *id, out),
             MountedNode::Component(id) => {
                 collect_snapshot(state, &state.components[*id].children, out);
             }
-            MountedNode::Show(show) => {
+            MountedNode::Show(payload) => {
+                let show = state.nodes.show(*payload);
                 if let Some(branch) = &show.active {
                     collect_snapshot(state, &branch.children, out);
                 }
             }
-            MountedNode::For(for_node) => {
+            MountedNode::For(payload) => {
+                let for_node = state.nodes.for_node(*payload);
                 if let Some((top, _)) = for_node.spacers {
                     collect_element(state, top, out);
                 }
@@ -6222,33 +6779,13 @@ fn collect_element(state: &State, id: usize, out: &mut Vec<SnapshotNode>) {
     collect_snapshot(state, &element.children, &mut children);
     out.push(SnapshotNode::Element(SnapshotElement {
         id: element.id,
-        tag: element.tag,
-        attrs: snapshot_attrs(element),
-        styles: snapshot_styles(element),
-        edit: snapshot_edit(&element.local),
-        semantics: SnapshotSemantics::new(
-            state.element_is_inherently_focusable(id),
-            snapshot_actions(state, element),
-        ),
+        tag: state.element_tag(id),
+        attrs: snapshot_attrs(state, id),
+        styles: snapshot_styles(state, id),
+        edit: snapshot_edit(state.element_local(id)),
+        semantics: state.element_semantics(id),
         children,
     }));
-}
-
-/// 已挂载的用户动作集合；焦点/组合等运行时事件不在此投影里。
-fn snapshot_actions(state: &State, element: &MountedElement) -> SnapshotActions {
-    let mut actions = SnapshotActions::default();
-    for id in &element.events {
-        let Some(event) = state.events.get(*id).and_then(Option::as_ref) else {
-            continue;
-        };
-        match event_kind(event) {
-            EventKind::Click => actions.insert(SnapshotAction::Click),
-            EventKind::Change => actions.insert(SnapshotAction::Change),
-            EventKind::Input => actions.insert(SnapshotAction::Input),
-            _ => {}
-        }
-    }
-    actions
 }
 
 /// 收集窗口化 For 的行带元数据；窗口外行没有节点，几何全靠这条记录定位。
@@ -6262,12 +6799,14 @@ fn collect_row_bands(state: &State, nodes: &[MountedNode], out: &mut Vec<Snapsho
             MountedNode::Component(id) => {
                 collect_row_bands(state, &state.components[*id].children, out);
             }
-            MountedNode::Show(show) => {
+            MountedNode::Show(payload) => {
+                let show = state.nodes.show(*payload);
                 if let Some(branch) = &show.active {
                     collect_row_bands(state, &branch.children, out);
                 }
             }
-            MountedNode::For(for_node) => {
+            MountedNode::For(payload) => {
+                let for_node = state.nodes.for_node(*payload);
                 if let (Some(row_height), Some((top, _))) = (for_node.row_height, for_node.spacers)
                 {
                     out.push(SnapshotRowBand {
@@ -6310,13 +6849,16 @@ fn snapshot_edit(local: &LocalState) -> Option<TextEditState> {
 /// 只复制已提交的声明；inline 槽的当前值在刷新时已经算好。
 /// 没有 inline 声明时借用 class 切片，避免每个元素都分配。
 fn snapshot_styles(
-    element: &MountedElement,
+    state: &State,
+    element: usize,
 ) -> std::borrow::Cow<'static, [zenui_style::StyleDeclaration]> {
-    if element.inline_styles.is_empty() {
-        return std::borrow::Cow::Borrowed(element.class_styles);
+    let class_styles = state.element_class_styles(element);
+    let inline_styles = state.element_inline_styles(element);
+    if inline_styles.is_empty() {
+        return std::borrow::Cow::Borrowed(class_styles);
     }
-    let mut styles = element.class_styles.to_vec();
-    styles.extend(element.inline_styles.iter().filter_map(|style| {
+    let mut styles = class_styles.to_vec();
+    styles.extend(inline_styles.iter().filter_map(|style| {
         style
             .current
             .map(|value| zenui_style::StyleDeclaration::inline(style.property, value))
@@ -6324,9 +6866,9 @@ fn snapshot_styles(
     std::borrow::Cow::Owned(styles)
 }
 
-fn snapshot_attrs(element: &MountedElement) -> Vec<SnapshotAttr> {
-    let mut attrs: Vec<SnapshotAttr> = element
-        .attrs
+fn snapshot_attrs(state: &State, element: usize) -> Vec<SnapshotAttr> {
+    let mut attrs: Vec<SnapshotAttr> = state
+        .element_attrs(element)
         .iter()
         .filter_map(|attr| {
             attr.current.as_ref().map(|current| SnapshotAttr {
@@ -6339,17 +6881,17 @@ fn snapshot_attrs(element: &MountedElement) -> Vec<SnapshotAttr> {
         })
         .collect();
     // 无 `checked` 绑定的 checkbox 由本地编辑状态决定呈现；有绑定时两者在已提交帧一致。
-    if let LocalState::Checkbox { checked } = element.local {
+    if let LocalState::Checkbox { checked } = state.element_local(element) {
         match attrs.iter_mut().find(|attr| attr.name == "checked") {
-            Some(attr) => attr.value = SnapshotValue::Bool(checked),
+            Some(attr) => attr.value = SnapshotValue::Bool(*checked),
             None => attrs.push(SnapshotAttr {
                 name: "checked",
-                value: SnapshotValue::Bool(checked),
+                value: SnapshotValue::Bool(*checked),
             }),
         }
     }
     // 文本输入呈现编辑器当前文本；`value` 绑定可能尚未追上本地编辑。
-    if let LocalState::TextInput(editor) = &element.local
+    if let LocalState::TextInput(editor) = state.element_local(element)
         && let Some(SnapshotValue::Text(value)) = attrs
             .iter_mut()
             .find(|attr| attr.name == "value")
@@ -6363,17 +6905,19 @@ fn snapshot_attrs(element: &MountedElement) -> Vec<SnapshotAttr> {
 fn collect_texts(state: &State, nodes: &[MountedNode], texts: &mut Vec<String>) {
     for node in nodes {
         match node {
-            MountedNode::Text(text) => texts.push(text.value.clone()),
+            MountedNode::Text(payload) => texts.push(state.nodes.text(*payload).value.clone()),
             MountedNode::Element(id) => collect_texts(state, &state.elements[*id].children, texts),
             MountedNode::Component(id) => {
                 collect_texts(state, &state.components[*id].children, texts);
             }
-            MountedNode::Show(show) => {
+            MountedNode::Show(payload) => {
+                let show = state.nodes.show(*payload);
                 if let Some(branch) = &show.active {
                     collect_texts(state, &branch.children, texts);
                 }
             }
-            MountedNode::For(for_node) => {
+            MountedNode::For(payload) => {
+                let for_node = state.nodes.for_node(*payload);
                 for key in &for_node.order {
                     if let Some(item) = for_node.items.get(key) {
                         collect_texts(state, &item.children, texts);
@@ -6394,12 +6938,14 @@ fn collect_items(state: &State, nodes: &[MountedNode], items: &mut Vec<ItemInfo>
             MountedNode::Component(id) => {
                 collect_items(state, &state.components[*id].children, items);
             }
-            MountedNode::Show(show) => {
+            MountedNode::Show(payload) => {
+                let show = state.nodes.show(*payload);
                 if let Some(branch) = &show.active {
                     collect_items(state, &branch.children, items);
                 }
             }
-            MountedNode::For(for_node) => {
+            MountedNode::For(payload) => {
+                let for_node = state.nodes.for_node(*payload);
                 for key in &for_node.order {
                     if let Some(item) = for_node.items.get(key) {
                         items.push(ItemInfo {
@@ -6466,12 +7012,12 @@ mod history_tests {
         let element = &state.elements[slot];
         assert_eq!(element.id, input, "the dead slot keeps the stale NodeId");
         assert!(
-            matches!(element.local, LocalState::None),
-            "the dead slot releases its text input"
+            element.children.is_empty() && state.element_aux_opt(slot).is_none(),
+            "the dead slot releases its children and auxiliary payload"
         );
         assert!(
-            element.attrs.is_empty() && element.events.is_empty() && element.children.is_empty(),
-            "the dead slot releases its payload"
+            state.nodes.get(input.node()).is_err(),
+            "the arena node rejects the stale identity"
         );
         assert!(
             state.free_elements.contains(&slot),
@@ -7241,7 +7787,7 @@ mod arena_tests {
                 if let Resource::Node(node) = resource
                     && let Ok(slot) = state.nodes.get(*node)
                 {
-                    nodes.push((*node, slot.kind));
+                    nodes.push((*node, slot.kind.expect("listed nodes are live")));
                 }
             }
         }
@@ -7260,10 +7806,18 @@ mod arena_tests {
         let nodes = owned_nodes(&state);
 
         assert!(count_kind(&nodes, NodeKindTag::Element) >= 5);
-        assert!(count_kind(&nodes, NodeKindTag::Text) >= 3);
+        let texts = count_kind(&nodes, NodeKindTag::Text);
+        assert!(texts >= 3);
         assert!(count_kind(&nodes, NodeKindTag::Component) >= 3);
         assert_eq!(count_kind(&nodes, NodeKindTag::Show), 1);
         assert_eq!(count_kind(&nodes, NodeKindTag::For), 1);
+        assert_eq!(
+            state.nodes.texts.live(),
+            texts,
+            "every text node owns one text payload"
+        );
+        assert_eq!(state.nodes.shows.live(), 1);
+        assert_eq!(state.nodes.forces.live(), 1);
 
         let mut roots = 0;
         let mut elements = 0;
@@ -7295,12 +7849,22 @@ mod arena_tests {
                         *node,
                         "the element resolves back to its node identity"
                     );
-                    assert_eq!(element.tree, Some(TreeSlot::Window(window.key)));
-                    assert_ne!(
-                        element.aux,
-                        AuxHandles::NONE,
-                        "every element owns auxiliary handles"
+                    assert_eq!(
+                        state.tree_for_element(payload),
+                        Some(TreeSlot::Window(window.key))
                     );
+                    let aux = state.element_aux(payload);
+                    for handle in [
+                        aux.attrs.raw(),
+                        aux.class_styles.raw(),
+                        aux.inline_styles.raw(),
+                        aux.events.raw(),
+                        aux.edit.raw(),
+                        aux.bindings.raw(),
+                        aux.semantics.raw(),
+                    ] {
+                        assert_ne!(handle, u32::MAX, "every element owns auxiliary handles");
+                    }
                 }
                 NodeKindTag::Component => {
                     let payload = slot.payload as usize;
@@ -7330,8 +7894,8 @@ mod arena_tests {
             .expect("the active branch")
             .id();
         assert_eq!(
-            branch.presentation_key().node(),
-            Some(branch.node()),
+            branch.presentation_key().raw(),
+            branch.node().raw(),
             "NodeId and PresentationKey share one encoding"
         );
 
@@ -7339,7 +7903,15 @@ mod arena_tests {
             let state = app.state.borrow();
             (state.nodes.live(), state.nodes.storage_len())
         };
-        let aux_before = app.state.borrow().nodes.aux_live();
+        let (aux_before, texts_before, shows_before, forces_before) = {
+            let state = app.state.borrow();
+            (
+                state.nodes.aux_live(),
+                state.nodes.texts.live(),
+                state.nodes.shows.live(),
+                state.nodes.forces.live(),
+            )
+        };
         assert_eq!(aux_before % 7, 0);
 
         app.click_label("toggle-show").expect("hide the branch");
@@ -7366,6 +7938,13 @@ mod arena_tests {
                 aux_before - 14,
                 "both retired elements return their auxiliary handles"
             );
+            assert_eq!(
+                state.nodes.texts.live(),
+                texts_before - 1,
+                "the branch text payload is released"
+            );
+            assert_eq!(state.nodes.shows.live(), shows_before);
+            assert_eq!(state.nodes.forces.live(), forces_before);
             assert!(
                 matches!(
                     state.nodes.get(branch.node()),
@@ -7397,5 +7976,8 @@ mod arena_tests {
             aux_before,
             "the remount reserves a fresh handle set"
         );
+        assert_eq!(state.nodes.texts.live(), texts_before);
+        assert_eq!(state.nodes.shows.live(), shows_before);
+        assert_eq!(state.nodes.forces.live(), forces_before);
     }
 }
