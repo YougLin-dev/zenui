@@ -2,7 +2,7 @@
 
 本页记录 #291：以公开模板 `templates/minimal-app` 为入口，检查编辑 ZenUI 应用时的补全、跳转、悬停文档、宏诊断、编译错误与快速修复。检查由脚本化 LSP 客户端完成，不经过具体编辑器界面。
 
-**状态：已完成；Rust 表达式内的补全、跳转、悬停与宏诊断可用；`view!` 的标签与属性补全缺失，记录为 [#313](https://github.com/ZenUIOrg/zenui/issues/313)。**
+**状态：已完成；Rust 表达式内的补全、跳转、悬停与宏诊断可用；`view!` 的标签与属性补全缺失，记录为 [#313](https://github.com/ZenUIOrg/zenui/issues/313)，决定以 [视图语法参考](../SDK/视图语法参考.md) 提供权威词表。**
 
 验收日期：2026-11-26。功能基线为 `main` 的 `49b6c3e`（#312 合并提交）加本工单的 `Runtime` 文档补充。
 
@@ -28,7 +28,7 @@
 | 检查项 | 结果 | 读数 |
 | --- | --- | --- |
 | `view!` 表达式内补全 | 通过 | `count.` 后返回 `get`、`set`、`with`、`try_into`、`into`、`clone`、`to_owned`、`clone_into`、`clone_from` |
-| 标签、属性与组件 props 补全 | 缺失 | `<` 后返回空列表；记录为 [#313](https://github.com/ZenUIOrg/zenui/issues/313) |
+| 标签、属性与组件 props 补全 | 缺失 | `<` 后返回空列表；记录为 [#313](https://github.com/ZenUIOrg/zenui/issues/313)，以 [视图语法参考](../SDK/视图语法参考.md) 提供词表 |
 | 跳转到定义 | 通过 | `view!` 中的 `Runtime` 跳到 `src/runtime.rs` 的结构体定义 |
 | 悬停文档 | 通过 | `Runtime`、`TextAssets`、`load_text_assets` 都返回中文文档；`Runtime` 与 `new` 的文档由本工单补齐 |
 | 宏错误范围 | 通过 | 未知 class 指向 token 本身（第 6 行 22–40 列）；未知事件指向事件名（第 13 行 20–27 列）；非法属性值指向字符串（第 17 行 32 列），并给出 `ValueSlot<zenui::Length>: From<&str>` 与引入该约束的调用位置 |
@@ -38,7 +38,7 @@
 
 ## 缺陷与文档补充
 
-- [#313](https://github.com/ZenUIOrg/zenui/issues/313)：`view!` 内没有标签、属性或组件 props 补全；需要决定文档方案或工具方案。
+- [#313](https://github.com/ZenUIOrg/zenui/issues/313)：`view!` 内没有标签、属性或组件 props 补全。决定采用方案 1：新增 [视图语法参考](../SDK/视图语法参考.md)，并在模板 README 与本页链接。语言服务器没有过程宏补全钩子，工具方案不在本切片承诺。
 - `Runtime` 与 `Runtime::new` 原先没有文档，悬停只显示签名；本工单在 `src/runtime.rs` 补上类型与构造函数的契约说明。`TextAssets` 与 `load_text_assets` 已有完整文档，悬停直接可用。
 - 悬停文档中的 intra-doc 链接按 rustdoc 默认规则指向 docs.rs 上的本地 crate（如 `https://docs.rs/minimal_app/...`），在编辑器中打开会 404；正文不受影响。
 

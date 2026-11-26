@@ -3,6 +3,8 @@
 一个最小的 ZenUI 原生应用：窗口标题为 `ZenUI Starter`，按钮增加计数，关闭窗口退出。
 它随模板携带固定字体 Noto Sans SC，界面包含一行中文样例；只依赖本地 `zenui` 与 `zenui-windows`，不依赖 demo crate。
 
+`view!` 的标签、属性、事件与组件 props 词表见[视图语法参考](https://github.com/ZenUIOrg/zenui/blob/main/docs/SDK/视图语法参考.md)。编辑器目前不补全 `view!` 的标签与属性；参考页是这些名称的权威列表。
+
 ## 运行
 
 在 Windows 11 上，从模板目录执行：
