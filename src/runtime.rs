@@ -73,6 +73,8 @@ struct MountedTree {
     owner: u32,
     focused: Option<usize>,
     settle_before: Option<Vec<usize>>,
+    /// 只在这棵树出现有效呈现变化时取新值；不同树互不影响。
+    revision: u64,
 }
 
 /// 宿主为一行带请求的挂载窗口；`count` 为零表示该行带当前不需要行。
@@ -100,6 +102,15 @@ struct SessionState {
 pub(crate) struct State {
     pub(crate) id: u32,
     pub(crate) read_only: u32,
+    /// 正在挂载或刷新的树；元素挂载时记录自己的树，查找为 O(1)。
+    building_tree: Option<TreeKey>,
+    /// 树 revision 的唯一分配器；每个树只在自身变化时取新值。
+    next_tree_revision: u64,
+    /// 自上次刷新以来出现可见变化的树；树在刷新期间被临时取出，
+    /// 因此不能把标记存放在 `MountedTree` 内。
+    dirty_trees: BTreeSet<TreeKey>,
+    /// 自上次公开 `Runtime::refresh` 报告以来 revision 推进的树。
+    changed_trees: BTreeSet<TreeKey>,
     pub(crate) write_error: Option<WriteError>,
     pub(crate) core: zenui_core::Runtime,
     pub(crate) phase: Phase,
@@ -151,8 +162,6 @@ pub(crate) struct State {
     next_close_epoch: u64,
     /// 窗口打开/关闭/隐藏/显示时递增；原生宿主据此跳过无变化的扫描。
     window_revision: u64,
-    /// 本地编辑状态（焦点、caret、selection、组合、勾选）的版本。
-    presentation_revision: u64,
     /// 已构建的 presentation snapshot 次数；宿主与基准用它验证滚动不重建快照。
     presentation_builds: Cell<u64>,
     /// 宿主为窗口化 For 声明的行窗口，按行带键索引。
@@ -215,6 +224,32 @@ pub struct FocusInfo {
     pub label: Option<String>,
 }
 
+/// 自上次公开 [`Runtime::refresh`] 报告以来的有效呈现变化。
+///
+/// 只统计会改变 presentation snapshot 的变化；空 click、相等写入与纯
+/// runtime 计数器变化都不在这里出现。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RefreshReport {
+    /// 任一树推进了 revision。
+    pub changed: bool,
+    /// headless 根树推进了 revision。
+    pub root_changed: bool,
+    /// revision 推进的窗口键，按字典序排列。
+    pub changed_windows: Vec<&'static str>,
+}
+
+impl RefreshReport {
+    /// 是否有任何有效呈现变化。
+    pub const fn changed(&self) -> bool {
+        self.changed
+    }
+
+    /// revision 推进的窗口键。
+    pub fn changed_windows(&self) -> &[&'static str] {
+        &self.changed_windows
+    }
+}
+
 impl State {
     fn new() -> Self {
         let mut owners = BTreeMap::new();
@@ -232,6 +267,10 @@ impl State {
         Self {
             id: NEXT_RUNTIME.fetch_add(1, Ordering::Relaxed),
             read_only: 0,
+            building_tree: None,
+            next_tree_revision: 1,
+            dirty_trees: BTreeSet::new(),
+            changed_trees: BTreeSet::new(),
             write_error: None,
             core: zenui_core::Runtime::new(),
             phase: Phase::Idle,
@@ -271,7 +310,6 @@ impl State {
             close_replies: Vec::new(),
             next_close_epoch: 1,
             window_revision: 0,
-            presentation_revision: 0,
             presentation_builds: Cell::new(0),
             row_windows: BTreeMap::new(),
             owner_bands: BTreeMap::new(),
@@ -307,6 +345,7 @@ impl State {
             editor.dispatch(value, epoch)
         };
         self.push_text_trace(trace);
+        self.mark_element_changed(element);
     }
 
     /// 每次元素挂载分配新的 generation；旧挂载的身份不会命中重新挂载的元素。
@@ -329,7 +368,8 @@ impl State {
         slot
     }
 
-    fn place_element(&mut self, slot: usize, element: MountedElement) {
+    fn place_element(&mut self, slot: usize, mut element: MountedElement) {
+        element.tree = self.building_tree;
         if slot == self.elements.len() {
             self.elements.push(element);
         } else {
@@ -377,6 +417,7 @@ impl State {
             id,
             tag,
             owner: 0,
+            tree: None,
             attrs: Vec::new(),
             class_styles: &[],
             inline_styles: Vec::new(),
@@ -467,6 +508,8 @@ impl State {
         if record.visible {
             record.visible = false;
             self.bump_window_revision();
+            self.mark_tree_changed(TreeKey::Window(key));
+            self.commit_tree_revision(TreeKey::Window(key));
         }
     }
 
@@ -477,6 +520,8 @@ impl State {
         if !record.visible {
             record.visible = true;
             self.bump_window_revision();
+            self.mark_tree_changed(TreeKey::Window(key));
+            self.commit_tree_revision(TreeKey::Window(key));
         }
     }
 
@@ -484,15 +529,60 @@ impl State {
         self.window_revision = self.window_revision.wrapping_add(1);
     }
 
-    /// 记录一次快照可见的本地状态变化；宿主据此决定是否重建快照。
-    fn bump_presentation(&mut self) {
-        self.presentation_revision = self.presentation_revision.wrapping_add(1);
+    /// 标记一棵树的已提交呈现需要推进 revision。
+    ///
+    /// 刷新期间树暂时不在 `trees` 中，标记仍必须生效，因此使用独立集合。
+    fn mark_tree_changed(&mut self, key: TreeKey) {
+        self.dirty_trees.insert(key);
+    }
+
+    /// 标记元素所属的树；元素已释放或尚未挂载时是静默无操作。
+    fn mark_element_changed(&mut self, element: usize) {
+        if let Some(key) = self.tree_for_element(element) {
+            self.mark_tree_changed(key);
+        }
+    }
+
+    /// 标记当前正在挂载/刷新的树；没有树上下文时无操作。
+    fn mark_building_tree_changed(&mut self) {
+        if let Some(key) = self.building_tree {
+            self.mark_tree_changed(key);
+        }
+    }
+
+    /// 应用级变化（例如 appearance）影响所有已提交树。
+    fn mark_all_trees_changed(&mut self) {
+        let keys: Vec<TreeKey> = self.trees.keys().copied().collect();
+        for key in keys {
+            self.mark_tree_changed(key);
+        }
+    }
+
+    /// 分配一个全局唯一的树 revision；只用于让不同树/重新打开的窗口不撞号。
+    fn allocate_tree_revision(&mut self) -> u64 {
+        let revision = self.next_tree_revision;
+        self.next_tree_revision = self.next_tree_revision.wrapping_add(1).max(1);
+        revision
+    }
+
+    /// 在刷新末提交本树的有效变化；返回是否推进了 revision。
+    fn commit_tree_revision(&mut self, key: TreeKey) -> bool {
+        if !self.dirty_trees.remove(&key) {
+            return false;
+        }
+        if !self.trees.contains_key(&key) {
+            return false;
+        }
+        let revision = self.allocate_tree_revision();
+        if let Some(tree) = self.trees.get_mut(&key) {
+            tree.revision = revision;
+        }
+        self.changed_trees.insert(key);
+        true
     }
 
     fn tree_for_element(&self, element: usize) -> Option<TreeKey> {
-        self.trees
-            .iter()
-            .find_map(|(key, tree)| contains_element(self, &tree.nodes, element).then_some(*key))
+        self.elements.get(element).and_then(|element| element.tree)
     }
 
     /// 指定树里是否还有这个行带的行窗口化 For；过期行带由宿主忽略。
@@ -527,16 +617,21 @@ impl State {
     }
 
     fn set_focused_in(&mut self, key: TreeKey, focused: Option<usize>) {
-        if let Some(tree) = self.tree_mut(key)
-            && tree.focused != focused
-        {
+        let changed = self.tree_mut(key).is_some_and(|tree| {
+            if tree.focused == focused {
+                return false;
+            }
             tree.focused = focused;
-            self.bump_presentation();
-            // 焦点变化结束所有输入的连续输入 run。
-            for element in &mut self.elements {
-                if let LocalState::TextInput(editor) = &mut element.local {
-                    editor.history.break_run();
-                }
+            true
+        });
+        if !changed {
+            return;
+        }
+        self.mark_tree_changed(key);
+        // 焦点变化结束所有输入的连续输入 run。
+        for element in &mut self.elements {
+            if let LocalState::TextInput(editor) = &mut element.local {
+                editor.history.break_run();
             }
         }
     }
@@ -696,7 +791,7 @@ impl State {
             return;
         }
         self.appearance = appearance;
-        self.bump_presentation();
+        self.mark_all_trees_changed();
         self.bump(DepKey::Appearance);
     }
 
@@ -1091,7 +1186,7 @@ impl State {
             }
             _ => return,
         }
-        self.bump_presentation();
+        self.mark_element_changed(element);
     }
 
     fn text_input(&self, target: &FindTarget) -> Option<usize> {
@@ -1236,10 +1331,18 @@ impl State {
         if editor.is_composing() {
             return false;
         }
+        let changed = editor.caret != offset
+            || editor.anchor != offset
+            || editor.selection != Some((offset, offset));
         editor.caret = offset;
         editor.anchor = offset;
         editor.selection = Some((offset, offset));
-        self.bump_presentation();
+        if changed {
+            self.mark_element_changed(element);
+            if let Some(key) = self.tree_for_element(element) {
+                self.commit_tree_revision(key);
+            }
+        }
         true
     }
 
@@ -1281,9 +1384,7 @@ impl State {
     }
 
     fn element_is_mounted(&self, element: usize) -> bool {
-        self.trees
-            .values()
-            .any(|tree| contains_element(self, &tree.nodes, element))
+        self.tree_for_element(element).is_some()
     }
 
     /// 旧焦点不在新的可聚焦集合时，下一次结算才产生接任目标。
@@ -1340,6 +1441,8 @@ pub struct MountedElement {
     id: NodeId,
     tag: &'static str,
     owner: u32,
+    /// 元素所属的已提交树；挂载时由构建上下文写入，释放后为 `None`。
+    tree: Option<TreeKey>,
     attrs: Vec<MountedAttr>,
     class_styles: &'static [zenui_style::StyleDeclaration],
     inline_styles: Vec<MountedInlineStyle>,
@@ -1396,7 +1499,7 @@ pub struct MountedAttr {
     current: Option<AttrCurrent>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 enum AttrCurrent {
     Text(String),
     Bool(bool),
@@ -2010,6 +2113,7 @@ fn ensure_spacers(state: &mut State, owner: u32) -> (usize, usize) {
                 id,
                 tag: "view",
                 owner,
+                tree: None,
                 attrs: vec![MountedAttr {
                     name: "role",
                     value: AttrValue::Text(TextSlot::Static("spacer")),
@@ -2034,14 +2138,23 @@ fn ensure_spacers(state: &mut State, owner: u32) -> (usize, usize) {
 /// 更新 spacer 的已提交高度；数量和单位一起保留，em 在场景里按最终字号解析。
 fn set_spacer_height(state: &mut State, spacer: usize, rows: usize, row_height: Length) {
     let height = rows_height(row_height, rows);
-    let element = &mut state.elements[spacer];
-    if let Some(style) = element
-        .inline_styles
-        .iter_mut()
-        .find(|style| style.property == Property::Height)
-    {
+    let changed = {
+        let element = &mut state.elements[spacer];
+        let Some(style) = element
+            .inline_styles
+            .iter_mut()
+            .find(|style| style.property == Property::Height)
+        else {
+            return;
+        };
+        let next = Some(StyleValue::Length(height));
+        let changed = style.current != next;
+        style.current = next;
         style.slot = StyleSlot::Length(ValueSlot::Static(height));
-        style.current = Some(StyleValue::Length(height));
+        changed
+    };
+    if changed {
+        state.mark_element_changed(spacer);
     }
 }
 
@@ -2132,19 +2245,53 @@ impl Drop for PhaseGuard {
     }
 }
 
+/// 挂载/刷新期间指定元素归属的树；Drop 恢复调用前的上下文。
+struct TreeContextGuard {
+    previous: Option<TreeKey>,
+}
+
+impl TreeContextGuard {
+    fn enter(key: TreeKey) -> Self {
+        let previous = with_state(|state| {
+            let previous = state.building_tree;
+            state.building_tree = Some(key);
+            previous
+        });
+        Self { previous }
+    }
+}
+
+impl Drop for TreeContextGuard {
+    fn drop(&mut self) {
+        with_state(|state| state.building_tree = self.previous);
+    }
+}
+
+fn with_tree_context<R>(key: TreeKey, f: impl FnOnce() -> R) -> R {
+    let _guard = TreeContextGuard::enter(key);
+    f()
+}
+
 /// 刷新期间临时借出一棵树；无论正常返回还是 unwind 都把树放回。
 struct TreeRefreshGuard {
     key: TreeKey,
     tree: Option<MountedTree>,
     previous_phase: Phase,
+    previous_tree: Option<TreeKey>,
 }
 
 impl TreeRefreshGuard {
-    fn new(key: TreeKey, tree: MountedTree, previous_phase: Phase) -> Self {
+    fn new(
+        key: TreeKey,
+        tree: MountedTree,
+        previous_phase: Phase,
+        previous_tree: Option<TreeKey>,
+    ) -> Self {
         Self {
             key,
             tree: Some(tree),
             previous_phase,
+            previous_tree,
         }
     }
 
@@ -2158,7 +2305,10 @@ impl TreeRefreshGuard {
 
     fn restore(mut self) {
         if let Some(tree) = self.tree.take() {
-            with_state(|state| state.put_tree(self.key, tree));
+            with_state(|state| {
+                state.put_tree(self.key, tree);
+                state.building_tree = self.previous_tree;
+            });
         }
     }
 }
@@ -2168,6 +2318,7 @@ impl Drop for TreeRefreshGuard {
         if let Some(tree) = self.tree.take() {
             with_state(|state| {
                 state.put_tree(self.key, tree);
+                state.building_tree = self.previous_tree;
                 state.refresh_focus = None;
                 state.window_focus_dropped = None;
                 state.phase = self.previous_phase;
@@ -2431,7 +2582,7 @@ impl Runtime {
                     return Err(MountError::Panic(panic));
                 }
             };
-            let mut tree = match self.mount_plan(plan, 0) {
+            let mut tree = match with_tree_context(TreeKey::Root, || self.mount_plan(plan, 0)) {
                 Ok(tree) => tree,
                 Err(error) => {
                     with_state(State::release_root_resources);
@@ -2450,11 +2601,13 @@ impl Runtime {
                         owner: 0,
                         focused: None,
                         settle_before: None,
+                        revision: 0,
                     },
                 );
+                state.mark_tree_changed(TreeKey::Root);
                 state.phase = Phase::Idle;
             });
-            self.refresh()
+            self.refresh_internal()
         })
     }
 
@@ -2806,13 +2959,14 @@ impl Runtime {
                 self.abort_open(key, activation, owner, None);
                 return Err(WindowError::Command(CommandError::MissingHandler(id)));
             }
-            let tree = match self.mount_plan(plan, owner) {
-                Ok(tree) => tree,
-                Err(error) => {
-                    self.abort_open(key, activation, owner, None);
-                    return Err(WindowError::Mount(error));
-                }
-            };
+            let tree =
+                match with_tree_context(TreeKey::Window(key), || self.mount_plan(plan, owner)) {
+                    Ok(tree) => tree,
+                    Err(error) => {
+                        self.abort_open(key, activation, owner, None);
+                        return Err(WindowError::Mount(error));
+                    }
+                };
             if let Some(fault) = with_state(|state| state.fault.take()) {
                 self.abort_open(key, activation, owner, Some(tree));
                 return Err(WindowError::Mount(MountError::Context {
@@ -2828,11 +2982,13 @@ impl Runtime {
                         owner,
                         focused: None,
                         settle_before: None,
+                        revision: 0,
                     },
                 );
+                state.mark_tree_changed(TreeKey::Window(key));
                 state.phase = Phase::Idle;
             });
-            if let Err(error) = self.refresh() {
+            if let Err(error) = self.refresh_internal() {
                 let nodes = with_state(|state| {
                     state
                         .trees
@@ -3613,7 +3769,7 @@ impl Runtime {
                     return false;
                 }
                 state.row_windows.insert(band, request);
-                state.bump_presentation();
+                state.mark_tree_changed(key);
                 true
             });
             if changed {
@@ -3623,7 +3779,16 @@ impl Runtime {
         })
     }
 
-    pub fn refresh(&mut self) -> Result<(), MountError> {
+    /// 刷新全部已提交树，并返回自上次报告以来的有效呈现变化。
+    ///
+    /// 报告是累计的：命令内部的刷新不会丢弃变化，调用方可以在一个 turn
+    /// 结束后读取它，看到本 turn 推进过 revision 的树。
+    pub fn refresh(&mut self) -> Result<RefreshReport, MountError> {
+        self.refresh_internal()?;
+        Ok(self.take_refresh_report())
+    }
+
+    pub(crate) fn refresh_internal(&mut self) -> Result<(), MountError> {
         if self.tree_keys().is_empty() {
             return Err(MountError::Component("no committed interface is mounted"));
         }
@@ -3635,27 +3800,45 @@ impl Runtime {
         self.settle_focus()
     }
 
+    /// 取走累计的树 revision 变化，组装公开报告。
+    fn take_refresh_report(&mut self) -> RefreshReport {
+        let mut state = self.state.borrow_mut();
+        let keys = std::mem::take(&mut state.changed_trees);
+        let mut report = RefreshReport::default();
+        for key in keys {
+            if !state.trees.contains_key(&key) {
+                continue;
+            }
+            match key {
+                TreeKey::Root => report.root_changed = true,
+                TreeKey::Window(key) => report.changed_windows.push(key),
+            }
+        }
+        report.changed = report.root_changed || !report.changed_windows.is_empty();
+        report
+    }
+
     fn tree_keys(&self) -> Vec<TreeKey> {
         self.state.borrow().trees.keys().copied().collect()
     }
 
     fn refresh_all_once(&mut self) -> Result<(), MountError> {
-        // 刷新会重新绑定组件并可能改写文本、属性和可见性；即使没有计数器
-        // 变化，也必须让宿主知道快照可能过期。
-        self.state.borrow_mut().bump_presentation();
         for key in self.tree_keys() {
             self.refresh_tree_once(key)?;
         }
         Ok(())
     }
 
-    fn refresh_tree_once(&mut self, key: TreeKey) -> Result<(), MountError> {
+    /// 刷新一棵树；返回本次是否推进了这棵树的 revision。
+    fn refresh_tree_once(&mut self, key: TreeKey) -> Result<bool, MountError> {
         let state = self.state.clone();
         context::install(&state, || {
-            let (taken, previous_phase) = with_state(|state| {
+            let (taken, previous_phase, previous_tree) = with_state(|state| {
                 state.fault = None;
                 let previous_phase = state.phase;
+                let previous_tree = state.building_tree;
                 state.phase = Phase::Binding;
+                state.building_tree = Some(key);
                 let focused = state.focused_in(key);
                 // 窗口化 For 在刷新里据此判断聚焦行是否仍在挂载窗口内。
                 state.refresh_focus = focused;
@@ -3663,13 +3846,16 @@ impl Runtime {
                 if let Some(entry) = state.tree_mut(key) {
                     entry.settle_before = settle_before;
                 }
-                (state.take_tree(key), previous_phase)
+                (state.take_tree(key), previous_phase, previous_tree)
             });
             let Some(tree) = taken else {
-                with_state(|state| state.refresh_focus = None);
-                return Ok(());
+                with_state(|state| {
+                    state.refresh_focus = None;
+                    state.building_tree = previous_tree;
+                });
+                return Ok(false);
             };
-            let mut guard = TreeRefreshGuard::new(key, tree, previous_phase);
+            let mut guard = TreeRefreshGuard::new(key, tree, previous_phase, previous_tree);
             let result = catch_panic(std::panic::AssertUnwindSafe(|| {
                 self.refresh_nodes(guard.nodes())
             }));
@@ -3693,11 +3879,13 @@ impl Runtime {
                 state.phase = previous_phase;
                 state.fault
             });
+            // revision 在焦点清理之后提交，聚焦行被窗口卸载也算本树变化。
+            let changed = with_state(|state| state.commit_tree_revision(key));
             result?;
             if let Some(fault) = fault {
                 return Err(State::context_error(fault));
             }
-            Ok(())
+            Ok(changed)
         })
     }
 
@@ -3884,6 +4072,7 @@ impl Runtime {
                             id,
                             tag,
                             owner,
+                            tree: None,
                             attrs,
                             class_styles: plan.class_styles,
                             inline_styles,
@@ -4012,7 +4201,11 @@ impl Runtime {
     fn refresh_node(&mut self, node: &mut MountedNode) -> Result<(), MountError> {
         match node {
             MountedNode::Text(text) => {
-                text.value = text.slot.evaluate();
+                let next = text.slot.evaluate();
+                if text.value != next {
+                    text.value = next;
+                    with_state(State::mark_building_tree_changed);
+                }
                 Ok(())
             }
             MountedNode::Element(id) => {
@@ -4037,8 +4230,9 @@ impl Runtime {
         // 属性求值会读取用户 memo；panic 时 guard 把旧 attrs/styles 放回元素，
         // 已提交界面因此保持完整。
         let mut scratch = ElementScratchGuard::take(id);
+        let mut attrs_changed = false;
         for attr in scratch.attrs_mut() {
-            attr.current = match &attr.value {
+            let next = match &attr.value {
                 AttrValue::Text(slot) => Some(AttrCurrent::Text(slot.evaluate())),
                 AttrValue::Bool(slot) => Some(AttrCurrent::Bool(slot.evaluate())),
                 AttrValue::ResultBool(ResultBoolValue::Field(field)) => {
@@ -4048,9 +4242,18 @@ impl Runtime {
                     memo.get().ok().map(AttrCurrent::Bool)
                 }
             };
+            if attr.current.as_ref() != next.as_ref() {
+                attrs_changed = true;
+            }
+            attr.current = next;
         }
+        let mut styles_changed = false;
         for style in scratch.styles_mut() {
-            style.current = Some(style.slot.evaluate());
+            let next = Some(style.slot.evaluate());
+            if style.current != next {
+                styles_changed = true;
+            }
+            style.current = next;
         }
         // 值绑定的写入代数要在同一份新属性上读取，且不能嵌套借用 State。
         let (committed, epoch) = with_state(|state| {
@@ -4077,6 +4280,7 @@ impl Runtime {
         with_state(|state| {
             let attrs = scratch.take_attrs();
             let styles = scratch.take_styles();
+            let mut local_changed = false;
             let event = {
                 let element = &mut state.elements[id];
                 if let LocalState::Checkbox { checked } = &mut element.local
@@ -4084,8 +4288,10 @@ impl Runtime {
                         .iter()
                         .find(|attr| attr.name == "checked")
                         .and_then(|attr| attr.current.clone())
+                    && *checked != value
                 {
                     *checked = value;
+                    local_changed = true;
                 }
                 element.attrs = attrs;
                 element.inline_styles = styles;
@@ -4095,7 +4301,19 @@ impl Runtime {
                 }
             };
             if let Some(event) = event {
+                // stale settlement 与未归一化的 settlement 不改变屏幕上的文本。
+                local_changed |= matches!(
+                    event,
+                    TextTrace::Settlement {
+                        normalized: true,
+                        ..
+                    } | TextTrace::ExternalReset { .. }
+                        | TextTrace::CompositionCancelledByReset { .. }
+                );
                 state.push_text_trace(event);
+            }
+            if attrs_changed || styles_changed || local_changed {
+                state.mark_element_changed(id);
             }
         });
     }
@@ -4113,7 +4331,8 @@ impl Runtime {
         } else {
             None
         };
-        if show.active.as_ref().map(|branch| branch.which) == wanted {
+        let branch_changed = show.active.as_ref().map(|branch| branch.which) != wanted;
+        if !branch_changed {
             if let Some(branch) = &mut show.active {
                 return self.refresh_nodes(&mut branch.children);
             }
@@ -4186,6 +4405,9 @@ impl Runtime {
             });
         }
         show.active = replacement;
+        if branch_changed {
+            with_state(State::mark_building_tree_changed);
+        }
         Ok(())
     }
 
@@ -4226,6 +4448,10 @@ impl Runtime {
             for_node.rows = Some(rows);
         }
         let total = for_node.entries.len();
+        let previous_order = for_node.order.clone();
+        let previous_first = for_node.first_row;
+        let previous_total = for_node.total_rows;
+        let had_spacers = for_node.spacers.is_some();
 
         let mut first = 0;
         let mut count = total;
@@ -4333,6 +4559,13 @@ impl Runtime {
             for_node.items.insert(key, item);
         }
         for_node.order = order;
+        let structural_changed = previous_order != for_node.order
+            || previous_first != first
+            || previous_total != total
+            || (!had_spacers && for_node.spacers.is_some());
+        if structural_changed {
+            with_state(State::mark_building_tree_changed);
+        }
         for item in for_node.items.values_mut() {
             self.refresh_nodes(&mut item.children)?;
         }
@@ -4579,7 +4812,12 @@ impl Runtime {
         if let LocalState::TextInput(editor) = &mut state.elements[element].local {
             editor.history.break_run();
         }
-        state.bump_presentation();
+        let key = state.tree_for_element(element);
+        state.mark_element_changed(element);
+        // 直接 selection 原语不经过 refresh；提交 revision 让宿主看到编辑状态变化。
+        if let Some(key) = key {
+            state.commit_tree_revision(key);
+        }
         Ok(())
     }
 
@@ -4630,7 +4868,6 @@ impl Runtime {
             }
             state.dispatch_text_edit(element, &new_value, epoch);
         });
-        with_state(State::bump_presentation);
         // 事件槽与 Event 阶段必须在 handler panic 时也恢复；abort_text_dispatch
         // 撤销这次尚未结算的本地编辑。
         let panic = invoke_event(event_id, event, |event| {
@@ -4747,7 +4984,6 @@ impl Runtime {
                 }
                 state.dispatch_text_edit(element, &target.value, epoch);
             });
-            with_state(State::bump_presentation);
             let panic = invoke_event(event_id, event, |event| {
                 if let Event::Input(handler) = event {
                     handler(target.value);
@@ -4831,7 +5067,7 @@ impl Runtime {
                 editor.history.break_run();
                 Ok((editor.caret, editor.selection))
             })?;
-            with_state(State::bump_presentation);
+            with_state(|state| state.mark_element_changed(element));
             self.enter_event_phase();
             let panic = self
                 .dispatch_element_event(element, EventKind::CompositionStart, |event| {
@@ -4889,7 +5125,7 @@ impl Runtime {
                 editor.selection = None;
                 Ok((caret, editor.selection))
             })?;
-            with_state(State::bump_presentation);
+            with_state(|state| state.mark_element_changed(element));
             self.enter_event_phase();
             let panic = self
                 .dispatch_element_event(element, EventKind::CompositionUpdate, |event| {
@@ -5033,7 +5269,6 @@ impl Runtime {
             Ok::<_, DispatchError>((before, new_text, next_caret))
         })?;
         with_state(|state| state.dispatch_text_edit(element, &new_text, epoch));
-        with_state(State::bump_presentation);
         if let Err(panic) =
             self.dispatch_element_event(element, EventKind::CompositionEnd, |event| {
                 if let Event::CompositionEnd(handler) = event {
@@ -5080,7 +5315,7 @@ impl Runtime {
             editor.selection = composition.base_selection;
             Ok((composition.preedit, editor.caret, editor.selection))
         })?;
-        with_state(State::bump_presentation);
+        with_state(|state| state.mark_element_changed(element));
         self.dispatch_element_event(element, EventKind::CompositionCancel, |event| {
             if let Event::CompositionCancel(handler) = event {
                 handler(CompositionEvent::new(
@@ -5423,7 +5658,7 @@ impl Runtime {
 
     fn finish_command(&mut self) -> Result<(), MountError> {
         self.finish_command_without_ui()?;
-        self.refresh()
+        self.refresh_internal()
     }
 
     /// 事件 handler 结束后的统一收尾。
@@ -5521,38 +5756,31 @@ impl Runtime {
         self.state.borrow().core.counters()
     }
 
-    /// 呈现版本：任何可能改变 presentation snapshot 的状态变化都会让它变化。
+    /// 当前焦点窗口的呈现 revision。
     ///
-    /// 原生宿主在重绘前比较它；版本未变时可以直接复用上一次快照，滚动与
-    /// 指针瞬态因此不需要重建运行时快照。
+    /// 每个树维护自己的计数器；这里只读取当前活动树的版本，不再混合
+    /// 全局计数器或其他窗口的变化。
     pub fn presentation_revision(&self) -> u64 {
         let state = self.state.borrow();
-        let counters = state.core.counters();
-        let mut revision = state.presentation_revision;
-        let mut mix = |value: u64| {
-            revision = revision.rotate_left(9) ^ value;
-            revision = revision.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        };
-        // 任何核心计数变化都可能对应一次组件刷新或挂载；宁可多重建一次，
-        // 也不能复用已经过期的快照。
-        mix(counters.total());
-        mix(state.unmounts);
-        mix(state.next_node_mount);
-        mix(state.window_revision);
-        // `Runtime::presentation()` 跟随焦点窗口；切换到已可见窗口不改变
-        // window_revision，必须单独进入版本。
-        mix(state.focused_window.map_or(0, |key| {
-            key.as_bytes()
-                .iter()
-                .fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
-                    (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3)
-                })
-        }));
-        mix(match state.appearance {
-            Appearance::Light => 0,
-            Appearance::Dark => 1,
-        });
-        revision
+        state
+            .active_tree_key()
+            .and_then(|key| state.tree(key))
+            .map_or(0, |tree| tree.revision)
+    }
+
+    /// 指定窗口所属树的呈现 revision；隐藏但存活的窗口也可以读取。
+    pub fn presentation_revision_of(&self, window: WindowCtx) -> Result<u64, WindowError> {
+        let state = self.state.borrow();
+        if window.runtime != state.id {
+            return Err(WindowError::WrongRuntime);
+        }
+        if !state.window_live_in_tree(window) {
+            return Err(WindowError::Stale);
+        }
+        state
+            .tree(TreeKey::Window(window.key))
+            .map(|tree| tree.revision)
+            .ok_or(WindowError::Stale)
     }
 
     /// 已构建的 presentation snapshot 次数；用于验证滚动与指针输入不重建快照。
@@ -5649,7 +5877,7 @@ impl Runtime {
     pub fn set_appearance(&mut self, appearance: Appearance) -> Result<(), MountError> {
         self.state.borrow_mut().set_appearance(appearance);
         if !self.state.borrow().trees.is_empty() {
-            self.refresh()?;
+            self.refresh_internal()?;
         }
         Ok(())
     }
