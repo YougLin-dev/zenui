@@ -2488,12 +2488,12 @@ impl Host {
         }
         window.hovered = Some(node);
 
+        // 按下与 headless 共用 Press Intent：最近可聚焦祖先获得焦点，text-input
+        // 使用场景算出的字符偏移放置 caret；禁用目标不会走到这里。
+        ignore_expected_dispatch(self.runtime.dispatch_intent(Intent::press(node, caret)))?;
+
         match visual {
             Visual::TextInput => {
-                ignore_expected_dispatch(self.runtime.focus_node(node))?;
-                if let Some(offset) = caret {
-                    ignore_expected_dispatch(self.runtime.set_caret_node(node, offset))?;
-                }
                 // 可见切片内的点击通常不需要移动；caret 落在视口外时由同一
                 // 显露规则拉回。
                 window.reveal_requested = true;
@@ -2509,9 +2509,6 @@ impl Host {
             }
             Visual::Container | Visual::Text => {
                 window.pressed = None;
-                self.runtime
-                    .blur_in(window.ctx)
-                    .map_err(HostError::WindowState)?;
             }
         }
         Ok(())
@@ -11606,6 +11603,46 @@ mod tests {
         assert!(
             after > before,
             "an unhandled PageDown still reaches the host scroll default"
+        );
+    }
+
+    #[test]
+    fn pointer_press_focuses_a_checkbox_through_the_press_intent() {
+        let mut host = open_host();
+        host.render().expect("render the todo window");
+        let button = host
+            .runtime
+            .presentation()
+            .expect("snapshot")
+            .find_label("Complete Write tests")
+            .expect("the checkbox")
+            .id();
+        let (point, scale, hit) = {
+            let scene = host.scene(MAIN).expect("scene");
+            let rect = scene.node(button).expect("scene button").rect();
+            let point = Point::new(rect.x + rect.width / 2.0, rect.y + rect.height / 2.0);
+            eprintln!(
+                "button rect {rect:?} point {point:?} hit rect {:?}",
+                scene
+                    .hit_test(point)
+                    .and_then(|id| scene.node(id))
+                    .map(|e| e.rect())
+            );
+            (point, scene.viewport().scale(), scene.hit_test(point))
+        };
+        assert_eq!(hit, Some(button), "the test point hits the button");
+        with_main(&mut host, |host, window| {
+            host.pointer_pressed(window, pointer_lparam(point, scale))
+        });
+        let snapshot = host.runtime.presentation().expect("snapshot");
+        let focused = snapshot
+            .focus()
+            .and_then(|node| snapshot.node(node))
+            .map(|element| (element.tag(), element.label()));
+        assert_eq!(
+            focused,
+            Some(("checkbox", Some("Complete Write tests"))),
+            "the host press path focuses the pressed checkbox"
         );
     }
 

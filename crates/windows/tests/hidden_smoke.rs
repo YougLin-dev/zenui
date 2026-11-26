@@ -717,7 +717,7 @@ fn reverse_reorders_the_native_rows() {
 }
 
 #[test]
-fn reorder_keeps_focus_and_caret_on_the_same_row() {
+fn reorder_keeps_the_editor_caret_on_the_same_column() {
     let mut host = open_host();
     host.render().expect("render the initial frame");
     let (editor, _, scale) = center_of(&host, |element| {
@@ -731,24 +731,45 @@ fn reorder_keeps_focus_and_caret_on_the_same_row() {
         .caret(editor)
         .expect("caret")
         .x;
+    let caret_value = host
+        .presentation(MAIN)
+        .expect("snapshot")
+        .node(editor)
+        .expect("editor")
+        .edit()
+        .expect("edit")
+        .caret();
 
     let (reverse, scale) = button_at(&host, 4);
     post_click(&host, reverse, scale);
     host.pump().expect("reverse the list");
 
-    assert_eq!(
+    assert_ne!(
         focused_id(&host),
         Some(editor),
-        "the focused row keeps its Node ID"
+        "Press moves focus from the editor to the pressed button"
+    );
+    let snapshot = host.presentation(MAIN).expect("snapshot");
+    assert_eq!(
+        snapshot
+            .node(editor)
+            .expect("the editor keeps its Node ID")
+            .edit()
+            .expect("edit")
+            .caret(),
+        caret_value,
+        "the editor keeps its caret value across the reorder"
     );
     assert_eq!(
         host.scene(MAIN)
             .expect("scene")
-            .caret(editor)
-            .expect("caret")
+            .node(editor)
+            .expect("editor in the scene")
+            .caret_at_value(caret_value)
+            .expect("caret geometry")
             .x,
         caret,
-        "the caret stays in the same logical row"
+        "the caret stays in the same logical column"
     );
 
     post_close(&host);
@@ -1364,11 +1385,10 @@ fn a_configured_dark_appearance_paints_and_the_toggle_preserves_edit_state() {
     post_click(&host, point, scale);
     host.pump().expect("focus the input");
     let focused = focused_id(&host).expect("focused input");
-    let caret = host
-        .scene(MAIN)
-        .expect("scene")
-        .caret(focused)
-        .expect("caret");
+    let before_snapshot = host.presentation(MAIN).expect("snapshot");
+    let before = before_snapshot.node(focused).expect("editor");
+    let caret = before.edit().expect("edit").caret();
+    let text = before.text_value().map(str::to_owned);
 
     let (toggle, scale) = button_at(&host, 8);
     post_click(&host, toggle, scale);
@@ -1381,18 +1401,26 @@ fn a_configured_dark_appearance_paints_and_the_toggle_preserves_edit_state() {
         "the toggle switches the palette back to light: {:?}",
         light.pixel(4, 4).expect("light pixel")
     );
+
+    let snapshot = host.presentation(MAIN).expect("snapshot");
+    let focused_after = snapshot.focus().and_then(|node| snapshot.node(node));
     assert_eq!(
-        focused_id(&host),
-        Some(focused),
-        "focus survives the switch"
+        focused_after.and_then(|element| element.label()),
+        Some("Toggle theme"),
+        "Press moves focus to the theme button"
+    );
+    let editor = snapshot
+        .node(focused)
+        .expect("the editor survives the switch");
+    assert_eq!(
+        editor.edit().expect("edit").caret(),
+        caret,
+        "the editor keeps its caret across the appearance switch"
     );
     assert_eq!(
-        host.scene(MAIN)
-            .expect("scene")
-            .caret(focused)
-            .expect("caret"),
-        caret,
-        "caret geometry survives the switch"
+        editor.text_value().map(str::to_owned),
+        text,
+        "the editor keeps its value across the appearance switch"
     );
 
     post_close(&host);

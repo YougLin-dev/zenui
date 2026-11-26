@@ -424,14 +424,14 @@ fn failed_label_commands_do_not_mutate_local_state() {
     assert_eq!(edit.caret(), 0, "a failed input leaves the caret alone");
     assert_eq!(edit.selection(), None);
 
-    assert_eq!(
-        app.change("silent-check", true),
-        Err(MountError::Component("change target not found"))
-    );
+    let report = app
+        .change("silent-check", true)
+        .expect("an uncontrolled checkbox toggles without a handler");
+    assert!(report.changed());
     assert_eq!(
         app.checked("silent-check"),
-        Some(false),
-        "a failed change leaves the checkbox alone"
+        Some(true),
+        "the uncontrolled local value changes"
     );
 
     let report = app
