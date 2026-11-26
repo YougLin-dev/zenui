@@ -20,7 +20,9 @@ mod text_assets;
 
 pub use error::SceneError;
 pub use geometry::{Point, Rect, Viewport};
-pub use gpu::{GpuContext, GpuRenderer, RenderError, RenderPalette, RenderTargetConfig};
+pub use gpu::{
+    GpuContext, GpuRenderer, HighContrastColors, RenderError, RenderPalette, RenderTargetConfig,
+};
 pub use parley::FontData;
 pub use scene::{
     Decoration, DecorationKind, PositionedGlyph, ResolvedStyle, Scene, SceneCache, SceneElement,

@@ -19,6 +19,32 @@ use crate::geometry::Rect;
 use crate::scene::{DecorationKind, ResolvedStyle, Scene, TextRun, Visual};
 use crate::scrollbar::{RADIUS, Scrollbar};
 
+/// Windows 高对比度主题的系统颜色；RGBA 字节，alpha 为 255。
+///
+/// 宿主从 `GetSysColor` 采样后交给 [`RenderPalette::high_contrast`]；显式
+/// 字面颜色不经过这里。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HighContrastColors {
+    /// 窗口背景（`COLOR_WINDOW`）。
+    pub window: [u8; 4],
+    /// 窗口文本（`COLOR_WINDOWTEXT`）。
+    pub window_text: [u8; 4],
+    /// 按钮与输入框底色（`COLOR_BTNFACE`）。
+    pub button_face: [u8; 4],
+    /// 按钮悬停底纹（`COLOR_BTNHIGHLIGHT`）。
+    pub button_highlight: [u8; 4],
+    /// 按钮按下底纹（`COLOR_BTNSHADOW`）。
+    pub button_shadow: [u8; 4],
+    /// 次要、禁用文本（`COLOR_GRAYTEXT`）。
+    pub gray_text: [u8; 4],
+    /// 选中与强调色（`COLOR_HIGHLIGHT`）。
+    pub highlight: [u8; 4],
+    /// 强调色上的文本（`COLOR_HIGHLIGHTTEXT`）。
+    pub highlight_text: [u8; 4],
+    /// 窗口边框（`COLOR_WINDOWFRAME`）。
+    pub window_frame: [u8; 4],
+}
+
 /// GPU 层绘制内建视觉与 class 颜色角色时使用的调色板；各字段是 RGBA 字节，
 /// 按目标视图的转移函数解释。
 ///
@@ -115,6 +141,40 @@ impl RenderPalette {
             caret: [250, 250, 250, 255],
             scrollbar_track: [250, 250, 250, 32],
             scrollbar_thumb: [161, 161, 170, 190],
+        }
+    }
+
+    /// 高对比度调色板：语义角色与内建视觉改用系统颜色。
+    ///
+    /// `selection` 保留半透明覆盖，避免选中文本与背景同色；它的色相来自
+    /// 系统 highlight。`danger` 在系统高对比度里没有独立颜色，与 accent 使用
+    /// 同一个 highlight。显式字面颜色不受调色板影响。
+    pub const fn high_contrast(colors: HighContrastColors) -> Self {
+        Self {
+            background: colors.window,
+            surface: colors.window,
+            control: colors.button_face,
+            control_hover: colors.button_highlight,
+            control_pressed: colors.button_shadow,
+            text: colors.window_text,
+            text_muted: colors.gray_text,
+            text_inverse: colors.highlight_text,
+            text_disabled: colors.gray_text,
+            border: colors.window_frame,
+            accent: colors.highlight,
+            accent_hover: colors.highlight,
+            accent_pressed: colors.highlight,
+            danger: colors.highlight,
+            danger_hover: colors.highlight,
+            selection: [
+                colors.highlight[0],
+                colors.highlight[1],
+                colors.highlight[2],
+                80,
+            ],
+            caret: colors.window_text,
+            scrollbar_track: colors.button_face,
+            scrollbar_thumb: colors.window_frame,
         }
     }
 }
@@ -613,4 +673,63 @@ fn physical_rect(rect: Rect, scale: f32) -> KurboRect {
 
 fn color(rgba: [u8; 4]) -> AlphaColor<Srgb> {
     AlphaColor::from_rgba8(rgba[0], rgba[1], rgba[2], rgba[3])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const COLORS: HighContrastColors = HighContrastColors {
+        window: [1, 2, 3, 255],
+        window_text: [4, 5, 6, 255],
+        button_face: [7, 8, 9, 255],
+        button_highlight: [10, 11, 12, 255],
+        button_shadow: [13, 14, 15, 255],
+        gray_text: [16, 17, 18, 255],
+        highlight: [19, 20, 21, 255],
+        highlight_text: [22, 23, 24, 255],
+        window_frame: [25, 26, 27, 255],
+    };
+
+    #[test]
+    fn high_contrast_maps_every_semantic_role_to_a_system_color() {
+        let palette = RenderPalette::high_contrast(COLORS);
+        let roles = [
+            (ColorRole::Surface, COLORS.window),
+            (ColorRole::Control, COLORS.button_face),
+            (ColorRole::ControlHover, COLORS.button_highlight),
+            (ColorRole::ControlPressed, COLORS.button_shadow),
+            (ColorRole::Accent, COLORS.highlight),
+            (ColorRole::AccentHover, COLORS.highlight),
+            (ColorRole::AccentPressed, COLORS.highlight),
+            (ColorRole::Danger, COLORS.highlight),
+            (ColorRole::DangerHover, COLORS.highlight),
+            (ColorRole::TextDefault, COLORS.window_text),
+            (ColorRole::TextMuted, COLORS.gray_text),
+            (ColorRole::TextInverse, COLORS.highlight_text),
+            (ColorRole::TextDisabled, COLORS.gray_text),
+            (ColorRole::BorderDefault, COLORS.window_frame),
+            (ColorRole::BorderAccent, COLORS.highlight),
+        ];
+        for (role, expected) in roles {
+            assert_eq!(role_color(role, palette), expected, "role {role:?}");
+        }
+        assert_eq!(palette.background, COLORS.window);
+        assert_eq!(palette.caret, COLORS.window_text);
+        assert_eq!(palette.selection, [19, 20, 21, 80]);
+        assert_eq!(palette.scrollbar_track, COLORS.button_face);
+        assert_eq!(palette.scrollbar_thumb, COLORS.window_frame);
+    }
+
+    #[test]
+    fn explicit_literal_colors_are_not_remapped_by_high_contrast() {
+        let literal = [40, 41, 42, 43];
+        assert_eq!(
+            resolve_color(
+                Color::Literal(literal),
+                RenderPalette::high_contrast(COLORS)
+            ),
+            literal
+        );
+    }
 }
