@@ -580,7 +580,7 @@ pub fn TodoApp(window: WindowCtx, state: TodoState) -> MountResult<MountPlan> {
                     label={filter_label(Filter::Completed)}
                 />
             </view>
-            <view role="toolbar" class="gap-3">
+            <view role="toolbar" class="gap-3 flex-wrap">
                 <button on:click={move || reverse()}>"Reverse"</button>
                 <button on:click={move || {
                     let _ = Transaction::new().write(todos.clear_completed()).finish();
@@ -599,7 +599,7 @@ pub fn TodoApp(window: WindowCtx, state: TodoState) -> MountResult<MountPlan> {
                     on:click={move || report(window.request_show(DETAILS_WINDOW), task_error)}
                 >"Details"</button>
             </view>
-            <view role="toolbar" class="gap-3">
+            <view role="toolbar" class="gap-3 flex-wrap">
                 <button on:click={move || save_tasks()}>"Save tasks"</button>
                 <button on:click={move || choose_folder()}>"Choose folder"</button>
             </view>
@@ -692,7 +692,7 @@ pub fn TodoDetails(window: WindowCtx, state: TodoState) -> MountResult<MountPlan
             <Show when={has_notice}>
                 <text aria:label="Notice">{notice}</text>
             </Show>
-            <view role="toolbar" class="gap-3">
+            <view role="toolbar" class="gap-3 flex-wrap">
                 <button
                     class="px-3 py-1 rounded-sm bg-control hover:bg-control-hover"
                     aria:label="Hide details"
@@ -730,7 +730,7 @@ fn CloseConfirmation(window: WindowCtx, state: TodoState) -> MountResult<MountPl
         <view role="main" class="p-4 gap-3">
             <text class="text-lg font-semibold">"Discard the draft?"</text>
             <text class="text-sm dark:text-muted">"The unsaved task draft will be lost."</text>
-            <view role="toolbar" class="gap-3">
+            <view role="toolbar" class="gap-3 flex-wrap">
                 <button
                     class="px-4 py-2 bg-accent text-inverse rounded-md font-semibold"
                     aria:label="Continue editing"

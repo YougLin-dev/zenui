@@ -3,8 +3,8 @@
 use std::collections::HashMap;
 
 use taffy::prelude::{
-    AlignItems, AvailableSpace, Display, FlexDirection, JustifyContent, Style, TaffyTree, auto,
-    length, percent, zero,
+    AlignItems, AvailableSpace, Display, FlexDirection, FlexWrap, JustifyContent, Style, TaffyTree,
+    auto, length, percent, zero,
 };
 use taffy::{
     Baselines, LayoutInput, LayoutOutput, NodeId as TaffyNodeId, Rect as TaffyRect, ResolveOrZero,
@@ -1340,6 +1340,7 @@ fn apply_declaration(
         (Property::FlexDirection, StyleValue::Column) => {
             style.flex_direction = FlexDirection::Column;
         }
+        (Property::FlexWrap, StyleValue::Wrap) => style.flex_wrap = FlexWrap::Wrap,
         (Property::AlignItems, StyleValue::CenterItems) => style.align_items = AlignItems::CENTER,
         (Property::JustifyContent, StyleValue::SpaceBetween) => {
             style.justify_content = JustifyContent::SPACE_BETWEEN;

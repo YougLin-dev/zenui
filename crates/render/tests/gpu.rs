@@ -260,8 +260,9 @@ fn a_known_color_scene_renders_expected_pixels() {
     app.focus("Edit Alpha").expect("focus");
     assert!(app.set_caret("Edit Alpha", 2), "place the caret");
     let snapshot = app.presentation().expect("snapshot");
-    let scene = scene(&snapshot, 256.0, 256.0, 1.0);
-    let pixels = render(&context, &scene, wgpu::TextureFormat::Bgra8Unorm, 256, 256);
+    // 256 宽时工具栏换行，视口需要相应增高，行内编辑器才在可见区域内。
+    let scene = scene(&snapshot, 256.0, 420.0, 1.0);
+    let pixels = render(&context, &scene, wgpu::TextureFormat::Bgra8Unorm, 256, 420);
 
     assert_eq!(
         pixels.at(4, 4),
