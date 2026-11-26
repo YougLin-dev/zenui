@@ -28,6 +28,8 @@ mod ole;
 #[cfg(windows)]
 mod shortcuts;
 #[cfg(windows)]
+mod startup;
+#[cfg(windows)]
 mod tray;
 
 #[cfg(windows)]
@@ -41,4 +43,8 @@ pub use file_dialog::FileDialogPresenter;
 #[cfg(windows)]
 pub use host::{DeviceLostError, Frame, GpuAdapterInfo, Host, HostConfig, HostError};
 #[cfg(windows)]
+pub use startup::show_startup_error;
+#[cfg(windows)]
 pub use tray::{TrayIconRequest, TrayMenuRequest, TrayPresenter, TrayTooltipRequest};
+#[cfg(windows)]
+pub use zenui_render::{FontAsset, TextAssetError, TextAssets};

@@ -14,12 +14,21 @@ fn starter_mounts_headlessly_and_increments() {
     app.mount(|| view! { <Starter /> })
         .expect("mount the starter component");
 
-    assert_eq!(app.texts(), vec!["Count: 0", "Increment"]);
+    assert_eq!(
+        app.texts(),
+        vec!["Count: 0", "中文示例：你好，世界", "Increment"]
+    );
 
     app.click_text("Increment").expect("click the counter");
-    assert_eq!(app.texts(), vec!["Count: 1", "Increment"]);
+    assert_eq!(
+        app.texts(),
+        vec!["Count: 1", "中文示例：你好，世界", "Increment"]
+    );
 
     app.click_text("Increment")
         .expect("click the counter again");
-    assert_eq!(app.texts(), vec!["Count: 2", "Increment"]);
+    assert_eq!(
+        app.texts(),
+        vec!["Count: 2", "中文示例：你好，世界", "Increment"]
+    );
 }
