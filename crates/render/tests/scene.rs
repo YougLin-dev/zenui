@@ -25,6 +25,15 @@ fn build_scene(snapshot: &PresentationSnapshot, width: f32) -> Scene {
     Scene::build(snapshot, viewport(width)).expect("scene")
 }
 
+fn build_scaled(snapshot: &PresentationSnapshot, width: f32, percent: u16) -> Scene {
+    Scene::build_with(
+        snapshot,
+        viewport(width),
+        &SceneEnv::default().with_text_scale_percent(percent),
+    )
+    .expect("scaled scene")
+}
+
 fn by_text(snapshot: &PresentationSnapshot, tag: &str, text: &str) -> NodeId {
     snapshot
         .elements()
@@ -2394,7 +2403,7 @@ fn a_windowed_list_keeps_its_declared_extent_and_band_geometry() {
     let band = base.row_bands()[0];
     assert_eq!(band.total_rows(), 100);
     assert_eq!(band.first_row(), 0);
-    assert!((band.row_height() - 37.0).abs() < 0.001);
+    assert!((band.row_height() - em(2.5).resolve(14.0)).abs() < 0.001);
     let top = band.top();
     let extent = base.content_extent().height;
     assert!(
@@ -2415,7 +2424,8 @@ fn a_windowed_list_keeps_its_declared_extent_and_band_geometry() {
     assert_eq!(band.top(), top, "the band anchors at the content top");
     assert!(
         (scene.content_extent().height - extent).abs() < 0.01,
-        "the declared extent is independent of the mounted window"
+        "the declared extent is independent of the mounted window: {} vs {extent}",
+        scene.content_extent().height
     );
     assert!(
         scene.elements().len() < 300,
@@ -2426,7 +2436,7 @@ fn a_windowed_list_keeps_its_declared_extent_and_band_geometry() {
         .node(snapshot.row_bands()[0].top())
         .expect("the top spacer has geometry");
     assert!(
-        (top_spacer.rect().height - 40.0 * 37.0).abs() < 0.01,
+        (top_spacer.rect().height - 40.0 * 35.0).abs() < 0.01,
         "the top spacer covers every row before the window"
     );
     let bottom_spacer = scene
@@ -2441,7 +2451,7 @@ fn a_windowed_list_keeps_its_declared_extent_and_band_geometry() {
         })
         .expect("the bottom spacer has geometry");
     assert!(
-        (bottom_spacer.rect().height - 50.0 * 37.0).abs() < 0.01,
+        (bottom_spacer.rect().height - 50.0 * 35.0).abs() < 0.01,
         "the bottom spacer covers every row after the window"
     );
 
@@ -2490,5 +2500,183 @@ fn offscreen_rows_keep_geometry_but_skip_glyphs() {
         offscreen.rect(),
         visible.rect(),
         "culling does not move the element"
+    );
+}
+
+#[test]
+fn text_scale_enlarges_fonts_controls_and_glyph_metrics() {
+    let mut app = runtime();
+    add(&mut app, "Write tests");
+    let snapshot = app.presentation().expect("snapshot");
+    let base = build_scaled(&snapshot, 800.0, 100);
+    let large = build_scaled(&snapshot, 800.0, 225);
+    let id = by_text(&snapshot, "text", "Write tests");
+    let base_text = base.node(id).expect("base text");
+    let large_text = large.node(id).expect("scaled text");
+
+    assert!((base_text.resolved_style().font_size() - 14.0).abs() < 0.01);
+    assert!(
+        (large_text.resolved_style().font_size() - 31.5).abs() < 0.01,
+        "225% scales the default 14-point text to 31.5"
+    );
+    assert!(large_text.rect().height > base_text.rect().height);
+    let glyph = large_text
+        .text()
+        .iter()
+        .flat_map(|run| run.glyphs())
+        .next()
+        .expect("a scaled glyph");
+    assert!(
+        glyph.y >= large_text.rect().y && glyph.y < large_text.rect().bottom(),
+        "the glyph baseline stays inside the scaled text: {glyph:?} vs {:?}",
+        large_text.rect()
+    );
+
+    let button = by_text(&snapshot, "button", "Load sample");
+    assert!(
+        large.node(button).expect("scaled button").rect().height
+            > base.node(button).expect("base button").rect().height,
+        "a built-in button grows with its text"
+    );
+}
+
+#[test]
+fn text_scale_moves_caret_and_hit_testing_boundaries() {
+    let mut app = runtime();
+    add(&mut app, "Write tests");
+    app.input("Edit Write tests", "Write tests")
+        .expect("seed the editor");
+    app.focus("Edit Write tests").expect("focus the editor");
+    assert!(app.set_caret("Edit Write tests", 5), "place the caret");
+    let snapshot = app.presentation().expect("snapshot");
+    let id = snapshot.find_label("Edit Write tests").expect("input").id();
+    let base = build_scaled(&snapshot, 800.0, 100);
+    let large = build_scaled(&snapshot, 800.0, 225);
+    let base_caret = base.caret(id).expect("base caret");
+    let large_caret = large.caret(id).expect("scaled caret");
+
+    assert!(
+        large_caret.x > base_caret.x,
+        "the caret moves with scaled glyphs"
+    );
+    assert!(
+        large_caret.height > base_caret.height,
+        "the caret grows with the line"
+    );
+    let editor = large.node(id).expect("scaled editor");
+    let point = Point::new(large_caret.x, large_caret.y + large_caret.height / 2.0);
+    assert_eq!(
+        editor.caret_index(point),
+        Some(5),
+        "hit-testing follows the scaled caret"
+    );
+}
+
+#[test]
+fn text_scale_grows_row_bands_and_scroll_extent() {
+    let mut app = runtime();
+    for index in 0..30 {
+        add(&mut app, &format!("Task {index}"));
+    }
+    let snapshot = app.presentation().expect("snapshot");
+    let base = build_scaled(&snapshot, 800.0, 100);
+    let large = build_scaled(&snapshot, 800.0, 225);
+    let base_band = base.row_bands().first().expect("base band");
+    let large_band = large.row_bands().first().expect("scaled band");
+
+    assert!(
+        large_band.row_height() > base_band.row_height(),
+        "the em row height follows the scaled font"
+    );
+    assert!(
+        large.max_scroll_offset() > base.max_scroll_offset(),
+        "the scaled content has a larger scroll extent"
+    );
+    let env = SceneEnv::default()
+        .with_text_scale_percent(225)
+        .with_scroll_offset(100_000);
+    let clamped =
+        Scene::build_with(&snapshot, viewport(800.0), &env).expect("clamped scaled scene");
+    assert_eq!(
+        clamped.scroll_offset(),
+        clamped.max_scroll_offset(),
+        "the stored offset is re-clamped to the scaled extent"
+    );
+}
+
+#[test]
+fn a_shared_cache_does_not_serve_layouts_from_another_text_scale() {
+    let mut app = runtime();
+    add(&mut app, "Write tests");
+    let snapshot = app.presentation().expect("snapshot");
+    let mut cache = SceneCache::new();
+    let base = Scene::build_cached(&snapshot, viewport(800.0), &SceneEnv::default(), &mut cache)
+        .expect("base scene");
+    let large = Scene::build_cached(
+        &snapshot,
+        viewport(800.0),
+        &SceneEnv::default().with_text_scale_percent(225),
+        &mut cache,
+    )
+    .expect("scaled scene");
+    let id = by_text(&snapshot, "text", "Write tests");
+
+    assert!(
+        large
+            .node(id)
+            .expect("scaled text")
+            .resolved_style()
+            .font_size()
+            > base
+                .node(id)
+                .expect("base text")
+                .resolved_style()
+                .font_size()
+    );
+}
+
+#[test]
+fn cjk_and_emoji_stay_inside_scaled_text() {
+    let mut app = runtime();
+    add(&mut app, "中文 😀");
+    let snapshot = app.presentation().expect("snapshot");
+    let scene = build_scaled(&snapshot, 800.0, 225);
+    let id = by_text(&snapshot, "text", "中文 😀");
+    let element = scene.node(id).expect("scaled CJK text");
+    let glyphs: Vec<_> = element.text().iter().flat_map(|run| run.glyphs()).collect();
+
+    assert!(!glyphs.is_empty(), "CJK and emoji produce glyphs");
+    assert!(
+        glyphs
+            .iter()
+            .all(|glyph| glyph.y < element.rect().bottom() + 1.0),
+        "every glyph stays inside the scaled text box"
+    );
+    assert!(
+        element.rect().height >= element.resolved_style().font_size(),
+        "the text box fits one scaled line"
+    );
+}
+
+#[test]
+fn text_scale_outside_the_supported_range_falls_back_to_100() {
+    assert_eq!(SceneEnv::default().text_scale_percent(), 100);
+    assert_eq!(
+        SceneEnv::default()
+            .with_text_scale_percent(99)
+            .text_scale_percent(),
+        100
+    );
+    assert_eq!(
+        SceneEnv::default()
+            .with_text_scale_percent(226)
+            .text_scale_percent(),
+        100
+    );
+    assert_eq!(
+        SceneEnv::default()
+            .with_text_scale_percent(225)
+            .text_scale_percent(),
+        225
     );
 }

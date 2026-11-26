@@ -3964,7 +3964,7 @@ impl Host {
         let mut scene = Scene::build_cached(
             snapshot,
             viewport,
-            &scene_env(window),
+            &scene_env(window, self.system_preferences),
             &mut self.scene_cache,
         )
         .map_err(HostError::Scene)?;
@@ -3975,7 +3975,7 @@ impl Host {
             scene = Scene::build_cached(
                 snapshot,
                 viewport,
-                &scene_env(window),
+                &scene_env(window, self.system_preferences),
                 &mut self.scene_cache,
             )
             .map_err(HostError::Scene)?;
@@ -4779,12 +4779,13 @@ fn adopt_scroll_offset(window: &mut WindowHost, scene: &Scene, requested: i32) {
     }
 }
 
-fn scene_env(window: &WindowHost) -> SceneEnv {
+fn scene_env(window: &WindowHost, preferences: SystemPreferences) -> SceneEnv {
     SceneEnv::default()
         .with_hovered(window.hovered)
         .with_pressed(window.pressed)
         .with_focus_visible(window.keyboard_modality)
         .with_scroll_offset(window.scroll_offset)
+        .with_text_scale_percent(preferences.text_scale_percent())
 }
 
 impl Drop for Host {
@@ -9908,6 +9909,144 @@ mod tests {
             host.runtime.presentation_revision(),
             revision,
             "a settings change does not touch the presentation snapshot"
+        );
+    }
+
+    #[test]
+    fn a_settings_broadcast_applies_a_new_text_scale() {
+        let mut host = open_host();
+        host.settings_sample = Some(SystemPreferences::new(false, 225));
+        host.with_window(MAIN, |host, window| {
+            host.handle_window_message(window, WM_SETTINGCHANGE, WPARAM(0), LPARAM(0))
+        })
+        .expect("settings change");
+        assert_eq!(
+            host.system_preferences().text_scale_percent(),
+            225,
+            "the broadcast samples the injected scale"
+        );
+        assert!(
+            host.windows.get(MAIN).expect("window").paint_requested,
+            "the broadcast requests a repaint"
+        );
+        host.render().expect("render at the new scale");
+        let node = host
+            .runtime
+            .presentation()
+            .expect("snapshot")
+            .find_label("What needs to be done?")
+            .expect("draft")
+            .id();
+        assert!(
+            (host
+                .scene(MAIN)
+                .expect("scene")
+                .node(node)
+                .expect("draft geometry")
+                .resolved_style()
+                .font_size()
+                - 31.5)
+                .abs()
+                < 0.01,
+            "the render uses the sampled scale"
+        );
+    }
+
+    #[test]
+    fn a_text_scale_change_rebuilds_text_and_preserves_edit_state() {
+        let mut host = open_host();
+        host.runtime
+            .focus("What needs to be done?")
+            .expect("focus the draft");
+        host.runtime
+            .input("What needs to be done?", "Scaled draft")
+            .expect("type the draft");
+        host.render().expect("render at 100%");
+        let snapshot = host.runtime.presentation().expect("snapshot");
+        let node = snapshot
+            .find_label("What needs to be done?")
+            .expect("draft")
+            .id();
+        host.runtime
+            .set_caret_node(node, 3)
+            .expect("place the caret");
+        host.render().expect("render the caret");
+        let (base_size, base_height, base_caret) = {
+            let scene = host.scene(MAIN).expect("base scene");
+            let base = scene.node(node).expect("base draft");
+            (
+                base.resolved_style().font_size(),
+                base.rect().height,
+                scene.caret(node).expect("base caret"),
+            )
+        };
+        let revision = host.runtime.presentation_revision();
+
+        host.set_system_preferences(SystemPreferences::new(false, 225));
+        host.render().expect("render at 225%");
+        let scene = host.scene(MAIN).expect("scaled scene");
+        let scaled = scene.node(node).expect("scaled draft");
+        assert!((base_size - 14.0).abs() < 0.01);
+        assert!(
+            (scaled.resolved_style().font_size() - 31.5).abs() < 0.01,
+            "225% scales the draft text"
+        );
+        assert!(scaled.rect().height > base_height);
+        let caret = scene.caret(node).expect("scaled caret");
+        assert!(caret.height > base_caret.height);
+        assert_eq!(
+            host.runtime.presentation().expect("snapshot").focus(),
+            Some(node),
+            "focus survives the rebuild"
+        );
+        assert_eq!(
+            host.runtime.presentation_revision(),
+            revision,
+            "text scale does not enter the presentation snapshot"
+        );
+        assert_eq!(
+            host.runtime
+                .presentation()
+                .expect("snapshot")
+                .node(node)
+                .and_then(|element| element.text_value()),
+            Some("Scaled draft"),
+            "the local edit value survives without on:input"
+        );
+    }
+
+    #[test]
+    fn a_text_scale_change_reclamps_the_scroll_offset() {
+        let mut runtime = Runtime::new();
+        zenui_demo::open_todo_window(&mut runtime).expect("open the todo window");
+        for index in 0..40 {
+            runtime
+                .input("What needs to be done?", &format!("Task {index}"))
+                .expect("fill the draft");
+            runtime.submit("Add task").expect("add a row");
+        }
+        let mut host = Host::open(runtime, HostConfig::hidden()).expect("open a tall host");
+        host.set_system_preferences(SystemPreferences::new(false, 225));
+        host.render().expect("render at 225%");
+        host.windows.get_mut(MAIN).expect("window").scroll_offset = 100_000;
+        host.render().expect("clamp at 225%");
+        let tall_max = host.scene(MAIN).expect("scene").max_scroll_offset();
+        assert!(tall_max > 400);
+        assert_eq!(
+            host.windows[MAIN].scroll_offset, tall_max,
+            "the offset clamps to the scaled extent"
+        );
+
+        host.set_system_preferences(SystemPreferences::new(false, 100));
+        host.render().expect("render at 100%");
+        let short_max = host.scene(MAIN).expect("scene").max_scroll_offset();
+        assert!(
+            short_max < tall_max,
+            "the smaller text has a smaller content extent"
+        );
+        assert_eq!(
+            host.windows[MAIN].scroll_offset, short_max,
+            "the stored offset is re-clamped to the smaller extent"
         );
     }
 

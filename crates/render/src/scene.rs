@@ -134,15 +134,28 @@ impl ResolvedStyle {
 
 /// 宿主拥有的呈现环境；不属于 presentation snapshot。
 ///
-/// `Default` 表示没有指针、指针输入方式，滚动偏移为 0：hover 与 active
-/// 都不命中。滚动偏移是每个窗口 activation 持续的呈现状态，不随指针瞬态
-/// 清除。
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// `Default` 表示没有指针、指针输入方式，滚动偏移为 0，文本缩放 100%：
+/// hover 与 active 都不命中。滚动偏移是每个窗口 activation 持续的呈现状态，
+/// 不随指针瞬态清除。文本缩放只影响文本与由字号派生的几何，不改变显示 DPI。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SceneEnv {
     hovered: Option<NodeId>,
     pressed: Option<NodeId>,
     focus_visible: bool,
     scroll_offset: i32,
+    text_scale_percent: u16,
+}
+
+impl Default for SceneEnv {
+    fn default() -> Self {
+        Self {
+            hovered: None,
+            pressed: None,
+            focus_visible: false,
+            scroll_offset: 0,
+            text_scale_percent: 100,
+        }
+    }
 }
 
 impl SceneEnv {
@@ -173,6 +186,18 @@ impl SceneEnv {
         self
     }
 
+    /// 辅助功能文本缩放百分比；有效范围 100–225，越界值回退到 100。
+    ///
+    /// 缩放改变字号、行高与 `em` 解析，进而改变测量、caret/selection 几何、
+    /// 命中与滚动范围；固定 `px` 长度仍是逻辑像素。
+    pub const fn with_text_scale_percent(mut self, percent: u16) -> Self {
+        self.text_scale_percent = match percent {
+            100..=225 => percent,
+            _ => 100,
+        };
+        self
+    }
+
     /// 当前悬停的节点。
     pub const fn hovered(self) -> Option<NodeId> {
         self.hovered
@@ -191,6 +216,11 @@ impl SceneEnv {
     /// 宿主请求的滚动偏移；场景构建前可能超出内容范围。
     pub const fn scroll_offset(self) -> i32 {
         self.scroll_offset
+    }
+
+    /// 辅助功能文本缩放百分比。
+    pub const fn text_scale_percent(self) -> u16 {
+        self.text_scale_percent
     }
 }
 
@@ -871,6 +901,7 @@ impl<'a> Builder<'a> {
             element.id(),
             element.styles(),
             state,
+            self.env.text_scale_percent(),
         )?;
         let node = match intrinsic {
             Intrinsic::TextInput => {
@@ -1260,6 +1291,7 @@ fn resolve_style(
     node: NodeId,
     declarations: &[StyleDeclaration],
     state: ElementState,
+    text_scale_percent: u16,
 ) -> Result<(Style, ResolvedStyle), SceneError> {
     let mut resolved = ResolvedStyle::initial();
     let mut width = None;
@@ -1301,7 +1333,9 @@ fn resolve_style(
             *declaration,
         )?;
     }
-    // `em` 宽度与高度依赖最终字号，所以等所有声明处理完再换成 Taffy 长度。
+    // 文本缩放放大最终字号；固定 px 长度保持逻辑像素，`em` 宽度与高度
+    // 因此要等这里缩放之后再解析。
+    resolved.text.size *= f32::from(text_scale_percent) / 100.0;
     if let Some(width) = width {
         style.size.width = length(width.resolve(resolved.text.size));
     }
