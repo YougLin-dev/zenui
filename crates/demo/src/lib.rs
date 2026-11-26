@@ -266,9 +266,11 @@ pub fn FilterButton(
 #[component]
 pub fn TodoItem(todo: TodoId, todos: Store) -> MountResult<MountPlan> {
     let title = todos.title(todo).read_once()?;
-    let completed = memo(move || todos.completed(todo).get());
+    // `checked` 直接绑定字段：行失效时绑定保留最后值并报告 typed fault。
+    let completed = todos.completed(todo);
+    let done = memo(move || completed.get().is_ok_and(|done| done));
     let tint = memo(move || {
-        if completed.get().is_ok_and(|done| done) {
+        if done.get() {
             Color::Role(ColorRole::TextMuted)
         } else {
             Color::Role(ColorRole::TextDefault)
@@ -619,7 +621,7 @@ pub fn TodoApp(window: WindowCtx, state: TodoState) -> MountResult<MountPlan> {
             <view class="gap-0">
                 <For each={visible} key={|id: TodoId| id} row-height={em(2.5)}>
                     {move |todo: TodoId| view! {
-                        <view style:height={em(2.5)}>
+                        <view style:height={once(em(2.5))}>
                             <TodoItem todo={todo} todos={todos} />
                         </view>
                     }}
@@ -638,7 +640,7 @@ fn TodoDetailRow(todo: TodoId, todos: Store) -> MountResult<MountPlan> {
     let title = todos.title(todo).read_once()?;
 
     view! {
-        <view role="listitem" class="flex-row items-center gap-3" style:height={em(2.5)}>
+        <view role="listitem" class="flex-row items-center gap-3" style:height={once(em(2.5))}>
             <text>{once(title)}</text>
         </view>
     }

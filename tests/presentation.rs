@@ -827,8 +827,8 @@ fn DynamicStyles() -> MountResult<MountPlan> {
                 style:width={width}
                 style:background={tint}
                 style:color={once(Color::Role(ColorRole::TextMuted))}
-                style:border-color={Color::Role(ColorRole::BorderAccent)}
-                style:opacity={Opacity::percent(50)}
+                style:border-color={once(Color::Role(ColorRole::BorderAccent))}
+                style:opacity={once(Opacity::percent(50))}
             />
         </view>
     }

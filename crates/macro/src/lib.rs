@@ -377,10 +377,28 @@ fn lower_attribute(attribute: &NodeAttribute) -> syn::Result<TokenStream> {
         Some(string) => Ok(quote! { ::zenui::view::attr(#key, #string) }),
         None => {
             let expression = expression(attribute)?;
+            if let Some(literal) = bool_literal(expression) {
+                // 布尔字面量是字面量数据位；显式 once 保留“快照”语义，
+                // 变量/表达式仍必须自己选择 once 或读句柄。
+                return Ok(quote_spanned! {literal.span()=>
+                    ::zenui::view::attr(#key, ::zenui::once(#literal))
+                });
+            }
             Ok(quote_spanned! {expression.span()=>
                 ::zenui::view::attr(#key, #expression)
             })
         }
+    }
+}
+
+/// `{true}` 与裸 `true` 都是布尔字面量；其他表达式返回 `None`。
+fn bool_literal(expression: &Expr) -> Option<syn::LitBool> {
+    match unbraced(expression) {
+        Expr::Lit(syn::ExprLit {
+            lit: syn::Lit::Bool(value),
+            ..
+        }) => Some(value.clone()),
+        _ => None,
     }
 }
 
@@ -470,6 +488,10 @@ fn lower_show(element: &NodeElement<rstml::Infallible>) -> syn::Result<TokenStre
         }
     }
     let when = when.ok_or_else(|| syn::Error::new_spanned(element.name(), "Show needs `when`"))?;
+    let when = match bool_literal(when) {
+        Some(literal) => quote! { ::zenui::once(#literal) },
+        None => quote! { #when },
+    };
     let then = children_plan(element)?;
     let fallback = match fallback {
         Some(expression) => quote! {

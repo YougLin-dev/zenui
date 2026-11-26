@@ -1,0 +1,22 @@
+error[E0277]: the trait bound `zenui::Read<zenui::Length>: From<zenui::Length>` is not satisfied
+ --> tests/compile_fail/bare_typed_constant.rs:6:64
+  |
+6 |     let _: MountResult<MountPlan> = view! { <view style:width={WIDTH}>"Width"</view> };
+  |                                     ---------------------------^^^^^------------------
+  |                                     |                          |
+  |                                     |                          the trait `From<zenui::Length>` is not implemented for `zenui::Read<zenui::Length>`
+  |                                     required by a bound introduced by this call
+  |
+  = help: the following other types implement trait `From<T>`:
+            `zenui::Read<String>` implements `From<&str>`
+            `zenui::Read<String>` implements `From<zenui::Once<&str>>`
+            `zenui::Read<T>` implements `From<zenui::Field<T>>`
+            `zenui::Read<T>` implements `From<zenui::Memo<T>>`
+            `zenui::Read<T>` implements `From<zenui::Once<T>>`
+            `zenui::Read<T>` implements `From<zenui::Signal<T>>`
+  = note: required for `zenui::Length` to implement `Into<zenui::Read<zenui::Length>>`
+note: required by a bound in `style_width`
+ --> src/view.rs
+  |
+  | pub fn style_width(value: impl Into<Read<Length>>) -> InlineStyle {
+  |                                ^^^^^^^^^^^^^^^^^^ required by this bound in `style_width`

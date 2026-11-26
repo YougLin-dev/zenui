@@ -44,14 +44,14 @@ pub use runtime::{
     TurnError, TurnOutcome, TurnReport,
 };
 pub use session::{SessionCtx, SessionError, SessionPolicy};
-pub use signal::{Memo, Once, Signal, memo, once, signal};
+pub use signal::{Memo, MemoCompute, Once, ReactiveValue, Signal, memo, once, signal};
 pub use store::{Field, FieldError, Store, TodoId, Transaction, WriteError, WriteOp};
 pub use task::{DeliveryReport, Task, TaskError, TaskScope, TaskStatus, TaskToken};
 pub use tray::{TrayError, TraySpec};
 pub use view::{
     BlurEvent, Children, ChildrenFactory, CompositionEvent, CompositionPhase, FocusCause,
     FocusEvent, HandlerError, HandlerOutcome, IntoHandlerOutcome, Key, KeyEvent, MountError,
-    MountPlan, MountResult, SubmitEvent,
+    MountPlan, MountResult, Read, ReadFault, ReadValue, SubmitEvent,
 };
 pub use window::{
     CatalogError, CloseError, CloseEvent, CloseOutcome, ClosePolicy, CloseRequest, CloseSource,
@@ -75,16 +75,17 @@ pub mod prelude {
         FileDialogError, FileDialogKind, FileDialogOptions, FileDialogOutcome, FileDialogRequest,
         FileDialogRequestError, FileFilter, FocusCause, FocusEvent, FocusInfo, HandlerError,
         HandlerOutcome, Intent, IntentPayload, IntoHandlerOutcome, Key, KeyEvent, Length,
-        LengthUnit, Memo, MenuCommand, MenuCommandState, MenuItem, MenuShortcut, MenuSpec,
-        MenuStateError, Modifiers, MountError, MountPlan, MountResult, NodeId, NodeOperation,
-        NodeStatus, Once, Opacity, PanicInfo, PresentationKey, PresentationSnapshot, Property,
-        RefreshReport, Runtime, SessionCtx, SessionError, SessionPolicy, ShortcutError,
-        ShortcutKey, Signal, SnapshotAction, SnapshotActions, SnapshotAttr, SnapshotElement,
-        SnapshotNode, SnapshotRowBand, SnapshotSemantics, SnapshotValue, Store, StyleDeclaration,
-        StyleOrigin, StyleValue, Submenu, SubmitEvent, Task, TaskError, TaskScope, TaskStatus,
-        TaskToken, TextEditState, TodoId, Transaction, TrayError, TraySpec, TurnError, TurnOutcome,
-        TurnReport, WindowCatalog, WindowCtx, WindowError, WindowInfo, WindowRole, WindowSpec,
-        WriteError, WriteOp, component, em, memo, once, px, signal, view,
+        LengthUnit, Memo, MemoCompute, MenuCommand, MenuCommandState, MenuItem, MenuShortcut,
+        MenuSpec, MenuStateError, Modifiers, MountError, MountPlan, MountResult, NodeId,
+        NodeOperation, NodeStatus, Once, Opacity, PanicInfo, PresentationKey, PresentationSnapshot,
+        Property, ReactiveValue, Read, ReadFault, ReadValue, RefreshReport, Runtime, SessionCtx,
+        SessionError, SessionPolicy, ShortcutError, ShortcutKey, Signal, SnapshotAction,
+        SnapshotActions, SnapshotAttr, SnapshotElement, SnapshotNode, SnapshotRowBand,
+        SnapshotSemantics, SnapshotValue, Store, StyleDeclaration, StyleOrigin, StyleValue,
+        Submenu, SubmitEvent, Task, TaskError, TaskScope, TaskStatus, TaskToken, TextEditState,
+        TodoId, Transaction, TrayError, TraySpec, TurnError, TurnOutcome, TurnReport,
+        WindowCatalog, WindowCtx, WindowError, WindowInfo, WindowRole, WindowSpec, WriteError,
+        WriteOp, component, em, memo, once, px, signal, view,
     };
     pub use zenui_core::Filter;
 }

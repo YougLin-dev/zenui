@@ -1,29 +1,22 @@
-error[E0277]: the trait bound `ValueSlot<zenui::Length>: From<zenui::Color>` is not satisfied
+error[E0277]: the trait bound `zenui::Read<zenui::Length>: From<zenui::Color>` is not satisfied
  --> tests/compile_fail/wrong_style_value.rs:5:64
   |
 5 |     let _: MountResult<MountPlan> = view! { <view style:width={color}>"Add"</view> };
   |                                     ---------------------------^^^^^----------------
   |                                     |                          |
-  |                                     |                          the trait `From<zenui::Color>` is not implemented for `ValueSlot<zenui::Length>`
+  |                                     |                          the trait `From<zenui::Color>` is not implemented for `zenui::Read<zenui::Length>`
   |                                     required by a bound introduced by this call
   |
-help: `ValueSlot<T>` implements trait `From<T>`
- --> src/view.rs
-  |
-  | impl<T> From<T> for ValueSlot<T> {
-  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `From<T>`
-...
-  | impl<T> From<Once<T>> for ValueSlot<T> {
-  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `From<zenui::Once<T>>`
-...
-  | impl<T> From<Signal<T>> for ValueSlot<T> {
-  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `From<zenui::Signal<T>>`
-...
-  | impl<T> From<Memo<T>> for ValueSlot<T> {
-  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `From<zenui::Memo<T>>`
-  = note: required for `zenui::Color` to implement `Into<ValueSlot<zenui::Length>>`
+  = help: the following other types implement trait `From<T>`:
+            `zenui::Read<String>` implements `From<&str>`
+            `zenui::Read<String>` implements `From<zenui::Once<&str>>`
+            `zenui::Read<T>` implements `From<zenui::Field<T>>`
+            `zenui::Read<T>` implements `From<zenui::Memo<T>>`
+            `zenui::Read<T>` implements `From<zenui::Once<T>>`
+            `zenui::Read<T>` implements `From<zenui::Signal<T>>`
+  = note: required for `zenui::Color` to implement `Into<zenui::Read<zenui::Length>>`
 note: required by a bound in `style_width`
  --> src/view.rs
   |
-  | pub fn style_width(value: impl Into<ValueSlot<Length>>) -> InlineStyle {
-  |                                ^^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `style_width`
+  | pub fn style_width(value: impl Into<Read<Length>>) -> InlineStyle {
+  |                                ^^^^^^^^^^^^^^^^^^ required by this bound in `style_width`

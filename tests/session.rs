@@ -257,7 +257,7 @@ fn explicit_quit_releases_a_pending_close_confirmation() {
                     .expect("the confirmation opens during a pending close");
                 view! {
                     <view>
-                        <text aria:label="draft">{request.epoch().to_string()}</text>
+                        <text aria:label="draft">{once(request.epoch().to_string())}</text>
                     </view>
                 }
             },

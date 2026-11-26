@@ -121,9 +121,9 @@ impl fmt::Debug for Store {
 }
 
 pub struct Field<T> {
-    runtime: u32,
-    id: TodoId,
-    kind: FieldKind,
+    pub(crate) runtime: u32,
+    pub(crate) id: TodoId,
+    pub(crate) kind: FieldKind,
     _marker: PhantomData<fn() -> T>,
     _not_send: PhantomData<*const ()>,
 }
@@ -137,6 +137,21 @@ impl<T> Field<T> {
             _marker: PhantomData,
             _not_send: PhantomData,
         }
+    }
+}
+
+impl<T> Field<T>
+where
+    T: crate::signal::ReactiveValue,
+{
+    /// 类型擦除读取：字段值的类型由构造字段的 accessor 决定。
+    pub(crate) fn read_value(self, once: bool) -> Result<T, FieldError> {
+        let value = with_state_of(self.runtime, |state| {
+            state.read_field(self.id, self.kind, once)
+        })?;
+        Ok(*value
+            .downcast::<T>()
+            .expect("field value type matches its accessor"))
     }
 }
 
@@ -312,33 +327,40 @@ impl crate::runtime::State {
     }
 
     pub(crate) fn read_title(&mut self, id: TodoId, once: bool) -> Result<String, FieldError> {
-        if !once && self.phase == Phase::Memo {
-            self.note_dep(DepKey::Field(id, FieldKind::Title));
-        }
-        if once {
-            self.once_reads += 1;
-        }
-        self.core
-            .committed()
-            .rows()
-            .find(|row| row.key() == id.0)
-            .map(|row| row.title().to_owned())
-            .ok_or(FieldError::Missing(id))
+        let value = self.read_field(id, FieldKind::Title, once)?;
+        Ok(*value.downcast::<String>().expect("title fields hold text"))
     }
 
     pub(crate) fn read_completed(&mut self, id: TodoId, once: bool) -> Result<bool, FieldError> {
+        let value = self.read_field(id, FieldKind::Completed, once)?;
+        Ok(*value
+            .downcast::<bool>()
+            .expect("completed fields hold a bool"))
+    }
+
+    /// 一次字段读取的唯一实现；返回类型擦除值，由 `Field<T>` 还原。
+    pub(crate) fn read_field(
+        &mut self,
+        id: TodoId,
+        kind: FieldKind,
+        once: bool,
+    ) -> Result<Box<dyn std::any::Any>, FieldError> {
         if !once && self.phase == Phase::Memo {
-            self.note_dep(DepKey::Field(id, FieldKind::Completed));
+            self.note_dep(DepKey::Field(id, kind));
         }
         if once {
             self.once_reads += 1;
         }
-        self.core
+        let row = self
+            .core
             .committed()
             .rows()
             .find(|row| row.key() == id.0)
-            .map(|row| row.completed())
-            .ok_or(FieldError::Missing(id))
+            .ok_or(FieldError::Missing(id))?;
+        Ok(match kind {
+            FieldKind::Title => Box::new(row.title().to_owned()),
+            FieldKind::Completed => Box::new(row.completed()),
+        })
     }
 
     /// 事务只在 Event command turn 中执行；失败不改变模型，但会记录到命令边界，

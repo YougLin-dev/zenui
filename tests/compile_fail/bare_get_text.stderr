@@ -1,0 +1,24 @@
+error[E0277]: the trait bound `String: IntoNode` is not satisfied
+ --> tests/compile_fail/bare_get_text.rs:5:52
+  |
+5 |     let _: MountResult<MountPlan> = view! { <text>{title.get()}</text> };
+  |                                                    -----^^^^^^
+  |                                                    |
+  |                                                    the trait `IntoNode` is not implemented for `String`
+  |                                                    required by a bound introduced by this call
+  |
+help: the trait `IntoNode` is implemented for `&str`
+ --> src/view.rs
+  |
+  | impl IntoNode for &'static str {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+note: required by a bound in `child`
+ --> src/view.rs
+  |
+  | pub fn child(value: impl IntoNode) -> PlanNode {
+  |                          ^^^^^^^^ required by this bound in `child`
+help: consider removing this method call, as the receiver has type `zenui::Signal<String>` and `zenui::Signal<String>: IntoNode` trivially holds
+  |
+5 -     let _: MountResult<MountPlan> = view! { <text>{title.get()}</text> };
+5 +     let _: MountResult<MountPlan> = view! { <text>{title}</text> };
+  |

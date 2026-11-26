@@ -651,7 +651,7 @@ fn leaf_intrinsics_and_bare_root_text_are_explicit_errors() {
     let mut app = Runtime::new();
     app.open_window("main", |_| {
         Ok(MountPlan::new(vec![zenui::view::PlanNode::Text(
-            zenui::view::TextSlot::Static("bare"),
+            zenui::view::Read::Static(String::from("bare")),
         )]))
     })
     .expect("window");
@@ -1112,8 +1112,8 @@ fn inline_styles_beat_class_base_and_state_variants() {
                 aria:label="styled"
                 disabled={true}
                 class="bg-control disabled:bg-danger"
-                style:background={Color::Role(ColorRole::Accent)}
-                style:opacity={Opacity::percent(75)}
+                style:background={once(Color::Role(ColorRole::Accent))}
+                style:opacity={once(Opacity::percent(75))}
             >"Styled"</button>
         }
     })
@@ -1138,8 +1138,8 @@ fn px_and_em_widths_produce_expected_geometry() {
     app.mount(|| {
         view! {
             <view class="flex-row">
-                <view aria:label="px" style:width={px(100.0)} />
-                <view aria:label="em" style:width={em(2.0)} />
+                <view aria:label="px" style:width={once(px(100.0))} />
+                <view aria:label="em" style:width={once(em(2.0))} />
             </view>
         }
     })
@@ -1202,7 +1202,7 @@ fn text_classes_change_glyph_size_height_and_caret_geometry() {
                 <button aria:label="normal" class="font-semibold font-normal">"Normal"</button>
                 <text-input aria:label="base" value="abc" />
                 <text-input aria:label="large-input" class="text-lg" value="abc" />
-                <view aria:label="em" class="text-lg" style:width={em(2.0)} />
+                <view aria:label="em" class="text-lg" style:width={once(em(2.0))} />
             </view>
         }
     })
@@ -1620,9 +1620,12 @@ fn row(index: usize) -> zenui::view::PlanNode {
         vec![zenui::view::attr("role", "listitem")],
         vec![zenui::view::element(
             "text",
-            vec![zenui::view::attr("aria:label", format!("row-{index:03}"))],
-            vec![zenui::view::PlanNode::Text(zenui::view::TextSlot::Once(
-                format!("row {index:03}"),
+            vec![zenui::view::attr(
+                "aria:label",
+                zenui::once(format!("row-{index:03}")),
+            )],
+            vec![zenui::view::PlanNode::Text(zenui::view::Read::Once(
+                zenui::once(format!("row {index:03}")),
             ))],
         )],
     )
@@ -1959,7 +1962,7 @@ fn a_zero_area_viewport_culls_everything_and_hit_tests_nothing() {
                 zenui::view::attr("value", "Alpha"),
             ],
             &[],
-            vec![zenui::view::style_width(px(100.0))],
+            vec![zenui::view::style_width(zenui::once(px(100.0)))],
             Vec::new(),
         );
         let parent = zenui::view::element(
