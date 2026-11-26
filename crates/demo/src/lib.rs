@@ -637,7 +637,7 @@ fn TodoDetailRow(todo: TodoId, todos: Store) -> MountResult<MountPlan> {
     let title = todos.title(todo).read_once()?;
 
     view! {
-        <view role="listitem" class="flex-row items-center gap-3">
+        <view role="listitem" class="flex-row items-center gap-3" style:height={px(37.0)}>
             <text>{once(title)}</text>
         </view>
     }
@@ -675,8 +675,8 @@ pub fn TodoDetails(window: WindowCtx, state: TodoState) -> MountResult<MountPlan
                 aria:label="Details note"
                 on:input={move |value: String| note.set(value)}
             />
-            <view role="list" aria:label="Details rows" class="gap-3">
-                <For each={visible} key={|id: TodoId| id}>
+            <view role="list" aria:label="Details rows" class="gap-0">
+                <For each={visible} key={|id: TodoId| id} row-height={px(37.0)}>
                     {move |todo: TodoId| view! { <TodoDetailRow todo={todo} todos={todos} /> }}
                 </For>
             </view>
@@ -772,7 +772,9 @@ mod tests {
     use std::path::Path;
     use std::rc::Rc;
 
-    use super::{TodoState, import_titles, read_titles, save_titles};
+    use super::{
+        DETAILS_WINDOW, TodoState, import_titles, open_todo_window, read_titles, save_titles,
+    };
     use zenui::prelude::*;
 
     type StaleRead = Rc<RefCell<Option<Result<Vec<String>, String>>>>;
@@ -829,6 +831,32 @@ mod tests {
                 save_titles(Path::new("unused"), &[title]).expect_err("a line break is rejected");
             assert!(error.contains("line break"), "unexpected error: {error}");
         }
+    }
+
+    #[test]
+    fn the_details_window_mounts_only_a_bounded_row_window() {
+        let mut app = Runtime::new();
+        open_todo_window(&mut app).expect("open the todo window");
+        for index in 0..1_000 {
+            app.input("What needs to be done?", &format!("Task {index}"))
+                .expect("fill the draft");
+            app.submit("Add task").expect("add a row");
+        }
+        let details = app.show(DETAILS_WINDOW).expect("show the details window");
+        let snapshot = app.presentation_of(details).expect("details snapshot");
+        let bands = snapshot.row_bands();
+        assert_eq!(bands.len(), 1, "the details list is the only windowed list");
+        assert_eq!(
+            bands[0].total_rows(),
+            1_000,
+            "every shared row is declared to the list"
+        );
+        assert_eq!(bands[0].first_row(), 0);
+        let mounted = snapshot.elements().count();
+        assert!(
+            mounted < 250,
+            "the details window mounts only its visible rows, got {mounted} elements"
+        );
     }
 
     #[test]
