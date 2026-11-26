@@ -117,7 +117,7 @@ fn Controls(clicks: Rc<Cell<u32>>, keys: Rc<Cell<u32>>) -> MountResult<MountPlan
                 aria:label="editor"
                 value={draft}
                 on:input={move |value: String| draft.set(value)}
-                on:keydown={move |event: KeyEvent| {
+                on:keydown={move |event: &mut KeyEvent| {
                     key_count.set(key_count.get() + 1);
                     if event.key() == Key::Escape {
                         draft.set(String::new());

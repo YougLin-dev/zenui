@@ -34,8 +34,9 @@ use windows::Win32::UI::Input::Ime::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     EnableWindow, GetCapture, GetKeyState, ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT,
-    TrackMouseEvent, VIRTUAL_KEY, VK_BACK, VK_CONTROL, VK_DELETE, VK_END, VK_ESCAPE, VK_HOME,
-    VK_LEFT, VK_MENU, VK_NEXT, VK_PRIOR, VK_PROCESSKEY, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_TAB,
+    TrackMouseEvent, VIRTUAL_KEY, VK_BACK, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE,
+    VK_HOME, VK_LEFT, VK_MENU, VK_NEXT, VK_PRIOR, VK_PROCESSKEY, VK_RETURN, VK_RIGHT, VK_SHIFT,
+    VK_SPACE, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::Shell::NIN_SELECT;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -3351,12 +3352,15 @@ impl Host {
         // AltGr 在 Windows 上表现为 Ctrl+Alt；不能把它当成编辑快捷键，
         // 否则使用 AltGr 布局的字符会被剪切/粘贴吞掉。
         let alt = unsafe { GetKeyState(i32::from(VK_MENU.0)) } < 0;
-        self.key_down_with(window, key, shift, control && !alt)
+        if alt {
+            // Alt 组合留给系统菜单与加速键预译；AltGr 的字符仍由 WM_CHAR 输入。
+            return Ok(());
+        }
+        self.key_down_with(window, key, shift, control)
     }
 
-    /// 键盘映射本体：编辑、撤销/重做、caret/selection、焦点遍历与表单提交。
-    ///
-    /// Shift+方向键保留 anchor、移动焦点端；Ctrl+A 全选，Ctrl+Z/Y 走运行时历史。
+    /// 键盘映射本体：runtime keydown turn 之前的宿主层（组合/IME、编辑快捷键）
+    /// 与之后仅存的滚动/绘制；控件默认动作全部由 runtime 结算。
     fn key_down_with(
         &mut self,
         window: &mut WindowHost,
@@ -3364,14 +3368,10 @@ impl Host {
         shift: bool,
         control: bool,
     ) -> Result<(), HostError> {
+        let modifiers = Modifiers::new(shift, control, false, false);
         if key == VK_TAB {
             self.cancel_compositions(window)?;
-            if shift {
-                self.runtime.focus_previous_in(window.ctx)
-            } else {
-                self.runtime.focus_next_in(window.ctx)
-            }
-            .map_err(HostError::WindowState)?;
+            let _ = self.dispatch_key_intent(window, Key::Tab, modifiers)?;
             window.reveal_requested = true;
             window.paint_requested = true;
             return Ok(());
@@ -3400,26 +3400,33 @@ impl Host {
             .presentation_of(window.ctx)
             .map_err(HostError::Snapshot)?;
         if matches!(key, VK_PRIOR | VK_NEXT) {
-            if focused_input(&snapshot).is_some_and(|node| is_composing(&snapshot, node)) {
-                // 组合期间翻页键归 IME；不滚动。
+            let report = self.dispatch_key_intent(window, host_key(key), modifiers)?;
+            if focused_input(&snapshot).is_some_and(|node| is_composing(&snapshot, node))
+                || key_default_blocked(&report)
+            {
+                // 组合期间翻页键归 IME；被 handler 消费的翻页键也不滚动。
                 return Ok(());
             }
             return self.scroll_by_key(window, key);
         }
         let Some(focused) = focused_input(&snapshot) else {
-            if matches!(key, VK_HOME | VK_END) {
+            // 没有文本输入焦点时仍把 keydown 交给 runtime：焦点控件、窗口
+            // fallback handler 与 Tab/Enter/Space 默认都在那里结算。
+            let report = self.dispatch_key_intent(window, host_key(key), modifiers)?;
+            if matches!(key, VK_HOME | VK_END) && !key_default_blocked(&report) {
                 return self.scroll_by_key(window, key);
             }
             return Ok(());
         };
         let composing = is_composing(&snapshot, focused);
         if key == VK_ESCAPE {
-            // 运行时在组合中优先取消并恢复文本；否则派发给用户 keydown。
-            ignore_expected_dispatch(self.runtime.keydown_node(focused, Key::Escape))?;
-            if composing {
-                self.notify_ime_cancel(window);
-                window.reveal_requested = true;
+            // L0：组合中的第一个 Escape 只取消组合（连同 OS IME）；组合结束后
+            // Escape 才作为用户 keydown 进入 runtime。
+            if composing && self.cancel_compositions(window)? {
+                window.paint_requested = true;
+                return Ok(());
             }
+            self.dispatch_key_intent(window, Key::Escape, modifiers)?;
             window.paint_requested = true;
             return Ok(());
         }
@@ -3451,43 +3458,34 @@ impl Host {
             }
             return Ok(());
         }
-        if key == VK_RETURN {
-            if !is_composing(&snapshot, focused) {
-                ignore_expected_dispatch(self.runtime.keydown_node(focused, Key::Enter))?;
-                if let Some(form) = ancestor_form(&snapshot, focused) {
-                    ignore_expected_dispatch(self.runtime.submit_node(form))?;
-                }
-            }
-            window.paint_requested = true;
-            return Ok(());
-        }
-        if key == VK_BACK {
-            ignore_expected_dispatch(self.runtime.backspace_node(focused))?;
-            window.reveal_requested = true;
-            window.paint_requested = true;
-            return Ok(());
-        }
-        if key == VK_DELETE {
-            ignore_expected_dispatch(self.runtime.delete_forward_node(focused))?;
-            window.reveal_requested = true;
-            window.paint_requested = true;
-            return Ok(());
-        }
-
-        let Some(command) = caret_command_for(&snapshot, focused, key, shift) else {
-            return Ok(());
-        };
-        match command {
-            CaretCommand::Caret(offset) => {
-                ignore_expected_dispatch(self.runtime.set_caret_node(focused, offset))?;
-            }
-            CaretCommand::Selection(anchor, focus) => {
-                ignore_expected_dispatch(self.runtime.set_selection_node(focused, anchor, focus))?;
-            }
-        }
+        // L3 用户 keydown → L4 控件默认全部在 runtime 内完成；宿主只保留
+        // L1 快捷键、IME 与 L5 滚动/绘制。
+        self.dispatch_key_intent(window, host_key(key), modifiers)?;
         window.reveal_requested = true;
         window.paint_requested = true;
         Ok(())
+    }
+
+    fn dispatch_key_intent(
+        &mut self,
+        window: &WindowHost,
+        key: Key,
+        modifiers: Modifiers,
+    ) -> Result<TurnReport, HostError> {
+        match self
+            .runtime
+            .dispatch_intent(Intent::keydown_window(window.ctx, key, modifiers))
+        {
+            Ok(report) => Ok(report),
+            Err(
+                DispatchError::WrongKind { .. }
+                | DispatchError::Rejected { .. }
+                | DispatchError::Suspended(_)
+                | DispatchError::StaleNode(_)
+                | DispatchError::TargetClosed,
+            ) => Ok(TurnReport::default()),
+            Err(error) => Err(HostError::Input(error)),
+        }
     }
 
     /// 把聚焦输入的已提交选区写入剪贴板；不派发 `on:input`。
@@ -5278,14 +5276,6 @@ fn pointer_point(lparam: LPARAM, scale: f32) -> Point {
     Point::new(x / scale, y / scale)
 }
 
-/// 一次导航键对 caret/selection 的目标；运行时的 selection 是归一化区间，
-/// 因此 Shift+左键扩展左端、Shift+右键扩展右端。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CaretCommand {
-    Caret(usize),
-    Selection(usize, usize),
-}
-
 /// 一条 `WM_IME_COMPOSITION` 同时可能带结果串与新组合串。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ImeRequest {
@@ -5417,71 +5407,31 @@ const fn blinked(current: bool, focused: bool, composing: bool, foreground: bool
     }
 }
 
-fn caret_command_for(
-    snapshot: &PresentationSnapshot,
-    node: NodeId,
-    key: VIRTUAL_KEY,
-    shift: bool,
-) -> Option<CaretCommand> {
-    let element = snapshot.node(node)?;
-    let edit = element.edit()?;
-    let length = element.text_value().unwrap_or_default().chars().count();
-    caret_command(edit, length, key, shift)
+/// 宿主虚拟键到 runtime `Key` 的映射；未建模的键交给用户 handler 作为
+/// `Key::Other`，宿主自身不再为它们提供默认动作。
+const fn host_key(key: VIRTUAL_KEY) -> Key {
+    match key.0 {
+        k if k == VK_ESCAPE.0 => Key::Escape,
+        k if k == VK_RETURN.0 => Key::Enter,
+        k if k == VK_TAB.0 => Key::Tab,
+        k if k == VK_SPACE.0 => Key::Space,
+        k if k == VK_BACK.0 => Key::Backspace,
+        k if k == VK_DELETE.0 => Key::Delete,
+        k if k == VK_LEFT.0 => Key::ArrowLeft,
+        k if k == VK_RIGHT.0 => Key::ArrowRight,
+        k if k == VK_UP.0 => Key::ArrowUp,
+        k if k == VK_DOWN.0 => Key::ArrowDown,
+        k if k == VK_HOME.0 => Key::Home,
+        k if k == VK_END.0 => Key::End,
+        k if k == VK_PRIOR.0 => Key::PageUp,
+        k if k == VK_NEXT.0 => Key::PageDown,
+        _ => Key::Other,
+    }
 }
 
-fn caret_command(
-    edit: &TextEditState,
-    length: usize,
-    key: VIRTUAL_KEY,
-    shift: bool,
-) -> Option<CaretCommand> {
-    let caret = edit.caret().min(length);
-    let anchor = edit.anchor().min(length);
-    // set_caret 会留下折叠的 (offset, offset)；只有非折叠区间才算选择。
-    let selection = edit
-        .selection()
-        .filter(|(start, end)| start != end)
-        .map(|(start, end)| (start.min(length), end.min(length)));
-    if shift {
-        return match key {
-            k if k == VK_LEFT => Some(CaretCommand::Selection(anchor, caret.saturating_sub(1))),
-            k if k == VK_RIGHT => Some(CaretCommand::Selection(anchor, (caret + 1).min(length))),
-            k if k == VK_HOME => Some(CaretCommand::Selection(anchor, 0)),
-            k if k == VK_END => Some(CaretCommand::Selection(anchor, length)),
-            _ => None,
-        };
-    }
-    let offset = match key {
-        k if k == VK_LEFT => selection.map_or_else(|| caret.saturating_sub(1), |(start, _)| start),
-        k if k == VK_RIGHT => selection.map_or_else(|| (caret + 1).min(length), |(_, end)| end),
-        k if k == VK_HOME => 0,
-        k if k == VK_END => length,
-        _ => return None,
-    };
-    Some(CaretCommand::Caret(offset))
-}
-
-fn ancestor_form(snapshot: &PresentationSnapshot, node: NodeId) -> Option<NodeId> {
-    fn walk(nodes: &[SnapshotNode], target: NodeId, form: Option<NodeId>) -> Option<NodeId> {
-        for candidate in nodes {
-            let SnapshotNode::Element(element) = candidate else {
-                continue;
-            };
-            let form = if element.tag() == "form" {
-                Some(element.id())
-            } else {
-                form
-            };
-            if element.id() == target {
-                return form;
-            }
-            if let Some(found) = walk(element.children(), target, form) {
-                return Some(found);
-            }
-        }
-        None
-    }
-    walk(snapshot.roots(), node, None)
+/// runtime 结算后，宿主是否仍应执行自己的原生默认动作（滚动等）。
+fn key_default_blocked(report: &TurnReport) -> bool {
+    !report.is_ok() || report.outcome().consumed() || report.outcome().prevent_default()
 }
 
 fn client_size(hwnd: HWND) -> Result<(u32, u32), HostError> {
@@ -9670,134 +9620,6 @@ mod tests {
         assert_eq!(pointer_point(LPARAM(packed), 1.0), Point::new(-5.0, -9.0));
     }
 
-    fn edit_state(caret: usize, selection: Option<(usize, usize)>) -> (Runtime, NodeId) {
-        let mut app = Runtime::new();
-        app.open_window("main", |_| {
-            view! { <text-input value="Alpha" aria:label="Input" /> }
-        })
-        .expect("open window");
-        let id = app
-            .presentation()
-            .expect("snapshot")
-            .find_label("Input")
-            .expect("input")
-            .id();
-        app.focus_node(id).expect("focus");
-        match selection {
-            Some((start, end)) => app.set_selection_node(id, start, end).expect("selection"),
-            None => app.set_caret_node(id, caret).expect("caret"),
-        }
-        (app, id)
-    }
-
-    fn command(
-        caret: usize,
-        selection: Option<(usize, usize)>,
-        key: VIRTUAL_KEY,
-        shift: bool,
-    ) -> Option<CaretCommand> {
-        let (app, id) = edit_state(caret, selection);
-        let snapshot = app.presentation().expect("snapshot");
-        let element = snapshot.node(id).expect("input");
-        let edit = element.edit().expect("edit");
-        let length = element.text_value().unwrap_or_default().chars().count();
-        caret_command(edit, length, key, shift)
-    }
-
-    #[test]
-    fn caret_commands_step_collapse_and_clamp() {
-        assert_eq!(
-            command(3, None, VK_LEFT, false),
-            Some(CaretCommand::Caret(2))
-        );
-        assert_eq!(
-            command(3, None, VK_RIGHT, false),
-            Some(CaretCommand::Caret(4))
-        );
-        assert_eq!(
-            command(0, None, VK_LEFT, false),
-            Some(CaretCommand::Caret(0)),
-            "left clamps at the start"
-        );
-        assert_eq!(
-            command(5, None, VK_RIGHT, false),
-            Some(CaretCommand::Caret(5)),
-            "right clamps at the end"
-        );
-        assert_eq!(
-            command(3, Some((1, 3)), VK_LEFT, false),
-            Some(CaretCommand::Caret(1)),
-            "left collapses the selection to its left edge"
-        );
-        assert_eq!(
-            command(3, Some((1, 3)), VK_RIGHT, false),
-            Some(CaretCommand::Caret(3)),
-            "right collapses the selection to its right edge"
-        );
-        assert_eq!(
-            command(3, None, VK_HOME, false),
-            Some(CaretCommand::Caret(0))
-        );
-        assert_eq!(
-            command(3, None, VK_END, false),
-            Some(CaretCommand::Caret(5))
-        );
-        assert_eq!(command(3, None, VK_RETURN, false), None);
-    }
-
-    #[test]
-    fn shift_caret_commands_keep_the_anchor_and_move_the_focus() {
-        assert_eq!(
-            command(3, None, VK_LEFT, true),
-            Some(CaretCommand::Selection(3, 2))
-        );
-        assert_eq!(
-            command(3, None, VK_RIGHT, true),
-            Some(CaretCommand::Selection(3, 4))
-        );
-        assert_eq!(
-            command(3, Some((1, 3)), VK_LEFT, true),
-            Some(CaretCommand::Selection(1, 2)),
-            "shift-left shrinks toward the anchor"
-        );
-        assert_eq!(
-            command(3, Some((1, 3)), VK_RIGHT, true),
-            Some(CaretCommand::Selection(1, 4)),
-            "shift-right extends away from the anchor"
-        );
-        assert_eq!(
-            command(3, Some((1, 3)), VK_HOME, true),
-            Some(CaretCommand::Selection(1, 0))
-        );
-        assert_eq!(
-            command(3, Some((1, 3)), VK_END, true),
-            Some(CaretCommand::Selection(1, 5))
-        );
-        assert_eq!(
-            command(0, None, VK_LEFT, true),
-            Some(CaretCommand::Selection(0, 0)),
-            "shift-left at the start stays collapsed"
-        );
-    }
-
-    #[test]
-    fn a_backward_selection_keeps_its_direction() {
-        assert_eq!(
-            command(1, Some((3, 1)), VK_LEFT, true),
-            Some(CaretCommand::Selection(3, 0)),
-            "the anchor stays at 3 and the focus moves left"
-        );
-        assert_eq!(
-            command(1, Some((3, 1)), VK_RIGHT, true),
-            Some(CaretCommand::Selection(3, 2))
-        );
-        assert_eq!(
-            command(1, Some((3, 1)), VK_LEFT, false),
-            Some(CaretCommand::Caret(1)),
-            "plain left collapses to the normalized left edge"
-        );
-    }
-
     fn open_host() -> Host {
         let mut runtime = Runtime::new();
         zenui_demo::open_todo_window(&mut runtime).expect("open the todo window");
@@ -11666,6 +11488,66 @@ mod tests {
         );
     }
 
+    /// 100 行待办窗口；`consume` 为真时窗口根 keydown 吃掉 PageDown。
+    fn scrolling_keydown_host(consume: bool) -> Host {
+        use zenui_demo::{TodoApp, TodoState};
+
+        let mut runtime = Runtime::new();
+        let state = runtime.setup(TodoState::new).expect("todo state");
+        runtime
+            .declare_windows(move |catalog| {
+                catalog.window(
+                    WindowSpec::new(MAIN).primary().sized(900, 700),
+                    move |window| {
+                        window
+                            .on_keydown(move |event: &mut KeyEvent| {
+                                if consume && event.key() == Key::PageDown {
+                                    event.consume();
+                                }
+                                HandlerOutcome::Ok
+                            })
+                            .map_err(|_| MountError::Component("register window keydown"))?;
+                        view! { <TodoApp window={window} state={state} /> }
+                    },
+                )
+            })
+            .expect("declare the window");
+        runtime.show(MAIN).expect("show the window");
+        let mut host = Host::open(runtime, HostConfig::hidden()).expect("open host");
+        for index in 0..100 {
+            host.runtime
+                .input("What needs to be done?", &format!("Task {index}"))
+                .expect("fill the draft");
+            host.runtime.submit("Add task").expect("add a row");
+        }
+        host.render().expect("render the tall window");
+        host
+    }
+
+    #[test]
+    fn a_consumed_keydown_blocks_the_host_scroll_default() {
+        let mut host = scrolling_keydown_host(true);
+        let (before, after) = with_main(&mut host, |host, window| {
+            let before = window.scroll_offset;
+            host.key_down_with(window, VK_NEXT, false, false)
+                .expect("page down");
+            Ok((before, window.scroll_offset))
+        });
+        assert_eq!(after, before, "a consumed PageDown does not scroll");
+
+        let mut host = scrolling_keydown_host(false);
+        let (before, after) = with_main(&mut host, |host, window| {
+            let before = window.scroll_offset;
+            host.key_down_with(window, VK_NEXT, false, false)
+                .expect("page down");
+            Ok((before, window.scroll_offset))
+        });
+        assert!(
+            after > before,
+            "an unhandled PageDown still reaches the host scroll default"
+        );
+    }
+
     #[test]
     fn shift_tab_moves_focus_backward() {
         let mut host = open_host();
@@ -12556,32 +12438,6 @@ mod tests {
                 .composition()
                 .is_none()
         );
-    }
-
-    #[test]
-    fn ancestor_form_finds_the_nearest_enclosing_form() {
-        let mut app = Runtime::new();
-        app.open_window("main", |_| {
-            view! {
-                <view>
-                    <form aria:label="Form">
-                        <text-input value="a" aria:label="Inside" />
-                    </form>
-                    <text-input value="b" aria:label="Outside" />
-                </view>
-            }
-        })
-        .expect("open window");
-        let snapshot = app.presentation().expect("snapshot");
-        let inside = snapshot.find_label("Inside").expect("inside").id();
-        let outside = snapshot.find_label("Outside").expect("outside").id();
-        let form = snapshot
-            .elements()
-            .find(|element| element.tag() == "form")
-            .expect("form")
-            .id();
-        assert_eq!(ancestor_form(&snapshot, inside), Some(form));
-        assert_eq!(ancestor_form(&snapshot, outside), None);
     }
 
     #[test]
