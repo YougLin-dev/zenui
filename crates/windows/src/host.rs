@@ -2734,7 +2734,7 @@ impl Host {
                 .map(SceneElement::visual);
             match visual {
                 Some(Visual::Button { .. }) => {
-                    ignore_expected_dispatch(self.runtime.click_node(node))?
+                    ignore_expected_dispatch(self.runtime.activate_node(node))?
                 }
                 Some(Visual::Checkbox { checked }) => {
                     ignore_expected_dispatch(self.runtime.change_node(node, !checked))?;
@@ -3674,7 +3674,7 @@ impl Host {
         for node in composing {
             match self.runtime.compose_cancel_node(node) {
                 Ok(()) => cancelled = true,
-                Err(error) => ignore_expected_dispatch(Err(error))?,
+                Err(error) => ignore_expected_dispatch::<()>(Err(error))?,
             }
         }
         if cancelled {
@@ -5259,9 +5259,9 @@ fn validated_file_dialog_outcome(
 /// 命中元素可以没有对应 handler（例如静态按钮）、处于不可聚焦、挂起或已卸载
 /// 状态，或在派发过程中被 handler 重挂载而失效；这些拒绝是正常交互结果，
 /// 不是宿主失败。指针、键盘与 UIA 动作共用这一个判定。
-fn ignore_expected_dispatch(result: Result<(), DispatchError>) -> Result<(), HostError> {
+fn ignore_expected_dispatch<T>(result: Result<T, DispatchError>) -> Result<(), HostError> {
     match result {
-        Ok(())
+        Ok(_)
         | Err(
             DispatchError::WrongKind { .. }
             | DispatchError::Rejected { .. }
@@ -10182,7 +10182,9 @@ mod tests {
                             <button
                                 aria:label="Dead"
                                 disabled={true}
-                                on:click={move || panic!("a disabled Invoke ran its handler")}
+                                on:click={move || -> () {
+                                    panic!("a disabled Invoke ran its handler")
+                                }}
                             >"Dead"</button>
                             <text-input
                                 aria:label="Locked"

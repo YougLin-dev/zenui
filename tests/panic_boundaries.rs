@@ -42,12 +42,15 @@ fn a_panicking_click_handler_leaves_the_event_slot_reusable() {
     })
     .expect("mount");
 
-    assert_eq!(
-        panic_message(
-            app.click_text("Target")
-                .expect_err("the handler panic is contained")
+    let report = app
+        .click_text("Target")
+        .expect("the click turn contains the handler panic");
+    assert!(
+        matches!(
+            report.errors(),
+            [TurnError::HandlerPanicked(panic)] if panic.message() == "click boom"
         ),
-        "click boom"
+        "the handler panic is reported in the turn"
     );
     assert_eq!(clicks.get(), 1, "writes before the panic are preserved");
 

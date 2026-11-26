@@ -380,7 +380,6 @@ fn a_setup_write_is_rejected_and_the_mount_can_retry() {
 }
 
 #[test]
-#[should_panic(expected = "another ZenUI Runtime")]
 fn a_handle_cannot_cross_runtimes() {
     #[component]
     fn Leak(slot: Rc<RefCell<Option<Signal<i32>>>>) -> MountResult<MountPlan> {
@@ -410,7 +409,13 @@ fn a_handle_cannot_cross_runtimes() {
             }
         })
         .expect("second runtime");
-    second.click_text("Touch").expect("the foreign read panics");
+    let report = second
+        .click_text("Touch")
+        .expect("the click turn contains the foreign read");
+    assert!(matches!(
+        report.errors(),
+        [TurnError::HandlerPanicked(panic)] if panic.message().contains("another ZenUI Runtime")
+    ));
 }
 
 #[test]
@@ -458,7 +463,6 @@ fn children_and_named_slots_take_their_own_factory_timing() {
 }
 
 #[test]
-#[should_panic(expected = "another ZenUI Runtime")]
 fn a_store_cannot_write_across_runtimes() {
     #[component]
     fn LeakStore(slot: Rc<RefCell<Option<Store>>>) -> MountResult<MountPlan> {
@@ -488,9 +492,13 @@ fn a_store_cannot_write_across_runtimes() {
             }
         })
         .expect("second runtime");
-    second
+    let report = second
         .click_text("Touch")
-        .expect("the foreign write panics");
+        .expect("the click turn contains the foreign write");
+    assert!(matches!(
+        report.errors(),
+        [TurnError::HandlerPanicked(panic)] if panic.message().contains("another ZenUI Runtime")
+    ));
 }
 
 #[test]
