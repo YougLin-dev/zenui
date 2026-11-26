@@ -6,9 +6,10 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+use windows::Win32::UI::Input::KeyboardAndMouse::VK_TAB;
 use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, MSG, PM_REMOVE, PeekMessageW, PostMessageW, TranslateMessage, WM_CHAR,
-    WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP,
 };
 use zenui::prelude::*;
 use zenui_windows::{Host, HostConfig};
@@ -300,11 +301,17 @@ fn a_presenter_can_pump_nested_messages_without_holding_the_host() {
         .set_file_dialog_presenter(move |anchor: HWND, options: &FileDialogOptions| {
             slot.borrow_mut().push((anchor.0 as isize, options.clone()));
             // 安全：post 只排队；嵌套循环在当前 UI 线程派发回窗口过程。
+            // 按下 Pick 已把焦点移到按钮，用两次 Tab 证明嵌套消息确实到达 host。
             unsafe {
-                PostMessageW(Some(anchor), WM_CHAR, WPARAM('X' as usize), LPARAM(0))
-                    .expect("post the first character");
-                PostMessageW(Some(anchor), WM_CHAR, WPARAM('Y' as usize), LPARAM(0))
-                    .expect("post the second character");
+                for _ in 0..2 {
+                    PostMessageW(
+                        Some(anchor),
+                        WM_KEYDOWN,
+                        WPARAM(VK_TAB.0 as usize),
+                        LPARAM(0),
+                    )
+                    .expect("post a tab");
+                }
                 let mut message = MSG::default();
                 for _ in 0..64 {
                     if PeekMessageW(&mut message, None, 0, 0, PM_REMOVE).0 == 0 {
@@ -327,9 +334,15 @@ fn a_presenter_can_pump_nested_messages_without_holding_the_host() {
     );
 
     assert_eq!(calls.borrow().len(), 1);
+    let snapshot = harness.host.presentation(MAIN).expect("a window snapshot");
+    let focused = snapshot
+        .focus()
+        .and_then(|node| snapshot.node(node))
+        .and_then(|element| element.label())
+        .map(str::to_owned);
     assert_eq!(
-        input_value(&harness).as_deref(),
-        Some("XY"),
+        focused.as_deref(),
+        Some("Folder"),
         "nested messages reached the host while the dialog was open"
     );
     assert_eq!(

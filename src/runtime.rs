@@ -93,7 +93,14 @@ impl fmt::Debug for EventTarget {
 pub enum IntentPayload {
     Click,
     Activate,
-    KeyDown { key: Key, modifiers: Modifiers },
+    /// 指针按下；宿主已算好 text-input 的字符偏移。
+    Press {
+        caret: Option<usize>,
+    },
+    KeyDown {
+        key: Key,
+        modifiers: Modifiers,
+    },
 }
 
 /// 键盘修饰键快照；指针点击当前只带默认值。
@@ -181,6 +188,16 @@ impl Intent {
             EventSource::Window,
             EventTarget::App,
             IntentPayload::Activate,
+            Modifiers::new(false, false, false, false),
+        )
+    }
+
+    /// 指针按下；`caret` 是宿主从场景算出的字符偏移，runtime 不依赖 render。
+    pub const fn press(target: NodeId, caret: Option<usize>) -> Self {
+        Self::new(
+            EventSource::Pointer,
+            EventTarget::Node(target),
+            IntentPayload::Press { caret },
             Modifiers::new(false, false, false, false),
         )
     }
@@ -5747,8 +5764,14 @@ impl Runtime {
 
     /// 路由一个 typed Intent；窗口/activation 目标先校验再询问处理器。
     pub fn dispatch_intent(&mut self, intent: Intent) -> Result<TurnReport, DispatchError> {
-        if let IntentPayload::KeyDown { key, modifiers } = intent.payload() {
-            return self.dispatch_keydown_intent(intent.target(), key, modifiers);
+        match intent.payload() {
+            IntentPayload::KeyDown { key, modifiers } => {
+                return self.dispatch_keydown_intent(intent.target(), key, modifiers);
+            }
+            IntentPayload::Press { caret } => {
+                return self.dispatch_press_intent(intent.target(), caret);
+            }
+            IntentPayload::Click | IntentPayload::Activate => {}
         }
         match intent.target() {
             EventTarget::Node(node) => {
@@ -5778,6 +5801,82 @@ impl Runtime {
     /// 路由原语：等价于派发一个指针 Click Intent。
     pub fn activate_node(&mut self, node: NodeId) -> Result<TurnReport, DispatchError> {
         self.dispatch_intent(Intent::click(node))
+    }
+
+    /// Press turn：最近可聚焦祖先获得焦点，text-input 按宿主偏移放置 caret。
+    ///
+    /// 禁用目标（含禁用祖先）不改变焦点；隐藏或挂起窗口由目标校验拒绝。
+    fn dispatch_press_intent(
+        &mut self,
+        target: EventTarget,
+        caret: Option<usize>,
+    ) -> Result<TurnReport, DispatchError> {
+        let EventTarget::Node(node) = target else {
+            return Ok(TurnReport::default());
+        };
+        let state = self.state.clone();
+        context::install(&state, || {
+            let element = with_state(|state| state.element_for_node(node))?;
+            let path = with_state(|state| state.element_path(element));
+            if path
+                .iter()
+                .any(|element| with_state(|state| state.element_is_disabled(*element)))
+            {
+                return Ok(TurnReport::default());
+            }
+            let focusable = path
+                .iter()
+                .rev()
+                .copied()
+                .find(|element| with_state(|state| state.is_focusable(*element)));
+            let focus_node =
+                focusable.map(|element| with_state(|state| state.elements[element].id));
+            let tree = with_state(|state| state.tree_for_element(element))
+                .ok_or(DispatchError::StaleNode(node))?;
+            let mut report = TurnReport::default();
+            if with_state(|state| state.focused_in(tree)) != focusable {
+                self.move_focus(tree, focusable)
+                    .map_err(DispatchError::Command)?;
+                report.mark_changed();
+            }
+            // focus handler 可能写入并重挂载；caret 只落在 flush 后仍然聚焦、
+            // 仍是同一个 text-input 的目标上。
+            if let (Some(focus_node), Some(caret)) = (focus_node, caret)
+                && let Some(focusable) = with_state(|state| state.element_for_node(focus_node).ok())
+                && with_state(|state| state.focused_in(tree)) == Some(focusable)
+                && with_state(|state| state.element_tag(focusable)) == "text-input"
+            {
+                let length = with_state(|state| text_length(state.element_local(focusable)));
+                let offset = caret.min(length);
+                let changed = with_state(|state| {
+                    let LocalState::TextInput(editor) = state.element_local_mut(focusable) else {
+                        return false;
+                    };
+                    if editor.is_composing() {
+                        return false;
+                    }
+                    let changed = editor.caret != offset
+                        || editor.anchor != offset
+                        || editor.selection != Some((offset, offset));
+                    editor.caret = offset;
+                    editor.anchor = offset;
+                    editor.selection = Some((offset, offset));
+                    editor.history.break_run();
+                    if changed {
+                        state.mark_element_changed(focusable);
+                    }
+                    changed
+                });
+                if changed {
+                    if let Some(key) = with_state(|state| state.tree_for_element(focusable)) {
+                        with_state(|state| state.commit_tree_revision(key));
+                    }
+                    report.mark_changed();
+                }
+            }
+            self.finish_command().map_err(DispatchError::Command)?;
+            Ok(report)
+        })
     }
 
     /// 一个 keydown turn：capture → closest 普通 handler → bubble → L4 默认。
@@ -6823,7 +6922,7 @@ impl Runtime {
         .map_err(DispatchError::Panic)
     }
 
-    pub fn change(&mut self, label: &str, value: bool) -> Result<(), MountError> {
+    pub fn change(&mut self, label: &str, value: bool) -> Result<TurnReport, MountError> {
         self.dispatch_label(
             FindTarget::Label(label.to_owned()),
             "change target not found",
@@ -6832,22 +6931,57 @@ impl Runtime {
         )
     }
 
-    /// 按 Node ID 派发 change；先确认该元素拥有 change handler，再更新本地状态。
-    pub fn change_node(&mut self, node: NodeId, value: bool) -> Result<(), DispatchError> {
+    /// 按 Node ID 派发一次复选框 change。
+    ///
+    /// 有 `on:change` 时先更新 proposed 再运行一次 handler；没有 handler 时
+    /// 直接本地切换。受控 checkbox 在 flush 后按 `checked` 绑定对齐，非受控
+    /// 的本地值由呈现层继续报告。
+    pub fn change_node(&mut self, node: NodeId, value: bool) -> Result<TurnReport, DispatchError> {
         let state = self.state.clone();
         context::install(&state, || {
             let element = with_state(|state| state.element_for_node(node))?;
-            let (event_id, event) =
-                self.take_node_event(node, element, EventKind::Change, NodeOperation::Change)?;
-            with_state(|state| state.update_local(element, LocalUpdate::Change(value)));
-            let panic = invoke_event(event_id, event, |event| {
-                if let Event::Change(handler) = event {
-                    handler(value);
+            let before = with_state(|state| match state.element_local(element) {
+                LocalState::Checkbox { checked } => Some(*checked),
+                _ => None,
+            });
+            let Some(before) = before else {
+                return Err(DispatchError::WrongKind {
+                    node,
+                    operation: NodeOperation::Change,
+                });
+            };
+            let event = with_state(|state| state.take_element_event(element, EventKind::Change));
+            let mut report = TurnReport::default();
+            if let Some((event_id, event)) = event {
+                with_state(|state| {
+                    state.phase = Phase::Event;
+                    state.fault = None;
+                    state.write_error = None;
+                    state.update_local(element, LocalUpdate::Change(value));
+                });
+                let panic = invoke_event(event_id, event, |event| {
+                    if let Event::Change(handler) = event {
+                        handler(value);
+                    }
+                })
+                .err();
+                with_state(|state| state.phase = Phase::Idle);
+                if let Some(panic) = panic {
+                    let _ = self.finish_command();
+                    return Err(DispatchError::Panic(panic));
                 }
-            })
-            .err();
-            with_state(|state| state.phase = Phase::Idle);
-            self.finish_event(panic)
+            } else {
+                with_state(|state| state.update_local(element, LocalUpdate::Change(value)));
+            }
+            self.finish_command().map_err(DispatchError::Command)?;
+            let after = with_state(|state| match state.element_local(element) {
+                LocalState::Checkbox { checked } => Some(*checked),
+                _ => None,
+            });
+            if after.is_some_and(|after| after != before) {
+                report.mark_changed();
+            }
+            Ok(report)
         })
     }
 
