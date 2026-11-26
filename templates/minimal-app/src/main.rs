@@ -3,10 +3,20 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 #[cfg(windows)]
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() {
+    if let Err(error) = run() {
+        zenui_windows::show_startup_error(minimal_app::STARTER_TITLE, &error.to_string());
+        std::process::exit(1);
+    }
+}
+
+#[cfg(windows)]
+fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut runtime = zenui::Runtime::new();
     minimal_app::open_starter_window(&mut runtime)?;
-    let mut host = zenui_windows::Host::open(runtime, zenui_windows::HostConfig::visible())?;
+    let config =
+        zenui_windows::HostConfig::visible().with_text_assets(minimal_app::load_text_assets()?);
+    let mut host = zenui_windows::Host::open(runtime, config)?;
     host.run()?;
     Ok(())
 }

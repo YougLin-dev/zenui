@@ -1,8 +1,8 @@
 //! Win32 宿主：一个 HWND 对应一个 activation，DX12 surface 呈现 `zenui-render`
 //! 从 presentation snapshot 生成的场景。
 //!
-//! 该 crate 只在 Windows 上提供 API；其他平台编译为空的 workspace 成员，因此
-//! 根 workspace 的 format、Clippy 与测试不需要 Windows SDK。
+//! 宿主 API 只在 Windows 上提供；其他平台只转发 `zenui-render` 的文本资产类型，
+//! 因此根 workspace 的 format、Clippy 与测试不需要 Windows SDK。
 //!
 //! unsafe 只出现在这个宿主 crate；根 crate 仍保持 unsafe-free。
 
@@ -28,6 +28,8 @@ mod ole;
 #[cfg(windows)]
 mod shortcuts;
 #[cfg(windows)]
+mod startup;
+#[cfg(windows)]
 mod tray;
 
 #[cfg(windows)]
@@ -41,4 +43,8 @@ pub use file_dialog::FileDialogPresenter;
 #[cfg(windows)]
 pub use host::{DeviceLostError, Frame, GpuAdapterInfo, Host, HostConfig, HostError};
 #[cfg(windows)]
+pub use startup::show_startup_error;
+#[cfg(windows)]
 pub use tray::{TrayIconRequest, TrayMenuRequest, TrayPresenter, TrayTooltipRequest};
+// 文本资产类型属于渲染器，跨平台可用；模板的资产加载不依赖宿主。
+pub use zenui_render::{FontAsset, TextAssetError, TextAssets};

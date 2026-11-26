@@ -20,6 +20,12 @@ Each layout pushes `FontFamily::List(primary + fallbacks)` in order. With `syste
 
 The Windows host accepts the same value through `HostConfig::with_text_assets`. `Host::open` constructs the scene cache before it shows the primary window or creates any native window; a rejected configuration returns `HostError::TextAssets` and leaves no HWND behind. Hosts without assets keep the system-font cache.
 
+### Shipped asset
+
+The template ships Noto Sans SC Regular (CFF OpenType, 8,331,336 bytes, 30,890 cmap codepoints, © 2014–2021 Adobe, SIL OFL 1.1) as a sidecar file rather than embedding it with `include_bytes!`. A sidecar keeps the release exe unchanged in size, lets the license travel beside the font, and makes a missing or replaced asset observable at startup. The file and its `OFL.txt` live in `templates/minimal-app/assets/`; the record in that directory names the source commit and SHA-256.
+
+The template loader searches `<exe dir>/assets/NotoSansSC-Regular.otf` first and `<cwd>/assets/NotoSansSC-Regular.otf` second, which covers the release layout and running from the template directory. A missing file returns a path-bearing error; an empty or unreadable file reaches `HostError::TextAssets`. The release entry point shows either through a modal message box because a Windows GUI-subsystem process has no visible `stderr`, then exits non-zero. The release CI step copies the assets beside the exe and asserts the font hash and the license file.
+
 ## Considered options
 
 - **System fonts plus explicitly named families**: no blobs and a family list only. Rejected: the application cannot guarantee a family on a clean machine, and a missing family is exactly what the contract must diagnose.
@@ -32,4 +38,4 @@ The Windows host accepts the same value through `HostConfig::with_text_assets`. 
 
 A cache built with assets is not interchangeable with a default cache: metrics and glyphs differ, and applications must keep one cache per configured asset set. `TextRun::font()` exposes the underlying `FontData`, so tests assert which blob shaped a run instead of inferring it from geometry.
 
-The template and release path that consume this contract, the shipped font's license and coverage, and the clean-machine and missing-asset evidence are recorded separately in #286. The segmentation-provider field carries the coverage and version contract from ADR-0020. The SDK renderer page documents the asset API; the quick-start, template README and release pages gain the concrete asset path when #286 ships it.
+The template, its assets directory and the release layout consume this contract; the visible and negative runs are recorded in [stage-two 文本资产验收](../实现/stage-two-文本资产-验收.md). The segmentation-provider field carries the coverage and version contract from ADR-0020. The SDK renderer page documents the asset API; the quick-start, template README and release page document the asset path, diagnostics and three licenses.
