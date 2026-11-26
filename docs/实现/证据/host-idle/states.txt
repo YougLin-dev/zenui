@@ -1,0 +1,16 @@
+# #288 空闲窗口重绘可见证据
+
+日期: 2026-11-26
+基线: main f505b22（#287 合并提交）加本工单的空闲回归测试
+示例: crates/windows/examples/todo_host.rs（窗口 `ZenUI Todo`），debug 构建
+方法: UIA 点击草稿框并保持前台，采样进程 TotalProcessorTime 15 秒；启动 Notepad 抢前台后重复
+环境: Windows 11，单屏 150%，无其它应用活动
+脚本: E:\code\zenui-acceptance-288.ps1（仓库外，未提交）
+
+[10:05:52.350] focused-idle start foreground=3670042 cpu=0.515625
+[10:06:07.369] focused-idle end cpu=0.5625 delta=0.046875 wall=15.023619
+[10:06:13.861] unfocused-idle start app=3670042 foreground=102893946 cpu=0.578125
+[10:06:28.861] unfocused-idle end cpu=0.578125 delta=0 wall=15.0015711
+[10:06:34.563] idle screenshot zenui-idle-288.png client=1350x1050
+[10:06:34.574] texts=1 remaining | Write tests | Read docs
+[10:06:34.723] exit code=0
