@@ -440,6 +440,7 @@ fn hidden_and_suspended_targets_are_valid_for_app_commands() {
                         window
                             .request_show("confirm")
                             .expect("show the confirmation");
+                        CloseOutcome::Pending
                     })
                     .expect("register the close handler");
                 view! { <view /> }

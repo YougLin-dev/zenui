@@ -100,15 +100,26 @@ impl WindowCtx {
 
     fn request(self, action: WindowAction) -> Result<(), WindowError> {
         crate::context::with_state_of(self.runtime, |state| {
-            state.queue_window_request(WindowRequest { from: self, action })
+            let close_source = matches!(action, WindowAction::Close)
+                .then(|| state.close_request_source())
+                .flatten();
+            state.queue_window_request(WindowRequest {
+                from: self,
+                action,
+                close_source,
+            })
         })
     }
 
-    /// 在窗口 factory 中注册关闭处理器；`Confirm` 策略的关闭请求会调用它。
+    /// 在窗口 factory 中注册关闭处理器；只有 `Confirm` 策略的关闭会调用它。
     ///
-    /// 每个 activation 只能注册一次。处理器收到当前关闭 epoch 的一次性句柄；
-    /// 它可以立即 allow/deny，或显示目录中声明给这个父窗口的确认窗口。
-    pub fn on_close(self, handler: impl Fn(CloseRequest) + 'static) -> Result<(), WindowError> {
+    /// 每个 activation 只能注册一次。处理器收到带来源的关闭事件与当前 epoch
+    /// 的一次性句柄，返回 [`CloseOutcome`]。显式调用 `request.allow()/deny()`
+    /// 时该回复优先于返回值；`Pending` 表示保持 epoch 并显示确认窗口。
+    pub fn on_close(
+        self,
+        handler: impl Fn(CloseEvent) -> CloseOutcome + 'static,
+    ) -> Result<(), WindowError> {
         crate::context::with_state_of(self.runtime, |state| {
             state.register_close_handler(self, Rc::new(handler))
         })
@@ -233,7 +244,50 @@ pub(crate) enum CloseReply {
     Deny,
 }
 
-pub(crate) type CloseHandler = Rc<dyn Fn(CloseRequest)>;
+/// 一次 Confirm 关闭的 handler 结果。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CloseOutcome {
+    /// 释放确认窗口与父窗口。
+    Allow,
+    /// 关闭确认窗口并恢复父窗口。
+    Deny,
+    /// 保持 epoch 待决；关闭 turn 内必须让确认窗口变为可见。
+    Pending,
+}
+
+/// 关闭请求的来源；确认窗口的回复单独标记。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CloseSource {
+    SystemMenu,
+    AltF4,
+    Command,
+    Programmatic,
+    ConfirmationWindow,
+}
+
+/// 传给 `on_close` 的值语义事件。
+#[derive(Clone, Copy, Debug)]
+pub struct CloseEvent {
+    request: CloseRequest,
+    source: CloseSource,
+}
+
+impl CloseEvent {
+    pub(crate) const fn new(request: CloseRequest, source: CloseSource) -> Self {
+        Self { request, source }
+    }
+
+    /// 本次关闭 epoch 的一次性句柄。
+    pub const fn request(self) -> CloseRequest {
+        self.request
+    }
+
+    pub const fn source(self) -> CloseSource {
+        self.source
+    }
+}
+
+pub(crate) type CloseHandler = Rc<dyn Fn(CloseEvent) -> CloseOutcome>;
 
 /// 一次已接受的窗口文件拖放。
 ///
@@ -336,6 +390,7 @@ pub enum CloseError {
 pub(crate) struct WindowRequest {
     pub(crate) from: WindowCtx,
     pub(crate) action: WindowAction,
+    pub(crate) close_source: Option<CloseSource>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

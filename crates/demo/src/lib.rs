@@ -385,14 +385,16 @@ pub fn open_todo_window(runtime: &mut Runtime) -> Result<WindowCtx, WindowError>
                 .close_policy(ClosePolicy::Confirm),
             move |window| {
                 window
-                    .on_close(move |request| {
+                    .on_close(move |event| {
                         if state.draft.with(String::is_empty) {
-                            report(request.allow(), state.task_error);
+                            report(event.request().allow(), state.task_error);
+                            CloseOutcome::Allow
                         } else {
                             report(
                                 window.request_show(CLOSE_CONFIRMATION_WINDOW),
                                 state.task_error,
                             );
+                            CloseOutcome::Pending
                         }
                     })
                     .map_err(|_| MountError::Component("register the todo close handler"))?;
