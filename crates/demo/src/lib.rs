@@ -616,9 +616,9 @@ pub fn TodoApp(window: WindowCtx, state: TodoState) -> MountResult<MountPlan> {
                 <text>"Nothing matches"</text>
             </Show>
             <view class="gap-0">
-                <For each={visible} key={|id: TodoId| id} row-height={px(37.0)}>
+                <For each={visible} key={|id: TodoId| id} row-height={em(2.5)}>
                     {move |todo: TodoId| view! {
-                        <view style:height={px(37.0)}>
+                        <view style:height={em(2.5)}>
                             <TodoItem todo={todo} todos={todos} />
                         </view>
                     }}
@@ -637,7 +637,7 @@ fn TodoDetailRow(todo: TodoId, todos: Store) -> MountResult<MountPlan> {
     let title = todos.title(todo).read_once()?;
 
     view! {
-        <view role="listitem" class="flex-row items-center gap-3" style:height={px(37.0)}>
+        <view role="listitem" class="flex-row items-center gap-3" style:height={em(2.5)}>
             <text>{once(title)}</text>
         </view>
     }
@@ -676,7 +676,7 @@ pub fn TodoDetails(window: WindowCtx, state: TodoState) -> MountResult<MountPlan
                 on:input={move |value: String| note.set(value)}
             />
             <view role="list" aria:label="Details rows" class="gap-0">
-                <For each={visible} key={|id: TodoId| id} row-height={px(37.0)}>
+                <For each={visible} key={|id: TodoId| id} row-height={em(2.5)}>
                     {move |todo: TodoId| view! { <TodoDetailRow todo={todo} todos={todos} /> }}
                 </For>
             </view>
