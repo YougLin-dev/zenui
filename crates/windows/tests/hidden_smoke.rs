@@ -19,7 +19,7 @@ use zenui::prelude::*;
 use zenui::{Appearance, Color, ColorRole, NodeId};
 use zenui_render::{Point, SceneElement, Visual};
 use zenui_windows::accessibility::ControlType;
-use zenui_windows::{Host, HostConfig, HostError};
+use zenui_windows::{Host, HostConfig, HostError, SystemPreferences};
 
 /// Todo demo 的 primary 目录键。
 const MAIN: &str = "main";
@@ -309,6 +309,23 @@ fn a_hidden_window_configures_a_surface_and_reads_back_a_frame() {
         distinct.len() > 3,
         "the frame contains control and text pixels, got {distinct:?}"
     );
+}
+
+#[test]
+fn system_preferences_can_be_injected_and_changed_through_the_public_api() {
+    let injected = SystemPreferences::new(true, 150);
+    let mut host = open_host_with(HostConfig::hidden().with_system_preferences(injected));
+    assert_eq!(
+        host.system_preferences(),
+        injected,
+        "the hidden host uses the injected preferences instead of sampling"
+    );
+
+    let changed = SystemPreferences::new(false, 225);
+    host.set_system_preferences(changed);
+    assert_eq!(host.system_preferences(), changed);
+    host.render()
+        .expect("render after the preference change without a model transaction");
 }
 
 #[test]
