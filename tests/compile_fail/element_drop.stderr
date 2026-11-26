@@ -1,0 +1,5 @@
+error: unsupported event `drop`
+ --> tests/compile_fail/element_drop.rs:4:27
+  |
+4 |     let _ = view! { <view on:drop={move |_event: DropEvent| {}}>"drop"</view> };
+  |                           ^^^^^^^
