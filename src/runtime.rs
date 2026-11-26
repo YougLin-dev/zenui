@@ -18,8 +18,9 @@ use crate::menu::{
     MenuSpec, MenuStateError, MenuStateHandler,
 };
 use crate::node::{
-    AttrListId, AuxHandles, BindingListId, EditStateId, ElementData, ElementFlags, EventListId,
-    NO_PAYLOAD, NodeKindTag, NodeRef, Pool, SemanticsId, SlotArena, StyleListId, TagId, TreeKey,
+    AttrListId, AuxHandles, BindingList, BindingListId, EditStateId, ElementData, ElementFlags,
+    EventListId, NO_PAYLOAD, NodeKindTag, NodeRef, Pool, SemanticsId, SlotArena, StyleListId, TagId,
+    TreeKey,
 };
 use crate::presentation::{
     Appearance, NodeId, NodeStatus, PresentationSnapshot, SnapshotAction, SnapshotActions,
@@ -626,9 +627,6 @@ struct AuxSeed {
     semantics: SnapshotSemantics,
 }
 
-/// 绑定列表在绑定表切片（#336）填充；本切片只确保句柄与释放路径存在。
-struct BindingList;
-
 struct AuxArenas {
     attrs: Pool<Vec<MountedAttr>>,
     class_styles: Pool<&'static [zenui_style::StyleDeclaration]>,
@@ -659,7 +657,7 @@ impl AuxArenas {
             inline_styles: StyleListId::from_raw(self.inline_styles.reserve(seed.inline_styles)),
             events: EventListId::from_raw(self.events.reserve(seed.events)),
             edit: EditStateId::from_raw(self.edits.reserve(seed.edit)),
-            bindings: BindingListId::from_raw(self.binding_lists.reserve(BindingList)),
+            bindings: BindingListId::from_raw(self.binding_lists.reserve(BindingList::default())),
             semantics: SemanticsId::from_raw(self.semantics.reserve(seed.semantics)),
         }
     }
