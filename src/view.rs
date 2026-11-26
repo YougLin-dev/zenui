@@ -430,7 +430,7 @@ impl<E: Into<HandlerError>> IntoHandlerOutcome for Result<(), E> {
 
 pub enum Event {
     Click(Box<dyn FnMut() -> HandlerOutcome>),
-    Input(Box<dyn FnMut(String)>),
+    Input(Box<dyn FnMut(String) -> HandlerOutcome>),
     Change(Box<dyn FnMut(bool)>),
     Submit(Box<dyn FnMut(SubmitEvent)>),
     KeyDown(Box<dyn FnMut(&mut KeyEvent) -> HandlerOutcome>),
@@ -698,8 +698,13 @@ where
     })))
 }
 
-pub fn on_input(handler: impl FnMut(String) + 'static) -> Attr {
-    Attr::Event(Event::Input(Box::new(handler)))
+pub fn on_input<R>(mut handler: impl FnMut(String) -> R + 'static) -> Attr
+where
+    R: IntoHandlerOutcome,
+{
+    Attr::Event(Event::Input(Box::new(move |value| {
+        handler(value).into_handler_outcome()
+    })))
 }
 
 pub fn on_change(handler: impl FnMut(bool) + 'static) -> Attr {
