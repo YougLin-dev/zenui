@@ -927,9 +927,11 @@ fn a_panicking_focus_handler_restores_the_event_slot() {
     );
     app.focus("panel")
         .expect("the same target is still focusable and already focused");
-    assert_eq!(
-        app.click_label("panel"),
-        Err(MountError::Component("click target not found")),
+    let report = app
+        .click_label("panel")
+        .expect("an unhandled routed click is a no-op turn");
+    assert!(
+        report.is_ok(),
         "the focus slot did not become a phantom click handler"
     );
 }

@@ -434,10 +434,12 @@ fn failed_label_commands_do_not_mutate_local_state() {
         "a failed change leaves the checkbox alone"
     );
 
-    assert_eq!(
-        app.click_label("plain"),
-        Err(MountError::Component("click target not found")),
-        "a label without a handler still reports the stage-one message"
+    let report = app
+        .click_label("plain")
+        .expect("a routed click without a handler is a no-op turn");
+    assert!(
+        report.is_ok(),
+        "a routed click without a handler reports no error"
     );
 }
 

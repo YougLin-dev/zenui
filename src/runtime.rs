@@ -34,14 +34,237 @@ use crate::text_edit::{self, Edit, Movement};
 use crate::tray::{TrayError, TraySpec};
 use crate::view::{
     Attr, AttrValue, BlurEvent, ChildrenFactory, CompositionEvent, CompositionPhase, Event,
-    FocusCause, FocusEvent, InlineStyle, Key, KeyEvent, MountError, MountPlan, MountResult,
-    PlanNode, ResultBoolValue, StyleSlot, SubmitEvent, TextSlot, ValueSlot,
+    FocusCause, FocusEvent, HandlerError, HandlerOutcome, InlineStyle, Key, KeyEvent, MountError,
+    MountPlan, MountResult, PlanNode, ResultBoolValue, StyleSlot, SubmitEvent, TextSlot, ValueSlot,
 };
 use crate::window::{
     CatalogEntry, CatalogError, CloseError, CloseHandler, ClosePolicy, CloseReply, CloseRequest,
     DropError, DropEvent, DropHandler, WindowAction, WindowCatalog, WindowCtx, WindowError,
     WindowInfo, WindowRecord, WindowRequest, WindowRole,
 };
+
+/// 路由型输入的来源；指针、键盘、菜单等共享同一套目标校验与错误通道。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum EventSource {
+    Pointer,
+    Keyboard,
+    Menu,
+    Tray,
+    Accessibility,
+    Window,
+}
+
+/// 一次 Intent 的目标；窗口目标携带打开时的 activation。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum EventTarget {
+    Node(NodeId),
+    Window(WindowCtx),
+    App,
+}
+
+impl EventTarget {
+    pub const fn node(self) -> Option<NodeId> {
+        match self {
+            Self::Node(node) => Some(node),
+            Self::Window(_) | Self::App => None,
+        }
+    }
+
+    pub const fn window(self) -> Option<WindowCtx> {
+        match self {
+            Self::Window(window) => Some(window),
+            Self::Node(_) | Self::App => None,
+        }
+    }
+}
+
+impl fmt::Debug for EventTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Node(node) => write!(f, "Node({node:?})"),
+            Self::Window(window) => write!(f, "Window({:?})", window.key),
+            Self::App => f.write_str("App"),
+        }
+    }
+}
+
+/// 类型化载荷；后续切片的键盘、菜单等 intent 在此扩展。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IntentPayload {
+    Click,
+    Activate,
+}
+
+/// 键盘修饰键快照；指针点击当前只带默认值。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Modifiers {
+    shift: bool,
+    control: bool,
+    alt: bool,
+    meta: bool,
+}
+
+impl Modifiers {
+    pub const fn new(shift: bool, control: bool, alt: bool, meta: bool) -> Self {
+        Self {
+            shift,
+            control,
+            alt,
+            meta,
+        }
+    }
+
+    pub const fn shift(self) -> bool {
+        self.shift
+    }
+
+    pub const fn control(self) -> bool {
+        self.control
+    }
+
+    pub const fn alt(self) -> bool {
+        self.alt
+    }
+
+    pub const fn meta(self) -> bool {
+        self.meta
+    }
+}
+
+/// 一个路由型用户意图。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Intent {
+    source: EventSource,
+    target: EventTarget,
+    payload: IntentPayload,
+    modifiers: Modifiers,
+}
+
+impl Intent {
+    pub const fn new(
+        source: EventSource,
+        target: EventTarget,
+        payload: IntentPayload,
+        modifiers: Modifiers,
+    ) -> Self {
+        Self {
+            source,
+            target,
+            payload,
+            modifiers,
+        }
+    }
+
+    /// 指针点击一个元素；路由时使用 closest-wins。
+    pub const fn click(target: NodeId) -> Self {
+        Self::new(
+            EventSource::Pointer,
+            EventTarget::Node(target),
+            IntentPayload::Click,
+            Modifiers::new(false, false, false, false),
+        )
+    }
+
+    /// 激活一个窗口；携带的 activation 在派发前校验。
+    pub const fn activate_window(window: WindowCtx) -> Self {
+        Self::new(
+            EventSource::Window,
+            EventTarget::Window(window),
+            IntentPayload::Activate,
+            Modifiers::new(false, false, false, false),
+        )
+    }
+
+    pub const fn activate_app() -> Self {
+        Self::new(
+            EventSource::Window,
+            EventTarget::App,
+            IntentPayload::Activate,
+            Modifiers::new(false, false, false, false),
+        )
+    }
+
+    pub const fn source(self) -> EventSource {
+        self.source
+    }
+
+    pub const fn target(self) -> EventTarget {
+        self.target
+    }
+
+    pub const fn payload(self) -> IntentPayload {
+        self.payload
+    }
+
+    pub const fn modifiers(self) -> Modifiers {
+        self.modifiers
+    }
+}
+
+/// 一次 turn 的 flow 结果。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TurnOutcome {
+    consumed: bool,
+    prevent_default: bool,
+}
+
+impl TurnOutcome {
+    pub const fn consumed(self) -> bool {
+        self.consumed
+    }
+
+    pub const fn prevent_default(self) -> bool {
+        self.prevent_default
+    }
+}
+
+/// turn 内出现的用户错误；写入已保留，错误不静默丢弃。
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum TurnError {
+    HandlerFailed(HandlerError),
+    HandlerPanicked(PanicInfo),
+}
+
+impl fmt::Display for TurnError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::HandlerFailed(error) => write!(f, "handler failed: {error}"),
+            Self::HandlerPanicked(panic) => write!(f, "handler panicked: {panic}"),
+        }
+    }
+}
+
+impl std::error::Error for TurnError {}
+
+/// 一次用户输入 turn 的报告；宿主据此决定是否执行原生默认动作。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TurnReport {
+    outcome: TurnOutcome,
+    errors: Vec<TurnError>,
+    changed: bool,
+}
+
+impl TurnReport {
+    pub const fn outcome(&self) -> TurnOutcome {
+        self.outcome
+    }
+
+    pub fn errors(&self) -> &[TurnError] {
+        &self.errors
+    }
+
+    pub fn is_ok(&self) -> bool {
+        self.errors.is_empty()
+    }
+
+    pub const fn changed(&self) -> bool {
+        self.changed
+    }
+
+    fn push_error(&mut self, error: TurnError) {
+        self.errors.push(error);
+    }
+}
 
 const HIDDEN_TARGET: &str = "target window is hidden";
 const SUSPENDED_TARGET: &str = "target window input is suspended";
@@ -1059,6 +1282,63 @@ impl State {
                 AttrCurrent::Text(text) => Some(text.as_str()),
                 AttrCurrent::Bool(_) => None,
             })
+    }
+
+    /// 元素自己是否挂载了普通 click handler。
+    fn has_click_handler(&self, element: usize) -> bool {
+        self.element_events(element).iter().any(|id| {
+            self.events
+                .get(*id)
+                .and_then(Option::as_ref)
+                .is_some_and(|event| event_kind(event) == EventKind::Click)
+        })
+    }
+
+    /// 原生交互控件即使没有 handler 也阻断 closest-wins 的祖先穿透。
+    fn is_interactive_control(&self, element: usize) -> bool {
+        matches!(
+            self.element_tag(element),
+            "button" | "checkbox" | "text-input"
+        )
+    }
+
+    /// 从命中元素沿父链找最近的可处理 click；交互控件无 handler 时停止。
+    fn closest_click_target(&self, hit: NodeId) -> Result<Option<usize>, DispatchError> {
+        let mut node = hit.node();
+        loop {
+            let slot = self
+                .nodes
+                .get(node)
+                .map_err(|_| DispatchError::StaleNode(hit))?;
+            if slot.kind == Some(NodeKindTag::Element) {
+                let payload = slot.payload as usize;
+                let live = self
+                    .elements
+                    .get(payload)
+                    .is_some_and(|element| element.id.node() == node);
+                if !live {
+                    return Err(DispatchError::StaleNode(hit));
+                }
+                if self.has_click_handler(payload) {
+                    return Ok(Some(payload));
+                }
+                if self.is_interactive_control(payload) {
+                    return Ok(None);
+                }
+            }
+            let Some(parent) = slot.parent else {
+                return Ok(None);
+            };
+            node = parent;
+        }
+    }
+
+    /// 窗口/activation 目标仍可接收输入；不做 nearest-target 回退。
+    fn intent_window_usable(&self, window: WindowCtx) -> bool {
+        window.runtime == self.id
+            && self.window_live_in_tree(window)
+            && self.window_is_visible(window.key)
+            && !self.close_epochs.contains_key(window.key)
     }
 
     fn element_is_disabled(&self, element: usize) -> bool {
@@ -2980,14 +3260,22 @@ impl Drop for ChildrenGuard {
 }
 
 /// 事件槽的 `take → catch → put`：handler panic 时槽位也必须回到运行时。
-fn invoke_event(
+fn invoke_event<R>(
     event_id: usize,
     mut event: Event,
-    invoke: impl FnOnce(&mut Event),
-) -> Result<(), PanicInfo> {
+    invoke: impl FnOnce(&mut Event) -> R,
+) -> Result<R, PanicInfo> {
     let outcome = catch_panic(|| invoke(&mut event));
     with_state(|state| state.put_event(event_id, event));
     outcome
+}
+
+/// click 槽返回 `HandlerOutcome`；event 槽在 panic 后也必须放回。
+fn invoke_click_event(event_id: usize, event: Event) -> Result<HandlerOutcome, PanicInfo> {
+    invoke_event(event_id, event, |event| match event {
+        Event::Click(handler) => handler(),
+        _ => HandlerOutcome::Ok,
+    })
 }
 
 fn find_element(state: &State, nodes: &[MountedNode], target: &FindTarget) -> Option<usize> {
@@ -5235,40 +5523,78 @@ impl Runtime {
         }
     }
 
-    pub fn click_text(&mut self, text: &str) -> Result<(), MountError> {
+    /// 指针点击：解析到元素后走 closest-wins 路由，并返回 turn 报告。
+    pub fn click_text(&mut self, text: &str) -> Result<TurnReport, MountError> {
         self.dispatch_label(
             FindTarget::Text(text.to_owned()),
             "click target not found",
             "click target not found",
-            Self::click_node,
+            Self::activate_node,
         )
     }
 
-    pub fn click_label(&mut self, label: &str) -> Result<(), MountError> {
+    /// 指针点击：解析到元素后走 closest-wins 路由，并返回 turn 报告。
+    pub fn click_label(&mut self, label: &str) -> Result<TurnReport, MountError> {
         self.dispatch_label(
             FindTarget::Label(label.to_owned()),
             "click target not found",
             "click target not found",
-            Self::click_node,
+            Self::activate_node,
         )
     }
 
-    /// 按 Node ID 派发 click；只运行该元素自己的 handler。
-    pub fn click_node(&mut self, node: NodeId) -> Result<(), DispatchError> {
+    /// 已解析目标的直接 click：只运行该元素自己的 handler。
+    pub fn click_node(&mut self, node: NodeId) -> Result<TurnReport, DispatchError> {
         let state = self.state.clone();
         context::install(&state, || {
             let element = with_state(|state| state.element_for_node(node))?;
             let (event_id, event) =
                 self.take_node_event(node, element, EventKind::Click, NodeOperation::Click)?;
-            let panic = invoke_event(event_id, event, |event| {
-                if let Event::Click(handler) = event {
-                    handler();
-                }
-            })
-            .err();
+            let outcome = invoke_click_event(event_id, event);
             with_state(|state| state.phase = Phase::Idle);
-            self.finish_event(panic)
+            let mut report = TurnReport::default();
+            match outcome {
+                Ok(HandlerOutcome::Ok) => {}
+                Ok(HandlerOutcome::Err(error)) => {
+                    report.push_error(TurnError::HandlerFailed(error));
+                }
+                Err(panic) => report.push_error(TurnError::HandlerPanicked(panic)),
+            }
+            self.finish_command().map_err(DispatchError::Command)?;
+            Ok(report)
         })
+    }
+
+    /// 路由一个 typed Intent；窗口/activation 目标先校验再询问处理器。
+    pub fn dispatch_intent(&mut self, intent: Intent) -> Result<TurnReport, DispatchError> {
+        match intent.target() {
+            EventTarget::Node(node) => {
+                let state = self.state.clone();
+                context::install(&state, || {
+                    with_state(|state| state.element_for_node(node))?;
+                    let target = with_state(|state| state.closest_click_target(node))?;
+                    match target {
+                        Some(element) => {
+                            let id = with_state(|state| state.elements[element].id);
+                            self.click_node(id)
+                        }
+                        None => Ok(TurnReport::default()),
+                    }
+                })
+            }
+            EventTarget::Window(window) => {
+                if !self.state.borrow().intent_window_usable(window) {
+                    return Err(DispatchError::TargetClosed);
+                }
+                Ok(TurnReport::default())
+            }
+            EventTarget::App => Ok(TurnReport::default()),
+        }
+    }
+
+    /// 路由原语：等价于派发一个指针 Click Intent。
+    pub fn activate_node(&mut self, node: NodeId) -> Result<TurnReport, DispatchError> {
+        self.dispatch_intent(Intent::click(node))
     }
 
     /// 先取事件再进入 Event 阶段：被拒绝的派发不会把运行时留在 Event 阶段。
@@ -5291,13 +5617,13 @@ impl Runtime {
     }
 
     /// label 只是查找助手：解析到 Node ID 后与原生派发共用同一条路径。
-    fn dispatch_label(
+    fn dispatch_label<T>(
         &mut self,
         target: FindTarget,
         not_found: &'static str,
         wrong_kind: &'static str,
-        dispatch: impl FnOnce(&mut Self, NodeId) -> Result<(), DispatchError>,
-    ) -> Result<(), MountError> {
+        dispatch: impl FnOnce(&mut Self, NodeId) -> Result<T, DispatchError>,
+    ) -> Result<T, MountError> {
         let Some(node) = self.label_node(&target) else {
             return Err(MountError::Component(not_found));
         };
@@ -5311,6 +5637,7 @@ impl Runtime {
             DispatchError::Rejected { reason, .. } => MountError::Component(reason),
             DispatchError::Command(error) => error,
             DispatchError::Panic(panic) => MountError::Panic(panic),
+            DispatchError::TargetClosed => MountError::Component("target is closed"),
         })
     }
 

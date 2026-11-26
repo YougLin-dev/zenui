@@ -89,6 +89,8 @@ pub enum DispatchError {
     Command(MountError),
     /// handler panic 已被 contain；事件槽与 phase 已恢复，可以继续派发。
     Panic(PanicInfo),
+    /// 窗口/activation 目标已关闭或被新一代替换。
+    TargetClosed,
 }
 
 impl fmt::Display for DispatchError {
@@ -113,6 +115,7 @@ impl fmt::Display for DispatchError {
             } => write!(f, "node {node:?} rejected {}: {reason}", operation.as_str()),
             Self::Command(error) => write!(f, "{error}"),
             Self::Panic(panic) => write!(f, "{panic}"),
+            Self::TargetClosed => f.write_str("target is closed"),
         }
     }
 }

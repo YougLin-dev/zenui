@@ -338,8 +338,98 @@ pub enum Attr {
     Event(Event),
 }
 
+/// 用户闭包返回的错误；在 turn 边界进入 [`crate::TurnReport::errors`]。
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct HandlerError {
+    message: String,
+}
+
+impl HandlerError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl fmt::Display for HandlerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for HandlerError {}
+
+impl From<WriteError> for HandlerError {
+    fn from(error: WriteError) -> Self {
+        Self::new(error.to_string())
+    }
+}
+
+impl From<&str> for HandlerError {
+    fn from(message: &str) -> Self {
+        Self::new(message)
+    }
+}
+
+impl From<String> for HandlerError {
+    fn from(message: String) -> Self {
+        Self::new(message)
+    }
+}
+
+/// 事件槽的返回值；`Err` 停止本事件剩余 handler 与默认动作。
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum HandlerOutcome {
+    Ok,
+    Err(HandlerError),
+}
+
+impl HandlerOutcome {
+    pub const fn is_err(&self) -> bool {
+        matches!(self, Self::Err(_))
+    }
+
+    pub const fn error(&self) -> Option<&HandlerError> {
+        match self {
+            Self::Ok => None,
+            Self::Err(error) => Some(error),
+        }
+    }
+}
+
+/// 把 `()`、`Result<(), E>` 或 [`HandlerOutcome`] 归一为事件槽结果。
+pub trait IntoHandlerOutcome {
+    fn into_handler_outcome(self) -> HandlerOutcome;
+}
+
+impl IntoHandlerOutcome for HandlerOutcome {
+    fn into_handler_outcome(self) -> HandlerOutcome {
+        self
+    }
+}
+
+impl IntoHandlerOutcome for () {
+    fn into_handler_outcome(self) -> HandlerOutcome {
+        HandlerOutcome::Ok
+    }
+}
+
+impl<E: Into<HandlerError>> IntoHandlerOutcome for Result<(), E> {
+    fn into_handler_outcome(self) -> HandlerOutcome {
+        match self {
+            Ok(()) => HandlerOutcome::Ok,
+            Err(error) => HandlerOutcome::Err(error.into()),
+        }
+    }
+}
+
 pub enum Event {
-    Click(Box<dyn FnMut()>),
+    Click(Box<dyn FnMut() -> HandlerOutcome>),
     Input(Box<dyn FnMut(String)>),
     Change(Box<dyn FnMut(bool)>),
     Submit(Box<dyn FnMut(SubmitEvent)>),
@@ -597,8 +687,13 @@ pub fn for_each_windowed(
     })
 }
 
-pub fn on_click(handler: impl FnMut() + 'static) -> Attr {
-    Attr::Event(Event::Click(Box::new(handler)))
+pub fn on_click<R>(mut handler: impl FnMut() -> R + 'static) -> Attr
+where
+    R: IntoHandlerOutcome,
+{
+    Attr::Event(Event::Click(Box::new(move || {
+        handler().into_handler_outcome()
+    })))
 }
 
 pub fn on_input(handler: impl FnMut(String) + 'static) -> Attr {
