@@ -70,7 +70,7 @@ use crate::tray::{
 };
 use zenui_render::{
     GpuRenderer, Point, Rect, RenderPalette, RenderTargetConfig, Scene, SceneCache, SceneElement,
-    SceneEnv, SceneRowBand, Scrollbar, Viewport, Visual, wgpu,
+    SceneEnv, SceneRowBand, Scrollbar, TextAssets, Viewport, Visual, wgpu,
 };
 
 /// 宿主私有的窗口消息注册表；其他模块不得自行定义 `WM_APP + N`。
@@ -228,12 +228,14 @@ const CARET_BLINK_TIMER: usize = 1;
 const CARET_BLINK_MS: u32 = 530;
 
 /// 打开宿主的进程级选项；每个窗口的标题与尺寸来自窗口目录。
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct HostConfig {
     /// 是否在 `run` 时显示已打开的窗口；隐藏模式供 CI smoke 使用。
     pub visible: bool,
     /// 应用的初始外观。
     pub appearance: Appearance,
+    /// 固定字体与分词语料；`None` 沿用系统字体集合。
+    pub text_assets: Option<TextAssets>,
 }
 
 impl HostConfig {
@@ -242,6 +244,7 @@ impl HostConfig {
         Self {
             visible: true,
             appearance: Appearance::Light,
+            text_assets: None,
         }
     }
 
@@ -250,12 +253,20 @@ impl HostConfig {
         Self {
             visible: false,
             appearance: Appearance::Light,
+            text_assets: None,
         }
     }
 
     /// 设置初始应用外观。
     pub const fn with_appearance(mut self, appearance: Appearance) -> Self {
         self.appearance = appearance;
+        self
+    }
+
+    /// 使用应用提供的字体与分词语料；无效资产让 [`Host::open`] 在创建窗口前失败。
+    #[must_use]
+    pub fn with_text_assets(mut self, assets: TextAssets) -> Self {
+        self.text_assets = Some(assets);
         self
     }
 }
@@ -746,6 +757,11 @@ impl Host {
         runtime
             .set_appearance(config.appearance)
             .map_err(HostError::Runtime)?;
+        // 资产在创建任何原生窗口之前注册并校验；坏资产是启动错误，不是绘制错误。
+        let scene_cache = match config.text_assets {
+            Some(assets) => SceneCache::with_text_assets(assets).map_err(HostError::TextAssets)?,
+            None => SceneCache::new(),
+        };
         // primary 由宿主实现首次打开；已打开时只聚焦。
         runtime.show(primary).map_err(HostError::Open)?;
         let hinstance = module_handle()?;
@@ -829,7 +845,7 @@ impl Host {
             queue,
             renderer,
             renderer_target: target,
-            scene_cache: SceneCache::new(),
+            scene_cache,
             format,
             hinstance,
             wake,
@@ -4662,6 +4678,8 @@ pub enum HostError {
     Command(CommandError),
     /// 菜单状态回调失败；回调内的写入已被只读作用域拒绝。
     MenuState(MenuStateError),
+    /// 文本资产在创建窗口之前校验失败。
+    TextAssets(zenui_render::TextAssetError),
     /// 场景构建失败。
     Scene(zenui_render::SceneError),
     /// GPU 渲染失败。
@@ -4706,6 +4724,7 @@ impl fmt::Display for HostError {
             Self::Session(error) => write!(f, "application session failed: {error}"),
             Self::Command(error) => write!(f, "menu command failed: {error}"),
             Self::MenuState(error) => write!(f, "menu state query failed: {error}"),
+            Self::TextAssets(error) => write!(f, "text assets failed: {error}"),
             Self::Scene(error) => write!(f, "scene failed: {error}"),
             Self::Render(error) => write!(f, "render failed: {error}"),
             Self::Input(error) => write!(f, "pointer dispatch failed: {error}"),
@@ -5916,12 +5935,12 @@ mod tests {
         VK_V, VK_X, VK_Y, VK_Z,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        CopyAcceleratorTableW, GetMenuItemCount, GetMenuItemID, GetMenuState, GetMenuStringW,
-        GetSubMenu, HMENU, IsMenu, MENU_ITEM_FLAGS, MF_BYCOMMAND, MF_BYPOSITION, MF_CHECKED,
-        MF_GRAYED, SendMessageW,
+        CopyAcceleratorTableW, FindWindowW, GetMenuItemCount, GetMenuItemID, GetMenuState,
+        GetMenuStringW, GetSubMenu, HMENU, IsMenu, MENU_ITEM_FLAGS, MF_BYCOMMAND, MF_BYPOSITION,
+        MF_CHECKED, MF_GRAYED, SendMessageW,
     };
     use windows::core::{BSTR, HRESULT, Interface, w};
-    use zenui_render::DecorationKind;
+    use zenui_render::{DecorationKind, FontAsset};
 
     const MAIN: &str = "main";
 
@@ -13790,6 +13809,69 @@ mod tests {
         );
         assert!(send_context_menu(&mut host, Some((3, 4))).is_none());
         assert!(host.context_menu_presenter.is_none());
+    }
+
+    /// 与原生原型共用的公有领域测试字体。
+    const TUFFY: &[u8] = include_bytes!("../../../examples/native_poc/assets/Tuffy.ttf");
+
+    #[test]
+    fn invalid_text_assets_fail_before_a_window_is_created() {
+        let mut runtime = Runtime::new();
+        runtime
+            .declare_windows(|catalog| {
+                catalog.window(
+                    WindowSpec::new(MAIN)
+                        .primary()
+                        .titled("ZenUI Bad Assets")
+                        .sized(320, 240),
+                    |_| view! { <text>"assets"</text> },
+                )?;
+                Ok(())
+            })
+            .expect("declare the catalog");
+        let error = Host::open(
+            runtime,
+            HostConfig::hidden().with_text_assets(
+                TextAssets::new("Missing").with_font(FontAsset::new(b"not a font")),
+            ),
+        )
+        .err()
+        .expect("invalid assets are a startup error");
+        assert!(matches!(error, HostError::TextAssets(_)), "{error}");
+        // 安全：只按标题查询本进程窗口；标题只属于这个测试。
+        let found = unsafe { FindWindowW(w!("ZenUI Bad Assets"), None) };
+        assert!(found.is_err(), "the failed host created no native window");
+    }
+
+    #[test]
+    fn the_configured_font_shapes_the_rendered_window() {
+        let mut runtime = Runtime::new();
+        zenui_demo::open_todo_window(&mut runtime).expect("open the todo window");
+        let mut host = Host::open(
+            runtime,
+            HostConfig::hidden()
+                .with_text_assets(TextAssets::new("Tuffy").with_font(FontAsset::new(TUFFY))),
+        )
+        .expect("open the host with fixed font assets");
+        host.render().expect("render the window");
+
+        let scene = host
+            .windows
+            .get(&MAIN)
+            .and_then(|window| window.scene.as_ref())
+            .expect("the rendered scene");
+        let mut runs = 0;
+        for element in scene.elements() {
+            for run in element.text() {
+                runs += 1;
+                assert_eq!(
+                    run.font().data.as_ref(),
+                    TUFFY,
+                    "the configured font shaped the window text"
+                );
+            }
+        }
+        assert!(runs > 0, "the demo window has text runs");
     }
 
     #[test]

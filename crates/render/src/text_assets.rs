@@ -37,12 +37,25 @@ impl FontAsset {
 /// 参与分词，因此 provider 必须覆盖应用用到的复杂脚本（[ADR-0020]）。
 ///
 /// [ADR-0020]: https://github.com/ZenUIOrg/zenui/blob/main/docs/adr/0020-application-segmentation-data.md
+#[derive(Clone)]
 pub struct TextAssets {
     fonts: Vec<FontAsset>,
     primary: String,
     fallbacks: Vec<String>,
     system_fallback: bool,
     dictionary: Option<Arc<dyn DictionaryProvider>>,
+}
+
+impl fmt::Debug for TextAssets {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TextAssets")
+            .field("fonts", &self.fonts)
+            .field("primary", &self.primary)
+            .field("fallbacks", &self.fallbacks)
+            .field("system_fallback", &self.system_fallback)
+            .field("dictionary", &self.dictionary.is_some())
+            .finish()
+    }
 }
 
 impl TextAssets {
