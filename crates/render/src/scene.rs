@@ -17,6 +17,7 @@ use crate::SceneError;
 use crate::geometry::{Point, Rect, Viewport};
 use crate::scrollbar::Scrollbar;
 use crate::text::{self, CharRange, TextShaper};
+use crate::text_assets::{TextAssetError, TextAssets};
 
 /// 场景理解的 intrinsic；其他 tag 是显式错误。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -443,6 +444,21 @@ impl SceneCache {
         Self {
             shaper: TextShaper::new(),
         }
+    }
+
+    /// 用应用提供的字体与分词语料创建文本布局缓存。
+    ///
+    /// 字体在构造期注册并校验；空字节、非字体容器、没有可用家族、未注册的主家族
+    /// 或回退家族都返回 typed error，不会推迟到绘制。默认不启用系统回退：已配置
+    /// 字体覆盖的文本不会改用系统字体。
+    ///
+    /// # Errors
+    ///
+    /// 资产不满足 [`TextAssets`] 的约定时返回 [`TextAssetError`]。
+    pub fn with_text_assets(assets: TextAssets) -> Result<Self, TextAssetError> {
+        Ok(Self {
+            shaper: TextShaper::with_assets(assets)?,
+        })
     }
 }
 
