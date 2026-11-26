@@ -3440,6 +3440,24 @@ fn invoke_click_event(event_id: usize, event: Event) -> Result<HandlerOutcome, P
     })
 }
 
+/// 把一次 handler 结果记入 turn 报告；返回是否发生了 panic。
+fn record_handler_outcome(
+    outcome: Result<HandlerOutcome, PanicInfo>,
+    report: &mut TurnReport,
+) -> bool {
+    match outcome {
+        Ok(HandlerOutcome::Ok) => false,
+        Ok(HandlerOutcome::Err(error)) => {
+            report.push_error(TurnError::HandlerFailed(error));
+            false
+        }
+        Err(panic) => {
+            report.push_error(TurnError::HandlerPanicked(panic));
+            true
+        }
+    }
+}
+
 fn find_element(state: &State, nodes: &[MountedNode], target: &FindTarget) -> Option<usize> {
     for node in nodes {
         match node {
@@ -6112,8 +6130,9 @@ impl Runtime {
 
     /// label 助手的整体值替换；视为外部替换并清空该输入的撤销/重做历史。
     ///
-    /// 它仍然派发一次 `on:input`，应用模型保持值的权威。
-    pub fn input(&mut self, label: &str, value: &str) -> Result<(), MountError> {
+    /// 它仍然派发一次 `on:input`，应用模型保持值的权威；handler 错误与 panic
+    /// 进入返回的 turn 报告。
+    pub fn input(&mut self, label: &str, value: &str) -> Result<TurnReport, MountError> {
         let target = FindTarget::Label(label.to_owned());
         let state = self.state.clone();
         context::install(&state, || {
@@ -6143,21 +6162,44 @@ impl Runtime {
                 }
                 state.update_local(element, LocalUpdate::Input(value.to_owned()));
             });
-            let panic = invoke_event(event_id, event, |event| {
-                if let Event::Input(handler) = event {
-                    handler(value.to_owned());
-                }
-            })
-            .err();
+            let outcome = invoke_event(event_id, event, |event| match event {
+                Event::Input(handler) => handler(value.to_owned()),
+                _ => HandlerOutcome::Ok,
+            });
+            let mut report = TurnReport::default();
+            let panicked = record_handler_outcome(outcome, &mut report);
             with_state(|state| state.phase = Phase::Idle);
-            self.finish_event_mount(panic)
+            if panicked {
+                let _ = self.finish_command();
+                return Ok(report);
+            }
+            self.finish_command()?;
+            report.mark_changed();
+            Ok(report)
         })
     }
 
     /// 在 caret/selection 处插入文本；一次编辑恰好派发一次 `on:input`。
     ///
     /// 连续的单字符插入合并为一个有界撤销步（ADR-0014）；多字符插入结束当前步。
-    pub fn insert_text_node(&mut self, node: NodeId, text: &str) -> Result<(), DispatchError> {
+    pub fn insert_text_node(
+        &mut self,
+        node: NodeId,
+        text: &str,
+    ) -> Result<TurnReport, DispatchError> {
+        self.type_text_node(node, text)
+    }
+
+    /// 宿主可打印字符默认：执行一次插入编辑与一次 `on:input`，返回 turn 报告。
+    ///
+    /// 不形成 `Input` intent；headless 与 Win32 宿主共用这条路径。handler 的
+    /// `Err` 或 panic 进入报告：`Err` 保留已提交的编辑，panic 撤销尚未结算的
+    /// 本地编辑，并保持事件槽可复用。
+    pub fn type_text_node(
+        &mut self,
+        node: NodeId,
+        text: &str,
+    ) -> Result<TurnReport, DispatchError> {
         let state = self.state.clone();
         context::install(&state, || {
             let element = with_state(|state| state.element_for_node(node))?;
@@ -6170,7 +6212,11 @@ impl Runtime {
     /// 与 `input` 的外部替换语义不同，这次替换保留既有撤销/重做历史，并作为
     /// 一条新的撤销记录；新值与当前值相同时是静默无操作。组合中、禁用或
     /// 非文本输入的目标被拒绝。
-    pub fn replace_text_node(&mut self, node: NodeId, value: &str) -> Result<(), DispatchError> {
+    pub fn replace_text_node(
+        &mut self,
+        node: NodeId,
+        value: &str,
+    ) -> Result<TurnReport, DispatchError> {
         let state = self.state.clone();
         context::install(&state, || {
             let element = with_state(|state| state.element_for_node(node))?;
@@ -6179,7 +6225,7 @@ impl Runtime {
     }
 
     /// 删除 selection，或 caret 前一个字符；没有可删除内容时是不派发事件的无操作。
-    pub fn backspace_node(&mut self, node: NodeId) -> Result<(), DispatchError> {
+    pub fn backspace_node(&mut self, node: NodeId) -> Result<TurnReport, DispatchError> {
         let state = self.state.clone();
         context::install(&state, || {
             let element = with_state(|state| state.element_for_node(node))?;
@@ -6188,7 +6234,7 @@ impl Runtime {
     }
 
     /// 删除 selection，或 caret 后一个字符；没有可删除内容时是不派发事件的无操作。
-    pub fn delete_forward_node(&mut self, node: NodeId) -> Result<(), DispatchError> {
+    pub fn delete_forward_node(&mut self, node: NodeId) -> Result<TurnReport, DispatchError> {
         let state = self.state.clone();
         context::install(&state, || {
             let element = with_state(|state| state.element_for_node(node))?;
@@ -6262,7 +6308,7 @@ impl Runtime {
         element: usize,
         operation: NodeOperation,
         edit: Edit<'_>,
-    ) -> Result<(), DispatchError> {
+    ) -> Result<TurnReport, DispatchError> {
         with_state(|state| state.require_editable_text_input(node, element, operation))?;
         let (before, caret, selection) = with_state(|state| {
             let LocalState::TextInput(editor) = state.element_local(element) else {
@@ -6288,7 +6334,7 @@ impl Runtime {
             Edit::Replace(_) | Edit::Backspace | Edit::DeleteForward => EditKind::Boundary,
         };
         let Some(outcome) = text_edit::apply(&before.value, caret, selection, edit) else {
-            return Ok(());
+            return Ok(TurnReport::default());
         };
         let text_edit::EditOutcome {
             value: new_value,
@@ -6303,31 +6349,28 @@ impl Runtime {
             }
             state.dispatch_text_edit(element, &new_value, epoch);
         });
-        // 事件槽与 Event 阶段必须在 handler panic 时也恢复；abort_text_dispatch
-        // 撤销这次尚未结算的本地编辑。
-        let panic = invoke_event(event_id, event, |event| {
-            if let Event::Input(handler) = event {
-                handler(new_value);
-            }
-        })
-        .err();
+        // 事件槽与 Event 阶段必须在 handler panic 时也恢复；panic 撤销这次
+        // 尚未结算的本地编辑，handler `Err` 则保留已提交的编辑。
+        let outcome = invoke_event(event_id, event, |event| match event {
+            Event::Input(handler) => handler(new_value),
+            _ => HandlerOutcome::Ok,
+        });
+        let mut report = TurnReport::default();
+        let panicked = record_handler_outcome(outcome, &mut report);
         with_state(|state| state.phase = Phase::Idle);
-        if panic.is_some() {
+        if panicked {
             with_state(|state| abort_text_dispatch(state, element));
+            let _ = self.finish_command();
+            return Ok(report);
         }
-        if panic.is_none()
-            && let Err(error) = self.finish_command()
-        {
+        if let Err(error) = self.finish_command() {
             with_state(|state| abort_text_dispatch(state, element));
             return Err(DispatchError::Command(error));
         }
-        if let Some(panic) = panic {
-            let _ = self.finish_command();
-            return Err(DispatchError::Panic(panic));
-        }
         with_state(|state| clamp_local_edit(state, element));
         self.record_text_edit(element, before, kind);
-        Ok(())
+        report.mark_changed();
+        Ok(report)
     }
 
     /// 把一次编辑前后的编辑器状态记入该输入自己的历史。
@@ -6579,7 +6622,7 @@ impl Runtime {
     }
 
     /// 候选确认：用 `text` 替换组合区间，清除 preedit 并派发一次 `on:input`。
-    pub fn compose_commit(&mut self, label: &str, text: &str) -> Result<(), MountError> {
+    pub fn compose_commit(&mut self, label: &str, text: &str) -> Result<TurnReport, MountError> {
         self.dispatch_label(
             FindTarget::Label(label.to_owned()),
             "composition target not found",
@@ -6589,7 +6632,11 @@ impl Runtime {
     }
 
     /// 按 Node ID 确认候选；只有组合中的文本输入接受该操作。
-    pub fn compose_commit_node(&mut self, node: NodeId, text: &str) -> Result<(), DispatchError> {
+    pub fn compose_commit_node(
+        &mut self,
+        node: NodeId,
+        text: &str,
+    ) -> Result<TurnReport, DispatchError> {
         let state = self.state.clone();
         context::install(&state, || {
             let element = with_state(|state| state.element_for_node(node))?;
@@ -6602,8 +6649,8 @@ impl Runtime {
                 state.require_composing_text_input(node, element, NodeOperation::CompositionCommit)
             })?;
             self.enter_event_phase();
-            let before = match self.commit_composition(node, element, text) {
-                Ok(before) => before,
+            let (before, mut report) = match self.commit_composition(node, element, text) {
+                Ok(done) => done,
                 Err(DispatchError::Panic(panic)) => {
                     with_state(|state| abort_text_dispatch(state, element));
                     let _ = self.finish_command();
@@ -6622,7 +6669,8 @@ impl Runtime {
             if let Some(before) = before {
                 self.record_text_edit(element, before, EditKind::Boundary);
             }
-            Ok(())
+            report.mark_changed();
+            Ok(report)
         })
     }
 
@@ -6663,7 +6711,7 @@ impl Runtime {
         node: NodeId,
         element: usize,
         text: &str,
-    ) -> Result<Option<TextSnapshot>, DispatchError> {
+    ) -> Result<(Option<TextSnapshot>, TurnReport), DispatchError> {
         // 组合期间外部 value 可能已更新；候选插入编辑器当前文本并按长度夹取组合区间。
         let current_text = with_state(|state| {
             let LocalState::TextInput(editor) = state.element_local(element) else {
@@ -6719,15 +6767,26 @@ impl Runtime {
             with_state(|state| state.phase = Phase::Idle);
             return Err(DispatchError::Panic(panic));
         }
-        if let Err(panic) = self.dispatch_element_event(element, EventKind::Input, |event| {
-            if let Event::Input(handler) = event {
-                handler(new_text.clone());
+        let mut report = TurnReport::default();
+        if let Some((event_id, event)) =
+            with_state(|state| state.take_element_event(element, EventKind::Input))
+        {
+            let outcome = invoke_event(event_id, event, |event| match event {
+                Event::Input(handler) => handler(new_text),
+                _ => HandlerOutcome::Ok,
+            });
+            match outcome {
+                Ok(HandlerOutcome::Ok) => {}
+                Ok(HandlerOutcome::Err(error)) => {
+                    report.push_error(TurnError::HandlerFailed(error));
+                }
+                Err(panic) => {
+                    with_state(|state| state.phase = Phase::Idle);
+                    return Err(DispatchError::Panic(panic));
+                }
             }
-        }) {
-            with_state(|state| state.phase = Phase::Idle);
-            return Err(DispatchError::Panic(panic));
         }
-        Ok(Some(before))
+        Ok((Some(before), report))
     }
 
     fn cancel_composition(&mut self, node: NodeId, element: usize) -> Result<(), DispatchError> {

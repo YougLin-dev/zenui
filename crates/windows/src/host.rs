@@ -6,6 +6,7 @@ use std::mem::size_of;
 use std::num::NonZeroIsize;
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{
     ERROR_CLASS_ALREADY_EXISTS, ERROR_SUCCESS, GetLastError, HINSTANCE, HWND, LPARAM, LRESULT,
@@ -705,6 +706,8 @@ struct WindowHost {
     tracking_leave: bool,
     keyboard_modality: bool,
     pending_high_surrogate: Option<u16>,
+    /// 被用户 keydown 消费/跳过默认后，等待丢弃的同一次按键的 WM_CHAR。
+    char_suppression: Option<CharSuppression>,
     caret_visible: bool,
     blink_timer: Option<usize>,
     close_requested: bool,
@@ -1770,9 +1773,9 @@ impl Host {
         } else if message == WM_CAPTURECHANGED {
             self.capture_lost(window)
         } else if message == WM_CHAR {
-            self.char_typed(window, wparam)
+            self.char_typed(window, wparam, lparam)
         } else if message == WM_KEYDOWN {
-            self.key_down(window, wparam)
+            self.key_down(window, wparam, lparam)
         } else if message == WM_IME_STARTCOMPOSITION {
             self.ime_start(window)
         } else if message == WM_IME_COMPOSITION {
@@ -2438,6 +2441,7 @@ impl Host {
     ) -> Result<(), HostError> {
         // 一次指针按下只属于一个窗口；其它窗口的按压瞬态立即结束。
         self.clear_pressed_except(window.ctx.key());
+        window.char_suppression = None;
         let scale = window
             .scene
             .as_ref()
@@ -2762,6 +2766,7 @@ impl Host {
 
     /// 焦点丢失：清除按住瞬态、thumb 拖动与组合，并让下一帧不再绘制按下状态。
     fn focus_lost(&mut self, window: &mut WindowHost) -> Result<(), HostError> {
+        window.char_suppression = None;
         let was_dragging = window.scrollbar_drag.take().is_some();
         let was_pressed = window.pressed.take().is_some();
         if was_pressed || was_dragging {
@@ -3287,7 +3292,12 @@ impl Host {
     ///
     /// Windows 用两条 UTF-16 代理项消息发送非 BMP 字符；宿主缓存高代理项并在
     /// 低代理项到达时组合。
-    fn char_typed(&mut self, window: &mut WindowHost, wparam: WPARAM) -> Result<(), HostError> {
+    fn char_typed(
+        &mut self,
+        window: &mut WindowHost,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> Result<(), HostError> {
         let unit = wparam.0 as u16;
         let character = match unit {
             0xD800..=0xDBFF => {
@@ -3305,16 +3315,27 @@ impl Host {
                 char::from_u32(u32::from(unit))
             }
         };
+        // 高代理项已经提前返回并保留令牌；其余任何 WM_CHAR 都消费令牌，
+        // 未匹配时按规范清除，避免迟到字符被旧按键误伤。
+        let suppression = window.char_suppression.take();
         let Some(character) = character else {
             return Ok(());
         };
         if character.is_control() {
             return Ok(());
         }
+        let scan_code = scan_code(lparam);
         let snapshot = self
             .runtime
             .presentation_of(window.ctx)
             .map_err(HostError::Snapshot)?;
+        if let Some(suppression) = suppression
+            && suppression.scan_code == scan_code
+            && suppression.at.elapsed() <= CHAR_SUPPRESSION_WINDOW
+            && focused_input(&snapshot) == Some(suppression.target)
+        {
+            return Ok(());
+        }
         let Some(focused) = focused_input(&snapshot) else {
             return Ok(());
         };
@@ -3325,7 +3346,9 @@ impl Host {
         if is_composing(&snapshot, focused) {
             ignore_expected_dispatch(self.runtime.compose_commit_node(focused, text))?;
         } else {
-            ignore_expected_dispatch(self.runtime.insert_text_node(focused, text))?;
+            // 可打印字符是宿主 L5 默认，但插入本身在 Event turn 内完成：
+            // 一次 `on:input`、一个 `TurnReport`，不形成 Input intent。
+            ignore_expected_dispatch(self.runtime.type_text_node(focused, text))?;
         }
         window.reveal_requested = true;
         window.paint_requested = true;
@@ -3333,7 +3356,15 @@ impl Host {
     }
 
     /// 一次 `WM_KEYDOWN`：从线程消息队列读取修饰键后进入映射本体。
-    fn key_down(&mut self, window: &mut WindowHost, wparam: WPARAM) -> Result<(), HostError> {
+    fn key_down(
+        &mut self,
+        window: &mut WindowHost,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> Result<(), HostError> {
+        // 任何新的 keydown 都让上一条抑制令牌失效；只有本次 turn 消费了按键
+        // 才在结算后重新安装。
+        window.char_suppression = None;
         let key = VIRTUAL_KEY(wparam.0 as u16);
         if key == VK_PROCESSKEY {
             // IME 已消费该键。部分 IME 在 Escape 结束组合时不发送
@@ -3356,7 +3387,20 @@ impl Host {
             // Alt 组合留给系统菜单与加速键预译；AltGr 的字符仍由 WM_CHAR 输入。
             return Ok(());
         }
-        self.key_down_with(window, key, shift, control)
+        let report = self.key_down_with(window, key, shift, control)?;
+        if (report.outcome().consumed() || report.outcome().prevent_default())
+            && let Ok(snapshot) = self.runtime.presentation_of(window.ctx)
+            && let Some(focused) = focused_input(&snapshot)
+        {
+            // WM_CHAR 只按 scan code 匹配，不按字符；dead key/IME 组合字符
+            // 由同一次 keydown 的消费状态决定是否抑制。
+            window.char_suppression = Some(CharSuppression {
+                target: focused,
+                scan_code: scan_code(lparam),
+                at: Instant::now(),
+            });
+        }
+        Ok(())
     }
 
     /// 键盘映射本体：runtime keydown turn 之前的宿主层（组合/IME、编辑快捷键）
@@ -3367,14 +3411,14 @@ impl Host {
         key: VIRTUAL_KEY,
         shift: bool,
         control: bool,
-    ) -> Result<(), HostError> {
+    ) -> Result<TurnReport, HostError> {
         let modifiers = Modifiers::new(shift, control, false, false);
         if key == VK_TAB {
             self.cancel_compositions(window)?;
-            let _ = self.dispatch_key_intent(window, Key::Tab, modifiers)?;
+            let report = self.dispatch_key_intent(window, Key::Tab, modifiers)?;
             window.reveal_requested = true;
             window.paint_requested = true;
-            return Ok(());
+            return Ok(report);
         }
         if key == VK_ESCAPE
             && self
@@ -3385,14 +3429,14 @@ impl Host {
             // 组合中的 Escape 只取消组合；否则确认窗口的 Escape 等价于 Deny。
             if self.cancel_compositions(window)? {
                 window.paint_requested = true;
-                return Ok(());
+                return Ok(TurnReport::default());
             }
             self.runtime
                 .request_close(window.ctx)
                 .map_err(HostError::Close)?;
             self.focus_after_sync = true;
             window.paint_requested = true;
-            return Ok(());
+            return Ok(TurnReport::default());
         }
 
         let snapshot = self
@@ -3405,18 +3449,19 @@ impl Host {
                 || key_default_blocked(&report)
             {
                 // 组合期间翻页键归 IME；被 handler 消费的翻页键也不滚动。
-                return Ok(());
+                return Ok(report);
             }
-            return self.scroll_by_key(window, key);
+            self.scroll_by_key(window, key)?;
+            return Ok(report);
         }
         let Some(focused) = focused_input(&snapshot) else {
             // 没有文本输入焦点时仍把 keydown 交给 runtime：焦点控件、窗口
             // fallback handler 与 Tab/Enter/Space 默认都在那里结算。
             let report = self.dispatch_key_intent(window, host_key(key), modifiers)?;
             if matches!(key, VK_HOME | VK_END) && !key_default_blocked(&report) {
-                return self.scroll_by_key(window, key);
+                self.scroll_by_key(window, key)?;
             }
-            return Ok(());
+            return Ok(report);
         };
         let composing = is_composing(&snapshot, focused);
         if key == VK_ESCAPE {
@@ -3424,16 +3469,16 @@ impl Host {
             // Escape 才作为用户 keydown 进入 runtime。
             if composing && self.cancel_compositions(window)? {
                 window.paint_requested = true;
-                return Ok(());
+                return Ok(TurnReport::default());
             }
-            self.dispatch_key_intent(window, Key::Escape, modifiers)?;
+            let report = self.dispatch_key_intent(window, Key::Escape, modifiers)?;
             window.paint_requested = true;
-            return Ok(());
+            return Ok(report);
         }
         // 组合期间编辑键归 IME：未被 IME 消费而送到宿主的箭头、Home/End、
         // Backspace/Delete 与选择键在这里丢弃，不编辑也不触发显露。
         if composing {
-            return Ok(());
+            return Ok(TurnReport::default());
         }
         if let Some(action) = editor_shortcut(key, control, true, composing) {
             match action {
@@ -3456,14 +3501,14 @@ impl Host {
                 EditorAction::Paste => self.paste_text(window, focused)?,
                 EditorAction::Cut => self.cut_selection(window, &snapshot, focused)?,
             }
-            return Ok(());
+            return Ok(TurnReport::default());
         }
         // L3 用户 keydown → L4 控件默认全部在 runtime 内完成；宿主只保留
         // L1 快捷键、IME 与 L5 滚动/绘制。
-        self.dispatch_key_intent(window, host_key(key), modifiers)?;
+        let report = self.dispatch_key_intent(window, host_key(key), modifiers)?;
         window.reveal_requested = true;
         window.paint_requested = true;
-        Ok(())
+        Ok(report)
     }
 
     fn dispatch_key_intent(
@@ -3548,7 +3593,7 @@ impl Host {
     /// 读取剪贴板文本，过滤单行输入不接受的控制字符后插入聚焦输入。
     ///
     /// 空文本、非文本、读取失败或 provider panic 都不改模型；成功时只调用一次
-    /// `insert_text_node`，因此恰好一次 `on:input`。
+    /// `type_text_node`，因此恰好一次 `on:input`。
     fn paste_text(&mut self, window: &mut WindowHost, focused: NodeId) -> Result<(), HostError> {
         let Some(provider) = self.clipboard.as_mut() else {
             return Ok(());
@@ -3564,7 +3609,7 @@ impl Host {
         if filtered.is_empty() {
             return Ok(());
         }
-        ignore_expected_dispatch(self.runtime.insert_text_node(focused, &filtered))?;
+        ignore_expected_dispatch(self.runtime.type_text_node(focused, &filtered))?;
         window.reveal_requested = true;
         window.paint_requested = true;
         Ok(())
@@ -4648,6 +4693,7 @@ impl WindowHost {
             tracking_leave: false,
             keyboard_modality: false,
             pending_high_surrogate: None,
+            char_suppression: None,
             caret_visible: true,
             blink_timer,
             close_requested: false,
@@ -5274,6 +5320,21 @@ fn pointer_point(lparam: LPARAM, scale: f32) -> Point {
     let x = (lparam.0 & 0xffff) as u16 as i16 as f32;
     let y = ((lparam.0 >> 16) & 0xffff) as u16 as i16 as f32;
     Point::new(x / scale, y / scale)
+}
+
+/// 一次被消费的 keydown；下一条同 target/scan code 的 WM_CHAR 必须丢弃。
+#[derive(Clone, Copy)]
+struct CharSuppression {
+    target: NodeId,
+    scan_code: u32,
+    at: Instant,
+}
+
+const CHAR_SUPPRESSION_WINDOW: Duration = Duration::from_millis(50);
+
+/// 扫描码来自键盘消息的 LPARAM 16..23 位；测试消息通常为 0。
+const fn scan_code(lparam: LPARAM) -> u32 {
+    ((lparam.0 >> 16) & 0xff) as u32
 }
 
 /// 一条 `WM_IME_COMPOSITION` 同时可能带结果串与新组合串。
@@ -10012,7 +10073,7 @@ mod tests {
                                 aria:label="Locked"
                                 value="frozen"
                                 disabled={true}
-                                on:input={move |_value: String| {
+                                on:input={move |_value: String| -> () {
                                     panic!("a disabled SetValue ran its handler")
                                 }}
                             />
@@ -10494,7 +10555,7 @@ mod tests {
             host.key_down_with(window, VK_A, false, true)
         });
         with_main(&mut host, |host, window| {
-            host.char_typed(window, WPARAM('X' as usize))
+            host.char_typed(window, WPARAM('X' as usize), LPARAM(0))
         });
         let snapshot = host.runtime.presentation().expect("snapshot");
         let element = snapshot.node(node).expect("editor");
@@ -10626,7 +10687,7 @@ mod tests {
             .set_selection_node(node, 1, 3)
             .expect("select the middle");
         with_main(&mut host, |host, window| {
-            host.char_typed(window, WPARAM('X' as usize))
+            host.char_typed(window, WPARAM('X' as usize), LPARAM(0))
         });
         {
             let snapshot = host.runtime.presentation().expect("snapshot");
@@ -10684,13 +10745,13 @@ mod tests {
         let node = history_node(&host);
         host.runtime.set_caret_node(node, 3).expect("caret at end");
         with_main(&mut host, |host, window| {
-            host.char_typed(window, WPARAM('X' as usize))
+            host.char_typed(window, WPARAM('X' as usize), LPARAM(0))
         });
         with_main(&mut host, |host, window| {
             host.key_down_with(window, VK_Z, false, true)
         });
         with_main(&mut host, |host, window| {
-            host.char_typed(window, WPARAM('Y' as usize))
+            host.char_typed(window, WPARAM('Y' as usize), LPARAM(0))
         });
 
         with_main(&mut host, |host, window| {
@@ -11548,6 +11609,89 @@ mod tests {
         );
     }
 
+    #[component]
+    fn CharProbe(calls: Rc<Cell<u32>>) -> MountResult<MountPlan> {
+        let value = signal(String::new());
+        view! {
+            <text-input
+                aria:label="char-probe"
+                value={value}
+                on:input={move |next: String| {
+                    calls.set(calls.get() + 1);
+                    value.set(next);
+                }}
+                on:keydown={move |event: &mut KeyEvent| {
+                    if event.key() == Key::Other {
+                        event.consume();
+                    }
+                }}
+            />
+        }
+    }
+
+    /// 一个聚焦输入，其 keydown handler 消费所有可打印键。
+    fn suppression_host() -> (Host, Rc<Cell<u32>>) {
+        let calls = Rc::new(Cell::new(0));
+        let probe_calls = calls.clone();
+        let mut runtime = Runtime::new();
+        runtime
+            .declare_windows(move |catalog| {
+                catalog.window(WindowSpec::new(MAIN).primary().sized(400, 300), move |_| {
+                    let calls = probe_calls.clone();
+                    view! { <CharProbe calls={calls} /> }
+                })
+            })
+            .expect("declare the window");
+        runtime.show(MAIN).expect("show the window");
+        let mut host = Host::open(runtime, HostConfig::hidden()).expect("open host");
+        host.render().expect("render the window");
+        host.runtime.focus("char-probe").expect("focus the input");
+        (host, calls)
+    }
+
+    #[test]
+    fn a_consumed_keydown_suppresses_the_matching_char() {
+        let (mut host, calls) = suppression_host();
+        let scan = (0x1e_i32 << 16) as isize;
+        with_main(&mut host, |host, window| {
+            host.key_down(window, WPARAM(VK_A.0 as usize), LPARAM(scan))
+                .expect("keydown");
+            host.char_typed(window, WPARAM('a' as usize), LPARAM(scan))
+                .expect("suppressed char");
+            Ok(())
+        });
+        let snapshot = host.runtime.presentation().expect("snapshot");
+        assert_eq!(
+            snapshot
+                .find_label("char-probe")
+                .expect("input")
+                .text_value(),
+            Some(""),
+            "the consumed keydown drops its WM_CHAR"
+        );
+        assert_eq!(calls.get(), 0, "the suppressed char runs no on:input");
+
+        with_main(&mut host, |host, window| {
+            host.char_typed(
+                window,
+                WPARAM('b' as usize),
+                LPARAM((0x30_i32 << 16) as isize),
+            )
+            .expect("a later char");
+            Ok(())
+        });
+        let snapshot = host.runtime.presentation().expect("snapshot");
+        assert_eq!(
+            snapshot
+                .find_label("char-probe")
+                .expect("input")
+                .text_value(),
+            Some("b"),
+            "the token is single-use"
+        );
+        assert_eq!(calls.get(), 1);
+    }
+
     #[test]
     fn shift_tab_moves_focus_backward() {
         let mut host = open_host();
@@ -11602,10 +11746,10 @@ mod tests {
         let node = editor_node(&host);
 
         with_main(&mut host, |host, window| {
-            host.char_typed(window, WPARAM(0x0009))
+            host.char_typed(window, WPARAM(0x0009), LPARAM(0))
         });
         with_main(&mut host, |host, window| {
-            host.char_typed(window, WPARAM(0xDC00))
+            host.char_typed(window, WPARAM(0xDC00), LPARAM(0))
         });
         let snapshot = host.runtime.presentation().expect("snapshot");
         assert_eq!(
@@ -11622,10 +11766,10 @@ mod tests {
         let node = editor_node(&host);
 
         with_main(&mut host, |host, window| {
-            host.char_typed(window, WPARAM(0xD83D))
+            host.char_typed(window, WPARAM(0xD83D), LPARAM(0))
         });
         with_main(&mut host, |host, window| {
-            host.char_typed(window, WPARAM(0xDE42))
+            host.char_typed(window, WPARAM(0xDE42), LPARAM(0))
         });
         let snapshot = host.runtime.presentation().expect("snapshot");
         assert!(
@@ -12027,7 +12171,7 @@ mod tests {
             )
         });
         with_main(&mut host, |host, window| {
-            host.char_typed(window, WPARAM(u32::from('中') as usize))
+            host.char_typed(window, WPARAM(u32::from('中') as usize), LPARAM(0))
         });
 
         let snapshot = host.runtime.presentation().expect("snapshot");
@@ -12111,7 +12255,7 @@ mod tests {
         // 没有真实 IME 上下文时 OS 组合串为空；本地仍在组合，按 Escape 的
         // 静默结束路径补一次取消。
         with_main(&mut host, |host, window| {
-            host.key_down(window, WPARAM(VK_PROCESSKEY.0 as usize))
+            host.key_down(window, WPARAM(VK_PROCESSKEY.0 as usize), LPARAM(0))
         });
         let snapshot = host.runtime.presentation().expect("snapshot");
         let element = snapshot.node(node).expect("editor");

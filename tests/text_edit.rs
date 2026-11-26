@@ -339,15 +339,15 @@ fn disabled_inputs_and_wrong_kinds_reject_edits_and_composition() {
     let plain = node(&app, "plain");
 
     let rejected = [
-        app.insert_text_node(off, "x"),
-        app.backspace_node(off),
-        app.delete_forward_node(off),
+        app.insert_text_node(off, "x").map(|_| ()),
+        app.backspace_node(off).map(|_| ()),
+        app.delete_forward_node(off).map(|_| ()),
         app.set_caret_node(off, 1),
         app.set_selection_node(off, 0, 1),
         app.select_all_node(off),
         app.compose_start_node(off),
         app.compose_update_node(off, "x"),
-        app.compose_commit_node(off, "x"),
+        app.compose_commit_node(off, "x").map(|_| ()),
     ];
     for result in rejected {
         match result {
