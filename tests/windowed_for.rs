@@ -37,7 +37,7 @@ fn WindowedList(store: Store) -> MountResult<MountPlan> {
                         let title = store.title(id).read_once()?;
                         let label = format!("Row {title}");
                         view! {
-                            <view style:height={px(20.0)}>
+                            <view style:height={once(px(20.0))}>
                                 <button aria:label={once(label)}>"row"</button>
                             </view>
                         }

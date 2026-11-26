@@ -5,7 +5,7 @@ use zenui_core::{PanicInfo, RowSet};
 use zenui_style::{Color, Length, Opacity, Property, StyleDeclaration, StyleValue};
 
 use crate::context::Phase;
-use crate::signal::{Memo, Once, Signal};
+use crate::signal::{Memo, Once, ReactiveValue, Signal};
 use crate::store::{Field, FieldError, TodoId, WriteError};
 
 pub type MountResult<T> = Result<T, MountError>;
@@ -18,6 +18,8 @@ pub enum MountError {
         phase: Phase,
     },
     Field(FieldError),
+    /// 组件 setup 的 `Read::read_once()?` 读取失败。
+    Read(ReadFault),
     DuplicateKey,
     Write(WriteError),
     Delivery(&'static str),
@@ -43,6 +45,7 @@ impl fmt::Display for MountError {
                 write!(f, "{operation} is not allowed during {phase:?}")
             }
             Self::Field(error) => write!(f, "{error}"),
+            Self::Read(fault) => write!(f, "{fault}"),
             Self::DuplicateKey => f.write_str("duplicate For key before interface publication"),
             Self::Write(error) => write!(f, "{error}"),
             Self::Delivery(message) => f.write_str(message),
@@ -58,6 +61,12 @@ impl std::error::Error for MountError {}
 impl From<FieldError> for MountError {
     fn from(error: FieldError) -> Self {
         Self::Field(error)
+    }
+}
+
+impl From<ReadFault> for MountError {
+    fn from(fault: ReadFault) -> Self {
+        Self::Read(fault)
     }
 }
 
@@ -78,7 +87,7 @@ impl MountPlan {
 }
 
 pub enum PlanNode {
-    Text(TextSlot),
+    Text(Read<String>),
     Children(Children),
     Factory(ChildrenFactory),
     Element(ElementPlan),
@@ -95,61 +104,212 @@ pub struct ElementPlan {
     pub(crate) children: Vec<PlanNode>,
 }
 
-/// 一个值槽：静态值或可求值句柄；求值发生在提交帧，不在快照里执行闭包。
-pub enum ValueSlot<T> {
+/// 数据位置与组件 prop 的统一读源。
+///
+/// `Static` 只由字面量构造；`Once` 是显式挂载快照；`Signal`/`Memo` 是可观察
+/// 句柄；`Field` 的读取可能失败。裸值不会自动变成 `Once`，因此“写了值却永远
+/// 不更新”不能靠隐式转换通过编译。
+#[derive(Clone, Debug)]
+pub enum Read<T> {
+    /// 字面量或 `&'static str` 静态值；挂载时写入绑定当前值，没有依赖。
+    ///
+    /// 条件选择的文本也属于静态值；需要随后更新时写 `once(...)`、signal 或
+    /// memo，否则它会永远停留在挂载时的值。
     Static(T),
+    /// 显式一次性快照；保留来源诊断，不注册依赖。
+    Once(Once<T>),
     Signal(Signal<T>),
     Memo(Memo<T>),
+    /// 行字段；读取可能返回 [`ReadFault::FieldMissing`]。
+    Field(Field<T>),
 }
 
-impl<T> From<T> for ValueSlot<T> {
-    fn from(value: T) -> Self {
-        Self::Static(value)
+/// 一次读取的结果；失败与最后已提交值并列，不把失败伪装成默认值。
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum ReadValue<T> {
+    Value(T),
+    Fault(ReadFault),
+}
+
+/// 数据位置读取失败的 typed 诊断。
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum ReadFault {
+    /// 行已经不存在；绑定保留最后一次成功值。
+    FieldMissing(FieldError),
+    /// memo 计算 panic 且没有最后已提交值。
+    ComputedPanicked,
+    /// memo 读取形成环。
+    GraphCycle,
+    /// 资源随 owner 释放后仍被读取。
+    Disposed,
+}
+
+impl fmt::Display for ReadFault {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::FieldMissing(error) => write!(f, "field read failed: {error}"),
+            Self::ComputedPanicked => f.write_str("memo compute panicked"),
+            Self::GraphCycle => f.write_str("memo graph cycle"),
+            Self::Disposed => f.write_str("reactive source was disposed"),
+        }
     }
 }
 
-impl<T> From<Once<T>> for ValueSlot<T> {
+impl std::error::Error for ReadFault {}
+
+impl From<FieldError> for ReadFault {
+    fn from(error: FieldError) -> Self {
+        Self::FieldMissing(error)
+    }
+}
+
+/// 行字段的类型化读取入口；`Field<T>` 目前覆盖文本与布尔字段。
+pub(crate) trait FieldSource<T>: Copy {
+    /// 在绑定/刷新阶段读取；在 memo 计算中注册字段依赖。
+    fn read_field(self) -> Result<T, FieldError>;
+    /// 组件 setup 的一次性读取；不注册依赖。
+    fn read_field_once(self) -> Result<T, FieldError>;
+}
+
+impl<T> FieldSource<T> for Field<T>
+where
+    T: ReactiveValue,
+{
+    fn read_field(self) -> Result<T, FieldError> {
+        self.read_value(false)
+    }
+
+    fn read_field_once(self) -> Result<T, FieldError> {
+        self.read_value(true)
+    }
+}
+
+impl<T> From<Once<T>> for Read<T>
+where
+    T: ReactiveValue,
+{
     fn from(value: Once<T>) -> Self {
-        Self::Static(value.into_inner())
+        Self::Once(value)
     }
 }
 
-impl<T> From<Signal<T>> for ValueSlot<T> {
+impl<T> From<Signal<T>> for Read<T>
+where
+    T: ReactiveValue,
+{
     fn from(value: Signal<T>) -> Self {
         Self::Signal(value)
     }
 }
 
-impl<T> From<Memo<T>> for ValueSlot<T> {
+impl<T> From<Memo<T>> for Read<T>
+where
+    T: ReactiveValue,
+{
     fn from(value: Memo<T>) -> Self {
         Self::Memo(value)
     }
 }
 
-impl<T: Clone + PartialEq + 'static> ValueSlot<T> {
-    pub(crate) fn evaluate(&self) -> T {
+impl<T: ReactiveValue> From<Field<T>> for Read<T> {
+    fn from(value: Field<T>) -> Self {
+        Self::Field(value)
+    }
+}
+
+impl From<&'static str> for Read<String> {
+    fn from(value: &'static str) -> Self {
+        Self::Static(value.to_owned())
+    }
+}
+
+impl From<Once<&'static str>> for Read<String> {
+    fn from(value: Once<&'static str>) -> Self {
+        Self::Once(crate::signal::once(value.into_inner().to_owned()))
+    }
+}
+
+impl<T: ReactiveValue> Read<T> {
+    /// 组件 setup 的一次性读取（`Field` 走 `read_once`，不注册依赖）。
+    ///
+    /// 失败实现 `From<ReadFault> for MountError`，因此组件里可以直接写
+    /// `read.read_once()?` 把 typed fault 交给挂载错误通道。
+    pub fn read_once(self) -> Result<T, ReadFault> {
         match self {
-            Self::Static(value) => value.clone(),
-            Self::Signal(signal) => signal.get(),
-            Self::Memo(memo) => memo.get(),
+            Self::Static(value) => Ok(value),
+            Self::Once(value) => Ok(value.into_inner()),
+            Self::Signal(signal) => signal.try_get_once(),
+            Self::Memo(memo) => memo.try_get_once(),
+            Self::Field(field) => field.read_field_once().map_err(ReadFault::FieldMissing),
+        }
+    }
+
+    /// [`Read::read_once`] 的别名，强调读取可能失败。
+    pub fn try_get(self) -> Result<T, ReadFault> {
+        self.read_once()
+    }
+
+    /// 绑定求值；`Field` 失败返回 fault，调用方保留最后已提交值。
+    pub(crate) fn evaluate(&self) -> ReadValue<T> {
+        match self {
+            Self::Static(value) => ReadValue::Value(value.clone()),
+            Self::Once(value) => ReadValue::Value(value.clone().into_inner()),
+            Self::Signal(signal) => match signal.try_get_once() {
+                Ok(value) => ReadValue::Value(value),
+                Err(fault) => ReadValue::Fault(fault),
+            },
+            Self::Memo(memo) => match memo.try_get_once() {
+                Ok(value) => ReadValue::Value(value),
+                // 已释放的派生值降级为 typed fault，绑定保留最后值。
+                Err(ReadFault::Disposed) => ReadValue::Fault(ReadFault::Disposed),
+                // 计算 panic 仍走 `Memo::get` 的既有契约，由刷新边界 contain。
+                Err(_) => ReadValue::Value(memo.get()),
+            },
+            Self::Field(field) => match field.read_field() {
+                Ok(value) => ReadValue::Value(value),
+                Err(error) => ReadValue::Fault(ReadFault::FieldMissing(error)),
+            },
+        }
+    }
+
+    /// 值绑定的写入代数；静态值、once 与字段没有写入路径。
+    pub(crate) fn epoch(&self, state: &crate::runtime::State) -> Option<u64> {
+        match self {
+            Self::Static(_) | Self::Once(_) => None,
+            Self::Signal(signal) => Some(signal.write_epoch(state)),
+            Self::Memo(memo) => Some(memo.write_epoch(state)),
+            // 字段写入由 Store touch 推进；处理器只写字段时，编辑器仍要把
+            // 这次编辑归为“已结算”，不能回退尚未写回的本地文本。
+            Self::Field(field) => Some(state.field_write_epoch(field.id, field.kind)),
         }
     }
 }
 
-/// 一条 inline `style:` 声明的类型化值槽。
+/// 一条 inline `style:` 声明的类型化读源。
 pub enum StyleSlot {
-    Color(ValueSlot<Color>),
-    Length(ValueSlot<Length>),
-    Opacity(ValueSlot<Opacity>),
+    Color(Read<Color>),
+    Length(Read<Length>),
+    Opacity(Read<Opacity>),
 }
 
 impl StyleSlot {
-    pub(crate) fn evaluate(&self) -> StyleValue {
+    /// 求值；`Field` 变体目前不用于样式，但仍走统一契约。
+    pub(crate) fn evaluate(&self) -> ReadValue<StyleValue> {
         match self {
-            Self::Color(slot) => StyleValue::Color(slot.evaluate()),
-            Self::Length(slot) => StyleValue::Length(slot.evaluate()),
-            Self::Opacity(slot) => StyleValue::Opacity(slot.evaluate().value()),
+            Self::Color(slot) => map_read_value(slot.evaluate(), StyleValue::Color),
+            Self::Length(slot) => map_read_value(slot.evaluate(), StyleValue::Length),
+            Self::Opacity(slot) => {
+                map_read_value(slot.evaluate(), |value| StyleValue::Opacity(value.value()))
+            }
         }
+    }
+}
+
+/// 把一次 typed 读取映射到样式值，fault 原样保留。
+fn map_read_value<T, U>(value: ReadValue<T>, map: impl FnOnce(T) -> U) -> ReadValue<U> {
+    match value {
+        ReadValue::Value(value) => ReadValue::Value(map(value)),
+        ReadValue::Fault(fault) => ReadValue::Fault(fault),
     }
 }
 
@@ -160,7 +320,7 @@ pub struct InlineStyle {
 }
 
 /// `style:background` 的类型化值。
-pub fn style_background(value: impl Into<ValueSlot<Color>>) -> InlineStyle {
+pub fn style_background(value: impl Into<Read<Color>>) -> InlineStyle {
     InlineStyle {
         property: Property::Background,
         slot: StyleSlot::Color(value.into()),
@@ -168,7 +328,7 @@ pub fn style_background(value: impl Into<ValueSlot<Color>>) -> InlineStyle {
 }
 
 /// `style:color` 的类型化值。
-pub fn style_color(value: impl Into<ValueSlot<Color>>) -> InlineStyle {
+pub fn style_color(value: impl Into<Read<Color>>) -> InlineStyle {
     InlineStyle {
         property: Property::TextColor,
         slot: StyleSlot::Color(value.into()),
@@ -176,7 +336,7 @@ pub fn style_color(value: impl Into<ValueSlot<Color>>) -> InlineStyle {
 }
 
 /// `style:border-color` 的类型化值。
-pub fn style_border_color(value: impl Into<ValueSlot<Color>>) -> InlineStyle {
+pub fn style_border_color(value: impl Into<Read<Color>>) -> InlineStyle {
     InlineStyle {
         property: Property::BorderColor,
         slot: StyleSlot::Color(value.into()),
@@ -184,7 +344,7 @@ pub fn style_border_color(value: impl Into<ValueSlot<Color>>) -> InlineStyle {
 }
 
 /// `style:opacity` 的类型化值。
-pub fn style_opacity(value: impl Into<ValueSlot<Opacity>>) -> InlineStyle {
+pub fn style_opacity(value: impl Into<Read<Opacity>>) -> InlineStyle {
     InlineStyle {
         property: Property::Opacity,
         slot: StyleSlot::Opacity(value.into()),
@@ -192,7 +352,7 @@ pub fn style_opacity(value: impl Into<ValueSlot<Opacity>>) -> InlineStyle {
 }
 
 /// `style:width` 的类型化值。
-pub fn style_width(value: impl Into<ValueSlot<Length>>) -> InlineStyle {
+pub fn style_width(value: impl Into<Read<Length>>) -> InlineStyle {
     InlineStyle {
         property: Property::Width,
         slot: StyleSlot::Length(value.into()),
@@ -200,7 +360,7 @@ pub fn style_width(value: impl Into<ValueSlot<Length>>) -> InlineStyle {
 }
 
 /// `style:height` 的类型化值。
-pub fn style_height(value: impl Into<ValueSlot<Length>>) -> InlineStyle {
+pub fn style_height(value: impl Into<Read<Length>>) -> InlineStyle {
     InlineStyle {
         property: Property::Height,
         slot: StyleSlot::Length(value.into()),
@@ -213,7 +373,7 @@ pub struct ComponentPlan {
 }
 
 pub struct ShowPlan {
-    pub(crate) when: Memo<bool>,
+    pub(crate) when: Read<bool>,
     pub(crate) then: ChildrenFactory,
     pub(crate) fallback: Option<ChildrenFactory>,
 }
@@ -268,66 +428,10 @@ where
     }
 }
 
-#[derive(Clone, Debug)]
-pub enum TextSlot {
-    Static(&'static str),
-    Once(String),
-    Signal(Signal<String>),
-    Memo(Memo<String>),
-}
-
-impl TextSlot {
-    pub(crate) fn evaluate(&self) -> String {
-        match self {
-            Self::Static(value) => (*value).to_owned(),
-            Self::Once(value) => value.clone(),
-            Self::Signal(signal) => signal.get(),
-            Self::Memo(memo) => memo.get(),
-        }
-    }
-
-    /// 值绑定的写入代数；静态值没有写入路径，返回 `None`。
-    ///
-    /// 编辑器用它区分“处理器写过值绑定”和“模型尚未追上本地编辑”。
-    /// Signal 绑定对相等写入也推进；Memo 绑定只观察计算值变化，写回原值的
-    /// 归一化因此不会被误当成推迟写入（编辑器保留本地文本）。
-    pub(crate) fn epoch(&self, state: &crate::runtime::State) -> Option<u64> {
-        match self {
-            Self::Static(_) | Self::Once(_) => None,
-            Self::Signal(signal) => Some(signal.write_epoch(state)),
-            Self::Memo(memo) => Some(memo.write_epoch(state)),
-        }
-    }
-}
-
+/// 一条属性值：文本或布尔，二者共用 [`Read`] 的读取与失败契约。
 pub enum AttrValue {
-    Text(TextSlot),
-    Bool(BoolValue),
-    ResultBool(ResultBoolValue),
-}
-
-#[derive(Clone, Debug)]
-pub enum BoolValue {
-    Static(bool),
-    Once(bool),
-    Signal(Signal<bool>),
-    Memo(Memo<bool>),
-}
-
-impl BoolValue {
-    pub(crate) fn evaluate(&self) -> bool {
-        match self {
-            Self::Static(value) | Self::Once(value) => *value,
-            Self::Signal(signal) => signal.get(),
-            Self::Memo(memo) => memo.get(),
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub enum ResultBoolValue {
-    Field(Field<bool>),
-    Memo(Memo<Result<bool, FieldError>>),
+    Text(Read<String>),
+    Bool(Read<bool>),
 }
 
 pub enum Attr {
@@ -444,112 +548,132 @@ pub enum Event {
     CompositionCancel(Box<dyn FnMut(CompositionEvent)>),
 }
 
+/// 文本数据位置：接受字面量、显式 once 与读句柄；裸 `String` 不再隐式成为 once。
 pub trait IntoText {
-    fn into_text(self) -> TextSlot;
+    fn into_text(self) -> Read<String>;
 }
 
 impl IntoText for &'static str {
-    fn into_text(self) -> TextSlot {
-        TextSlot::Static(self)
-    }
-}
-
-impl IntoText for String {
-    fn into_text(self) -> TextSlot {
-        TextSlot::Once(self)
+    fn into_text(self) -> Read<String> {
+        Read::Static(self.to_owned())
     }
 }
 
 impl IntoText for Once<String> {
-    fn into_text(self) -> TextSlot {
-        TextSlot::Once(self.into_inner())
+    fn into_text(self) -> Read<String> {
+        Read::Once(self)
+    }
+}
+
+impl IntoText for Once<&'static str> {
+    fn into_text(self) -> Read<String> {
+        Read::from(self)
     }
 }
 
 impl IntoText for Signal<String> {
-    fn into_text(self) -> TextSlot {
-        TextSlot::Signal(self)
+    fn into_text(self) -> Read<String> {
+        Read::Signal(self)
     }
 }
 
 impl IntoText for Memo<String> {
-    fn into_text(self) -> TextSlot {
-        TextSlot::Memo(self)
+    fn into_text(self) -> Read<String> {
+        Read::Memo(self)
     }
 }
 
+impl IntoText for Field<String> {
+    fn into_text(self) -> Read<String> {
+        Read::Field(self)
+    }
+}
+
+impl IntoText for Read<String> {
+    fn into_text(self) -> Read<String> {
+        self
+    }
+}
+
+/// 属性数据位置：字面量、显式 once 与读句柄；裸 `String`/`bool` 不再隐式成为静态值。
 pub trait IntoAttr {
     fn into_attr(self) -> AttrValue;
 }
 
 impl IntoAttr for &'static str {
     fn into_attr(self) -> AttrValue {
-        AttrValue::Text(TextSlot::Static(self))
-    }
-}
-
-impl IntoAttr for String {
-    fn into_attr(self) -> AttrValue {
-        AttrValue::Text(TextSlot::Once(self))
-    }
-}
-
-impl IntoAttr for bool {
-    fn into_attr(self) -> AttrValue {
-        AttrValue::Bool(BoolValue::Static(self))
+        AttrValue::Text(Read::Static(self.to_owned()))
     }
 }
 
 impl IntoAttr for Once<String> {
     fn into_attr(self) -> AttrValue {
-        AttrValue::Text(TextSlot::Once(self.into_inner()))
+        AttrValue::Text(Read::Once(self))
+    }
+}
+
+impl IntoAttr for Once<&'static str> {
+    fn into_attr(self) -> AttrValue {
+        AttrValue::Text(Read::from(self))
     }
 }
 
 impl IntoAttr for Once<bool> {
     fn into_attr(self) -> AttrValue {
-        AttrValue::Bool(BoolValue::Once(self.into_inner()))
+        AttrValue::Bool(Read::Once(self))
     }
 }
 
 impl IntoAttr for Signal<String> {
     fn into_attr(self) -> AttrValue {
-        AttrValue::Text(TextSlot::Signal(self))
+        AttrValue::Text(Read::Signal(self))
     }
 }
 
 impl IntoAttr for Memo<String> {
     fn into_attr(self) -> AttrValue {
-        AttrValue::Text(TextSlot::Memo(self))
+        AttrValue::Text(Read::Memo(self))
     }
 }
 
 impl IntoAttr for Signal<bool> {
     fn into_attr(self) -> AttrValue {
-        AttrValue::Bool(BoolValue::Signal(self))
+        AttrValue::Bool(Read::Signal(self))
     }
 }
 
 impl IntoAttr for Memo<bool> {
     fn into_attr(self) -> AttrValue {
-        AttrValue::Bool(BoolValue::Memo(self))
+        AttrValue::Bool(Read::Memo(self))
+    }
+}
+
+impl IntoAttr for Field<String> {
+    fn into_attr(self) -> AttrValue {
+        AttrValue::Text(Read::Field(self))
     }
 }
 
 impl IntoAttr for Field<bool> {
     fn into_attr(self) -> AttrValue {
-        AttrValue::ResultBool(ResultBoolValue::Field(self))
+        AttrValue::Bool(Read::Field(self))
     }
 }
 
-impl IntoAttr for Memo<Result<bool, FieldError>> {
+impl IntoAttr for Read<String> {
     fn into_attr(self) -> AttrValue {
-        AttrValue::ResultBool(ResultBoolValue::Memo(self))
+        AttrValue::Text(self)
+    }
+}
+
+impl IntoAttr for Read<bool> {
+    fn into_attr(self) -> AttrValue {
+        AttrValue::Bool(self)
     }
 }
 
 pub fn text_static(value: &'static str) -> PlanNode {
-    PlanNode::Text(TextSlot::Static(value))
+    PlanNode::Text(Read::Static(value.to_owned()))
 }
 
 pub fn child(value: impl IntoNode) -> PlanNode {
@@ -566,13 +690,13 @@ impl IntoNode for &'static str {
     }
 }
 
-impl IntoNode for String {
+impl IntoNode for Once<String> {
     fn into_node(self) -> PlanNode {
         PlanNode::Text(self.into_text())
     }
 }
 
-impl IntoNode for Once<String> {
+impl IntoNode for Once<&'static str> {
     fn into_node(self) -> PlanNode {
         PlanNode::Text(self.into_text())
     }
@@ -585,6 +709,18 @@ impl IntoNode for Signal<String> {
 }
 
 impl IntoNode for Memo<String> {
+    fn into_node(self) -> PlanNode {
+        PlanNode::Text(self.into_text())
+    }
+}
+
+impl IntoNode for Field<String> {
+    fn into_node(self) -> PlanNode {
+        PlanNode::Text(self.into_text())
+    }
+}
+
+impl IntoNode for Read<String> {
     fn into_node(self) -> PlanNode {
         PlanNode::Text(self.into_text())
     }
@@ -647,12 +783,12 @@ pub fn component(
 }
 
 pub fn show(
-    when: Memo<bool>,
+    when: impl Into<Read<bool>>,
     then: impl Into<ChildrenFactory>,
     fallback: Option<ChildrenFactory>,
 ) -> PlanNode {
     PlanNode::Show(ShowPlan {
-        when,
+        when: when.into(),
         then: then.into(),
         fallback,
     })

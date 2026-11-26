@@ -1,0 +1,37 @@
+warning: unnecessary braces around function argument
+ --> tests/compile_fail/bare_bool_attr.rs:5:62
+  |
+5 |     let _: MountResult<MountPlan> = view! { <button disabled={blocked}>"Blocked"</button> };
+  |                                                              ^       ^
+  |
+  = note: `#[warn(unused_braces)]` (part of `#[warn(unused)]`) on by default
+help: remove these braces
+  |
+5 -     let _: MountResult<MountPlan> = view! { <button disabled={blocked}>"Blocked"</button> };
+5 +     let _: MountResult<MountPlan> = view! { <button disabled=blocked>"Blocked"</button> };
+  |
+
+error[E0277]: the trait bound `bool: IntoAttr` is not satisfied
+ --> tests/compile_fail/bare_bool_attr.rs:5:62
+  |
+5 |     let _: MountResult<MountPlan> = view! { <button disabled={blocked}>"Blocked"</button> };
+  |                                                              ^-------^
+  |                                                              ||
+  |                                                              |this tail expression is of type `bool`
+  |                                                              the trait `IntoAttr` is not implemented for `bool`
+  |
+  = help: the following other types implement trait `IntoAttr`:
+            &'static str
+            zenui::Field<String>
+            zenui::Field<bool>
+            zenui::Memo<String>
+            zenui::Memo<bool>
+            zenui::Once<&'static str>
+            zenui::Once<String>
+            zenui::Once<bool>
+          and $N others
+note: required by a bound in `attr`
+ --> src/view.rs
+  |
+  | pub fn attr(name: &'static str, value: impl IntoAttr) -> Attr {
+  |                                             ^^^^^^^^ required by this bound in `attr`

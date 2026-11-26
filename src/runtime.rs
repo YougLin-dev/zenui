@@ -35,7 +35,7 @@ use crate::tray::{TrayError, TraySpec};
 use crate::view::{
     Attr, AttrValue, BlurEvent, ChildrenFactory, CompositionEvent, CompositionPhase, Event,
     FocusCause, FocusEvent, HandlerError, HandlerOutcome, InlineStyle, Key, KeyEvent, MountError,
-    MountPlan, MountResult, PlanNode, ResultBoolValue, StyleSlot, SubmitEvent, TextSlot, ValueSlot,
+    MountPlan, MountResult, PlanNode, Read, ReadFault, ReadValue, StyleSlot, SubmitEvent,
 };
 use crate::window::{
     CatalogEntry, CatalogError, CloseError, CloseEvent, CloseHandler, CloseOutcome, ClosePolicy,
@@ -609,8 +609,11 @@ impl NodeArena {
 
 /// 文本节点的 payload：求值来源与已提交文本。
 struct TextData {
-    source: TextSlot,
+    source: Read<String>,
+    /// 最后已提交文本；读取失败时保持不变。
     value: String,
+    /// 本次求值失败；可与 `value` 同时存在。
+    fault: Option<ReadFault>,
 }
 
 /// 元素挂载时一次性写入辅助 arena 的初始列表。
@@ -753,6 +756,10 @@ pub(crate) struct State {
     dirty_trees: BTreeSet<TreeSlot>,
     /// 自上次公开 `Runtime::refresh` 报告以来 revision 推进的树。
     changed_trees: BTreeSet<TreeSlot>,
+    /// 本次刷新观察到的读取失败；绑定保留最后值，诊断按值去重。
+    pub(crate) read_faults: Vec<ReadFault>,
+    /// 源写入代数；字段绑定用它辨认处理器是否写过这次编辑。
+    pub(crate) write_epochs: BTreeMap<DepKey, u64>,
     pub(crate) write_error: Option<WriteError>,
     pub(crate) core: zenui_core::Runtime,
     pub(crate) phase: Phase,
@@ -881,6 +888,8 @@ pub struct RefreshReport {
     pub root_changed: bool,
     /// revision 推进的窗口键，按字典序排列。
     pub changed_windows: Vec<&'static str>,
+    /// 本次刷新遇到的 typed 读取失败；值绑定保留最后已提交值。
+    faults: Vec<ReadFault>,
 }
 
 impl RefreshReport {
@@ -892,6 +901,18 @@ impl RefreshReport {
     /// revision 推进的窗口键。
     pub fn changed_windows(&self) -> &[&'static str] {
         &self.changed_windows
+    }
+
+    /// 本次刷新遇到的 typed 读取失败，按值去重。
+    pub fn faults(&self) -> &[ReadFault] {
+        &self.faults
+    }
+}
+
+/// 记录一个 `Read` 源的 memo 槽位；其他来源没有 memo 依赖。
+fn collect_read_memo<T>(read: &Read<T>, live: &mut BTreeSet<u32>) {
+    if let Read::Memo(memo) = read {
+        live.insert(memo.memo_id());
     }
 }
 
@@ -927,6 +948,71 @@ fn actions_for_events(state: &State, events: &[usize]) -> SnapshotActions {
 }
 
 impl State {
+    /// 已挂载绑定与结构触发直接引用的 memo，加上它们的 memo 依赖闭包。
+    ///
+    /// 这是 #336 BindingTable 之前的 liveness 近似：从当前保留树的 `Read`
+    /// 源出发，不把只被处理器读取的派生值提前结算。
+    pub(crate) fn live_memo_set(&self) -> BTreeSet<u32> {
+        let mut live = BTreeSet::new();
+        for tree in self.trees.values() {
+            self.collect_node_memos(&tree.nodes, &mut live);
+        }
+        let mut stack: Vec<u32> = live.iter().copied().collect();
+        while let Some(memo) = stack.pop() {
+            for key in &self.memos[memo as usize].deps {
+                if let DepKey::Memo(dep) = key
+                    && live.insert(*dep)
+                {
+                    stack.push(*dep);
+                }
+            }
+        }
+        live
+    }
+
+    fn collect_node_memos(&self, nodes: &[MountedNode], live: &mut BTreeSet<u32>) {
+        for node in nodes {
+            match node {
+                MountedNode::Text(payload) => {
+                    collect_read_memo(&self.nodes.text(*payload).source, live);
+                }
+                MountedNode::Element(id) => {
+                    for attr in self.element_attrs(*id) {
+                        match &attr.value {
+                            AttrValue::Text(read) => collect_read_memo(read, live),
+                            AttrValue::Bool(read) => collect_read_memo(read, live),
+                        }
+                    }
+                    for style in self.element_inline_styles(*id) {
+                        match &style.slot {
+                            StyleSlot::Color(read) => collect_read_memo(read, live),
+                            StyleSlot::Length(read) => collect_read_memo(read, live),
+                            StyleSlot::Opacity(read) => collect_read_memo(read, live),
+                        }
+                    }
+                    self.collect_node_memos(&self.elements[*id].children, live);
+                }
+                MountedNode::Component(id) => {
+                    self.collect_node_memos(&self.components[*id].children, live);
+                }
+                MountedNode::Show(payload) => {
+                    let show = self.nodes.show(*payload);
+                    collect_read_memo(&show.when, live);
+                    if let Some(branch) = &show.active {
+                        self.collect_node_memos(&branch.children, live);
+                    }
+                }
+                MountedNode::For(payload) => {
+                    let data = self.nodes.for_node(*payload);
+                    live.insert(data.each.memo_id());
+                    for item in data.items.values() {
+                        self.collect_node_memos(&item.children, live);
+                    }
+                }
+            }
+        }
+    }
+
     fn new() -> Self {
         let mut owners = BTreeMap::new();
         owners.insert(
@@ -950,6 +1036,8 @@ impl State {
             next_tree_revision: 1,
             dirty_trees: BTreeSet::new(),
             changed_trees: BTreeSet::new(),
+            read_faults: Vec::new(),
+            write_epochs: BTreeMap::new(),
             write_error: None,
             core: zenui_core::Runtime::new(),
             phase: Phase::Idle,
@@ -1547,8 +1635,8 @@ impl State {
             .iter()
             .find(|attr| attr.name == "value")
             .and_then(|attr| match &attr.value {
-                AttrValue::Text(slot) => slot.epoch(self),
-                AttrValue::Bool(_) | AttrValue::ResultBool(_) => None,
+                AttrValue::Text(read) => read.epoch(self),
+                AttrValue::Bool(_) => None,
             })
     }
 
@@ -2473,12 +2561,15 @@ struct MountedInlineStyle {
     property: zenui_style::Property,
     slot: StyleSlot,
     current: Option<zenui_style::StyleValue>,
+    fault: Option<ReadFault>,
 }
 
 pub struct MountedAttr {
     name: &'static str,
     value: AttrValue,
     current: Option<AttrCurrent>,
+    /// 本次求值失败；`current` 仍是最后已提交值。
+    fault: Option<ReadFault>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -3033,7 +3124,7 @@ pub struct MountedComponent {
 struct ShowData {
     owner: u32,
     node: NodeRef,
-    when: Memo<bool>,
+    when: Read<bool>,
     then: ChildrenFactory,
     fallback: Option<ChildrenFactory>,
     active: Option<MountedBranch>,
@@ -3094,14 +3185,16 @@ fn ensure_spacers(state: &mut State, owner: u32, parent: Option<NodeRef>) -> (us
         let aux = state.nodes.reserve_element_aux(AuxSeed {
             attrs: vec![MountedAttr {
                 name: "role",
-                value: AttrValue::Text(TextSlot::Static("spacer")),
+                value: AttrValue::Text(Read::Static(String::from("spacer"))),
                 current: Some(AttrCurrent::Text(String::from("spacer"))),
+                fault: None,
             }],
             class_styles: &[],
             inline_styles: vec![MountedInlineStyle {
                 property: Property::Height,
-                slot: StyleSlot::Length(ValueSlot::Static(Length::px(0.0))),
+                slot: StyleSlot::Length(Read::Static(Length::px(0.0))),
                 current: Some(StyleValue::Length(Length::px(0.0))),
+                fault: None,
             }],
             events: Vec::new(),
             edit: LocalState::None,
@@ -3143,7 +3236,7 @@ fn set_spacer_height(state: &mut State, spacer: usize, rows: usize, row_height: 
         let next = Some(StyleValue::Length(height));
         let changed = style.current != next;
         style.current = next;
-        style.slot = StyleSlot::Length(ValueSlot::Static(height));
+        style.slot = StyleSlot::Length(Read::Static(height));
         changed
     };
     if changed {
@@ -4915,6 +5008,20 @@ impl Runtime {
         if self.tree_keys().is_empty() {
             return Err(MountError::Component("no committed interface is mounted"));
         }
+        self.state.borrow_mut().read_faults.clear();
+        self.settle_memos();
+        // settle 在 Phase::Memo 中运行；非法写入要像刷新期写入一样冒泡为
+        // Context 错误，而不是被随后每棵树的 fault 重置吞掉。
+        let fault = self.state.borrow_mut().fault.take();
+        if let Some(fault) = fault {
+            self.clear_invalid_focus();
+            return Err(State::context_error(fault));
+        }
+        let write_error = self.state.borrow_mut().write_error.take();
+        if let Some(error) = write_error {
+            self.clear_invalid_focus();
+            return Err(MountError::Write(error));
+        }
         if let Err(error) = self.refresh_all_once() {
             // 已完成的窗口保留本帧结果；不能让焦点身份停留在已被移除或禁用的旧目标上。
             self.clear_invalid_focus();
@@ -4927,7 +5034,11 @@ impl Runtime {
     fn take_refresh_report(&mut self) -> RefreshReport {
         let mut state = self.state.borrow_mut();
         let keys = std::mem::take(&mut state.changed_trees);
-        let mut report = RefreshReport::default();
+        let faults = std::mem::take(&mut state.read_faults);
+        let mut report = RefreshReport {
+            faults,
+            ..RefreshReport::default()
+        };
         for key in keys {
             if !state.trees.contains_key(&key) {
                 continue;
@@ -4943,6 +5054,35 @@ impl Runtime {
 
     fn tree_keys(&self) -> Vec<TreeSlot> {
         self.state.borrow().trees.keys().copied().collect()
+    }
+
+    /// flush step 1：只结算仍被已挂载消费者可达的脏 memo。
+    ///
+    /// 一个 memo 重算相等时不会传播，因此下游不会被拉进 worklist；只被事件
+    /// 处理器读取的 memo 保持惰性，也不会有挂载期副作用。
+    fn settle_memos(&mut self) {
+        let state = self.state.clone();
+        context::install(&state, || {
+            let live = with_state(|state| state.live_memo_set());
+            let mut settled = BTreeSet::new();
+            while let Some(id) = with_state(|state| state.next_dirty_live_memo(&live)) {
+                // 无环图里每个 memo 一拍最多结算一次：依赖都在读取时先结算，
+                // 之后的源写入在本帧被禁止。再次被选中说明动态依赖成环。
+                if !settled.insert(id) {
+                    with_state(|state| state.record_read_fault(ReadFault::GraphCycle));
+                    break;
+                }
+                let (compute, previous) = with_state(|state| state.begin_memo(id));
+                match catch_panic(|| compute.call()) {
+                    Ok(value) => {
+                        with_state(|state| state.finish_memo(id, value, previous, compute));
+                    }
+                    Err(panic) => {
+                        with_state(|state| state.abort_memo(id, panic, previous));
+                    }
+                }
+            }
+        });
     }
 
     fn refresh_all_once(&mut self) -> Result<(), MountError> {
@@ -5089,7 +5229,7 @@ impl Runtime {
             let _ = self.finish_command();
             return Err(MountError::Panic(panic));
         }
-        if let Some(fault) = with_state(|state| state.fault) {
+        if let Some(fault) = with_state(|state| state.fault.take()) {
             return Err(State::context_error(fault));
         }
         if let Some(error) = with_state(|state| state.write_error.take()) {
@@ -5149,6 +5289,7 @@ impl Runtime {
                     let payload = state.nodes.reserve_text(TextData {
                         source: slot,
                         value: String::new(),
+                        fault: None,
                     });
                     state
                         .nodes
@@ -5185,6 +5326,7 @@ impl Runtime {
                                 name,
                                 value,
                                 current: None,
+                                fault: None,
                             }),
                             Attr::Event(event) => {
                                 let id = state.reserve_event(event);
@@ -5222,6 +5364,7 @@ impl Runtime {
                             property,
                             slot,
                             current: None,
+                            fault: None,
                         })
                         .collect();
                     let semantics = SnapshotSemantics::new(
@@ -5399,20 +5542,32 @@ impl Runtime {
             MountedNode::Text(payload) => {
                 let source = with_state(|state| state.nodes.text(*payload).source.clone());
                 let next = source.evaluate();
-                with_state(|state| {
-                    let changed = {
-                        let text = state.nodes.text_mut(*payload);
-                        if text.value == next {
-                            false
-                        } else {
-                            text.value = next;
-                            true
+                let fault = with_state(|state| match next {
+                    ReadValue::Value(value) => {
+                        let changed = {
+                            let text = state.nodes.text_mut(*payload);
+                            text.fault = None;
+                            if text.value == value {
+                                false
+                            } else {
+                                text.value = value;
+                                true
+                            }
+                        };
+                        if changed {
+                            state.mark_building_tree_changed();
                         }
-                    };
-                    if changed {
-                        state.mark_building_tree_changed();
+                        None
+                    }
+                    ReadValue::Fault(fault) => {
+                        // 读取失败保留最后已提交文本；fault 与值并列。
+                        state.nodes.text_mut(*payload).fault = Some(fault.clone());
+                        Some(fault)
                     }
                 });
+                if let Some(fault) = fault {
+                    with_state(|state| state.record_read_fault(fault));
+                }
                 Ok(())
             }
             MountedNode::Element(id) => {
@@ -5438,29 +5593,57 @@ impl Runtime {
         // 已提交界面因此保持完整。
         let mut scratch = ElementScratchGuard::take(id);
         let mut attrs_changed = false;
+        let mut faults = Vec::new();
         for attr in scratch.attrs_mut() {
-            let next = match &attr.value {
-                AttrValue::Text(slot) => Some(AttrCurrent::Text(slot.evaluate())),
-                AttrValue::Bool(slot) => Some(AttrCurrent::Bool(slot.evaluate())),
-                AttrValue::ResultBool(ResultBoolValue::Field(field)) => {
-                    field.get().ok().map(AttrCurrent::Bool)
-                }
-                AttrValue::ResultBool(ResultBoolValue::Memo(memo)) => {
-                    memo.get().ok().map(AttrCurrent::Bool)
-                }
+            let evaluated = match &attr.value {
+                AttrValue::Text(read) => match read.evaluate() {
+                    ReadValue::Value(value) => ReadValue::Value(AttrCurrent::Text(value)),
+                    ReadValue::Fault(fault) => ReadValue::Fault(fault),
+                },
+                AttrValue::Bool(read) => match read.evaluate() {
+                    ReadValue::Value(value) => ReadValue::Value(AttrCurrent::Bool(value)),
+                    ReadValue::Fault(fault) => ReadValue::Fault(fault),
+                },
             };
-            if attr.current.as_ref() != next.as_ref() {
-                attrs_changed = true;
+            match evaluated {
+                ReadValue::Value(next) => {
+                    let next = Some(next);
+                    if attr.current != next {
+                        attrs_changed = true;
+                    }
+                    attr.current = next;
+                    attr.fault = None;
+                }
+                ReadValue::Fault(fault) => {
+                    // 失败不替换 current：属性保持最后已提交值，首次失败则缺席。
+                    attr.fault = Some(fault.clone());
+                    faults.push(fault);
+                }
             }
-            attr.current = next;
         }
         let mut styles_changed = false;
         for style in scratch.styles_mut() {
-            let next = Some(style.slot.evaluate());
-            if style.current != next {
-                styles_changed = true;
+            match style.slot.evaluate() {
+                ReadValue::Value(value) => {
+                    let next = Some(value);
+                    if style.current != next {
+                        styles_changed = true;
+                    }
+                    style.current = next;
+                    style.fault = None;
+                }
+                ReadValue::Fault(fault) => {
+                    style.fault = Some(fault.clone());
+                    faults.push(fault);
+                }
             }
-            style.current = next;
+        }
+        if !faults.is_empty() {
+            with_state(|state| {
+                for fault in faults {
+                    state.record_read_fault(fault);
+                }
+            });
         }
         // 值绑定的写入代数要在同一份新属性上读取，且不能嵌套借用 State。
         let (committed, epoch) = with_state(|state| {
@@ -5479,8 +5662,8 @@ impl Runtime {
                 .iter()
                 .find(|attr| attr.name == "value")
                 .and_then(|attr| match &attr.value {
-                    AttrValue::Text(slot) => slot.epoch(state),
-                    AttrValue::Bool(_) | AttrValue::ResultBool(_) => None,
+                    AttrValue::Text(read) => read.epoch(state),
+                    AttrValue::Bool(_) => None,
                 });
             (committed, epoch)
         });
@@ -5532,8 +5715,17 @@ impl Runtime {
         };
         let show = guard.data_mut();
         // `when` 的求值可能读到毒化且没有最后值的 memo；旧分支保持挂载。
-        let active = match catch_panic(|| show.when.get()) {
-            Ok(active) => active,
+        let active = match catch_panic(|| show.when.evaluate()) {
+            Ok(ReadValue::Value(active)) => active,
+            Ok(ReadValue::Fault(fault)) => {
+                // 读取失败不伪造 false：保持当前分支，并报告 typed fault。
+                // 分支里的其他绑定仍要在这一帧刷新，不能被结构触发冻结。
+                with_state(|state| state.record_read_fault(fault));
+                if let Some(branch) = &mut show.active {
+                    return self.refresh_nodes(&mut branch.children);
+                }
+                return Ok(());
+            }
             Err(panic) => return Err(MountError::Panic(panic)),
         };
         let wanted = if active {
@@ -7456,7 +7648,7 @@ impl Runtime {
 
     /// 没有挂载界面时的命令收尾：只报告 handler 的 fault 与写错误。
     fn finish_command_without_ui(&mut self) -> Result<(), MountError> {
-        let fault = with_state(|state| state.fault);
+        let fault = with_state(|state| state.fault.take());
         if let Some(fault) = fault {
             return Err(State::context_error(fault));
         }
@@ -8720,7 +8912,7 @@ mod recycling_tests {
         let title = store.title(id).read_once()?;
         let label = format!("Row {title}");
         view! {
-            <view style:height={px(20.0)}>
+            <view style:height={once(px(20.0))}>
                 <button aria:label={once(label)} on:click={move || {}}>"row"</button>
             </view>
         }

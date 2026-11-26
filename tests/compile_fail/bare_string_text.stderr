@@ -1,0 +1,16 @@
+error[E0277]: the trait bound `String: IntoNode` is not satisfied
+ --> tests/compile_fail/bare_string_text.rs:5:52
+  |
+5 |     let _: MountResult<MountPlan> = view! { <text>{title}</text> };
+  |                                                    ^^^^^ the trait `IntoNode` is not implemented for `String`
+  |
+help: the trait `IntoNode` is implemented for `&str`
+ --> src/view.rs
+  |
+  | impl IntoNode for &'static str {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+note: required by a bound in `child`
+ --> src/view.rs
+  |
+  | pub fn child(value: impl IntoNode) -> PlanNode {
+  |                          ^^^^^^^^ required by this bound in `child`

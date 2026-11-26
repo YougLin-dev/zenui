@@ -40,7 +40,7 @@ fn Demo() -> MountResult<MountPlan> {
             <For each={rows} key={|todo: TodoId| todo}>
                 {move |todo: TodoId| view! {
                     <text aria:label={once(format!("row {}", todo.raw()))}>
-                        {todos.title(todo).read_once()?}
+                        {once(todos.title(todo).read_once()?)}
                     </text>
                 }}
             </For>
