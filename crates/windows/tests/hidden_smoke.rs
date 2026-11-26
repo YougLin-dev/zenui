@@ -1314,6 +1314,32 @@ fn focus_visible_follows_keyboard_not_pointer_modality() {
 }
 
 #[test]
+fn high_contrast_preferences_paint_with_the_system_window_color() {
+    use windows::Win32::Graphics::Gdi::{COLOR_WINDOW, GetSysColor};
+
+    // 安全：GetSysColor 只读取当前主题的缓存颜色。
+    let window = unsafe { GetSysColor(COLOR_WINDOW) };
+    let expected = [
+        (window & 0xFF) as u8,
+        ((window >> 8) & 0xFF) as u8,
+        ((window >> 16) & 0xFF) as u8,
+        255,
+    ];
+    let mut host = open_host_with(
+        HostConfig::hidden()
+            .with_appearance(Appearance::Dark)
+            .with_system_preferences(SystemPreferences::new(true, 100)),
+    );
+    host.render().expect("render the high contrast frame");
+    let frame = host.read_frame(MAIN).expect("read the high contrast frame");
+    assert_eq!(
+        frame.pixel(4, 4),
+        Some(expected),
+        "high contrast overrides the dark appearance with COLOR_WINDOW"
+    );
+}
+
+#[test]
 fn a_configured_dark_appearance_paints_and_the_toggle_preserves_edit_state() {
     let mut host = open_host_with(HostConfig::hidden().with_appearance(Appearance::Dark));
     host.render().expect("render the dark frame");

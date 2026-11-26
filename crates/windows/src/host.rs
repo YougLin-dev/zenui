@@ -12,7 +12,9 @@ use windows::Win32::Foundation::{
     POINT, RECT, SIZE, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, ClientToScreen, EndPaint, PAINTSTRUCT, ValidateRect,
+    BeginPaint, COLOR_BTNFACE, COLOR_BTNHIGHLIGHT, COLOR_BTNSHADOW, COLOR_GRAYTEXT,
+    COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT, COLOR_WINDOW, COLOR_WINDOWFRAME, COLOR_WINDOWTEXT,
+    ClientToScreen, EndPaint, GetSysColor, PAINTSTRUCT, SYS_COLOR_INDEX, ValidateRect,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
@@ -72,8 +74,9 @@ use crate::tray::{
     NativeTrayPresenter, TrayIconRequest, TrayMenuRequest, TrayPresenter, TrayTooltipRequest,
 };
 use zenui_render::{
-    GpuRenderer, Point, Rect, RenderPalette, RenderTargetConfig, Scene, SceneCache, SceneElement,
-    SceneEnv, SceneRowBand, Scrollbar, TextAssets, Viewport, Visual, wgpu,
+    GpuRenderer, HighContrastColors, Point, Rect, RenderPalette, RenderTargetConfig, Scene,
+    SceneCache, SceneElement, SceneEnv, SceneRowBand, Scrollbar, TextAssets, Viewport, Visual,
+    wgpu,
 };
 
 /// 宿主私有的窗口消息注册表；其他模块不得自行定义 `WM_APP + N`。
@@ -313,6 +316,31 @@ fn text_scale_percent() -> u16 {
     } else {
         100
     }
+}
+
+fn high_contrast_colors() -> HighContrastColors {
+    HighContrastColors {
+        window: system_color(COLOR_WINDOW),
+        window_text: system_color(COLOR_WINDOWTEXT),
+        button_face: system_color(COLOR_BTNFACE),
+        button_highlight: system_color(COLOR_BTNHIGHLIGHT),
+        button_shadow: system_color(COLOR_BTNSHADOW),
+        gray_text: system_color(COLOR_GRAYTEXT),
+        highlight: system_color(COLOR_HIGHLIGHT),
+        highlight_text: system_color(COLOR_HIGHLIGHTTEXT),
+        window_frame: system_color(COLOR_WINDOWFRAME),
+    }
+}
+
+fn system_color(index: SYS_COLOR_INDEX) -> [u8; 4] {
+    // 安全：GetSysColor 只读取当前主题的缓存颜色，没有指针参数。
+    let value = unsafe { GetSysColor(index) };
+    [
+        (value & 0xFF) as u8,
+        ((value >> 8) & 0xFF) as u8,
+        ((value >> 16) & 0xFF) as u8,
+        255,
+    ]
 }
 
 /// 打开宿主的进程级选项；每个窗口的标题与尺寸来自窗口目录。
@@ -2175,8 +2203,11 @@ impl Host {
             self.renderer.resize(target);
             self.renderer_target = target;
         }
-        self.renderer
-            .set_palette(palette_for(snapshot.appearance()));
+        self.renderer.set_palette(palette_for(
+            snapshot.appearance(),
+            self.system_preferences,
+            high_contrast_colors,
+        ));
         let mut reconfigured = false;
         loop {
             let status = self.next_surface_status(window)?;
@@ -3146,8 +3177,11 @@ impl Host {
             self.renderer.resize(target);
             self.renderer_target = target;
         }
-        self.renderer
-            .set_palette(palette_for(snapshot.appearance()));
+        self.renderer.set_palette(palette_for(
+            snapshot.appearance(),
+            self.system_preferences,
+            high_contrast_colors,
+        ));
         let format = self.format;
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("zenui host readback"),
@@ -5494,7 +5528,14 @@ fn surface_configuration(
     Ok(config)
 }
 
-const fn palette_for(appearance: Appearance) -> RenderPalette {
+fn palette_for(
+    appearance: Appearance,
+    preferences: SystemPreferences,
+    colors: impl FnOnce() -> HighContrastColors,
+) -> RenderPalette {
+    if preferences.high_contrast() {
+        return RenderPalette::high_contrast(colors());
+    }
     match appearance {
         Appearance::Light => RenderPalette::light(),
         Appearance::Dark => RenderPalette::dark(),
@@ -9745,6 +9786,42 @@ mod tests {
         assert!(
             (100..=225).contains(&preferences.text_scale_percent()),
             "the sampled scale is always in the supported range"
+        );
+    }
+
+    #[test]
+    fn high_contrast_overrides_the_application_appearance() {
+        let colors = HighContrastColors {
+            window: [1, 2, 3, 255],
+            window_text: [4, 5, 6, 255],
+            button_face: [7, 8, 9, 255],
+            button_highlight: [10, 11, 12, 255],
+            button_shadow: [13, 14, 15, 255],
+            gray_text: [16, 17, 18, 255],
+            highlight: [19, 20, 21, 255],
+            highlight_text: [22, 23, 24, 255],
+            window_frame: [25, 26, 27, 255],
+        };
+        assert_eq!(
+            palette_for(Appearance::Dark, SystemPreferences::new(true, 100), || {
+                colors
+            }),
+            RenderPalette::high_contrast(colors),
+            "high contrast overrides the dark appearance"
+        );
+        assert_eq!(
+            palette_for(Appearance::Dark, SystemPreferences::new(false, 100), || {
+                unreachable!("normal appearance does not sample system colors")
+            }),
+            RenderPalette::dark()
+        );
+        assert_eq!(
+            palette_for(
+                Appearance::Light,
+                SystemPreferences::new(false, 100),
+                || { unreachable!("normal appearance does not sample system colors") }
+            ),
+            RenderPalette::light()
         );
     }
 
