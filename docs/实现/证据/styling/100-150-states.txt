@@ -1,0 +1,40 @@
+# #287 样式状态在 100% 与 150% 的可见证据
+
+日期: 2026-11-26
+基线: main 9ca0cf4（#286 合并提交），本工作树无代码改动
+示例: crates/windows/examples/todo_host.rs（窗口 `ZenUI Todo`），debug 构建
+方法: UIA 读取控件矩形与文本；SendInput 移动/按下/松开与 Tab；CopyFromScreen 采集客户区
+脚本: E:\code\zenui-acceptance-287（仓库外，未提交）
+缩放: -2 = 150%（144 DPI），-4 = 100%（96 DPI）；先跑 150% 再跑 100%，运行后恢复 150%
+按钮底色采样点: Reverse 左边框内 12 物理像素、垂直居中；边框采样点: 草稿框左边缘
+
+[09:55:12.249] scale-request rel=-2 result=min=-4 cur=-2 max=2 set=-2 size=24 rc=0 err=203
+[09:55:15.605] app title='ZenUI Todo' dpi=144 expected=144 foreground=True
+[09:55:15.633] client 1350x1050 origin=49,83
+[09:55:15.693] reverse=(73,266,118x43) draft=(73,149,1197x43)
+[09:55:16.166] baseline reverse.center=#E4E4E7 page=#FFFFFF order=Write tests|Read docs
+[09:55:16.696] hover reverse.center=#D4D4D8
+[09:55:17.038] pressed reverse.center=#A1A1AA
+[09:55:17.433] drag-off reverse.center=#E4E4E7 order=Write tests|Read docs
+[09:55:17.800] released off the button order=Write tests|Read docs
+[09:55:18.628] release order=Read docs|Write tests
+[09:55:19.446] pointer-focus draft.border=#B2B2B9 inner=#E4E4E7 focused='What needs to be done?'
+[09:55:20.227] focus-visible draft.border=#5583EA inner=#E4E4E7 focused='What needs to be done?' tabs=1
+[09:55:21.205] dark page=#18181B focused='What needs to be done?'
+[09:55:21.216] texts=1 remaining | Read docs | Write tests
+[09:55:21.344] app exit code=0
+[09:55:35.088] scale-request rel=-4 result=min=-4 cur=-2 max=2 set=-4 size=24 rc=0 err=203
+[09:55:38.462] app title='ZenUI Todo' dpi=96 expected=96 foreground=True
+[09:55:38.490] client 900x700 origin=60,83
+[09:55:38.549] reverse=(76,205,79x29) draft=(76,127,798x29)
+[09:55:39.015] baseline reverse.center=#E4E4E7 page=#FFFFFF order=Write tests|Read docs
+[09:55:39.541] hover reverse.center=#D4D4D8
+[09:55:39.886] pressed reverse.center=#A1A1AA
+[09:55:40.269] drag-off reverse.center=#E4E4E7 order=Write tests|Read docs
+[09:55:40.631] released off the button order=Write tests|Read docs
+[09:55:41.443] release order=Read docs|Write tests
+[09:55:42.248] pointer-focus draft.border=#C3C3C8 inner=#E4E4E7 focused='What needs to be done?'
+[09:55:43.034] focus-visible draft.border=#85A4E9 inner=#E4E4E7 focused='What needs to be done?' tabs=1
+[09:55:44.004] dark page=#18181B focused='What needs to be done?'
+[09:55:44.013] texts=1 remaining | Read docs | Write tests
+[09:55:44.145] app exit code=0
