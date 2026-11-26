@@ -1,0 +1,45 @@
+
+running 1 test
+test host::tests::a_bounded_visible_soak_stays_flat ... soak seed 2000/10000 at 2.7s
+soak seed 4000/10000 at 9.3s
+soak seed 6000/10000 at 19.9s
+soak seed 8000/10000 at 34.6s
+soak seed 10000/10000 at 53.8s
+soak start pid=29812 rows=10000 minutes=30
+soak sample t=0.0s ws=176752KB private=337172KB handles=476 scene_builds=5 presents=4 snapshots=4 remaining=10001
+soak sample t=60.1s ws=179256KB private=338928KB handles=473 scene_builds=212 presents=157 snapshots=218 remaining=10008
+soak sample t=120.1s ws=182120KB private=341008KB handles=466 scene_builds=427 presents=317 snapshots=438 remaining=10015
+soak sample t=180.2s ws=182840KB private=341432KB handles=452 scene_builds=646 presents=481 snapshots=670 remaining=10022
+soak sample t=240.2s ws=183984KB private=342776KB handles=453 scene_builds=865 presents=645 snapshots=898 remaining=10029
+soak sample t=300.3s ws=186996KB private=345280KB handles=457 scene_builds=1084 presents=809 snapshots=1130 remaining=10037
+soak sample t=360.3s ws=188156KB private=346400KB handles=467 scene_builds=1303 presents=973 snapshots=1358 remaining=10044
+soak sample t=420.4s ws=188768KB private=346848KB handles=463 scene_builds=1522 presents=1137 snapshots=1590 remaining=10051
+soak sample t=480.4s ws=189408KB private=347312KB handles=453 scene_builds=1735 presents=1296 snapshots=1812 remaining=10058
+soak sample t=540.5s ws=189732KB private=347828KB handles=453 scene_builds=1954 presents=1460 snapshots=2044 remaining=10065
+soak sample t=600.5s ws=189584KB private=347340KB handles=455 scene_builds=2173 presents=1624 snapshots=2272 remaining=10073
+soak sample t=660.5s ws=190444KB private=348276KB handles=453 scene_builds=2392 presents=1788 snapshots=2504 remaining=10080
+soak sample t=720.6s ws=190556KB private=348320KB handles=453 scene_builds=2611 presents=1952 snapshots=2732 remaining=10087
+soak sample t=780.6s ws=189504KB private=348384KB handles=461 scene_builds=2830 presents=2116 snapshots=2964 remaining=10094
+soak sample t=840.7s ws=189892KB private=348900KB handles=461 scene_builds=3049 presents=2280 snapshots=3192 remaining=10101
+soak sample t=900.7s ws=190512KB private=350000KB handles=453 scene_builds=3262 presents=2439 snapshots=3418 remaining=10109
+soak sample t=960.8s ws=190692KB private=350000KB handles=453 scene_builds=3481 presents=2603 snapshots=3646 remaining=10116
+soak sample t=1020.8s ws=190804KB private=350064KB handles=463 scene_builds=3702 presents=2769 snapshots=3882 remaining=10123
+soak sample t=1080.9s ws=190840KB private=350064KB handles=463 scene_builds=3927 presents=2939 snapshots=4122 remaining=10130
+soak sample t=1140.9s ws=191376KB private=350520KB handles=453 scene_builds=4152 presents=3109 snapshots=4366 remaining=10137
+soak sample t=1200.9s ws=191496KB private=350584KB handles=461 scene_builds=4377 presents=3279 snapshots=4606 remaining=10145
+soak sample t=1261.0s ws=191504KB private=350584KB handles=461 scene_builds=4602 presents=3449 snapshots=4850 remaining=10152
+soak sample t=1321.0s ws=191536KB private=350520KB handles=453 scene_builds=4821 presents=3614 snapshots=5084 remaining=10159
+soak sample t=1381.1s ws=191400KB private=350832KB handles=453 scene_builds=5046 presents=3784 snapshots=5328 remaining=10166
+soak sample t=1441.1s ws=191532KB private=350832KB handles=453 scene_builds=5271 presents=3954 snapshots=5568 remaining=10173
+soak sample t=1501.2s ws=191688KB private=351132KB handles=453 scene_builds=5496 presents=4124 snapshots=5812 remaining=10181
+soak sample t=1561.2s ws=192600KB private=351648KB handles=453 scene_builds=5721 presents=4294 snapshots=6052 remaining=10188
+soak sample t=1621.2s ws=192908KB private=351720KB handles=461 scene_builds=5946 presents=4464 snapshots=6296 remaining=10195
+soak sample t=1681.3s ws=193444KB private=352240KB handles=461 scene_builds=6171 presents=4634 snapshots=6536 remaining=10202
+soak sample t=1741.3s ws=193452KB private=352176KB handles=453 scene_builds=6390 presents=4799 snapshots=6774 remaining=10209
+soak sample t=1801.4s ws=193856KB private=352692KB handles=453 scene_builds=6615 presents=4969 snapshots=7014 remaining=10217
+soak quiet t=1804.1s ws=193856KB private=352692KB handles=453 scene_builds=6616 presents=4970 snapshots=7015 remaining=10217
+soak summary cycles=180 working_growth=14600KB private_growth=13764KB late_working_growth=3164KB handle_growth=0
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 232 filtered out; finished in 1860.02s
+
