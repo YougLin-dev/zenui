@@ -2139,11 +2139,16 @@ fn find_element(state: &State, nodes: &[MountedNode], target: &FindTarget) -> Op
     None
 }
 
+/// 应用运行时：声明窗口目录、挂载界面、驱动任务并生成呈现快照。
+///
+/// 一个应用通常创建一个 `Runtime`，交给 Windows 宿主或 headless 测试使用。
+/// Signal、Memo 与 Store 句柄归属于应用 owner；窗口关闭不会释放它们。
 pub struct Runtime {
     pub(crate) state: Rc<RefCell<State>>,
 }
 
 impl Runtime {
+    /// 创建一个没有窗口、没有已挂载界面的运行时。
     pub fn new() -> Self {
         Self {
             state: Rc::new(RefCell::new(State::new())),
