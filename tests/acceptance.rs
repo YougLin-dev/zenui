@@ -296,7 +296,7 @@ fn typed_key_events_reach_the_target_handler() {
                 <text-input
                     value={text}
                     aria:label="Editor"
-                    on:keydown={move |event: KeyEvent| {
+                    on:keydown={move |event: &mut KeyEvent| {
                         if event.key() == Key::Escape {
                             text.set(String::new());
                         }

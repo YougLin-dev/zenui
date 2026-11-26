@@ -93,6 +93,7 @@ impl fmt::Debug for EventTarget {
 pub enum IntentPayload {
     Click,
     Activate,
+    KeyDown { key: Key, modifiers: Modifiers },
 }
 
 /// 键盘修饰键快照；指针点击当前只带默认值。
@@ -184,6 +185,26 @@ impl Intent {
         )
     }
 
+    /// 一个节点 keydown；target 通常是焦点节点。
+    pub const fn keydown(target: NodeId, key: Key, modifiers: Modifiers) -> Self {
+        Self::new(
+            EventSource::Keyboard,
+            EventTarget::Node(target),
+            IntentPayload::KeyDown { key, modifiers },
+            modifiers,
+        )
+    }
+
+    /// 没有节点焦点时的窗口根 keydown。
+    pub const fn keydown_window(window: WindowCtx, key: Key, modifiers: Modifiers) -> Self {
+        Self::new(
+            EventSource::Keyboard,
+            EventTarget::Window(window),
+            IntentPayload::KeyDown { key, modifiers },
+            modifiers,
+        )
+    }
+
     pub const fn source(self) -> EventSource {
         self.source
     }
@@ -264,6 +285,17 @@ impl TurnReport {
     fn push_error(&mut self, error: TurnError) {
         self.errors.push(error);
     }
+
+    fn set_outcome(&mut self, consumed: bool, prevent_default: bool) {
+        self.outcome = TurnOutcome {
+            consumed,
+            prevent_default,
+        };
+    }
+
+    fn mark_changed(&mut self) {
+        self.changed = true;
+    }
 }
 
 const HIDDEN_TARGET: &str = "target window is hidden";
@@ -276,6 +308,9 @@ pub(crate) enum Resource {
     /// 随 owner 释放的 arena 节点；保证文本/Show/For 等没有元素槽的节点也能回收。
     Node(NodeRef),
 }
+
+/// 窗口根 keydown 处理器；调用时从 state 克隆 Rc，避免持有 State 借用。
+type WindowKeyDownHandler = Rc<RefCell<Box<dyn FnMut(&mut KeyEvent) -> HandlerOutcome>>>;
 
 pub(crate) struct OwnerRecord {
     parent: Option<u32>,
@@ -727,6 +762,8 @@ pub(crate) struct State {
     close_handlers: BTreeMap<&'static str, CloseHandler>,
     /// 每个 activation 在 factory 中注册的文件拖放处理器，随窗口关闭释放。
     drop_handlers: BTreeMap<&'static str, DropHandler>,
+    /// 每个 activation 的窗口根 keydown fallback。
+    keydown_handlers: BTreeMap<&'static str, WindowKeyDownHandler>,
     /// 每个 activation 在 factory 中注册的命令处理器，随窗口关闭释放。
     command_handlers: BTreeMap<&'static str, BTreeMap<&'static str, CommandHandler>>,
     /// 应用级命令处理器；不随窗口关闭释放，运行时启动后拒绝注册。
@@ -916,6 +953,7 @@ impl State {
             window_requests: Vec::new(),
             close_handlers: BTreeMap::new(),
             drop_handlers: BTreeMap::new(),
+            keydown_handlers: BTreeMap::new(),
             command_handlers: BTreeMap::new(),
             app_command_handlers: BTreeMap::new(),
             tray: None,
@@ -1333,6 +1371,105 @@ impl State {
         }
     }
 
+    /// 从根到命中元素的元素路径；结构节点透明。
+    fn element_path(&self, hit: usize) -> Vec<usize> {
+        let mut path = Vec::new();
+        let mut node = self.elements[hit].id.node();
+        while let Ok(slot) = self.nodes.get(node) {
+            if slot.kind == Some(NodeKindTag::Element) {
+                let payload = slot.payload as usize;
+                if self
+                    .elements
+                    .get(payload)
+                    .is_some_and(|element| element.id.node() == node)
+                {
+                    path.push(payload);
+                }
+            }
+            let Some(parent) = slot.parent else {
+                break;
+            };
+            node = parent;
+        }
+        path.reverse();
+        path
+    }
+
+    fn ancestor_form(&self, element: usize) -> Option<usize> {
+        let mut node = self.elements.get(element)?.id.node();
+        loop {
+            let slot = self.nodes.get(node).ok()?;
+            if slot.kind == Some(NodeKindTag::Element) {
+                let payload = slot.payload as usize;
+                if self.elements.get(payload).is_some_and(|element| {
+                    element.id.node() == node && self.element_tag(payload) == "form"
+                }) {
+                    return Some(payload);
+                }
+            }
+            node = slot.parent?;
+        }
+    }
+
+    /// 文本输入的 L4 caret/selection 默认；返回是否改变本地编辑状态。
+    fn move_text_caret(&mut self, element: usize, key: Key, shift: bool) -> bool {
+        let LocalState::TextInput(editor) = self.element_local_mut(element) else {
+            return false;
+        };
+        let length = editor.value.chars().count();
+        let caret = editor.caret.min(length);
+        let anchor = editor.anchor.min(length);
+        let selection = editor
+            .selection
+            .filter(|(start, end)| start != end)
+            .map(|(start, end)| (start.min(length), end.min(length)));
+        let (caret, anchor, selection) = match key {
+            Key::ArrowLeft => match (shift, selection) {
+                (false, Some((start, _))) => (start, start, None),
+                _ => {
+                    let next = caret.saturating_sub(1);
+                    if shift {
+                        (next, anchor, Some((anchor.min(next), anchor.max(next))))
+                    } else {
+                        (next, next, None)
+                    }
+                }
+            },
+            Key::ArrowRight => match (shift, selection) {
+                (false, Some((_, end))) => (end, end, None),
+                _ => {
+                    let next = (caret + 1).min(length);
+                    if shift {
+                        (next, anchor, Some((anchor.min(next), anchor.max(next))))
+                    } else {
+                        (next, next, None)
+                    }
+                }
+            },
+            Key::Home => {
+                if shift {
+                    (0, anchor, Some((0, anchor)))
+                } else {
+                    (0, 0, None)
+                }
+            }
+            Key::End => {
+                if shift {
+                    (length, anchor, Some((anchor.min(length), length)))
+                } else {
+                    (length, length, None)
+                }
+            }
+            _ => return false,
+        };
+        let changed =
+            editor.caret != caret || editor.anchor != anchor || editor.selection != selection;
+        editor.caret = caret;
+        editor.anchor = anchor;
+        editor.selection = selection;
+        changed
+    }
+
     /// 窗口/activation 目标仍可接收输入；不做 nearest-target 回退。
     fn intent_window_usable(&self, window: WindowCtx) -> bool {
         window.runtime == self.id
@@ -1624,6 +1761,7 @@ impl State {
         self.window_factory_ran = true;
         // 旧 activation 的处理器不能进入新 factory；正常关闭已经清理过。
         self.drop_handlers.remove(key);
+        self.keydown_handlers.remove(key);
         self.command_handlers.remove(key);
         self.menu_state_handlers.remove(key);
         let activation = self
@@ -1647,6 +1785,7 @@ impl State {
     pub(crate) fn mark_window_closed(&mut self, key: &'static str) {
         self.close_handlers.remove(key);
         self.drop_handlers.remove(key);
+        self.keydown_handlers.remove(key);
         self.command_handlers.remove(key);
         self.menu_state_handlers.remove(key);
         let Some(record) = self.windows.get_mut(key) else {
@@ -1753,6 +1892,25 @@ impl State {
             ));
         }
         self.drop_handlers.insert(window.key, handler);
+        Ok(())
+    }
+
+    /// 在窗口 factory 中登记窗口根 keydown fallback；每个 activation 一次。
+    pub(crate) fn register_keydown_handler(
+        &mut self,
+        window: WindowCtx,
+        handler: WindowKeyDownHandler,
+    ) -> Result<(), WindowError> {
+        self.ensure_factory_registration(
+            window,
+            "keydown handlers must be registered during the window factory",
+        )?;
+        if self.keydown_handlers.contains_key(window.key) {
+            return Err(WindowError::State(
+                "a keydown handler is already registered for this activation",
+            ));
+        }
+        self.keydown_handlers.insert(window.key, handler);
         Ok(())
     }
 
@@ -2940,6 +3098,8 @@ enum EventKind {
     Change,
     Submit,
     KeyDown,
+    KeyDownCapture,
+    KeyDownBubble,
     Focus,
     Blur,
     CompositionStart,
@@ -2955,6 +3115,8 @@ fn event_kind(event: &Event) -> EventKind {
         Event::Change(_) => EventKind::Change,
         Event::Submit(_) => EventKind::Submit,
         Event::KeyDown(_) => EventKind::KeyDown,
+        Event::KeyDownCapture(_) => EventKind::KeyDownCapture,
+        Event::KeyDownBubble(_) => EventKind::KeyDownBubble,
         Event::Focus(_) => EventKind::Focus,
         Event::Blur(_) => EventKind::Blur,
         Event::CompositionStart(_) => EventKind::CompositionStart,
@@ -5567,6 +5729,9 @@ impl Runtime {
 
     /// 路由一个 typed Intent；窗口/activation 目标先校验再询问处理器。
     pub fn dispatch_intent(&mut self, intent: Intent) -> Result<TurnReport, DispatchError> {
+        if let IntentPayload::KeyDown { key, modifiers } = intent.payload() {
+            return self.dispatch_keydown_intent(intent.target(), key, modifiers);
+        }
         match intent.target() {
             EventTarget::Node(node) => {
                 let state = self.state.clone();
@@ -5595,6 +5760,304 @@ impl Runtime {
     /// 路由原语：等价于派发一个指针 Click Intent。
     pub fn activate_node(&mut self, node: NodeId) -> Result<TurnReport, DispatchError> {
         self.dispatch_intent(Intent::click(node))
+    }
+
+    /// 一个 keydown turn：capture → closest 普通 handler → bubble → L4 默认。
+    fn dispatch_keydown_intent(
+        &mut self,
+        target: EventTarget,
+        key: Key,
+        modifiers: Modifiers,
+    ) -> Result<TurnReport, DispatchError> {
+        let state = self.state.clone();
+        context::install(&state, || match target {
+            EventTarget::Node(node) => {
+                let element = with_state(|state| state.element_for_node(node))?;
+                if with_state(|state| state.element_local(element).is_composing()) {
+                    return self.keydown_node(node, key);
+                }
+                let window = with_state(|state| {
+                    state.tree_for_element(element).and_then(|tree| match tree {
+                        TreeSlot::Window(key) => state.window_ctx(key),
+                        TreeSlot::Root => None,
+                    })
+                });
+                self.route_keydown(Some(element), window, key, modifiers)
+            }
+            EventTarget::Window(window) => {
+                if !with_state(|state| state.intent_window_usable(window)) {
+                    return Err(DispatchError::TargetClosed);
+                }
+                let focused =
+                    with_state(|state| state.presented_focus_in(TreeSlot::Window(window.key)));
+                self.route_keydown(focused, Some(window), key, modifiers)
+            }
+            EventTarget::App => Ok(TurnReport::default()),
+        })
+    }
+
+    fn route_keydown(
+        &mut self,
+        hit: Option<usize>,
+        window: Option<WindowCtx>,
+        key: Key,
+        modifiers: Modifiers,
+    ) -> Result<TurnReport, DispatchError> {
+        let path = hit
+            .map(|element| with_state(|state| state.element_path(element)))
+            .unwrap_or_default();
+        self.enter_event_phase();
+        let mut key_event = KeyEvent::new(key);
+        let mut report = TurnReport::default();
+        let mut stopped = false;
+
+        for element in &path {
+            if let Some(stop) = self.run_key_event(
+                *element,
+                EventKind::KeyDownCapture,
+                &mut key_event,
+                &mut report,
+            )? && stop
+            {
+                stopped = true;
+                break;
+            }
+        }
+        let mut ran_normal = false;
+        if !stopped {
+            for element in path.iter().rev() {
+                if let Some(stop) =
+                    self.run_key_event(*element, EventKind::KeyDown, &mut key_event, &mut report)?
+                {
+                    ran_normal = true;
+                    stopped = stop;
+                    break;
+                }
+            }
+        }
+        if !stopped
+            && !ran_normal
+            && let Some(window) = window
+            && let Some(stop) = self.run_window_key_event(window, &mut key_event, &mut report)?
+        {
+            stopped = stop;
+        }
+        if !stopped {
+            for element in path.iter().rev().skip(1) {
+                if let Some(stop) = self.run_key_event(
+                    *element,
+                    EventKind::KeyDownBubble,
+                    &mut key_event,
+                    &mut report,
+                )? && stop
+                {
+                    stopped = true;
+                    break;
+                }
+            }
+        }
+        if !stopped && !key_event.is_consumed() && !key_event.prevents_default() {
+            self.apply_key_default(hit, window, key, modifiers, &mut report)?;
+        }
+        report.set_outcome(key_event.is_consumed(), key_event.prevents_default());
+        with_state(|state| state.phase = Phase::Idle);
+        self.finish_command().map_err(DispatchError::Command)?;
+        Ok(report)
+    }
+
+    /// 运行一个 keydown 槽；None 表示该阶段没有处理器。
+    fn run_key_event(
+        &mut self,
+        element: usize,
+        kind: EventKind,
+        key_event: &mut KeyEvent,
+        report: &mut TurnReport,
+    ) -> Result<Option<bool>, DispatchError> {
+        let Some((event_id, event)) = with_state(|state| state.take_element_event(element, kind))
+        else {
+            return Ok(None);
+        };
+        let result = invoke_event(event_id, event, |event| match event {
+            Event::KeyDown(handler)
+            | Event::KeyDownCapture(handler)
+            | Event::KeyDownBubble(handler) => handler(key_event),
+            _ => HandlerOutcome::Ok,
+        });
+        let mut stop = false;
+        match result {
+            Ok(HandlerOutcome::Ok) => {}
+            Ok(HandlerOutcome::Err(error)) => {
+                report.push_error(TurnError::HandlerFailed(error));
+                stop = true;
+            }
+            Err(panic) => {
+                report.push_error(TurnError::HandlerPanicked(panic));
+                stop = true;
+            }
+        }
+        Ok(Some(stop || key_event.is_consumed()))
+    }
+
+    fn run_window_key_event(
+        &mut self,
+        window: WindowCtx,
+        key_event: &mut KeyEvent,
+        report: &mut TurnReport,
+    ) -> Result<Option<bool>, DispatchError> {
+        let handler = self
+            .state
+            .borrow()
+            .keydown_handlers
+            .get(window.key)
+            .cloned();
+        let Some(handler) = handler else {
+            return Ok(None);
+        };
+        let outcome = catch_panic(|| {
+            let mut handler = handler.borrow_mut();
+            handler(key_event)
+        });
+        let mut stop = false;
+        match outcome {
+            Ok(HandlerOutcome::Ok) => {}
+            Ok(HandlerOutcome::Err(error)) => {
+                report.push_error(TurnError::HandlerFailed(error));
+                stop = true;
+            }
+            Err(panic) => {
+                report.push_error(TurnError::HandlerPanicked(panic));
+                stop = true;
+            }
+        }
+        Ok(Some(stop || key_event.is_consumed()))
+    }
+
+    /// L4 控件默认：只在没有 consume/prevent_default 且没有 handler 错误时运行。
+    fn apply_key_default(
+        &mut self,
+        hit: Option<usize>,
+        window: Option<WindowCtx>,
+        key: Key,
+        modifiers: Modifiers,
+        report: &mut TurnReport,
+    ) -> Result<(), DispatchError> {
+        match key {
+            Key::Tab => {
+                let Some(window) = window else {
+                    return Ok(());
+                };
+                let result = if modifiers.shift() {
+                    self.focus_previous_in(window)
+                } else {
+                    self.focus_next_in(window)
+                };
+                if result.is_ok() {
+                    report.mark_changed();
+                }
+                result.map_err(|_| DispatchError::TargetClosed)?;
+            }
+            Key::Enter | Key::Space => {
+                let Some(element) = hit else {
+                    return Ok(());
+                };
+                let id = with_state(|state| state.elements[element].id);
+                let tag = with_state(|state| state.element_tag(element));
+                match (key, tag) {
+                    (Key::Enter | Key::Space, "button") => {
+                        if with_state(|state| state.has_click_handler(element)) {
+                            let click = self.click_node(id)?;
+                            report.errors.extend(click.errors);
+                            report.mark_changed();
+                        }
+                    }
+                    (Key::Space, "checkbox") => {
+                        let next = with_state(|state| match state.element_local(element) {
+                            LocalState::Checkbox { checked } => Some(!checked),
+                            _ => None,
+                        });
+                        if let Some(next) = next {
+                            let has_change = with_state(|state| {
+                                state.element_events(element).iter().any(|event| {
+                                    state
+                                        .events
+                                        .get(*event)
+                                        .and_then(Option::as_ref)
+                                        .is_some_and(|event| event_kind(event) == EventKind::Change)
+                                })
+                            });
+                            if has_change {
+                                self.change_node(id, next)?;
+                            } else {
+                                with_state(|state| {
+                                    state.update_local(element, LocalUpdate::Change(next))
+                                });
+                            }
+                            report.mark_changed();
+                        }
+                    }
+                    (Key::Enter, "text-input") => {
+                        let form = with_state(|state| state.ancestor_form(element));
+                        if let Some(form) = form {
+                            let form_id = with_state(|state| state.elements[form].id);
+                            let has_submit = with_state(|state| {
+                                state.element_events(form).iter().any(|event| {
+                                    state
+                                        .events
+                                        .get(*event)
+                                        .and_then(Option::as_ref)
+                                        .is_some_and(|event| event_kind(event) == EventKind::Submit)
+                                })
+                            });
+                            if has_submit {
+                                self.submit_node(form_id)?;
+                                report.mark_changed();
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Key::Backspace | Key::Delete => {
+                let Some(element) = hit else {
+                    return Ok(());
+                };
+                if with_state(|state| state.element_tag(element)) != "text-input"
+                    || with_state(|state| state.element_is_disabled(element))
+                {
+                    return Ok(());
+                }
+                let id = with_state(|state| state.elements[element].id);
+                if key == Key::Backspace {
+                    self.backspace_node(id)?;
+                } else {
+                    self.delete_forward_node(id)?;
+                }
+                report.mark_changed();
+            }
+            Key::ArrowLeft
+            | Key::ArrowRight
+            | Key::Home
+            | Key::End
+            | Key::PageUp
+            | Key::PageDown => {
+                let Some(element) = hit else {
+                    return Ok(());
+                };
+                if with_state(|state| state.element_tag(element)) != "text-input"
+                    || with_state(|state| state.element_is_disabled(element))
+                {
+                    return Ok(());
+                }
+                let changed =
+                    with_state(|state| state.move_text_caret(element, key, modifiers.shift()));
+                if changed {
+                    with_state(|state| state.mark_element_changed(element));
+                    report.mark_changed();
+                }
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     /// 先取事件再进入 Event 阶段：被拒绝的派发不会把运行时留在 Event 阶段。
@@ -6359,7 +6822,7 @@ impl Runtime {
     /// 组合中的候选 Enter 与取消 Escape 在用户 key handler 之前被消费；
     /// 候选文本由 IME 随后通过 compositionend/`compose_commit` 确认。
     /// 其他键仍按普通路由派发。未消费的 Enter 才是表单提交命令。
-    pub fn keydown(&mut self, label: &str, key: Key) -> Result<(), MountError> {
+    pub fn keydown(&mut self, label: &str, key: Key) -> Result<TurnReport, MountError> {
         self.dispatch_label(
             FindTarget::Label(label.to_owned()),
             "keydown target not found",
@@ -6369,40 +6832,57 @@ impl Runtime {
     }
 
     /// 按 Node ID 派发 keydown；组合中的 Enter/Escape 仍然优先被编辑器消费。
-    pub fn keydown_node(&mut self, node: NodeId, key: Key) -> Result<(), DispatchError> {
+    /// 已解析目标的直接 keydown：只运行节点自己的普通 handler，不回溯祖先。
+    pub fn keydown_node(&mut self, node: NodeId, key: Key) -> Result<TurnReport, DispatchError> {
         let state = self.state.clone();
         context::install(&state, || {
             let element = with_state(|state| state.element_for_node(node))?;
             if with_state(|state| state.element_local(element).is_composing()) {
-                match key {
-                    Key::Enter => {
-                        // 确认候选属于 IME；这里只保证按键不会进入表单提交或用户 handler。
-                        return Ok(());
+                let mut report = TurnReport::default();
+                if key == Key::Escape {
+                    self.enter_event_phase();
+                    match self.cancel_composition(node, element) {
+                        Ok(()) => {}
+                        Err(DispatchError::Panic(panic)) => {
+                            report.push_error(TurnError::HandlerPanicked(panic));
+                        }
+                        Err(error) => {
+                            with_state(|state| state.phase = Phase::Idle);
+                            return Err(error);
+                        }
                     }
-                    Key::Escape => {
-                        self.enter_event_phase();
-                        return match self.cancel_composition(node, element) {
-                            Ok(()) => self.finish_event(None),
-                            Err(DispatchError::Panic(panic)) => self.finish_event(Some(panic)),
-                            Err(error) => {
-                                with_state(|state| state.phase = Phase::Idle);
-                                Err(error)
-                            }
-                        };
-                    }
-                    Key::Other => {}
                 }
+                report.set_outcome(true, false);
+                with_state(|state| state.phase = Phase::Idle);
+                self.finish_command().map_err(DispatchError::Command)?;
+                return Ok(report);
             }
             let (event_id, event) =
                 self.take_node_event(node, element, EventKind::KeyDown, NodeOperation::KeyDown)?;
-            let panic = invoke_event(event_id, event, |event| {
-                if let Event::KeyDown(handler) = event {
-                    handler(KeyEvent::new(key));
+            let mut key_event = KeyEvent::new(key);
+            let outcome = invoke_event(event_id, event, |event| match event {
+                Event::KeyDown(handler) => handler(&mut key_event),
+                _ => HandlerOutcome::Ok,
+            });
+            let mut report = TurnReport::default();
+            match outcome {
+                Ok(HandlerOutcome::Ok) => {}
+                Ok(HandlerOutcome::Err(error)) => {
+                    report.push_error(TurnError::HandlerFailed(error));
                 }
-            })
-            .err();
+                Err(panic) => report.push_error(TurnError::HandlerPanicked(panic)),
+            }
+            report.set_outcome(
+                key_event.is_consumed()
+                    || report
+                        .errors()
+                        .iter()
+                        .any(|error| matches!(error, TurnError::HandlerPanicked(_))),
+                key_event.prevents_default(),
+            );
             with_state(|state| state.phase = Phase::Idle);
-            self.finish_event(panic)
+            self.finish_command().map_err(DispatchError::Command)?;
+            Ok(report)
         })
     }
 

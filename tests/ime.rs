@@ -180,7 +180,7 @@ fn KeyEditor(keydowns: Rc<Cell<u32>>) -> MountResult<MountPlan> {
                 value={draft}
                 aria:label="editor"
                 on:input={move |value: String| draft.set(value)}
-                on:keydown={move |_event: KeyEvent| {
+                on:keydown={move |_event: &mut KeyEvent| {
                     handler_count.set(handler_count.get() + 1);
                 }}
             />

@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::marker::PhantomData;
@@ -10,7 +11,7 @@ use crate::menu::{
 };
 use crate::presentation::Appearance;
 use crate::task::TaskScope;
-use crate::view::{MountError, MountPlan, MountResult};
+use crate::view::{HandlerOutcome, KeyEvent, MountError, MountPlan, MountResult};
 
 /// 一次窗口打开的 identity；它不等于目录键，也不保证窗口仍然存活。
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -110,6 +111,19 @@ impl WindowCtx {
     pub fn on_close(self, handler: impl Fn(CloseRequest) + 'static) -> Result<(), WindowError> {
         crate::context::with_state_of(self.runtime, |state| {
             state.register_close_handler(self, Rc::new(handler))
+        })
+    }
+
+    /// 在窗口 factory 中注册窗口根 keydown fallback；每个 activation 一次。
+    ///
+    /// 没有节点焦点时它作为根 handler 运行；有焦点时作为 closest-wins 的
+    /// 最后兜底。处理器可以 consume 或 prevent_default，阻塞控件与宿主默认。
+    pub fn on_keydown(
+        self,
+        handler: impl FnMut(&mut KeyEvent) -> HandlerOutcome + 'static,
+    ) -> Result<(), WindowError> {
+        crate::context::with_state_of(self.runtime, |state| {
+            state.register_keydown_handler(self, Rc::new(RefCell::new(Box::new(handler))))
         })
     }
 

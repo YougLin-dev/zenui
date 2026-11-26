@@ -354,6 +354,8 @@ fn lower_attribute(attribute: &NodeAttribute) -> syn::Result<TokenStream> {
             "change" => quote! { on_change },
             "submit" => quote! { on_submit },
             "keydown" => quote! { on_keydown },
+            "keydown_capture" => quote! { on_keydown_capture },
+            "keydown_bubble" => quote! { on_keydown_bubble },
             "focus" => quote! { on_focus },
             "blur" => quote! { on_blur },
             "compositionstart" => quote! { on_composition_start },

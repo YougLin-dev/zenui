@@ -433,7 +433,9 @@ pub enum Event {
     Input(Box<dyn FnMut(String)>),
     Change(Box<dyn FnMut(bool)>),
     Submit(Box<dyn FnMut(SubmitEvent)>),
-    KeyDown(Box<dyn FnMut(KeyEvent)>),
+    KeyDown(Box<dyn FnMut(&mut KeyEvent) -> HandlerOutcome>),
+    KeyDownCapture(Box<dyn FnMut(&mut KeyEvent) -> HandlerOutcome>),
+    KeyDownBubble(Box<dyn FnMut(&mut KeyEvent) -> HandlerOutcome>),
     Focus(Box<dyn FnMut(FocusEvent)>),
     Blur(Box<dyn FnMut(BlurEvent)>),
     CompositionStart(Box<dyn FnMut(CompositionEvent)>),
@@ -708,8 +710,31 @@ pub fn on_submit(handler: impl FnMut(SubmitEvent) + 'static) -> Attr {
     Attr::Event(Event::Submit(Box::new(handler)))
 }
 
-pub fn on_keydown(handler: impl FnMut(KeyEvent) + 'static) -> Attr {
-    Attr::Event(Event::KeyDown(Box::new(handler)))
+pub fn on_keydown<R>(mut handler: impl FnMut(&mut KeyEvent) -> R + 'static) -> Attr
+where
+    R: IntoHandlerOutcome,
+{
+    Attr::Event(Event::KeyDown(Box::new(move |event| {
+        handler(event).into_handler_outcome()
+    })))
+}
+
+pub fn on_keydown_capture<R>(mut handler: impl FnMut(&mut KeyEvent) -> R + 'static) -> Attr
+where
+    R: IntoHandlerOutcome,
+{
+    Attr::Event(Event::KeyDownCapture(Box::new(move |event| {
+        handler(event).into_handler_outcome()
+    })))
+}
+
+pub fn on_keydown_bubble<R>(mut handler: impl FnMut(&mut KeyEvent) -> R + 'static) -> Attr
+where
+    R: IntoHandlerOutcome,
+{
+    Attr::Event(Event::KeyDownBubble(Box::new(move |event| {
+        handler(event).into_handler_outcome()
+    })))
 }
 
 pub fn on_focus(handler: impl FnMut(FocusEvent) + 'static) -> Attr {
@@ -843,20 +868,57 @@ impl CompositionEvent {
 pub enum Key {
     Escape,
     Enter,
+    Tab,
+    Space,
+    Backspace,
+    Delete,
+    ArrowLeft,
+    ArrowRight,
+    ArrowUp,
+    ArrowDown,
+    Home,
+    End,
+    PageUp,
+    PageDown,
     Other,
 }
 
+/// 一次 keydown 的载荷；处理器可消费事件或只跳过默认动作。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct KeyEvent {
     key: Key,
+    consumed: bool,
+    prevent_default: bool,
 }
 
 impl KeyEvent {
     pub const fn new(key: Key) -> Self {
-        Self { key }
+        Self {
+            key,
+            consumed: false,
+            prevent_default: false,
+        }
     }
 
     pub const fn key(self) -> Key {
         self.key
+    }
+
+    /// 停止后续捕获/冒泡阶段与全部默认动作。
+    pub fn consume(&mut self) {
+        self.consumed = true;
+    }
+
+    /// 只跳过默认动作，传播继续。
+    pub fn prevent_default(&mut self) {
+        self.prevent_default = true;
+    }
+
+    pub const fn is_consumed(self) -> bool {
+        self.consumed
+    }
+
+    pub const fn prevents_default(self) -> bool {
+        self.prevent_default
     }
 }
