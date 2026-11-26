@@ -11,6 +11,7 @@ mod context;
 pub mod dispatch;
 pub mod file_dialog;
 pub mod menu;
+mod node;
 pub mod presentation;
 pub mod runtime;
 pub mod session;
@@ -32,6 +33,7 @@ pub use menu::{
     CommandError, CommandEvent, CommandSource, MenuCommand, MenuCommandState, MenuItem,
     MenuShortcut, MenuSpec, MenuStateError, ShortcutError, ShortcutKey, Submenu,
 };
+pub use node::PresentationKey;
 pub use presentation::{
     Appearance, NodeId, NodeStatus, PresentationSnapshot, SnapshotAction, SnapshotActions,
     SnapshotAttr, SnapshotElement, SnapshotNode, SnapshotRowBand, SnapshotSemantics, SnapshotValue,
@@ -68,7 +70,7 @@ pub mod prelude {
         FileDialogOutcome, FileDialogRequest, FileDialogRequestError, FileFilter, FocusCause,
         FocusEvent, FocusInfo, Key, KeyEvent, Length, LengthUnit, Memo, MenuCommand,
         MenuCommandState, MenuItem, MenuShortcut, MenuSpec, MenuStateError, MountError, MountPlan,
-        MountResult, NodeId, NodeOperation, NodeStatus, Once, Opacity, PanicInfo,
+        MountResult, NodeId, NodeOperation, NodeStatus, Once, Opacity, PanicInfo, PresentationKey,
         PresentationSnapshot, Property, RefreshReport, Runtime, SessionCtx, SessionError,
         SessionPolicy, ShortcutError, ShortcutKey, Signal, SnapshotAction, SnapshotActions,
         SnapshotAttr, SnapshotElement, SnapshotNode, SnapshotRowBand, SnapshotSemantics,

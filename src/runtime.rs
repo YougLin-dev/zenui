@@ -16,6 +16,7 @@ use crate::menu::{
     CommandError, CommandEvent, CommandHandler, CommandSource, MenuCommand, MenuCommandState,
     MenuSpec, MenuStateError, MenuStateHandler,
 };
+use crate::node::{AuxHandles, NO_PAYLOAD, NodeArena, NodeKindTag, NodeRef, TreeKey};
 use crate::presentation::{
     Appearance, NodeId, NodeStatus, PresentationSnapshot, SnapshotAction, SnapshotActions,
     SnapshotAttr, SnapshotElement, SnapshotNode, SnapshotRowBand, SnapshotSemantics, SnapshotValue,
@@ -45,6 +46,8 @@ pub(crate) enum Resource {
     Signal(u32),
     Memo(u32),
     Event(usize),
+    /// 随 owner 释放的 arena 节点；保证文本/Show/For 等没有元素槽的节点也能回收。
+    Node(NodeRef),
 }
 
 pub(crate) struct OwnerRecord {
@@ -62,7 +65,7 @@ static NEXT_RUNTIME: AtomicU32 = AtomicU32::new(1);
 
 /// 一棵已提交树的身份：headless 根，或目录中的窗口键。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum TreeKey {
+enum TreeSlot {
     Root,
     Window(&'static str),
 }
@@ -103,14 +106,18 @@ pub(crate) struct State {
     pub(crate) id: u32,
     pub(crate) read_only: u32,
     /// 正在挂载或刷新的树；元素挂载时记录自己的树，查找为 O(1)。
-    building_tree: Option<TreeKey>,
+    building_tree: Option<TreeSlot>,
+    /// 统一 UI 节点身份；旧 payload 存储仍由 elements/components/trees 承担。
+    nodes: NodeArena,
+    /// runtime 树槽位到 arena 树键的映射。
+    arena_trees: BTreeMap<TreeSlot, TreeKey>,
     /// 树 revision 的唯一分配器；每个树只在自身变化时取新值。
     next_tree_revision: u64,
     /// 自上次刷新以来出现可见变化的树；树在刷新期间被临时取出，
     /// 因此不能把标记存放在 `MountedTree` 内。
-    dirty_trees: BTreeSet<TreeKey>,
+    dirty_trees: BTreeSet<TreeSlot>,
     /// 自上次公开 `Runtime::refresh` 报告以来 revision 推进的树。
-    changed_trees: BTreeSet<TreeKey>,
+    changed_trees: BTreeSet<TreeSlot>,
     pub(crate) write_error: Option<WriteError>,
     pub(crate) core: zenui_core::Runtime,
     pub(crate) phase: Phase,
@@ -131,7 +138,7 @@ pub(crate) struct State {
     free_elements: Vec<usize>,
     free_components: Vec<usize>,
     free_events: Vec<usize>,
-    trees: BTreeMap<TreeKey, MountedTree>,
+    trees: BTreeMap<TreeSlot, MountedTree>,
     app_setup: bool,
     window_factory_ran: bool,
     catalog: BTreeMap<&'static str, CatalogEntry>,
@@ -180,7 +187,6 @@ pub(crate) struct State {
     pub(crate) wake_callback: Arc<RwLock<Option<WakeCallback>>>,
     setup_counts: BTreeMap<&'static str, u64>,
     next_instance: u64,
-    next_node_mount: u64,
     unmounts: u64,
     /// 文本编辑谱系归约的有界记录；测试据此刻画分类顺序，不是公开 API。
     text_trace: VecDeque<TextTrace>,
@@ -268,6 +274,8 @@ impl State {
             id: NEXT_RUNTIME.fetch_add(1, Ordering::Relaxed),
             read_only: 0,
             building_tree: None,
+            nodes: NodeArena::new(),
+            arena_trees: BTreeMap::new(),
             next_tree_revision: 1,
             dirty_trees: BTreeSet::new(),
             changed_trees: BTreeSet::new(),
@@ -322,7 +330,6 @@ impl State {
             wake_callback: Arc::new(RwLock::new(None)),
             setup_counts: BTreeMap::new(),
             next_instance: 1,
-            next_node_mount: 0,
             unmounts: 0,
             text_trace: VecDeque::new(),
         }
@@ -348,15 +355,13 @@ impl State {
         self.mark_element_changed(element);
     }
 
-    /// 每次元素挂载分配新的 generation；旧挂载的身份不会命中重新挂载的元素。
-    fn mint_node_at(&mut self, slot: usize) -> NodeId {
-        let id = NodeId::mint(
-            self.id,
-            u32::try_from(slot).expect("node identity exhausted"),
-            self.next_node_mount,
-        );
-        self.next_node_mount += 1;
-        id
+    /// 为元素槽位分配 arena 节点；槽位复用换 generation，旧 NodeId 解析失败。
+    fn mint_element_node(&mut self, slot: usize, owner: u32, parent: Option<NodeRef>) -> NodeId {
+        let node = self.register_node(NodeKindTag::Element, owner, parent);
+        self.nodes
+            .set_payload(node, u32::try_from(slot).expect("node identity exhausted"))
+            .expect("the node was just inserted");
+        NodeId::mint(self.id, node)
     }
 
     /// 预留一个元素槽位并登记到 owner；`place_element` 完成挂载。
@@ -413,11 +418,14 @@ impl State {
         };
         let id = element.id;
         let tag = element.tag;
+        let aux = element.aux;
+        self.nodes.release_element_aux(aux);
         *element = MountedElement {
             id,
             tag,
             owner: 0,
             tree: None,
+            aux: AuxHandles::NONE,
             attrs: Vec::new(),
             class_styles: &[],
             inline_styles: Vec::new(),
@@ -437,46 +445,46 @@ impl State {
         self.free_components.push(slot);
     }
 
-    fn tree(&self, key: TreeKey) -> Option<&MountedTree> {
+    fn tree(&self, key: TreeSlot) -> Option<&MountedTree> {
         self.trees.get(&key)
     }
 
-    fn tree_mut(&mut self, key: TreeKey) -> Option<&mut MountedTree> {
+    fn tree_mut(&mut self, key: TreeSlot) -> Option<&mut MountedTree> {
         self.trees.get_mut(&key)
     }
 
     /// 取走指定窗口的树供刷新使用。
-    fn take_tree(&mut self, key: TreeKey) -> Option<MountedTree> {
+    fn take_tree(&mut self, key: TreeSlot) -> Option<MountedTree> {
         self.trees.remove(&key)
     }
 
-    fn put_tree(&mut self, key: TreeKey, tree: MountedTree) {
+    fn put_tree(&mut self, key: TreeSlot, tree: MountedTree) {
         self.trees.insert(key, tree);
     }
 
     /// 当前接收输入的窗口；没有焦点窗口时退到目录中的第一个可见窗口或 headless 根。
-    fn active_tree_key(&self) -> Option<TreeKey> {
+    fn active_tree_key(&self) -> Option<TreeSlot> {
         if let Some(key) = self.focused_window
-            && self.tree_is_visible(TreeKey::Window(key))
+            && self.tree_is_visible(TreeSlot::Window(key))
         {
-            return Some(TreeKey::Window(key));
+            return Some(TreeSlot::Window(key));
         }
         self.windows
             .keys()
             .copied()
             .find(|key| self.window_is_visible(key))
-            .map(TreeKey::Window)
+            .map(TreeSlot::Window)
             .or_else(|| {
                 self.trees
-                    .contains_key(&TreeKey::Root)
-                    .then_some(TreeKey::Root)
+                    .contains_key(&TreeSlot::Root)
+                    .then_some(TreeSlot::Root)
             })
     }
 
     fn window_ctx(&self, key: &'static str) -> Option<WindowCtx> {
         let record = self.windows.get(key)?;
         let live = self.window_is_live(key, record.activation, record.owner)
-            && self.trees.contains_key(&TreeKey::Window(key));
+            && self.trees.contains_key(&TreeSlot::Window(key));
         live.then(|| WindowCtx::new(self.id, key, record.activation, record.owner))
     }
 
@@ -484,13 +492,13 @@ impl State {
         self.windows
             .get(key)
             .is_some_and(|record| record.open && record.visible)
-            && self.trees.contains_key(&TreeKey::Window(key))
+            && self.trees.contains_key(&TreeSlot::Window(key))
     }
 
-    fn tree_is_visible(&self, key: TreeKey) -> bool {
+    fn tree_is_visible(&self, key: TreeSlot) -> bool {
         match key {
-            TreeKey::Root => self.trees.contains_key(&key),
-            TreeKey::Window(key) => self.window_is_visible(key),
+            TreeSlot::Root => self.trees.contains_key(&key),
+            TreeSlot::Window(key) => self.window_is_visible(key),
         }
     }
 
@@ -508,8 +516,8 @@ impl State {
         if record.visible {
             record.visible = false;
             self.bump_window_revision();
-            self.mark_tree_changed(TreeKey::Window(key));
-            self.commit_tree_revision(TreeKey::Window(key));
+            self.mark_tree_changed(TreeSlot::Window(key));
+            self.commit_tree_revision(TreeSlot::Window(key));
         }
     }
 
@@ -520,8 +528,8 @@ impl State {
         if !record.visible {
             record.visible = true;
             self.bump_window_revision();
-            self.mark_tree_changed(TreeKey::Window(key));
-            self.commit_tree_revision(TreeKey::Window(key));
+            self.mark_tree_changed(TreeSlot::Window(key));
+            self.commit_tree_revision(TreeSlot::Window(key));
         }
     }
 
@@ -532,7 +540,7 @@ impl State {
     /// 标记一棵树的已提交呈现需要推进 revision。
     ///
     /// 刷新期间树暂时不在 `trees` 中，标记仍必须生效，因此使用独立集合。
-    fn mark_tree_changed(&mut self, key: TreeKey) {
+    fn mark_tree_changed(&mut self, key: TreeSlot) {
         self.dirty_trees.insert(key);
     }
 
@@ -552,7 +560,7 @@ impl State {
 
     /// 应用级变化（例如 appearance）影响所有已提交树。
     fn mark_all_trees_changed(&mut self) {
-        let keys: Vec<TreeKey> = self.trees.keys().copied().collect();
+        let keys: Vec<TreeSlot> = self.trees.keys().copied().collect();
         for key in keys {
             self.mark_tree_changed(key);
         }
@@ -566,7 +574,7 @@ impl State {
     }
 
     /// 在刷新末提交本树的有效变化；返回是否推进了 revision。
-    fn commit_tree_revision(&mut self, key: TreeKey) -> bool {
+    fn commit_tree_revision(&mut self, key: TreeSlot) -> bool {
         if !self.dirty_trees.remove(&key) {
             return false;
         }
@@ -581,12 +589,35 @@ impl State {
         true
     }
 
-    fn tree_for_element(&self, element: usize) -> Option<TreeKey> {
+    fn tree_for_element(&self, element: usize) -> Option<TreeSlot> {
         self.elements.get(element).and_then(|element| element.tree)
     }
 
+    /// 取得或分配一棵树的 arena 键；同一个 runtime 树槽位在存续期间保持稳定。
+    fn arena_tree(&mut self, slot: TreeSlot) -> TreeKey {
+        if let Some(key) = self.arena_trees.get(&slot) {
+            return *key;
+        }
+        let key = self.nodes.allocate_tree();
+        self.arena_trees.insert(slot, key);
+        key
+    }
+
+    /// 在 arena 中登记一个已挂载节点，并把回收责任交给指定 owner。
+    fn register_node(&mut self, kind: NodeKindTag, owner: u32, parent: Option<NodeRef>) -> NodeRef {
+        let tree_key = self.arena_tree(self.building_tree.unwrap_or(TreeSlot::Root));
+        let node = self
+            .nodes
+            .insert(kind, NO_PAYLOAD, tree_key, parent)
+            .expect("a mounted parent node is live");
+        if let Some(record) = self.owners.get_mut(&owner) {
+            record.resources.push(Resource::Node(node));
+        }
+        node
+    }
+
     /// 指定树里是否还有这个行带的行窗口化 For；过期行带由宿主忽略。
-    fn tree_has_band(&self, key: TreeKey, band: u64) -> bool {
+    fn tree_has_band(&self, key: TreeSlot, band: u64) -> bool {
         self.tree(key)
             .is_some_and(|tree| contains_band(self, &tree.nodes, band))
     }
@@ -604,7 +635,7 @@ impl State {
 
     fn window_live_in_tree(&self, window: WindowCtx) -> bool {
         self.trees
-            .get(&TreeKey::Window(window.key))
+            .get(&TreeSlot::Window(window.key))
             .is_some_and(|tree| {
                 tree.owner == window.owner
                     && self.window_is_live(window.key, window.activation, window.owner)
@@ -612,11 +643,11 @@ impl State {
     }
 
     /// 当前焦点目标；焦点属于树，而不是整个应用。
-    fn focused_in(&self, key: TreeKey) -> Option<usize> {
+    fn focused_in(&self, key: TreeSlot) -> Option<usize> {
         self.tree(key).and_then(|tree| tree.focused)
     }
 
-    fn set_focused_in(&mut self, key: TreeKey, focused: Option<usize>) {
+    fn set_focused_in(&mut self, key: TreeSlot, focused: Option<usize>) {
         let changed = self.tree_mut(key).is_some_and(|tree| {
             if tree.focused == focused {
                 return false;
@@ -642,12 +673,12 @@ impl State {
             .and_then(|key| self.presented_focus_in(key))
     }
 
-    fn presented_focus_in(&self, key: TreeKey) -> Option<usize> {
+    fn presented_focus_in(&self, key: TreeSlot) -> Option<usize> {
         self.focused_in(key)
             .filter(|element| self.element_is_mounted(*element) && self.is_focusable(*element))
     }
 
-    fn snapshot(&self, key: TreeKey) -> Option<PresentationSnapshot> {
+    fn snapshot(&self, key: TreeSlot) -> Option<PresentationSnapshot> {
         self.presentation_builds
             .set(self.presentation_builds.get().wrapping_add(1));
         let tree = self.tree(key)?;
@@ -764,6 +795,7 @@ impl State {
                         self.free_events.push(event);
                     }
                 }
+                Resource::Node(node) => self.nodes.release(node),
             }
         }
     }
@@ -1120,8 +1152,8 @@ impl State {
 
     fn element_accepts_input(&self, element: usize) -> bool {
         self.tree_for_element(element).is_some_and(|key| match key {
-            TreeKey::Root => true,
-            TreeKey::Window(key) => self.window_accepts_input(key),
+            TreeSlot::Root => true,
+            TreeSlot::Window(key) => self.window_accepts_input(key),
         })
     }
 
@@ -1265,19 +1297,34 @@ impl State {
         }
     }
 
+    /// 把一个已分配过的 Node ID 解析回旧的元素存储槽位；不检查可见性。
+    ///
+    /// `NodeId` 的 arena 槽位与元素存储下标是两套空间，任何需要元素数据的
+    /// 路径都必须经过这里，不能把 `slot()` 当下标使用。
+    fn element_slot(&self, node: NodeId) -> Option<usize> {
+        if node.runtime_id() != self.id {
+            return None;
+        }
+        let slot = self
+            .nodes
+            .require_kind(node.node(), NodeKindTag::Element)
+            .ok()?;
+        let element = slot.payload as usize;
+        self.elements
+            .get(element)
+            .is_some_and(|element| element.id == node)
+            .then_some(element)
+    }
+
     /// 判定一个 Node ID 相对已提交界面的状态。
     fn node_status(&self, node: NodeId) -> NodeStatus {
-        if node.runtime_id() != self.id {
+        if node.runtime_id() != self.id || !self.nodes.slot_exists(node.node()) {
             return NodeStatus::Unknown;
         }
-        let Some(element) = self.elements.get(node.slot() as usize) else {
-            return NodeStatus::Unknown;
-        };
-        // 槽位已由查表确定；代际仍须匹配，否则这是同一槽位更早一次挂载的身份。
-        if element.id.slot() != node.slot() || element.id.generation() != node.generation() {
+        let Some(element) = self.element_slot(node) else {
             return NodeStatus::Stale;
-        }
-        if self.element_is_mounted(node.slot() as usize) {
+        };
+        if self.element_is_mounted(element) {
             NodeStatus::Live
         } else {
             NodeStatus::Stale
@@ -1299,16 +1346,16 @@ impl State {
         if node.runtime_id() != self.id {
             return Err(DispatchError::UnknownNode(node));
         }
-        let Some(element) = self.elements.get(node.slot() as usize) else {
+        if !self.nodes.slot_exists(node.node()) {
             return Err(DispatchError::UnknownNode(node));
-        };
-        if element.id.slot() != node.slot() || element.id.generation() != node.generation() {
-            return Err(DispatchError::StaleNode(node));
         }
-        match self.tree_for_element(node.slot() as usize) {
+        let Some(element) = self.element_slot(node) else {
+            return Err(DispatchError::StaleNode(node));
+        };
+        match self.tree_for_element(element) {
             Some(key) if self.tree_is_visible(key) => {
-                if allow_suspended || self.element_accepts_input(node.slot() as usize) {
-                    Ok(node.slot() as usize)
+                if allow_suspended || self.element_accepts_input(element) {
+                    Ok(element)
                 } else {
                     Err(DispatchError::Suspended(node))
                 }
@@ -1366,7 +1413,7 @@ impl State {
     }
 
     /// Tab/方向键共用的确定性前序：控件先于自己的子树，Show 只看活动分支，For 按业务顺序。
-    fn focus_order(&self, key: TreeKey) -> Vec<usize> {
+    fn focus_order(&self, key: TreeSlot) -> Vec<usize> {
         let mut order = Vec::new();
         if let Some(tree) = self.tree(key) {
             collect_focusable(self, &tree.nodes, &mut order);
@@ -1375,7 +1422,7 @@ impl State {
     }
 
     /// 结算快照包含旧一代的全部挂载元素；某个控件当时禁用、本帧重新启用时仍可接任。
-    fn element_order(&self, key: TreeKey) -> Vec<usize> {
+    fn element_order(&self, key: TreeSlot) -> Vec<usize> {
         let mut order = Vec::new();
         if let Some(tree) = self.tree(key) {
             collect_elements(self, &tree.nodes, &mut order);
@@ -1392,7 +1439,7 @@ impl State {
     /// 只在旧一代的挂载顺序里选：同 tag 的下一控件、同 tag 的上一控件，
     /// 再退到任意下一控件、任意上一控件；本帧新挂载的控件不会因返场抢焦点，
     /// 当时禁用、本帧重新启用的旧控件仍然可以接任。
-    fn focus_settlement(&mut self, key: TreeKey) -> Option<FocusSettlement> {
+    fn focus_settlement(&mut self, key: TreeSlot) -> Option<FocusSettlement> {
         let old = self.focused_in(key)?;
         let after = self.focus_order(key);
         if after.contains(&old) {
@@ -1442,7 +1489,9 @@ pub struct MountedElement {
     tag: &'static str,
     owner: u32,
     /// 元素所属的已提交树；挂载时由构建上下文写入，释放后为 `None`。
-    tree: Option<TreeKey>,
+    tree: Option<TreeSlot>,
+    /// 该元素在辅助 arena 中的句柄；列表内容仍留在旧存储里。
+    aux: AuxHandles,
     attrs: Vec<MountedAttr>,
     class_styles: &'static [zenui_style::StyleDeclaration],
     inline_styles: Vec<MountedInlineStyle>,
@@ -2050,6 +2099,7 @@ pub struct MountedComponent {
 
 pub struct MountedShow {
     owner: u32,
+    node: NodeRef,
     when: Memo<bool>,
     then: ChildrenFactory,
     fallback: Option<ChildrenFactory>,
@@ -2064,6 +2114,7 @@ pub struct MountedBranch {
 
 pub struct MountedFor {
     owner: u32,
+    node: NodeRef,
     each: Memo<RowSet>,
     key: Box<dyn Fn(TodoId) -> TodoId>,
     item: Box<dyn Fn(TodoId) -> MountResult<MountPlan>>,
@@ -2103,10 +2154,11 @@ fn rows_height(row_height: Length, rows: usize) -> Length {
 }
 
 /// 为窗口化 For 创建上下两个零高 spacer；高度由每次刷新按窗口更新。
-fn ensure_spacers(state: &mut State, owner: u32) -> (usize, usize) {
+fn ensure_spacers(state: &mut State, owner: u32, parent: Option<NodeRef>) -> (usize, usize) {
     let mut make = || {
         let slot = state.reserve_element(owner);
-        let id = state.mint_node_at(slot);
+        let id = state.mint_element_node(slot, owner, parent);
+        let aux = state.nodes.reserve_element_aux();
         state.place_element(
             slot,
             MountedElement {
@@ -2114,6 +2166,7 @@ fn ensure_spacers(state: &mut State, owner: u32) -> (usize, usize) {
                 tag: "view",
                 owner,
                 tree: None,
+                aux,
                 attrs: vec![MountedAttr {
                     name: "role",
                     value: AttrValue::Text(TextSlot::Static("spacer")),
@@ -2247,11 +2300,11 @@ impl Drop for PhaseGuard {
 
 /// 挂载/刷新期间指定元素归属的树；Drop 恢复调用前的上下文。
 struct TreeContextGuard {
-    previous: Option<TreeKey>,
+    previous: Option<TreeSlot>,
 }
 
 impl TreeContextGuard {
-    fn enter(key: TreeKey) -> Self {
+    fn enter(key: TreeSlot) -> Self {
         let previous = with_state(|state| {
             let previous = state.building_tree;
             state.building_tree = Some(key);
@@ -2267,25 +2320,25 @@ impl Drop for TreeContextGuard {
     }
 }
 
-fn with_tree_context<R>(key: TreeKey, f: impl FnOnce() -> R) -> R {
+fn with_tree_context<R>(key: TreeSlot, f: impl FnOnce() -> R) -> R {
     let _guard = TreeContextGuard::enter(key);
     f()
 }
 
 /// 刷新期间临时借出一棵树；无论正常返回还是 unwind 都把树放回。
 struct TreeRefreshGuard {
-    key: TreeKey,
+    key: TreeSlot,
     tree: Option<MountedTree>,
     previous_phase: Phase,
-    previous_tree: Option<TreeKey>,
+    previous_tree: Option<TreeSlot>,
 }
 
 impl TreeRefreshGuard {
     fn new(
-        key: TreeKey,
+        key: TreeSlot,
         tree: MountedTree,
         previous_phase: Phase,
-        previous_tree: Option<TreeKey>,
+        previous_tree: Option<TreeSlot>,
     ) -> Self {
         Self {
             key,
@@ -2582,20 +2635,21 @@ impl Runtime {
                     return Err(MountError::Panic(panic));
                 }
             };
-            let mut tree = match with_tree_context(TreeKey::Root, || self.mount_plan(plan, 0)) {
-                Ok(tree) => tree,
-                Err(error) => {
-                    with_state(State::release_root_resources);
-                    return Err(error);
-                }
-            };
+            let mut tree =
+                match with_tree_context(TreeSlot::Root, || self.mount_plan(plan, 0, None)) {
+                    Ok(tree) => tree,
+                    Err(error) => {
+                        with_state(State::release_root_resources);
+                        return Err(error);
+                    }
+                };
             if let Some(fault) = with_state(|state| state.fault.take()) {
                 self.release_nodes(&mut tree);
                 return Err(State::context_error(fault));
             }
             with_state(|state| {
                 state.put_tree(
-                    TreeKey::Root,
+                    TreeSlot::Root,
                     MountedTree {
                         nodes: tree,
                         owner: 0,
@@ -2604,7 +2658,7 @@ impl Runtime {
                         revision: 0,
                     },
                 );
-                state.mark_tree_changed(TreeKey::Root);
+                state.mark_tree_changed(TreeSlot::Root);
                 state.phase = Phase::Idle;
             });
             self.refresh_internal()
@@ -2788,7 +2842,7 @@ impl Runtime {
                 .ok_or(WindowError::UnknownWindow(key))?;
             Rc::clone(&entry.factory)
         };
-        if self.state.borrow().trees.contains_key(&TreeKey::Root) {
+        if self.state.borrow().trees.contains_key(&TreeSlot::Root) {
             return Err(WindowError::State(
                 "cannot show a window while a headless root is mounted",
             ));
@@ -2959,14 +3013,15 @@ impl Runtime {
                 self.abort_open(key, activation, owner, None);
                 return Err(WindowError::Command(CommandError::MissingHandler(id)));
             }
-            let tree =
-                match with_tree_context(TreeKey::Window(key), || self.mount_plan(plan, owner)) {
-                    Ok(tree) => tree,
-                    Err(error) => {
-                        self.abort_open(key, activation, owner, None);
-                        return Err(WindowError::Mount(error));
-                    }
-                };
+            let tree = match with_tree_context(TreeSlot::Window(key), || {
+                self.mount_plan(plan, owner, None)
+            }) {
+                Ok(tree) => tree,
+                Err(error) => {
+                    self.abort_open(key, activation, owner, None);
+                    return Err(WindowError::Mount(error));
+                }
+            };
             if let Some(fault) = with_state(|state| state.fault.take()) {
                 self.abort_open(key, activation, owner, Some(tree));
                 return Err(WindowError::Mount(MountError::Context {
@@ -2976,7 +3031,7 @@ impl Runtime {
             }
             with_state(|state| {
                 state.put_tree(
-                    TreeKey::Window(key),
+                    TreeSlot::Window(key),
                     MountedTree {
                         nodes: tree,
                         owner,
@@ -2985,14 +3040,14 @@ impl Runtime {
                         revision: 0,
                     },
                 );
-                state.mark_tree_changed(TreeKey::Window(key));
+                state.mark_tree_changed(TreeSlot::Window(key));
                 state.phase = Phase::Idle;
             });
             if let Err(error) = self.refresh_internal() {
                 let nodes = with_state(|state| {
                     state
                         .trees
-                        .remove(&TreeKey::Window(key))
+                        .remove(&TreeSlot::Window(key))
                         .map(|tree| tree.nodes)
                 });
                 self.abort_open(key, activation, owner, nodes);
@@ -3249,8 +3304,10 @@ impl Runtime {
             if let Some(target) = target {
                 let valid = with_state(|state| {
                     state.node_status(target) == NodeStatus::Live
-                        && state.tree_for_element(target.slot() as usize)
-                            == Some(TreeKey::Window(window.key))
+                        && state
+                            .element_slot(target)
+                            .and_then(|element| state.tree_for_element(element))
+                            == Some(TreeSlot::Window(window.key))
                 });
                 if !valid {
                     return Err(CommandError::InvalidTarget(target));
@@ -3524,7 +3581,7 @@ impl Runtime {
                 let epoch = state.next_close_epoch;
                 state.next_close_epoch += 1;
                 let focus = state
-                    .focused_in(TreeKey::Window(window.key))
+                    .focused_in(TreeSlot::Window(window.key))
                     .map(|element| state.elements[element].id);
                 state.close_epochs.insert(
                     window.key,
@@ -3679,12 +3736,12 @@ impl Runtime {
                 with_state(|state| state.focused_window = Some(parent.key));
                 if let Some(focus) = epoch.focus {
                     let target = with_state(|state| {
-                        (state.node_status(focus) == NodeStatus::Live
-                            && state.is_focusable(focus.slot() as usize))
-                        .then_some(focus.slot() as usize)
+                        let element = state.element_slot(focus)?;
+                        (state.element_is_mounted(element) && state.is_focusable(element))
+                            .then_some(element)
                     });
                     if let Some(target) = target {
-                        self.move_focus(TreeKey::Window(parent.key), Some(target))?;
+                        self.move_focus(TreeSlot::Window(parent.key), Some(target))?;
                     }
                 }
             }
@@ -3705,7 +3762,7 @@ impl Runtime {
             if !with_state(|state| state.window_live_in_tree(window)) {
                 return Err(WindowError::Stale);
             }
-            let tree = with_state(|state| state.trees.remove(&TreeKey::Window(window.key)));
+            let tree = with_state(|state| state.trees.remove(&TreeSlot::Window(window.key)));
             let Some(MountedTree { mut nodes, .. }) = tree else {
                 return Err(WindowError::Stale);
             };
@@ -3759,7 +3816,7 @@ impl Runtime {
             if !with_state(|state| state.window_live_in_tree(window)) {
                 return Err(WindowError::Stale);
             }
-            let key = TreeKey::Window(window.key);
+            let key = TreeSlot::Window(window.key);
             if !with_state(|state| state.tree_has_band(key, band)) {
                 return Err(WindowError::Stale);
             }
@@ -3810,15 +3867,15 @@ impl Runtime {
                 continue;
             }
             match key {
-                TreeKey::Root => report.root_changed = true,
-                TreeKey::Window(key) => report.changed_windows.push(key),
+                TreeSlot::Root => report.root_changed = true,
+                TreeSlot::Window(key) => report.changed_windows.push(key),
             }
         }
         report.changed = report.root_changed || !report.changed_windows.is_empty();
         report
     }
 
-    fn tree_keys(&self) -> Vec<TreeKey> {
+    fn tree_keys(&self) -> Vec<TreeSlot> {
         self.state.borrow().trees.keys().copied().collect()
     }
 
@@ -3830,7 +3887,7 @@ impl Runtime {
     }
 
     /// 刷新一棵树；返回本次是否推进了这棵树的 revision。
-    fn refresh_tree_once(&mut self, key: TreeKey) -> Result<bool, MountError> {
+    fn refresh_tree_once(&mut self, key: TreeSlot) -> Result<bool, MountError> {
         let state = self.state.clone();
         context::install(&state, || {
             let (taken, previous_phase, previous_tree) = with_state(|state| {
@@ -3934,7 +3991,7 @@ impl Runtime {
     /// 应用一次焦点结算；`keep_target` 为 false 时只清理旧目标（第 8 轮兜底）。
     fn apply_focus_settlement(
         &mut self,
-        key: TreeKey,
+        key: TreeSlot,
         settlement: FocusSettlement,
         keep_target: bool,
     ) -> Result<(), MountError> {
@@ -3975,25 +4032,32 @@ impl Runtime {
         Ok(())
     }
 
-    fn mount_plan(&mut self, plan: MountPlan, parent: u32) -> Result<Vec<MountedNode>, MountError> {
+    fn mount_plan(
+        &mut self,
+        plan: MountPlan,
+        parent: u32,
+        parent_node: Option<NodeRef>,
+    ) -> Result<Vec<MountedNode>, MountError> {
         let mut nodes = Vec::with_capacity(plan.nodes.len());
         for node in plan.nodes {
             let result = match node {
                 PlanNode::Children(children) => {
                     match with_owner(parent, || catch_panic(|| children.mount())) {
-                        Ok(Ok(plan)) => self.mount_plan(plan, parent),
+                        Ok(Ok(plan)) => self.mount_plan(plan, parent, parent_node),
                         Ok(Err(error)) => Err(error),
                         Err(panic) => Err(MountError::Panic(panic)),
                     }
                 }
                 PlanNode::Factory(factory) => {
                     match with_owner(parent, || catch_panic(|| factory.mount())) {
-                        Ok(Ok(plan)) => self.mount_plan(plan, parent),
+                        Ok(Ok(plan)) => self.mount_plan(plan, parent, parent_node),
                         Ok(Err(error)) => Err(error),
                         Err(panic) => Err(MountError::Panic(panic)),
                     }
                 }
-                node => self.mount_node(node, parent).map(|node| vec![node]),
+                node => self
+                    .mount_node(node, parent, parent_node)
+                    .map(|node| vec![node]),
             };
             match result {
                 Ok(mut mounted) => nodes.append(&mut mounted),
@@ -4006,24 +4070,37 @@ impl Runtime {
         Ok(nodes)
     }
 
-    fn mount_node(&mut self, node: PlanNode, parent: u32) -> Result<MountedNode, MountError> {
+    fn mount_node(
+        &mut self,
+        node: PlanNode,
+        parent: u32,
+        parent_node: Option<NodeRef>,
+    ) -> Result<MountedNode, MountError> {
         match node {
-            PlanNode::Text(slot) => Ok(MountedNode::Text(MountedText {
-                value: String::new(),
-                slot,
-            })),
+            PlanNode::Text(slot) => {
+                with_state(|state| state.register_node(NodeKindTag::Text, parent, parent_node));
+                Ok(MountedNode::Text(MountedText {
+                    value: String::new(),
+                    slot,
+                }))
+            }
             PlanNode::Children(_) | PlanNode::Factory(_) => {
                 unreachable!("slots are spliced by mount_plan")
             }
             PlanNode::Element(plan) => {
                 let owner = with_state(|state| state.create_owner(Some(parent)));
-                let children = match self.mount_plan(MountPlan::new(plan.children), owner) {
-                    Ok(children) => children,
-                    Err(error) => {
-                        with_state(|state| state.dispose_owner(owner));
-                        return Err(error);
-                    }
-                };
+                let element_node = with_state(|state| {
+                    state.register_node(NodeKindTag::Element, owner, parent_node)
+                });
+                let children =
+                    match self.mount_plan(MountPlan::new(plan.children), owner, Some(element_node))
+                    {
+                        Ok(children) => children,
+                        Err(error) => {
+                            with_state(|state| state.dispose_owner(owner));
+                            return Err(error);
+                        }
+                    };
                 let tag = plan.tag;
                 let id = with_state(|state| {
                     let mut attrs = Vec::new();
@@ -4045,7 +4122,15 @@ impl Runtime {
                         }
                     }
                     let slot = state.reserve_element(owner);
-                    let id = state.mint_node_at(slot);
+                    let id = NodeId::mint(state.id, element_node);
+                    state
+                        .nodes
+                        .set_payload(
+                            element_node,
+                            u32::try_from(slot).expect("node identity exhausted"),
+                        )
+                        .expect("the element node is live");
+                    let aux = state.nodes.reserve_element_aux();
                     // 每次挂载（包括同 key 重挂载）都建立新的编辑 origin；
                     // 旧挂载的 Node ID 是 StaleNode，旧派发无法命中新编辑器。
                     let local = match tag {
@@ -4073,6 +4158,7 @@ impl Runtime {
                             tag,
                             owner,
                             tree: None,
+                            aux,
                             attrs,
                             class_styles: plan.class_styles,
                             inline_styles,
@@ -4088,6 +4174,9 @@ impl Runtime {
             PlanNode::Component(plan) => {
                 let label = plan.label;
                 let owner = with_state(|state| state.create_owner(Some(parent)));
+                let component_node = with_state(|state| {
+                    state.register_node(NodeKindTag::Component, owner, parent_node)
+                });
                 let mounted = with_owner(owner, || {
                     let _phase = PhaseGuard::enter(Phase::Setup);
                     catch_panic(plan.mount)
@@ -4108,7 +4197,7 @@ impl Runtime {
                     with_state(|state| state.dispose_owner(owner));
                     return Err(State::context_error(fault));
                 }
-                let children = match self.mount_plan(plan, owner) {
+                let children = match self.mount_plan(plan, owner, Some(component_node)) {
                     Ok(children) => children,
                     Err(error) => {
                         with_state(|state| state.dispose_owner(owner));
@@ -4118,6 +4207,13 @@ impl Runtime {
                 let id = with_state(|state| {
                     *state.setup_counts.entry(label).or_default() += 1;
                     let slot = state.reserve_component(owner);
+                    state
+                        .nodes
+                        .set_payload(
+                            component_node,
+                            u32::try_from(slot).expect("component identity exhausted"),
+                        )
+                        .expect("the component node is live");
                     state.place_component(slot, MountedComponent { owner, children });
                     slot
                 });
@@ -4125,8 +4221,11 @@ impl Runtime {
             }
             PlanNode::Show(plan) => {
                 let owner = with_state(|state| state.create_owner(Some(parent)));
+                let show_node =
+                    with_state(|state| state.register_node(NodeKindTag::Show, owner, parent_node));
                 let mut node = MountedShow {
                     owner,
+                    node: show_node,
                     when: plan.when,
                     then: plan.then,
                     fallback: plan.fallback,
@@ -4140,6 +4239,8 @@ impl Runtime {
             }
             PlanNode::For(plan) => {
                 let owner = with_state(|state| state.create_owner(Some(parent)));
+                let for_node =
+                    with_state(|state| state.register_node(NodeKindTag::For, owner, parent_node));
                 let band = with_state(|state| {
                     let band = state.next_row_band;
                     state.next_row_band += 1;
@@ -4148,6 +4249,7 @@ impl Runtime {
                 });
                 let mut node = MountedFor {
                     owner,
+                    node: for_node,
                     each: plan.each,
                     key: plan.key,
                     item: plan.item,
@@ -4358,7 +4460,7 @@ impl Runtime {
                         return Err(MountError::Panic(panic));
                     }
                 };
-                let children = match self.mount_plan(plan, owner) {
+                let children = match self.mount_plan(plan, owner, Some(show.node)) {
                     Ok(children) => children,
                     Err(error) => {
                         with_state(|state| state.dispose_owner(owner));
@@ -4457,7 +4559,8 @@ impl Runtime {
         let mut count = total;
         if for_node.row_height.is_some() {
             if for_node.spacers.is_none() {
-                let spacers = with_state(|state| ensure_spacers(state, for_node.owner));
+                let spacers =
+                    with_state(|state| ensure_spacers(state, for_node.owner, Some(for_node.node)));
                 for_node.spacers = Some(spacers);
             }
             let requested = with_state(|state| state.row_windows.get(&for_node.band).copied())
@@ -4515,7 +4618,7 @@ impl Runtime {
                     return Err(MountError::Panic(panic));
                 }
             };
-            let children = match self.mount_plan(plan, owner) {
+            let children = match self.mount_plan(plan, owner, Some(for_node.node)) {
                 Ok(children) => children,
                 Err(error) => {
                     with_state(|state| state.dispose_owner(owner));
@@ -5528,7 +5631,7 @@ impl Runtime {
             if !with_state(|state| state.window_live_in_tree(window)) {
                 return Err(WindowError::Stale);
             }
-            self.move_focus(TreeKey::Window(window.key), None)
+            self.move_focus(TreeSlot::Window(window.key), None)
                 .map_err(WindowError::Mount)
         })
     }
@@ -5551,7 +5654,7 @@ impl Runtime {
             if !with_state(|state| state.window_live_in_tree(window)) {
                 return Err(WindowError::Stale);
             }
-            let tree = TreeKey::Window(window.key);
+            let tree = TreeSlot::Window(window.key);
             if with_state(|state| state.focus_order(tree)).is_empty() {
                 return Ok(());
             }
@@ -5560,7 +5663,7 @@ impl Runtime {
         })
     }
 
-    fn traverse_focus_for(&mut self, tree: TreeKey, forward: bool) -> Result<(), MountError> {
+    fn traverse_focus_for(&mut self, tree: TreeSlot, forward: bool) -> Result<(), MountError> {
         let order = with_state(|state| state.focus_order(tree));
         if order.is_empty() {
             return Err(MountError::Component("no focusable target"));
@@ -5577,8 +5680,8 @@ impl Runtime {
         self.move_focus(tree, Some(order[index]))
     }
 
-    fn move_focus(&mut self, tree: TreeKey, target: Option<usize>) -> Result<(), MountError> {
-        if let TreeKey::Window(key) = tree {
+    fn move_focus(&mut self, tree: TreeSlot, target: Option<usize>) -> Result<(), MountError> {
+        if let TreeSlot::Window(key) = tree {
             with_state(|state| state.focused_window = Some(key));
         }
         let current = with_state(|state| state.focused_in(tree));
@@ -5778,7 +5881,7 @@ impl Runtime {
             return Err(WindowError::Stale);
         }
         state
-            .tree(TreeKey::Window(window.key))
+            .tree(TreeSlot::Window(window.key))
             .map(|tree| tree.revision)
             .ok_or(WindowError::Stale)
     }
@@ -5864,7 +5967,7 @@ impl Runtime {
             return Err(WindowError::Hidden);
         }
         state
-            .snapshot(TreeKey::Window(window.key))
+            .snapshot(TreeSlot::Window(window.key))
             .ok_or(WindowError::Stale)
     }
 
@@ -6355,18 +6458,23 @@ mod history_tests {
         app.click_label("hide-toggle").expect("unmount the input");
 
         let state = app.state.borrow();
-        let slot = &state.elements[input.slot() as usize];
-        assert_eq!(slot.id, input, "the dead slot keeps the stale NodeId");
+        let slot = state
+            .elements
+            .iter()
+            .position(|element| element.id == input)
+            .expect("the retired element keeps its identity tombstone");
+        let element = &state.elements[slot];
+        assert_eq!(element.id, input, "the dead slot keeps the stale NodeId");
         assert!(
-            matches!(slot.local, LocalState::None),
+            matches!(element.local, LocalState::None),
             "the dead slot releases its text input"
         );
         assert!(
-            slot.attrs.is_empty() && slot.events.is_empty() && slot.children.is_empty(),
+            element.attrs.is_empty() && element.events.is_empty() && element.children.is_empty(),
             "the dead slot releases its payload"
         );
         assert!(
-            state.free_elements.contains(&(input.slot() as usize)),
+            state.free_elements.contains(&slot),
             "the dead slot is available for reuse"
         );
     }
@@ -7046,6 +7154,248 @@ mod recycling_tests {
                 && steady.2 <= baseline.2 + 16
                 && steady.3 <= baseline.3 + 16,
             "the steady state stays near the live window: baseline {baseline:?}, steady {steady:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod arena_tests {
+    #![allow(unused_braces)]
+
+    use super::*;
+    use crate::node::NodeError;
+    use crate::prelude::*;
+
+    /// 覆盖 For 行：每个行组件拥有元素与文本节点。
+    #[component]
+    fn ArenaRow(id: TodoId, store: Store) -> MountResult<MountPlan> {
+        let title = store.title(id).read_once()?;
+        let label = format!("Row {title}");
+        view! {
+            <view>
+                <text>{once(label)}</text>
+            </view>
+        }
+    }
+
+    /// 覆盖 Show 的活动分支与卸载后的分支释放。
+    #[component]
+    fn ArenaShow() -> MountResult<MountPlan> {
+        let visible = signal(true);
+        let shown = memo(move || visible.get());
+        view! {
+            <view>
+                <Show when={shown}>
+                    <view aria:label="branch"><text>"shown"</text></view>
+                </Show>
+                <button
+                    aria:label="toggle-show"
+                    on:click={move || visible.set(!visible.get())}
+                >"toggle"</button>
+            </view>
+        }
+    }
+
+    /// 覆盖元素、文本、组件、Show 与 For 五种节点。
+    #[component]
+    fn ArenaList(store: Store) -> MountResult<MountPlan> {
+        let rows = memo(move || store.rows(Filter::All));
+        let seed = move || {
+            let mut transaction = Transaction::new();
+            for index in 0..2 {
+                transaction = transaction.write(store.insert(format!("r{index}")));
+            }
+            transaction.finish().expect("seed the rows");
+        };
+        view! {
+            <view role="main">
+                <button aria:label="Seed" on:click={move || seed()}>"Seed"</button>
+                <text>"plain"</text>
+                <ArenaShow />
+                <For each={rows} key={|id: TodoId| id}>
+                    {move |id: TodoId| view! { <ArenaRow id={id} store={store} /> }}
+                </For>
+            </view>
+        }
+    }
+
+    fn fixture() -> (Runtime, WindowCtx) {
+        let mut app = Runtime::new();
+        let store = app.setup(Store::new).expect("application setup");
+        app.declare_windows(move |catalog| {
+            catalog.window(WindowSpec::new("main").primary(), move |_| {
+                view! { <ArenaList store={store} /> }
+            })
+        })
+        .expect("declare the window");
+        let window = app.show("main").expect("show the window");
+        app.click_label("Seed").expect("seed the rows");
+        (app, window)
+    }
+
+    /// 当前由 owner 回收的 arena 节点；覆盖文本与结构节点的登记路径。
+    fn owned_nodes(state: &State) -> Vec<(NodeRef, NodeKindTag)> {
+        let mut nodes = Vec::new();
+        for record in state.owners.values() {
+            for resource in &record.resources {
+                if let Resource::Node(node) = resource
+                    && let Ok(slot) = state.nodes.get(*node)
+                {
+                    nodes.push((*node, slot.kind));
+                }
+            }
+        }
+        nodes
+    }
+
+    fn count_kind(nodes: &[(NodeRef, NodeKindTag)], kind: NodeKindTag) -> usize {
+        nodes.iter().filter(|(_, actual)| *actual == kind).count()
+    }
+
+    #[test]
+    fn every_mounted_kind_is_reachable_through_the_node_arena() {
+        let (app, window) = fixture();
+        let state = app.state.borrow();
+        let tree = state.arena_trees[&TreeSlot::Window(window.key)];
+        let nodes = owned_nodes(&state);
+
+        assert!(count_kind(&nodes, NodeKindTag::Element) >= 5);
+        assert!(count_kind(&nodes, NodeKindTag::Text) >= 3);
+        assert!(count_kind(&nodes, NodeKindTag::Component) >= 3);
+        assert_eq!(count_kind(&nodes, NodeKindTag::Show), 1);
+        assert_eq!(count_kind(&nodes, NodeKindTag::For), 1);
+
+        let mut roots = 0;
+        let mut elements = 0;
+        for (node, kind) in &nodes {
+            let slot = state.nodes.get(*node).expect("listed nodes are live");
+            assert_eq!(
+                slot.tree, tree,
+                "every mounted node belongs to the window tree"
+            );
+            match slot.parent {
+                Some(parent) => {
+                    assert!(
+                        state.nodes.get(parent).is_ok(),
+                        "the parent link never dangles"
+                    );
+                }
+                None => roots += 1,
+            }
+            match kind {
+                NodeKindTag::Element => {
+                    elements += 1;
+                    let payload = slot.payload as usize;
+                    let element = state
+                        .elements
+                        .get(payload)
+                        .expect("the element payload index is live");
+                    assert_eq!(
+                        element.id.node(),
+                        *node,
+                        "the element resolves back to its node identity"
+                    );
+                    assert_eq!(element.tree, Some(TreeSlot::Window(window.key)));
+                    assert_ne!(
+                        element.aux,
+                        AuxHandles::NONE,
+                        "every element owns auxiliary handles"
+                    );
+                }
+                NodeKindTag::Component => {
+                    let payload = slot.payload as usize;
+                    assert!(
+                        state.components.get(payload).is_some(),
+                        "the component payload index is live"
+                    );
+                }
+                NodeKindTag::Text | NodeKindTag::Show | NodeKindTag::For => {}
+            }
+        }
+        assert_eq!(roots, 1, "only the window root has no parent");
+        assert_eq!(
+            state.nodes.aux_live(),
+            elements * 7,
+            "one auxiliary handle set per live element"
+        );
+    }
+
+    #[test]
+    fn hiding_a_show_branch_releases_nodes_and_aux_handles() {
+        let (mut app, _window) = fixture();
+        let branch = app
+            .presentation()
+            .expect("snapshot")
+            .find_label("branch")
+            .expect("the active branch")
+            .id();
+        assert_eq!(
+            branch.presentation_key().node(),
+            Some(branch.node()),
+            "NodeId and PresentationKey share one encoding"
+        );
+
+        let before = {
+            let state = app.state.borrow();
+            (state.nodes.live(), state.nodes.storage_len())
+        };
+        let aux_before = app.state.borrow().nodes.aux_live();
+        assert_eq!(aux_before % 7, 0);
+
+        app.click_label("toggle-show").expect("hide the branch");
+        assert!(!app.texts().iter().any(|text| text == "shown"));
+        assert_eq!(
+            app.node_status(branch),
+            NodeStatus::Stale,
+            "the hide retires the old element identity"
+        );
+        {
+            let state = app.state.borrow();
+            assert_eq!(
+                state.nodes.live(),
+                before.0 - 3,
+                "the branch view, its text element and raw text node were released"
+            );
+            assert_eq!(
+                state.nodes.storage_len(),
+                before.1,
+                "release keeps slots for reuse"
+            );
+            assert_eq!(
+                state.nodes.aux_live(),
+                aux_before - 14,
+                "both retired elements return their auxiliary handles"
+            );
+            assert!(
+                matches!(
+                    state.nodes.get(branch.node()),
+                    Err(NodeError::Vacant { .. } | NodeError::StaleGeneration { .. })
+                ),
+                "the arena rejects the retired identity"
+            );
+        }
+
+        app.click_label("toggle-show")
+            .expect("show the branch again");
+        let fresh = app
+            .presentation()
+            .expect("snapshot")
+            .find_label("branch")
+            .expect("the remounted branch")
+            .id();
+        assert_ne!(fresh, branch, "a reused arena slot gets a new generation");
+        assert_eq!(app.node_status(fresh), NodeStatus::Live);
+        let state = app.state.borrow();
+        assert_eq!(state.nodes.live(), before.0, "the live set is restored");
+        assert_eq!(
+            state.nodes.storage_len(),
+            before.1,
+            "the remount reuses arena slots"
+        );
+        assert_eq!(
+            state.nodes.aux_live(),
+            aux_before,
+            "the remount reserves a fresh handle set"
         );
     }
 }
