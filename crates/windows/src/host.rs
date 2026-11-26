@@ -1983,7 +1983,10 @@ impl Host {
 
     /// 重绘当前窗口：运行时呈现未变时复用缓存快照，否则重建快照。
     fn render_current(&mut self, window: &mut WindowHost) -> Result<(), HostError> {
-        let revision = self.runtime.presentation_revision();
+        let revision = self
+            .runtime
+            .presentation_revision_of(window.ctx)
+            .unwrap_or(window.snapshot_revision);
         if window.last_snapshot.is_some() && window.snapshot_revision == revision {
             return self.render_cached(window);
         }
@@ -1996,7 +1999,10 @@ impl Host {
         window: &mut WindowHost,
         read: impl FnOnce(&PresentationSnapshot) -> T,
     ) -> Result<T, HostError> {
-        let revision = self.runtime.presentation_revision();
+        let revision = self
+            .runtime
+            .presentation_revision_of(window.ctx)
+            .unwrap_or(window.snapshot_revision);
         if window.last_snapshot.is_some() && window.snapshot_revision == revision {
             let Some(snapshot) = window.last_snapshot.take() else {
                 unreachable!("the cache check guarantees a snapshot");
@@ -2024,7 +2030,10 @@ impl Host {
             return Ok(());
         }
         // 运行时版本已经前进时缓存快照不再可信；行窗口更新也会改变版本。
-        let revision = self.runtime.presentation_revision();
+        let revision = self
+            .runtime
+            .presentation_revision_of(window.ctx)
+            .unwrap_or(window.snapshot_revision);
         if window.snapshot_revision != revision || window.last_snapshot.is_none() {
             match self.runtime.presentation_of(window.ctx) {
                 Ok(snapshot) => {
@@ -2053,7 +2062,10 @@ impl Host {
             Ok(Some(scene))
         })();
         window.last_snapshot = Some(snapshot);
-        window.snapshot_revision = self.runtime.presentation_revision();
+        window.snapshot_revision = self
+            .runtime
+            .presentation_revision_of(window.ctx)
+            .unwrap_or(window.snapshot_revision);
         if let Some(scene) = result? {
             match window.last_snapshot.take() {
                 Some(snapshot) => {
@@ -2134,7 +2146,10 @@ impl Host {
         let snapshot_changed = window.last_snapshot.as_ref() != Some(&snapshot);
         if self.render_snapshot(window, &mut snapshot, snapshot_changed)? {
             window.last_snapshot = Some(snapshot);
-            window.snapshot_revision = self.runtime.presentation_revision();
+            window.snapshot_revision = self
+                .runtime
+                .presentation_revision_of(window.ctx)
+                .unwrap_or(window.snapshot_revision);
         }
         Ok(())
     }
@@ -2150,7 +2165,10 @@ impl Host {
         let result = self.render_snapshot(window, &mut snapshot, false);
         window.last_snapshot = Some(snapshot);
         if result? {
-            window.snapshot_revision = self.runtime.presentation_revision();
+            window.snapshot_revision = self
+                .runtime
+                .presentation_revision_of(window.ctx)
+                .unwrap_or(window.snapshot_revision);
         }
         Ok(())
     }
@@ -3252,7 +3270,10 @@ impl Host {
         // 同步供输入与后续绘制使用，避免下一次呈现把同一快照当成新快照
         // 并再次清空滚轮 residue。
         commit_scene(window, &snapshot, scene);
-        window.snapshot_revision = self.runtime.presentation_revision();
+        window.snapshot_revision = self
+            .runtime
+            .presentation_revision_of(window.ctx)
+            .unwrap_or(window.snapshot_revision);
         window.last_snapshot = Some(snapshot);
         Ok(Frame {
             width,
@@ -4561,11 +4582,14 @@ impl Host {
     /// 运行时呈现版本没有变化时复用缓存快照：滚动、hover、pressed 与 caret
     /// 闪烁都是宿主瞬态，不重建运行时快照，也不复制它。
     fn repaint_changed_windows(&mut self) -> Result<(), HostError> {
-        let revision = self.runtime.presentation_revision();
         for key in self.windows.keys().copied().collect::<Vec<_>>() {
             let Some(window) = self.windows.get(&key) else {
                 continue;
             };
+            let revision = self
+                .runtime
+                .presentation_revision_of(window.ctx)
+                .unwrap_or(window.snapshot_revision);
             if window.last_snapshot.is_some() && window.snapshot_revision == revision {
                 if window.paint_requested {
                     self.with_window(key, |host, window| host.render_cached(window))?;

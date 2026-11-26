@@ -783,7 +783,7 @@ impl Runtime {
                         report.delivered += 1;
 
                         let refresh_error = with_state(State::has_tree)
-                            .then(|| self.refresh().err())
+                            .then(|| self.refresh_internal().err())
                             .flatten();
                         if let Some(error) = outcome
                             .err()
