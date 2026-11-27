@@ -4,7 +4,7 @@ Windows accessibility support grew across several slices: a read-only tree, Invo
 
 ## Decision
 
-Each published window answers `WM_GETOBJECT` with its own UIA fragment root. The root and every element provider resolve the window's **current** published tree; they never keep a copy of interface state or mutate the runtime. Reading is served from immutable publications, and every write becomes an action on a per-window queue drained by the UI thread.
+Each published window answers `WM_GETOBJECT` with its own UIA fragment root. The root and every element provider resolve the window's **current** published tree; they never keep a copy of interface state or mutate the runtime. Reading is served from immutable publications, and every write becomes a provider action on the window's single typed-command queue, stamped with the window's runtime-global `ActivationId` and drained by the UI thread.
 
 ## Per-HWND fragment roots
 
@@ -41,11 +41,12 @@ Each published window answers `WM_GETOBJECT` with its own UIA fragment root. The
 
 ## Action queue
 
-- Writes never run on the provider thread. `Invoke`, `Toggle`, `SetValue`, `SetSelection`, `SetFocus` and `Scroll` push an `AccessibilityAction` onto that window's FIFO queue and post `WM_APP + 3` (`UIA_ACTION`). The post only wakes the UI thread; the order is the queue order.
-- The queue holds at most 1024 pending actions. A full queue or a failed post rejects the action and reports `UIA_E_ELEMENTNOTAVAILABLE`; no partial entry remains.
-- The UI thread drains the queue inside its normal message turn. Each action is revalidated against the latest presentation snapshot or scene: the NodeId must still exist, the element must remain enabled and (for text edits) not composing; SetFocus requires the window to be foreground; Scroll requires the window to accept input and a positive maximum offset. A rejected action is a normal race and is dropped without a host error and without a retry.
-- Node actions call the same runtime commands as pointer and keyboard input: `click_node`, `change_node`, `replace_text_node` (one `on:input`, caret at the end, one undo entry, silent when unchanged), `set_selection_node` (no `on:input`) and `focus_node`. Scroll calls the host's explicit scroll path and changes only the presentation offset; it never reads a runtime snapshot.
-- Clearing a publication (hide, close, zero client area) also clears pending actions. An action that was queued before the clear never runs after the window becomes hidden.
+- Every activation carries a runtime-global `ActivationId { slot, generation }`. Slots are allocated monotonically by the runtime and never reused; the generation is the catalog key's open count. `WindowCtx::runtime_id()`, `WindowCtx::activation_id()` and `NodeId::runtime_id()` expose the runtime identity to the host and to providers; `WindowCtx` itself never enters a cross-thread queue.
+- Writes never run on the provider thread. `Invoke`, `Toggle`, `ReplaceValue`, `SetSelection`, `SetFocus` and `Scroll` push a `ProviderAction` onto that window's FIFO queue and post `WM_APP + 3` (`UIA_ACTION`). The post only wakes the UI thread; the order is the queue order. The queue is created with the window and stores the injected `runtime` and `ActivationId` on every request as `UiActionRequest` (Node) or `ScrollRequest` (Scroll, which carries no NodeId).
+- Node and Scroll requests share one FIFO, the 1024-entry limit, the order and the clearing rules; Scroll is not a second queue. A full queue or a failed post rejects the action and reports `UIA_E_ELEMENTNOTAVAILABLE`; no partial entry remains.
+- The UI thread drains the queue inside its normal message turn. Each action first matches the window's injected identity; a foreign runtime or an old activation is a race and is dropped. Node actions then revalidate against the latest presentation snapshot: the NodeId must belong to this runtime and still exist, the element must remain enabled, and the window must be visible, not close-suspended and not natively disabled. `ReplaceValue` and `SetSelection` additionally reject while the input is composing; SetFocus requires the node to be focusable and the window to be foreground; Scroll requires the window to accept input and a positive maximum offset. A rejected action is a normal race and is dropped without a host error and without a retry.
+- Node actions are typed commands, not routed intents: `Invoke` → `click_node`, `Toggle` → `change_node`, `ReplaceValue` → `replace_text_node` (one `on:input`, caret at the end, one undo entry, silent when unchanged), `SetSelection` → `set_selection_node` (no `on:input`) and `SetFocus` → `focus_node`. They do not run ancestor handlers, submit defaults, menu commands or capture/bubble phases. Scroll calls the host's explicit scroll path and changes only the presentation offset; it never reads a runtime snapshot.
+- Clearing a publication (hide, close, zero client area) also clears pending actions, including unexecuted Scroll requests. Hiding and closing clear the queue by value, so a provider that still holds the publication unit cannot run an action queued before the clear.
 
 ## Patterns
 

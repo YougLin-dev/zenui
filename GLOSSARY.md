@@ -5,8 +5,12 @@ ZenUI 是一个 Rust 原生桌面界面框架；这个上下文覆盖 target SDK
 ## Language
 
 **Activation**:
-一个窗口实例的身份；关闭后旧 activation 的交付被丢弃，重开产生新 activation。
+一个窗口实例的身份；关闭后旧 activation 的交付被丢弃，重开产生新 activation。目录键上的打开代际由 `ActivationId` 的 runtime 全局令牌承载。
 _Avoid_: window instance, window generation
+
+**ActivationId**:
+runtime 全局唯一的窗口激活令牌 `{ slot, generation }`；slot 单调分配、不复用，generation 是目录键上的打开代际。provider 把 `(runtime, ActivationId)` 注入动作请求，UI 线程据此丢弃旧 activation 或其它 runtime 的竞态动作；`WindowCtx::activation_id()` 与 `NodeId::runtime_id()` 暴露同一身份。
+_Avoid_: window handle, catalog key
 
 **Application owner**:
 归属应用而不是某个窗口的 owner 0；`Runtime::setup` 创建的 Signal、Memo 与 Store 在窗口关闭后仍保留。
@@ -168,20 +172,24 @@ _Avoid_: a11y DOM, accessibility model (when meaning a separate retained tree)
 每个已发布窗口的 UIA fragment root 与元素 provider；持有窗口发布单元的弱引用，按调用线程解析当前不可变树，不保存第二份界面，也不在 provider 线程修改 Runtime。写操作经每窗口动作队列交给 UI 线程重验；隐藏、过期或清除发布的查询返回 `UIA_E_ELEMENTNOTAVAILABLE`。
 _Avoid_: a11y proxy, retained UIA model
 
-**Accessibility action**:
-provider 从当前 UIA 树派生、经窗口队列交给 UI 线程重验后执行的写操作（Invoke、Toggle、SetValue、SetSelection、SetFocus、Scroll）；节点动作最终调用 Runtime 的按 Node ID 命令，Scroll 只改宿主的 applied scroll offset，两者都不保留第二份界面状态。
-_Avoid_: UIA command, native click
+**Provider action**:
+provider 线程排入、UI 线程按 FIFO 取出并重验的一条写请求：`Node(UiActionRequest)` 或 `Scroll(ScrollRequest)`，两者共享每窗口 1024 上限、顺序与隐藏/关闭/零客户区清空。请求只含 POD 身份与载荷，不含 `WindowCtx`；Scroll 请求不携带 NodeId。
+_Avoid_: UIA queue item, host action
+
+**UIA action**:
+Provider action 的 Node 载荷：Invoke、Toggle、ReplaceValue、SetSelection、SetFocus。UI 线程按最新快照重验 NodeId、窗口身份、启用、可见、挂起与组合状态后调用对应的 Runtime 命令；SetFocus 额外要求前台，ReplaceValue 与 SetSelection 在组合中拒绝。Scroll 不是 UIA action，由宿主在显式滚动路径执行。
+_Avoid_: UIA command (when meaning the Node payload), native click
 
 **Accessibility event**:
 相邻两次已发布 UIA 树按 runtime ID 比较后产生、在发布线程投递的一次通知；顺序为结构、属性、焦点。只有前台窗口投递焦点事件，后台焦点变化不在激活时补发；焦点清空以 `GetFocus` 为空表达，没有单独事件。hover/press 与滚动几何不进入树，因此不产生事件。
 _Avoid_: accessibility notification (when meaning transient UI changes), screen reader message
 
 **ScrollPattern**:
-窗口根上的最小 UIA `IScrollProvider`：只报告垂直可滚动状态、垂直 view size（viewport 与 content 的百分比）和由 applied scroll offset 算出的垂直百分比，水平接口固定为 `NoScroll`。`Scroll` 与 `SetScrollPercent` 派生 ScrollCommand 进入 accessibility action 队列，UI 线程按当前场景夹取后走宿主显式滚动路径；百分比按最近整数逻辑像素映射到 `[0, max]`。
+窗口根上的最小 UIA `IScrollProvider`：只报告垂直可滚动状态、垂直 view size（viewport 与 content 的百分比）和由 applied scroll offset 算出的垂直百分比，水平接口固定为 `NoScroll`。`Scroll` 与 `SetScrollPercent` 派生 ScrollCommand 进入 provider action 队列，UI 线程按当前场景夹取后走宿主显式滚动路径；百分比按最近整数逻辑像素映射到 `[0, max]`。
 _Avoid_: scrollbar provider, scroll model (when meaning a second offset)
 
 **TextPattern**:
-文本输入 Edit 节点上的最小 UIA 文本接口：已提交文档（不含 preedit）、当前 selection、文本、场景矩形与 Select。对外偏移是 UTF-16 code unit，运行时仍是字符偏移；Select 经 accessibility action 调用 `set_selection_node`，不派发 `on:input`。查找、移动、扩展、比较、多选与滚动等 range 方法不属于本切片，显式返回 `UIA_E_NOTSUPPORTED`。
+文本输入 Edit 节点上的最小 UIA 文本接口：已提交文档（不含 preedit）、当前 selection、文本、场景矩形与 Select。对外偏移是 UTF-16 code unit，运行时仍是字符偏移；Select 经 provider action 的 `SetSelection` 调用 `set_selection_node`，不派发 `on:input`。查找、移动、扩展、比较、多选与滚动等 range 方法不属于本切片，显式返回 `UIA_E_NOTSUPPORTED`。
 _Avoid_: rich text provider, text model (when meaning the committed value)
 
 **Text edit**:

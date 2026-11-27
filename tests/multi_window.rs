@@ -149,6 +149,68 @@ fn show_rejects_a_mounted_headless_root() {
 }
 
 #[test]
+fn catalog_windows_get_runtime_global_activation_ids() {
+    let mut app = Runtime::new();
+    app.declare_windows(|catalog| {
+        catalog.window(WindowSpec::new("main").primary(), |_| {
+            view! {
+                <view>
+                    <button aria:label="mine">"Mine"</button>
+                </view>
+            }
+        })?;
+        catalog.window(WindowSpec::new("details"), |_| view! { <view /> })?;
+        Ok(())
+    })
+    .expect("catalog");
+
+    let main = app.show("main").expect("show main");
+    let details = app.show("details").expect("show details");
+    assert_eq!(main.activation(), 1);
+    assert_eq!(
+        details.activation(),
+        1,
+        "both windows are the first open of their catalog key"
+    );
+    assert_ne!(
+        main.activation_id(),
+        details.activation_id(),
+        "activation ids are runtime-global, not catalog-local"
+    );
+    assert_eq!(main.runtime_id(), details.runtime_id());
+    assert_eq!(
+        ActivationId::from_bits(main.activation_id().to_bits()),
+        main.activation_id(),
+        "the provider can round-trip the packed identity"
+    );
+    assert_eq!(main.activation_id().generation(), 1);
+    let node = app
+        .presentation_of(main)
+        .expect("snapshot")
+        .find_label("mine")
+        .expect("the button")
+        .id();
+    assert_eq!(
+        node.runtime_id(),
+        main.runtime_id(),
+        "a NodeId exposes the runtime that minted it"
+    );
+
+    app.close_window(main).expect("close main");
+    let reopened = app.show("main").expect("reopen main");
+    assert_eq!(
+        reopened.activation(),
+        2,
+        "the key's open generation advances"
+    );
+    assert_ne!(
+        reopened.activation_id().slot(),
+        main.activation_id().slot(),
+        "a reopened window gets a fresh runtime slot"
+    );
+}
+
+#[test]
 fn presentation_of_rejects_a_window_from_another_runtime() {
     fn shown() -> (Runtime, WindowCtx) {
         let mut app = Runtime::new();

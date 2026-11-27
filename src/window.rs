@@ -13,6 +13,46 @@ use crate::presentation::Appearance;
 use crate::task::TaskScope;
 use crate::view::{HandlerOutcome, KeyEvent, MountError, MountPlan, MountResult};
 
+/// runtime 全局唯一的窗口激活令牌；可跨线程传递。
+///
+/// `slot` 由 runtime 单调分配且不复用，`generation` 是目录键上的打开代际。
+/// provider 把 `(runtime, activation)` 注入动作请求，UI 线程据此拒绝旧
+/// activation 或其它窗口的竞态动作。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ActivationId {
+    slot: u32,
+    generation: u32,
+}
+
+impl ActivationId {
+    pub(crate) const fn new(slot: u32, generation: u32) -> Self {
+        Self { slot, generation }
+    }
+
+    /// 打包为 provider 可保存的普通整数。
+    pub const fn to_bits(self) -> u64 {
+        ((self.slot as u64) << 32) | self.generation as u64
+    }
+
+    /// 从 [`ActivationId::to_bits`] 的打包值恢复。
+    pub const fn from_bits(bits: u64) -> Self {
+        Self {
+            slot: (bits >> 32) as u32,
+            generation: bits as u32,
+        }
+    }
+
+    /// runtime 内全局唯一的窗口槽；关闭后永不复用。
+    pub const fn slot(self) -> u32 {
+        self.slot
+    }
+
+    /// 目录键上的打开代际；重新打开递增。
+    pub const fn generation(self) -> u32 {
+        self.generation
+    }
+}
+
 /// 一次窗口打开的 identity；它不等于目录键，也不保证窗口仍然存活。
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct WindowCtx {
@@ -20,16 +60,24 @@ pub struct WindowCtx {
     pub(crate) key: &'static str,
     pub(crate) activation: u32,
     pub(crate) owner: u32,
+    id: ActivationId,
     _not_send: PhantomData<*const ()>,
 }
 
 impl WindowCtx {
-    pub(crate) const fn new(runtime: u32, key: &'static str, activation: u32, owner: u32) -> Self {
+    pub(crate) const fn new(
+        runtime: u32,
+        key: &'static str,
+        activation: u32,
+        owner: u32,
+        id: ActivationId,
+    ) -> Self {
         Self {
             runtime,
             key,
             activation,
             owner,
+            id,
             _not_send: PhantomData,
         }
     }
@@ -41,6 +89,16 @@ impl WindowCtx {
     /// 目录键之外的打开代际；旧 activation 的结果不得命中重新打开的窗口。
     pub const fn activation(self) -> u32 {
         self.activation
+    }
+
+    /// 创建这个窗口的 runtime 身份；NodeId 携带同一个值。
+    pub const fn runtime_id(self) -> u32 {
+        self.runtime
+    }
+
+    /// runtime 全局唯一的窗口令牌；`activation()` 是它的打开代际。
+    pub const fn activation_id(self) -> ActivationId {
+        self.id
     }
 
     /// 窗口 activation 拥有的工作：关闭后交付被取消。
@@ -930,6 +988,7 @@ impl From<CatalogError> for WindowError {
 /// 目录键的稳定记录；activation 只随真正打开递增。
 pub(crate) struct WindowRecord {
     pub(crate) activation: u32,
+    pub(crate) id: ActivationId,
     pub(crate) owner: u32,
     pub(crate) open: bool,
     /// `visible` 只在 `open` 时有效；关闭同时清掉两者。

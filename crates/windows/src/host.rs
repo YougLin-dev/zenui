@@ -62,8 +62,8 @@ use windows::core::{HSTRING, w};
 use zenui::prelude::*;
 
 use crate::accessibility::{
-    self, AccessibilityAction, AccessibilityIds, AccessibilityTree, ScrollCommand,
-    WindowAccessibility,
+    self, AccessibilityIds, AccessibilityTree, ProviderAction, ScrollCommand, UiAction,
+    UiActionRequest, WindowAccessibility,
 };
 use crate::clipboard::{ClipboardProvider, NativeClipboard, single_line_text};
 use crate::context_menu::{ContextMenuPresenter, ContextMenuRequest, NativeContextMenuPresenter};
@@ -3262,85 +3262,106 @@ impl Host {
     fn run_accessibility_actions(&mut self, window: &mut WindowHost) -> Result<(), HostError> {
         let mut failure = None;
         for action in window.accessibility.take_actions() {
-            let action = match action {
-                AccessibilityAction::Scroll(command) => {
-                    self.apply_accessibility_scroll(window, command);
-                    continue;
-                }
-                action => action,
-            };
-            let Some(node) = action.node() else {
-                continue;
-            };
-            let Ok(snapshot) = self.runtime.presentation_of(window.ctx) else {
-                continue;
-            };
-            let Some(element) = snapshot.node(node) else {
-                continue;
-            };
-            if element.disabled() {
-                continue;
-            }
-            let dispatched = match action {
-                AccessibilityAction::Invoke(_) => {
-                    if !element.semantics().has_action(SnapshotAction::Click) {
-                        continue;
-                    }
-                    self.runtime.click_node(node)
-                }
-                AccessibilityAction::Toggle(_) => {
-                    let Some(checked) = element.toggle_state() else {
-                        continue;
-                    };
-                    if !element.semantics().has_action(SnapshotAction::Change) {
-                        continue;
-                    }
-                    self.runtime.change_node(node, !checked)
-                }
-                AccessibilityAction::SetValue(_, value) => {
-                    let editable = element.semantics().has_action(SnapshotAction::Input)
-                        && element
-                            .edit()
-                            .is_some_and(|edit| edit.composition().is_none());
-                    if !editable {
-                        continue;
-                    }
-                    self.runtime.replace_text_node(node, &value)
-                }
-                AccessibilityAction::SetSelection(_, start, end) => {
-                    let editable = element.semantics().has_action(SnapshotAction::Input)
-                        && element
-                            .edit()
-                            .is_some_and(|edit| edit.composition().is_none());
-                    if !editable {
-                        continue;
-                    }
-                    self.runtime.set_selection_node(node, start, end)
-                }
-                AccessibilityAction::SetFocus(_) => {
-                    if !element.semantics().focusable()
-                        || !accessibility::window_is_foreground(window.hwnd())
+            match action {
+                ProviderAction::Scroll(request) => {
+                    if request.runtime != window.ctx.runtime_id()
+                        || request.activation != window.ctx.activation_id()
                     {
                         continue;
                     }
-                    self.runtime.focus_node(node)
+                    self.apply_accessibility_scroll(window, request.command);
+                    continue;
                 }
-                AccessibilityAction::Scroll(_) => continue,
-            };
-            // 无障碍动作也是用户输入：处理器结算的焦点或 caret 与服务端点击
-            // 同样需要显露。
-            window.reveal_requested |= dispatched
-                .as_ref()
-                .is_ok_and(|report| report.reveal().needs_reveal());
-            // 继续执行剩余动作；真正失败仍报告给宿主，但不丢弃已经应答的动作。
-            if let Err(error) = ignore_expected_dispatch(dispatched) {
-                failure.get_or_insert(error);
+                ProviderAction::Node(request) => {
+                    if !Self::action_is_current(window, &request) {
+                        continue;
+                    }
+                    // 隐藏、等待关闭确认或原生禁用的窗口拒绝所有写动作。
+                    if !self.window_accepts_host_input(window) {
+                        continue;
+                    }
+                    let node = request.action.node();
+                    // NodeId 必须来自本 runtime；旧窗口或其它 runtime 的目标按竞态丢弃。
+                    if node.runtime_id() != window.ctx.runtime_id() {
+                        continue;
+                    }
+                    let Ok(snapshot) = self.runtime.presentation_of(window.ctx) else {
+                        continue;
+                    };
+                    let Some(element) = snapshot.node(node) else {
+                        continue;
+                    };
+                    if element.disabled() {
+                        continue;
+                    }
+                    let dispatched = match request.action {
+                        UiAction::Invoke { .. } => {
+                            if !element.semantics().has_action(SnapshotAction::Click) {
+                                continue;
+                            }
+                            self.runtime.click_node(node)
+                        }
+                        UiAction::Toggle { .. } => {
+                            let Some(checked) = element.toggle_state() else {
+                                continue;
+                            };
+                            if !element.semantics().has_action(SnapshotAction::Change) {
+                                continue;
+                            }
+                            self.runtime.change_node(node, !checked)
+                        }
+                        UiAction::ReplaceValue { text, .. } => {
+                            // 组合中的输入可读但拒绝整体替换，也不取消组合。
+                            let editable = element.semantics().has_action(SnapshotAction::Input)
+                                && element
+                                    .edit()
+                                    .is_some_and(|edit| edit.composition().is_none());
+                            if !editable {
+                                continue;
+                            }
+                            self.runtime.replace_text_node(node, &text)
+                        }
+                        UiAction::SetSelection { anchor, focus, .. } => {
+                            let editable = element.semantics().has_action(SnapshotAction::Input)
+                                && element
+                                    .edit()
+                                    .is_some_and(|edit| edit.composition().is_none());
+                            if !editable {
+                                continue;
+                            }
+                            self.runtime.set_selection_node(node, anchor, focus)
+                        }
+                        UiAction::SetFocus { .. } => {
+                            if !element.semantics().focusable()
+                                || !accessibility::window_is_foreground(window.hwnd())
+                            {
+                                continue;
+                            }
+                            self.runtime.focus_node(node)
+                        }
+                    };
+                    // 无障碍动作也是用户输入：处理器结算的焦点或 caret 与服务端点击
+                    // 同样需要显露。
+                    window.reveal_requested |= dispatched
+                        .as_ref()
+                        .is_ok_and(|report| report.reveal().needs_reveal());
+                    // 继续执行剩余动作；真正失败仍报告给宿主，但不丢弃已经应答的动作。
+                    if let Err(error) = ignore_expected_dispatch(dispatched) {
+                        failure.get_or_insert(error);
+                    }
+                }
             }
         }
         match failure {
             Some(error) => Err(error),
             None => Ok(()),
         }
+    }
+
+    /// 队列动作必须属于当前窗口 activation；旧窗口遗留的请求直接丢弃。
+    fn action_is_current(window: &WindowHost, request: &UiActionRequest) -> bool {
+        let (runtime, activation) = window.accessibility.identity();
+        request.runtime == runtime && request.activation == activation
     }
 
     /// UIA 滚动动作的 UI 线程落点：只改宿主呈现偏移，不刷新 runtime。
@@ -4580,6 +4601,9 @@ impl Host {
                 }
             }
         }
+        // 关闭窗口即清空它的 action 队列；已经克隆发布单元的 provider 也
+        // 不能看到关闭前排队、关闭后执行的动作。
+        window.accessibility.clear();
         window.kill_timer();
         self.update_wake_target();
         drop(window);
@@ -4941,7 +4965,11 @@ impl WindowHost {
         surface_config: wgpu::SurfaceConfiguration,
         blink_timer: Option<usize>,
     ) -> Self {
-        let accessibility = Arc::new(WindowAccessibility::new(native.hwnd));
+        let accessibility = Arc::new(WindowAccessibility::new(
+            native.hwnd,
+            ctx.runtime_id(),
+            ctx.activation_id(),
+        ));
         Self {
             surface: Some(surface),
             surface_config,
@@ -6558,6 +6586,7 @@ mod tests {
 
     use super::*;
     use crate::accessibility::ControlType;
+    use crate::accessibility::ScrollRequest;
     use crate::clipboard::ClipboardError;
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
@@ -9020,7 +9049,7 @@ mod tests {
             .expect("the action node");
         let accessibility = Arc::clone(&host.windows[MAIN].accessibility);
         std::thread::spawn(move || {
-            assert!(accessibility.enqueue(AccessibilityAction::Invoke(node)));
+            assert!(accessibility.enqueue_node(UiAction::Invoke { node }));
         })
         .join()
         .expect("the provider thread enqueues");
@@ -9054,7 +9083,7 @@ mod tests {
         assert!(
             host.windows[MAIN]
                 .accessibility
-                .enqueue(AccessibilityAction::Invoke(node))
+                .enqueue_node(UiAction::Invoke { node })
         );
         with_main(&mut host, |host, window| {
             host.run_accessibility_actions(window)
@@ -9074,6 +9103,197 @@ mod tests {
     }
 
     #[test]
+    fn provider_actions_carry_the_injected_window_identity() {
+        let mut host = open_host();
+        host.resize(MAIN, 320, 100).expect("shrink the window");
+        host.render().expect("render the small window");
+        let (runtime, activation) = host.windows[MAIN].accessibility.identity();
+        assert_eq!(runtime, host.windows[MAIN].ctx.runtime_id());
+        assert_eq!(activation, host.windows[MAIN].ctx.activation_id());
+
+        let root = root_fragment(&mut host);
+        let checkbox = provider_named(&root, "Complete Write tests");
+        let toggle: IToggleProvider = pattern(&checkbox, UIA_TogglePatternId);
+        unsafe { toggle.Toggle() }.expect("queue the toggle");
+        let scroll = scroll_pattern(&mut host);
+        unsafe { scroll.Scroll(ScrollAmount_NoAmount, ScrollAmount_SmallIncrement) }
+            .expect("queue the line scroll");
+
+        let mut actions = host.windows[MAIN].accessibility.take_actions();
+        assert_eq!(actions.len(), 2, "node and scroll share one FIFO");
+        match actions.remove(0) {
+            ProviderAction::Node(request) => {
+                assert_eq!(request.runtime, runtime);
+                assert_eq!(request.activation, activation);
+                assert!(matches!(request.action, UiAction::Toggle { .. }));
+            }
+            ProviderAction::Scroll(_) => panic!("the toggle is queued first"),
+        }
+        match actions.remove(0) {
+            ProviderAction::Scroll(request) => {
+                assert_eq!(request.runtime, runtime);
+                assert_eq!(request.activation, activation);
+                assert_eq!(request.command, ScrollCommand::LineDown);
+            }
+            ProviderAction::Node(_) => panic!("the scroll is queued second"),
+        }
+    }
+
+    #[test]
+    fn foreign_or_stale_action_identity_is_dropped() {
+        let (mut host, probe) = open_uia_probe();
+        // 让窗口真的可滚动；否则 Scroll 会被 max == 0 提前拒绝，identity 检查
+        // 就没有被测试到。
+        host.resize(MAIN, 320, 100).expect("shrink the window");
+        host.render().expect("render the scrollable window");
+        assert!(
+            host.scene(MAIN).expect("scene").max_scroll_offset() > 0,
+            "the probe must be scrollable for this test to discriminate"
+        );
+        let node = host
+            .accessibility_tree(MAIN)
+            .expect("published tree")
+            .find_name("Act")
+            .and_then(|node| node.node_id())
+            .expect("the action node");
+        let (runtime, activation) = host.windows[MAIN].accessibility.identity();
+        let stale = ActivationId::from_bits(activation.to_bits().wrapping_add(1));
+        let accessibility = Arc::clone(&host.windows[MAIN].accessibility);
+        assert!(accessibility.enqueue(ProviderAction::Node(UiActionRequest {
+            runtime: runtime + 1,
+            activation,
+            action: UiAction::Invoke { node },
+        })));
+        assert!(accessibility.enqueue(ProviderAction::Node(UiActionRequest {
+            runtime,
+            activation: stale,
+            action: UiAction::Invoke { node },
+        })));
+        assert!(accessibility.enqueue(ProviderAction::Scroll(ScrollRequest {
+            runtime: runtime + 1,
+            activation,
+            command: ScrollCommand::LineDown,
+        })));
+        assert!(accessibility.enqueue(ProviderAction::Scroll(ScrollRequest {
+            runtime,
+            activation: stale,
+            command: ScrollCommand::LineDown,
+        })));
+        with_main(&mut host, |host, window| {
+            host.run_accessibility_actions(window)
+        });
+        assert_eq!(
+            probe.clicks.load(Ordering::SeqCst),
+            0,
+            "a foreign runtime or stale activation never runs a node action"
+        );
+        assert_eq!(
+            host.windows[MAIN].scroll_offset, 0,
+            "a foreign runtime or stale activation never moves the scroll offset"
+        );
+
+        // 同一份场景上，身份正确的同类请求必须生效：证明上一条断言不是因为
+        // 窗口不可滚动或队列失效而恒真。
+        assert!(accessibility.enqueue_scroll(ScrollCommand::LineDown));
+        with_main(&mut host, |host, window| {
+            host.run_accessibility_actions(window)
+        });
+        assert!(
+            host.windows[MAIN].scroll_offset > 0,
+            "a request with the injected identity moves the offset"
+        );
+    }
+
+    #[test]
+    fn hiding_closing_and_zero_area_clear_the_shared_queue() {
+        let (mut host, _probe) = open_uia_probe();
+        let node = host
+            .accessibility_tree(MAIN)
+            .expect("published tree")
+            .find_name("Act")
+            .and_then(|node| node.node_id())
+            .expect("the action node");
+        let accessibility = Arc::clone(&host.windows[MAIN].accessibility);
+        assert!(accessibility.enqueue_node(UiAction::Invoke { node }));
+        assert!(accessibility.enqueue_scroll(ScrollCommand::LineDown));
+        host.hide(MAIN).expect("hide the window");
+        assert!(
+            accessibility.take_actions().is_empty(),
+            "hiding clears node and scroll actions"
+        );
+
+        let (mut host, _probe) = open_uia_probe();
+        let node = host
+            .accessibility_tree(MAIN)
+            .expect("published tree")
+            .find_name("Act")
+            .and_then(|node| node.node_id())
+            .expect("the action node");
+        let accessibility = Arc::clone(&host.windows[MAIN].accessibility);
+        assert!(accessibility.enqueue_node(UiAction::Invoke { node }));
+        host.close(MAIN).expect("close the window");
+        assert!(
+            accessibility.take_actions().is_empty(),
+            "closing clears the shared queue"
+        );
+
+        let (mut host, _probe) = open_uia_probe();
+        let node = host
+            .accessibility_tree(MAIN)
+            .expect("published tree")
+            .find_name("Act")
+            .and_then(|node| node.node_id())
+            .expect("the action node");
+        let accessibility = Arc::clone(&host.windows[MAIN].accessibility);
+        assert!(accessibility.enqueue_scroll(ScrollCommand::LineDown));
+        assert!(accessibility.enqueue_node(UiAction::Invoke { node }));
+        host.resize(MAIN, 0, 0).expect("zero resize");
+        host.render().expect("zero frame");
+        assert!(
+            accessibility.take_actions().is_empty(),
+            "a zero client area clears the shared queue"
+        );
+    }
+
+    #[test]
+    fn a_stale_accessibility_target_is_dropped() {
+        let (mut host, probe) = open_uia_probe();
+        let tree = host.accessibility_tree(MAIN).expect("published tree");
+        let ephemeral = tree
+            .find_name("Ephemeral")
+            .and_then(|node| node.node_id())
+            .expect("the ephemeral button");
+        let hide = tree
+            .find_name("Hide")
+            .and_then(|node| node.node_id())
+            .expect("the hide button");
+        assert!(
+            host.windows[MAIN]
+                .accessibility
+                .enqueue_node(UiAction::Invoke { node: ephemeral })
+        );
+        host.runtime
+            .click_node(hide)
+            .expect("hide the ephemeral button");
+        assert!(
+            host.runtime
+                .presentation()
+                .expect("snapshot")
+                .find_label("Ephemeral")
+                .is_none(),
+            "the target unmounted while its action waited"
+        );
+        with_main(&mut host, |host, window| {
+            host.run_accessibility_actions(window)
+        });
+        assert_eq!(
+            probe.clicks.load(Ordering::SeqCst),
+            0,
+            "a stale NodeId is dropped during revalidation"
+        );
+    }
+
+    #[test]
     fn the_accessibility_action_queue_rejects_overflow() {
         let (host, _probe) = open_uia_probe();
         let node = host
@@ -9084,12 +9304,24 @@ mod tests {
             .expect("the action node");
         let accessibility = Arc::clone(&host.windows[MAIN].accessibility);
         let limit = crate::accessibility::MAX_PENDING_ACTIONS;
-        for _ in 0..limit {
-            assert!(accessibility.enqueue(AccessibilityAction::Invoke(node)));
+        for index in 0..limit {
+            let accepted = if index % 2 == 0 {
+                accessibility.enqueue_node(UiAction::Invoke { node })
+            } else {
+                accessibility.enqueue_scroll(ScrollCommand::LineDown)
+            };
+            assert!(
+                accepted,
+                "the shared queue accepts both kinds up to the limit"
+            );
         }
         assert!(
-            !accessibility.enqueue(AccessibilityAction::Invoke(node)),
-            "a full queue rejects the next action instead of growing"
+            !accessibility.enqueue_node(UiAction::Invoke { node }),
+            "a full queue rejects the next node action instead of growing"
+        );
+        assert!(
+            !accessibility.enqueue_scroll(ScrollCommand::LineDown),
+            "the shared limit rejects scroll actions too"
         );
         assert_eq!(accessibility.take_actions().len(), limit);
     }

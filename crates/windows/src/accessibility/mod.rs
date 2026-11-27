@@ -10,7 +10,7 @@
 //! `UIA_E_ELEMENTNOTAVAILABLE`。隐藏窗口与关闭中的窗口不发布树。
 //!
 //! 写操作只经排队通道：Invoke、Toggle、Value、SetSelection、SetFocus 与 Scroll
-//! 在 provider 线程上检查当前树与启用状态后把 [`AccessibilityAction`] 入队并
+//! 在 provider 线程上检查当前树与启用状态后把 [`ProviderAction`] 入队并
 //! 唤醒窗口；UI 线程再按最新快照或当前场景重验。前五者走 Runtime 命令路径，
 //! Scroll 只改宿主呈现偏移，不进入 Runtime。provider 线程从不直接修改 Runtime；
 //! `UIA_ACTION` 消息只负责唤醒，具体动作以队列顺序为准。
@@ -63,8 +63,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled;
 use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
 use windows::core::{BOOL, BSTR, Error, HRESULT, PCWSTR, Result as WinResult, implement};
 use zenui::{
-    NodeId, PresentationSnapshot, SnapshotAction, SnapshotActions, SnapshotAttr, SnapshotElement,
-    SnapshotNode,
+    ActivationId, NodeId, PresentationSnapshot, SnapshotAction, SnapshotActions, SnapshotAttr,
+    SnapshotElement, SnapshotNode,
 };
 use zenui_render::{DecorationKind, Rect, Scene, Viewport};
 
@@ -421,14 +421,38 @@ impl AccessibilityIds {
     }
 }
 
-/// provider 线程排入、UI 线程重验后执行的动作。
-pub(crate) enum AccessibilityAction {
-    Invoke(NodeId),
-    Toggle(NodeId),
-    SetValue(NodeId, String),
-    SetSelection(NodeId, usize, usize),
-    SetFocus(NodeId),
-    Scroll(ScrollCommand),
+/// provider 线程构造的 typed UIA 命令；目标 NodeId 携带 runtime 身份。
+pub(crate) enum UiAction {
+    Invoke {
+        node: NodeId,
+    },
+    Toggle {
+        node: NodeId,
+    },
+    ReplaceValue {
+        node: NodeId,
+        text: String,
+    },
+    SetSelection {
+        node: NodeId,
+        anchor: usize,
+        focus: usize,
+    },
+    SetFocus {
+        node: NodeId,
+    },
+}
+
+impl UiAction {
+    pub(crate) const fn node(&self) -> NodeId {
+        match self {
+            Self::Invoke { node }
+            | Self::Toggle { node }
+            | Self::ReplaceValue { node, .. }
+            | Self::SetSelection { node, .. }
+            | Self::SetFocus { node } => *node,
+        }
+    }
 }
 
 /// UIA 滚动动作；`Percent` 以 0..=100 的垂直百分比表达目标。
@@ -441,17 +465,27 @@ pub(crate) enum ScrollCommand {
     Percent(f64),
 }
 
-impl AccessibilityAction {
-    pub(crate) const fn node(&self) -> Option<NodeId> {
-        match self {
-            Self::Invoke(node)
-            | Self::Toggle(node)
-            | Self::SetValue(node, _)
-            | Self::SetSelection(node, _, _)
-            | Self::SetFocus(node) => Some(*node),
-            Self::Scroll(_) => None,
-        }
-    }
+/// provider 注入 runtime 与窗口令牌后的 Node 请求。
+///
+/// 只含 POD；队列不保存 `WindowCtx`，UI 线程按 identity 重验并解析窗口。
+pub(crate) struct UiActionRequest {
+    pub(crate) runtime: u32,
+    pub(crate) activation: ActivationId,
+    pub(crate) action: UiAction,
+}
+
+/// Scroll 请求不含 NodeId，身份只能来自 provider 创建时注入的窗口令牌。
+pub(crate) struct ScrollRequest {
+    pub(crate) runtime: u32,
+    pub(crate) activation: ActivationId,
+    pub(crate) command: ScrollCommand,
+}
+
+/// provider 线程 → UI 线程的同一个 per-window FIFO；Node 与 Scroll 共享
+/// 顺序、上限与清空规则。
+pub(crate) enum ProviderAction {
+    Node(UiActionRequest),
+    Scroll(ScrollRequest),
 }
 
 /// 单个窗口最多保留的待执行动作数。
@@ -462,21 +496,32 @@ pub(crate) const MAX_PENDING_ACTIONS: usize = 1024;
 /// 一个窗口的可访问性发布单元；provider 通过弱引用解析当前发布。
 pub(crate) struct WindowAccessibility {
     hwnd: WindowHandle,
+    /// 创建窗口时注入的 runtime 身份；provider 用它构造动作请求。
+    runtime: u32,
+    /// runtime 全局唯一的窗口令牌；旧 activation 的动作在此失配。
+    activation: ActivationId,
     published: RwLock<Option<Arc<AccessibilityTree>>>,
     /// 最后一次发布对应的快照 revision；UIA 不维护 `applied_revision`，
     /// 因为 delta 不服务无障碍树。
     last_published_revision: AtomicU64,
-    actions: Mutex<VecDeque<AccessibilityAction>>,
+    actions: Mutex<VecDeque<ProviderAction>>,
 }
 
 impl WindowAccessibility {
-    pub(crate) fn new(hwnd: HWND) -> Self {
+    pub(crate) fn new(hwnd: HWND, runtime: u32, activation: ActivationId) -> Self {
         Self {
             hwnd: WindowHandle(hwnd),
+            runtime,
+            activation,
             published: RwLock::new(None),
             last_published_revision: AtomicU64::new(0),
             actions: Mutex::new(VecDeque::new()),
         }
+    }
+
+    /// 本窗口注入的 `(runtime, activation)`；provider 与宿主的重验共用。
+    pub(crate) const fn identity(&self) -> (u32, ActivationId) {
+        (self.runtime, self.activation)
     }
 
     /// 整体替换发布树，并按与上一棵树的差异投递 UIA 事件。
@@ -535,7 +580,7 @@ impl WindowAccessibility {
     ///
     /// 队列满或投递失败时返回 false，且不留下动作；调用方据此向 UIA 报告
     /// 元素暂不可用。持锁调用 `PostMessageW` 只排队，不会回调本进程。
-    pub(crate) fn enqueue(&self, action: AccessibilityAction) -> bool {
+    pub(crate) fn enqueue(&self, action: ProviderAction) -> bool {
         let mut actions = self.actions.lock().unwrap_or_else(PoisonError::into_inner);
         if actions.len() >= MAX_PENDING_ACTIONS {
             return false;
@@ -548,8 +593,26 @@ impl WindowAccessibility {
         false
     }
 
+    /// 排入一个 Node 动作；身份取自窗口创建时的注入值。
+    pub(crate) fn enqueue_node(&self, action: UiAction) -> bool {
+        self.enqueue(ProviderAction::Node(UiActionRequest {
+            runtime: self.runtime,
+            activation: self.activation,
+            action,
+        }))
+    }
+
+    /// 排入一个 Scroll 动作；它与 Node 共用同一队列与上限。
+    pub(crate) fn enqueue_scroll(&self, command: ScrollCommand) -> bool {
+        self.enqueue(ProviderAction::Scroll(ScrollRequest {
+            runtime: self.runtime,
+            activation: self.activation,
+            command,
+        }))
+    }
+
     /// 按入队顺序取走动作；宿主在 UI 线程上调用。
-    pub(crate) fn take_actions(&self) -> Vec<AccessibilityAction> {
+    pub(crate) fn take_actions(&self) -> Vec<ProviderAction> {
         self.actions
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -634,7 +697,7 @@ impl IInvokeProvider_Impl for InvokePattern_Impl {
         if !node.has_action(SnapshotAction::Click) {
             return Err(not_supported());
         }
-        if !window.enqueue(AccessibilityAction::Invoke(self.node)) {
+        if !window.enqueue_node(UiAction::Invoke { node: self.node }) {
             return Err(element_not_available());
         }
         Ok(())
@@ -655,7 +718,7 @@ impl IToggleProvider_Impl for TogglePattern_Impl {
         if !node.has_action(SnapshotAction::Change) || node.toggle_state().is_none() {
             return Err(not_supported());
         }
-        if !window.enqueue(AccessibilityAction::Toggle(self.node)) {
+        if !window.enqueue_node(UiAction::Toggle { node: self.node }) {
             return Err(element_not_available());
         }
         Ok(())
@@ -689,7 +752,10 @@ impl IValueProvider_Impl for ValuePattern_Impl {
         let value = unsafe { val.to_string() }.map_err(|_| Error::from_hresult(E_INVALIDARG))?;
         if node.has_action(SnapshotAction::Input)
             && !node.composing
-            && window.enqueue(AccessibilityAction::SetValue(self.node, value))
+            && window.enqueue_node(UiAction::ReplaceValue {
+                node: self.node,
+                text: value,
+            })
         {
             return Ok(());
         }
@@ -1002,7 +1068,7 @@ impl IRawElementProviderFragment_Impl for ZenProvider_Impl {
         }
         let id = node.node_id().ok_or_else(element_not_available)?;
         // 前台检查留给 UI 线程：从 provider 调用到执行之间窗口可能已经切到前台。
-        if !window.enqueue(AccessibilityAction::SetFocus(id)) {
+        if !window.enqueue_node(UiAction::SetFocus { node: id }) {
             return Err(element_not_available());
         }
         Ok(())

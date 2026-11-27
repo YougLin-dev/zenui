@@ -22,9 +22,9 @@ use windows::core::{BOOL, BSTR, Error, Interface, Ref, Result as WinResult, impl
 use zenui::{NodeId, SnapshotAction};
 
 use super::{
-    AccessibilityAction, AccessibilityTree, AccessibleNode, ControlType, ProviderKey,
-    WindowAccessibility, ZenProvider, available_node, client_origin, element_not_available,
-    not_supported, physical_rect, resolve_node,
+    AccessibilityTree, AccessibleNode, ControlType, ProviderKey, UiAction, WindowAccessibility,
+    ZenProvider, available_node, client_origin, element_not_available, not_supported,
+    physical_rect, resolve_node,
 };
 
 pub(super) fn provider(window: Weak<WindowAccessibility>, node: NodeId) -> ITextProvider {
@@ -293,7 +293,11 @@ impl ITextRangeProvider_Impl for TextRangeProvider_Impl {
         let (start, end) = clamp_utf16(text, self.start, self.end);
         let start = utf16_to_char(text, start);
         let end = utf16_to_char(text, end);
-        if !window.enqueue(AccessibilityAction::SetSelection(self.node, start, end)) {
+        if !window.enqueue_node(UiAction::SetSelection {
+            node: self.node,
+            anchor: start,
+            focus: end,
+        }) {
             return Err(element_not_available());
         }
         Ok(())
