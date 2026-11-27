@@ -5,11 +5,20 @@
 //! 父子兄弟链；payload 与辅助列表由 runtime 的 `NodeArena`/`AuxArenas`
 //! 按 [`NodeSlot::payload`] 和 [`AuxHandles`] 存放。
 
+use std::any::Any;
+use std::collections::BTreeMap;
 use std::fmt;
 use std::num::NonZeroU64;
 use std::sync::Arc;
 
+use zenui_core::RowSet;
+use zenui_style::{Color, Length, Opacity, Property, StyleValue};
+
+use crate::context::FieldKind;
 use crate::presentation::SnapshotNode;
+use crate::signal::ReactiveValue;
+use crate::store::TodoId;
+use crate::view::ReadFault;
 
 /// 一棵已提交树的稳定键；单调分配、不复用。
 #[repr(transparent)]
@@ -541,7 +550,666 @@ pub(crate) struct ElementData {
 
 const _: () = assert!(std::mem::size_of::<ElementData>() <= 96);
 
-/// 绑定消费者的打包引用；绑定表与边 arena 在 #336 接入。
+/// 绑定槽的稳定 part 判别式。
+///
+/// 结构触发排在最前，保证补丁应用时结构先于值。属性名与样式属性都来自
+/// 宏的静态 token，因此可以直接作为稳定键。
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) enum BindingPart {
+    ShowWhen,
+    ForEach,
+    Text,
+    Attr(&'static str),
+    Style(Property),
+}
+
+impl BindingPart {
+    const fn rank(self) -> u8 {
+        match self {
+            Self::ShowWhen => 0,
+            Self::ForEach => 1,
+            Self::Text => 2,
+            Self::Attr(_) => 3,
+            Self::Style(_) => 4,
+        }
+    }
+}
+
+impl Ord for BindingPart {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.rank()
+            .cmp(&other.rank())
+            .then_with(|| match (self, other) {
+                (Self::Attr(left), Self::Attr(right)) => left.cmp(right),
+                (Self::Style(left), Self::Style(right)) => (*left as u8).cmp(&(*right as u8)),
+                _ => std::cmp::Ordering::Equal,
+            })
+    }
+}
+
+impl PartialOrd for BindingPart {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// `BindingPart` 在绑定列表中的 16-bit 注册值。
+#[repr(transparent)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub(crate) struct PartId(u16);
+
+impl PartId {
+    pub(crate) const fn from_raw(raw: u16) -> Self {
+        Self(raw)
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn raw(self) -> u16 {
+        self.0
+    }
+}
+
+/// 源句柄；runtime 身份 + arena 槽位。generation 由槽位自身校验。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct SourceRef {
+    pub(crate) runtime: u32,
+    pub(crate) id: u32,
+}
+
+/// 字段源；值类型由持有它的 `BindingSlot<T>` 决定。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct FieldKey {
+    pub(crate) runtime: u32,
+    pub(crate) id: TodoId,
+    pub(crate) kind: FieldKind,
+}
+
+/// once 来源的诊断 id；不携带值。
+#[repr(transparent)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct OnceOrigin(u32);
+
+impl OnceOrigin {
+    pub(crate) const fn from_raw(raw: u32) -> Self {
+        Self(raw)
+    }
+}
+
+/// 来源描述；最后已提交值只在 `BindingSlot::current`。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ReadSlot {
+    Static,
+    Once(OnceOrigin),
+    Signal(SourceRef),
+    Memo(SourceRef),
+    Field(FieldKey),
+}
+
+impl ReadSlot {
+    /// 静态/once 值在挂载时写入 current，永不重算。
+    pub(crate) const fn is_static(self) -> bool {
+        matches!(self, Self::Static | Self::Once(_))
+    }
+}
+
+/// 一个绑定槽；`current` 是最后已提交值的唯一权威。
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct BindingSlot<T> {
+    pub(crate) source: ReadSlot,
+    pub(crate) current: Option<T>,
+    /// 本次求值失败；可与 `current` 同时存在。
+    pub(crate) fault: Option<ReadFault>,
+    pub(crate) generation: u32,
+}
+
+impl<T> BindingSlot<T> {
+    fn new(
+        source: ReadSlot,
+        current: Option<T>,
+        fault: Option<ReadFault>,
+        generation: u32,
+    ) -> Self {
+        Self {
+            source,
+            current,
+            fault,
+            generation,
+        }
+    }
+}
+
+/// 8 B 打包引用：table u8 + slot u24 + generation u32。
+#[repr(transparent)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub(crate) struct BindingRef(u64);
+
+impl BindingRef {
+    const SLOT_BITS: u32 = 24;
+    const SLOT_MASK: u64 = (1 << Self::SLOT_BITS) - 1;
+
+    pub(crate) fn new(table: u8, slot: u32, generation: u32) -> Option<Self> {
+        if generation == 0 || u64::from(slot) > Self::SLOT_MASK {
+            return None;
+        }
+        Some(Self(
+            (u64::from(table) << 56) | (u64::from(slot) << 32) | u64::from(generation),
+        ))
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn raw(self) -> u64 {
+        self.0
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn from_raw(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    pub(crate) const fn table(self) -> u8 {
+        (self.0 >> 56) as u8
+    }
+
+    pub(crate) const fn slot(self) -> u32 {
+        ((self.0 >> 32) & Self::SLOT_MASK) as u32
+    }
+
+    pub(crate) const fn generation(self) -> u32 {
+        self.0 as u32
+    }
+}
+
+const _: () = assert!(std::mem::size_of::<BindingRef>() == 8);
+const _: () = assert!(std::mem::size_of::<(PartId, BindingRef)>() == 16);
+
+const TEXT_TABLE: u8 = 0;
+const BOOL_TABLE: u8 = 1;
+const COLOR_TABLE: u8 = 2;
+const LENGTH_TABLE: u8 = 3;
+const OPACITY_TABLE: u8 = 4;
+const ROW_SET_TABLE: u8 = 5;
+
+enum BindingCell<T> {
+    Live(BindingSlot<T>),
+    Vacant { generation: u32 },
+}
+
+/// 单一值类型的绑定槽表；释放推进 generation，旧 `BindingRef` 失效。
+pub(crate) struct BindingArena<T> {
+    cells: Vec<BindingCell<T>>,
+    free: Vec<u32>,
+    live: usize,
+}
+
+impl<T> BindingArena<T> {
+    const fn new() -> Self {
+        Self {
+            cells: Vec::new(),
+            free: Vec::new(),
+            live: 0,
+        }
+    }
+
+    fn insert(
+        &mut self,
+        table: u8,
+        source: ReadSlot,
+        current: Option<T>,
+        fault: Option<ReadFault>,
+    ) -> BindingRef {
+        match self.free.pop() {
+            Some(slot) => {
+                let generation = match &self.cells[slot as usize] {
+                    BindingCell::Vacant { generation } => *generation,
+                    BindingCell::Live(_) => unreachable!("a free binding slot is vacant"),
+                };
+                let reference = BindingRef::new(table, slot, generation)
+                    .expect("a reusable binding slot is encodable");
+                self.cells[slot as usize] =
+                    BindingCell::Live(BindingSlot::new(source, current, fault, generation));
+                self.live += 1;
+                reference
+            }
+            None => {
+                let slot = u32::try_from(self.cells.len()).expect("binding arena exhausted");
+                let reference =
+                    BindingRef::new(table, slot, 1).expect("the binding arena fits 24-bit slots");
+                self.cells.push(BindingCell::Live(BindingSlot::new(
+                    source, current, fault, 1,
+                )));
+                self.live += 1;
+                reference
+            }
+        }
+    }
+
+    fn get(&self, reference: BindingRef) -> Option<&BindingSlot<T>> {
+        match self.cells.get(reference.slot() as usize)? {
+            BindingCell::Live(slot) if slot.generation == reference.generation() => Some(slot),
+            _ => None,
+        }
+    }
+
+    fn get_mut(&mut self, reference: BindingRef) -> Option<&mut BindingSlot<T>> {
+        match self.cells.get_mut(reference.slot() as usize)? {
+            BindingCell::Live(slot) if slot.generation == reference.generation() => Some(slot),
+            _ => None,
+        }
+    }
+
+    fn release(&mut self, reference: BindingRef) -> Option<BindingSlot<T>> {
+        let cell = self.cells.get_mut(reference.slot() as usize)?;
+        let BindingCell::Live(slot) = cell else {
+            return None;
+        };
+        if slot.generation != reference.generation() {
+            return None;
+        }
+        let generation = slot.generation;
+        let BindingCell::Live(value) = std::mem::replace(
+            cell,
+            BindingCell::Vacant {
+                generation: generation.wrapping_add(1),
+            },
+        ) else {
+            unreachable!("the cell was just observed live");
+        };
+        self.live -= 1;
+        if generation != u32::MAX {
+            self.free.push(reference.slot());
+        }
+        Some(value)
+    }
+
+    pub(crate) const fn live(&self) -> usize {
+        self.live
+    }
+}
+
+/// 让 `BindingTable` 按值类型分表；`PartId` 决定类型，`BindingRef.table` 必须匹配。
+///
+/// `ReactiveValue` 是超 trait：绑定源与 memo 使用同一套值语义相等。
+pub(crate) trait BindingValue: ReactiveValue + PartialEq + 'static {
+    const TABLE: u8;
+
+    fn arena(table: &BindingTable) -> &BindingArena<Self>;
+    fn arena_mut(table: &mut BindingTable) -> &mut BindingArena<Self>;
+}
+
+macro_rules! binding_value {
+    ($type:ty, $table:expr, $field:ident) => {
+        impl BindingValue for $type {
+            const TABLE: u8 = $table;
+
+            fn arena(table: &BindingTable) -> &BindingArena<Self> {
+                &table.$field
+            }
+
+            fn arena_mut(table: &mut BindingTable) -> &mut BindingArena<Self> {
+                &mut table.$field
+            }
+        }
+    };
+}
+
+binding_value!(String, TEXT_TABLE, text);
+binding_value!(bool, BOOL_TABLE, bools);
+binding_value!(Color, COLOR_TABLE, colors);
+binding_value!(Length, LENGTH_TABLE, lengths);
+binding_value!(Opacity, OPACITY_TABLE, opacities);
+binding_value!(RowSet, ROW_SET_TABLE, row_sets);
+
+/// 绑定槽的值类型；由 `BindingRef.table` 决定，读取方据此还原 typed 槽。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum BindingType {
+    Text,
+    Bool,
+    Color,
+    Length,
+    Opacity,
+    RowSet,
+}
+
+/// 每棵树一份的绑定表；元素只存 `BindingListId`，Show/For 存直接 ref。
+pub(crate) struct BindingTable {
+    text: BindingArena<String>,
+    bools: BindingArena<bool>,
+    colors: BindingArena<Color>,
+    lengths: BindingArena<Length>,
+    opacities: BindingArena<Opacity>,
+    row_sets: BindingArena<RowSet>,
+    parts: Vec<BindingPart>,
+    part_ids: BTreeMap<BindingPart, PartId>,
+    next_once: u32,
+}
+
+impl BindingTable {
+    pub(crate) const fn new() -> Self {
+        Self {
+            text: BindingArena::new(),
+            bools: BindingArena::new(),
+            colors: BindingArena::new(),
+            lengths: BindingArena::new(),
+            opacities: BindingArena::new(),
+            row_sets: BindingArena::new(),
+            parts: Vec::new(),
+            part_ids: BTreeMap::new(),
+            next_once: 0,
+        }
+    }
+
+    pub(crate) fn insert<T: BindingValue>(
+        &mut self,
+        source: ReadSlot,
+        current: Option<T>,
+        fault: Option<ReadFault>,
+    ) -> BindingRef {
+        T::arena_mut(self).insert(T::TABLE, source, current, fault)
+    }
+
+    pub(crate) fn once_origin(&mut self) -> OnceOrigin {
+        let origin = OnceOrigin::from_raw(self.next_once);
+        self.next_once = self.next_once.wrapping_add(1);
+        origin
+    }
+
+    /// 注册 part 并返回稳定 id；同一 part 复用同一 id。
+    pub(crate) fn part_id(&mut self, part: BindingPart) -> PartId {
+        if let Some(id) = self.part_ids.get(&part) {
+            return *id;
+        }
+        let id = PartId::from_raw(
+            u16::try_from(self.parts.len()).expect("binding part registry exhausted"),
+        );
+        self.parts.push(part);
+        self.part_ids.insert(part, id);
+        id
+    }
+
+    #[cfg(test)]
+    pub(crate) fn part(&self, id: PartId) -> Option<BindingPart> {
+        self.parts.get(id.raw() as usize).copied()
+    }
+
+    pub(crate) fn slot<T: BindingValue>(&self, reference: BindingRef) -> Option<&BindingSlot<T>> {
+        if reference.table() != T::TABLE {
+            return None;
+        }
+        T::arena(self).get(reference)
+    }
+
+    pub(crate) fn slot_mut<T: BindingValue>(
+        &mut self,
+        reference: BindingRef,
+    ) -> Option<&mut BindingSlot<T>> {
+        if reference.table() != T::TABLE {
+            return None;
+        }
+        T::arena_mut(self).get_mut(reference)
+    }
+
+    /// 释放任意类型的槽；`false` 表示 ref 已过期或类型不可识别。
+    pub(crate) fn release(&mut self, reference: BindingRef) -> bool {
+        match reference.table() {
+            TEXT_TABLE => self.text.release(reference).is_some(),
+            BOOL_TABLE => self.bools.release(reference).is_some(),
+            COLOR_TABLE => self.colors.release(reference).is_some(),
+            LENGTH_TABLE => self.lengths.release(reference).is_some(),
+            OPACITY_TABLE => self.opacities.release(reference).is_some(),
+            ROW_SET_TABLE => self.row_sets.release(reference).is_some(),
+            _ => false,
+        }
+    }
+
+    /// 引用是否落在文本表；属性快照据此选择值类型。
+    pub(crate) fn is_text(&self, reference: BindingRef) -> bool {
+        reference.table() == TEXT_TABLE
+    }
+
+    /// 引用是否落在布尔表。
+    pub(crate) fn is_bool(&self, reference: BindingRef) -> bool {
+        reference.table() == BOOL_TABLE
+    }
+
+    /// 引用的值类型；未知表或过期引用返回 `None`。
+    pub(crate) fn kind(&self, reference: BindingRef) -> Option<BindingType> {
+        Some(match reference.table() {
+            TEXT_TABLE => BindingType::Text,
+            BOOL_TABLE => BindingType::Bool,
+            COLOR_TABLE => BindingType::Color,
+            LENGTH_TABLE => BindingType::Length,
+            OPACITY_TABLE => BindingType::Opacity,
+            ROW_SET_TABLE => BindingType::RowSet,
+            _ => return None,
+        })
+    }
+
+    /// 来源描述；类型擦除后按表分派，求值方按 [`BindingTable::kind`] 还原类型。
+    pub(crate) fn read_slot(&self, reference: BindingRef) -> Option<ReadSlot> {
+        match reference.table() {
+            TEXT_TABLE => self.slot::<String>(reference).map(|slot| slot.source),
+            BOOL_TABLE => self.slot::<bool>(reference).map(|slot| slot.source),
+            COLOR_TABLE => self.slot::<Color>(reference).map(|slot| slot.source),
+            LENGTH_TABLE => self.slot::<Length>(reference).map(|slot| slot.source),
+            OPACITY_TABLE => self.slot::<Opacity>(reference).map(|slot| slot.source),
+            ROW_SET_TABLE => self.slot::<RowSet>(reference).map(|slot| slot.source),
+            _ => None,
+        }
+    }
+
+    /// 已提交文本；`None` 表示首次求值尚未成功。
+    pub(crate) fn text_current(&self, reference: BindingRef) -> Option<&str> {
+        self.slot::<String>(reference)
+            .and_then(|slot| slot.current.as_deref())
+    }
+
+    /// 已提交布尔值；`None` 表示首次求值尚未成功。
+    pub(crate) fn bool_current(&self, reference: BindingRef) -> Option<bool> {
+        self.slot::<bool>(reference).and_then(|slot| slot.current)
+    }
+
+    /// 已提交的 inline 样式值；颜色/长度/不透明度映射为统一的样式值。
+    pub(crate) fn inline_style(&self, reference: BindingRef) -> Option<StyleValue> {
+        match reference.table() {
+            COLOR_TABLE => self
+                .slot::<Color>(reference)
+                .and_then(|slot| slot.current)
+                .map(StyleValue::Color),
+            LENGTH_TABLE => self
+                .slot::<Length>(reference)
+                .and_then(|slot| slot.current)
+                .map(StyleValue::Length),
+            OPACITY_TABLE => self
+                .slot::<Opacity>(reference)
+                .and_then(|slot| slot.current)
+                .map(|value| StyleValue::Opacity(value.value())),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn live(&self) -> usize {
+        self.text.live()
+            + self.bools.live()
+            + self.colors.live()
+            + self.lengths.live()
+            + self.opacities.live()
+            + self.row_sets.live()
+    }
+}
+
+/// 元素的稳定绑定索引；按 `PartId` 排序，同一 part 最多一项。
+#[derive(Clone, Debug, Default)]
+pub(crate) struct BindingList {
+    entries: Vec<(PartId, BindingRef)>,
+}
+
+impl BindingList {
+    /// 写入一个 part；返回被替换的旧引用，调用方必须把它归还绑定表。
+    ///
+    /// 正常挂载按 part 去重，替换只用于防御未来新增的写入路径。
+    pub(crate) fn insert(&mut self, part: PartId, binding: BindingRef) -> Option<BindingRef> {
+        match self.entries.binary_search_by_key(&part, |(part, _)| *part) {
+            Ok(index) => Some(std::mem::replace(&mut self.entries[index].1, binding)),
+            Err(index) => {
+                self.entries.insert(index, (part, binding));
+                None
+            }
+        }
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (PartId, BindingRef)> + '_ {
+        self.entries.iter().copied()
+    }
+}
+
+/// 一个 part 在本 turn 的已提交变化。
+///
+/// `old` 是补丁在该 turn 第一次应用前的最后值，`new` 是最终值；同一
+/// `(tree, node, part)` 在一个 turn 内只保留一条记录。结构 part（`ShowWhen`/
+/// `ForEach`）排在值 part 之前，供快照与 delta 复用，不在构建快照时重新读取源。
+pub(crate) struct BindingPatch {
+    pub(crate) tree: TreeKey,
+    pub(crate) node: NodeRef,
+    pub(crate) part: BindingPart,
+    pub(crate) old: Option<Box<dyn Any>>,
+    pub(crate) new: Option<Box<dyn Any>>,
+    /// 值不变但求值失败时的 typed fault；本 turn 的即时诊断走
+    /// `RefreshReport.faults`，fault-only 变化不单独生成补丁。
+    pub(crate) fault: Option<ReadFault>,
+}
+
+/// 补丁日志在某个时刻的标记；拟议结构失败时回滚到它。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BindingPatchMark(usize);
+
+/// 一个 turn 内按 `(tree, node, part)` 去重的补丁记录。
+///
+/// 值已经是 `BindingSlot.current` 的权威结果；这里只保留“本 turn 变过什么”。
+/// 同一 part 再次变化时保留首次 `old`、更新 `new`；净变化为零时撤销记录。
+#[derive(Default)]
+pub(crate) struct BindingPatchLog {
+    patches: Vec<BindingPatch>,
+    index: BTreeMap<(TreeKey, NodeRef, BindingPart), usize>,
+}
+
+impl BindingPatchLog {
+    /// 记录当前日志位置；只有拟议结构预刷新会产生需要回滚的补丁。
+    pub(crate) fn mark(&self) -> BindingPatchMark {
+        BindingPatchMark(self.patches.len())
+    }
+
+    /// 丢弃标记之后记录的所有补丁（拟议分支被拒绝或释放），并重建去重索引。
+    pub(crate) fn rollback(&mut self, mark: BindingPatchMark) {
+        if mark.0 >= self.patches.len() {
+            return;
+        }
+        self.patches.truncate(mark.0);
+        self.index = self
+            .patches
+            .iter()
+            .enumerate()
+            .map(|(index, patch)| ((patch.tree, patch.node, patch.part), index))
+            .collect();
+    }
+
+    /// 节点释放时丢弃它在本 turn 的补丁；turn 日志只保留仍挂载的节点。
+    pub(crate) fn remove_node(&mut self, tree: TreeKey, node: NodeRef) {
+        if self.patches.is_empty() {
+            return;
+        }
+        let before = self.patches.len();
+        self.patches
+            .retain(|patch| patch.tree != tree || patch.node != node);
+        if self.patches.len() != before {
+            self.index = self
+                .patches
+                .iter()
+                .enumerate()
+                .map(|(index, patch)| ((patch.tree, patch.node, patch.part), index))
+                .collect();
+        }
+    }
+
+    /// 记录一次已提交变化；同一 part 一个 turn 内最多保留一条净记录。
+    pub(crate) fn record<T: BindingValue>(
+        &mut self,
+        tree: TreeKey,
+        node: NodeRef,
+        part: BindingPart,
+        old: Option<T>,
+        new: Option<T>,
+        fault: Option<ReadFault>,
+    ) {
+        let key = (tree, node, part);
+        if let Some(&index) = self.index.get(&key) {
+            let net_zero = match (self.patches[index].old.as_ref(), new.as_ref()) {
+                (Some(stored), Some(value)) => stored
+                    .downcast_ref::<T>()
+                    .is_some_and(|stored| stored == value),
+                _ => false,
+            };
+            if net_zero {
+                self.remove(index);
+                return;
+            }
+            let patch = &mut self.patches[index];
+            patch.new = new.map(|value| Box::new(value) as Box<dyn Any>);
+            patch.fault = fault;
+            return;
+        }
+        let index = self.patches.len();
+        self.patches.push(BindingPatch {
+            tree,
+            node,
+            part,
+            old: old.map(|value| Box::new(value) as Box<dyn Any>),
+            new: new.map(|value| Box::new(value) as Box<dyn Any>),
+            fault,
+        });
+        self.index.insert(key, index);
+    }
+
+    fn remove(&mut self, index: usize) {
+        let removed = self.patches.swap_remove(index);
+        self.index
+            .remove(&(removed.tree, removed.node, removed.part));
+        if let Some(moved) = self.patches.get(index) {
+            // swap_remove 把末项移到 index；索引表必须跟随。
+            self.index
+                .insert((moved.tree, moved.node, moved.part), index);
+        }
+    }
+
+    /// 取走本 turn 的补丁；结构 part 先于值 part，同一节点按 part 稳定序。
+    pub(crate) fn take(&mut self) -> Vec<BindingPatch> {
+        self.index.clear();
+        let mut patches = std::mem::take(&mut self.patches);
+        patches.sort_by(|left, right| {
+            (left.part.rank(), left.tree, left.node, left.part).cmp(&(
+                right.part.rank(),
+                right.tree,
+                right.node,
+                right.part,
+            ))
+        });
+        patches
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.patches.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn parts(&self) -> Vec<(TreeKey, NodeRef, BindingPart)> {
+        self.patches
+            .iter()
+            .map(|patch| (patch.tree, patch.node, patch.part))
+            .collect()
+    }
+}
+
+/// 绑定消费者的打包引用；反向订阅边在增量 flush 切片接入。
 ///
 /// 固定 16 B：NodeRef 8 B + PartId 2 B + kind/padding。
 #[repr(C)]
@@ -556,7 +1224,7 @@ pub(crate) struct ConsumerRef {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[expect(
     dead_code,
-    reason = "binding edges are wired by the binding-table slice (#336)"
+    reason = "reverse subscription edges are wired by the incremental flush slice"
 )]
 enum ConsumerKind {
     Binding = 0,
@@ -576,6 +1244,211 @@ mod tests {
         assert_eq!(std::mem::size_of::<ConsumerRef>(), 16);
         assert_eq!(std::mem::size_of::<Option<NodeRef>>(), 8);
         assert_eq!(std::mem::size_of::<PresentationKey>(), 8);
+    }
+
+    #[test]
+    fn binding_refs_round_trip_and_reject_stale_generations() {
+        let reference = BindingRef::new(TEXT_TABLE, 7, 3).expect("encodable");
+        assert_eq!(reference.table(), TEXT_TABLE);
+        assert_eq!(reference.slot(), 7);
+        assert_eq!(reference.generation(), 3);
+        assert_eq!(BindingRef::from_raw(reference.raw()), reference);
+        assert!(BindingRef::new(TEXT_TABLE, 7, 0).is_none());
+        assert!(BindingRef::new(TEXT_TABLE, 1 << 24, 1).is_none());
+        assert_eq!(std::mem::size_of::<(PartId, BindingRef)>(), 16);
+    }
+
+    #[test]
+    fn a_released_binding_slot_rejects_the_old_reference() {
+        let mut table = BindingTable::new();
+        let reference = table.insert::<String>(ReadSlot::Static, Some(String::from("first")), None);
+        assert_eq!(
+            table
+                .slot::<String>(reference)
+                .and_then(|slot| slot.current.clone()),
+            Some(String::from("first"))
+        );
+        assert!(table.release(reference));
+        assert!(table.slot::<String>(reference).is_none());
+        assert!(!table.release(reference));
+
+        let reused = table.insert::<String>(ReadSlot::Static, Some(String::from("second")), None);
+        assert_eq!(reused.slot(), reference.slot());
+        assert_ne!(reused.generation(), reference.generation());
+        assert!(table.slot::<String>(reference).is_none());
+        assert_eq!(
+            table
+                .slot::<String>(reused)
+                .and_then(|slot| slot.current.clone()),
+            Some(String::from("second"))
+        );
+        assert_eq!(table.live(), 1);
+        assert!(table.release(reused));
+        assert_eq!(table.live(), 0);
+    }
+
+    #[test]
+    fn binding_parts_register_once_and_sort_structure_first() {
+        let mut table = BindingTable::new();
+        let when = table.part_id(BindingPart::ShowWhen);
+        let text = table.part_id(BindingPart::Text);
+        let attr = table.part_id(BindingPart::Attr("aria:label"));
+        assert_eq!(table.part_id(BindingPart::ShowWhen), when);
+        assert_eq!(table.part_id(BindingPart::Text), text);
+        assert_eq!(table.part(when), Some(BindingPart::ShowWhen));
+        assert!(when < text);
+        assert!(text < attr);
+
+        let mut list = BindingList::default();
+        assert!(
+            list.insert(text, BindingRef::new(TEXT_TABLE, 0, 1).expect("ref"))
+                .is_none()
+        );
+        assert!(
+            list.insert(when, BindingRef::new(BOOL_TABLE, 0, 1).expect("ref"))
+                .is_none()
+        );
+        let parts: Vec<PartId> = list.iter().map(|(part, _)| part).collect();
+        assert_eq!(parts, vec![when, text]);
+        assert_eq!(std::mem::size_of::<(PartId, BindingRef)>(), 16);
+    }
+
+    #[test]
+    fn binding_types_stay_in_their_typed_tables() {
+        let mut table = BindingTable::new();
+        let text = table.insert::<String>(ReadSlot::Static, None, None);
+        let flag = table.insert::<bool>(ReadSlot::Static, Some(true), None);
+        assert!(table.slot::<bool>(text).is_none());
+        assert!(table.slot::<String>(flag).is_none());
+        assert!(table.slot::<bool>(flag).is_some());
+        assert!(table.release(text));
+        assert!(table.release(flag));
+    }
+
+    #[test]
+    fn binding_patches_dedupe_by_node_part_and_apply_structure_first() {
+        let tree = TreeKey::from_raw(3);
+        let node = NodeRef::new(1, 1).expect("node ref");
+        let mut log = BindingPatchLog::default();
+        log.record(
+            tree,
+            node,
+            BindingPart::Text,
+            Some(String::from("a")),
+            Some(String::from("b")),
+            None,
+        );
+        log.record(
+            tree,
+            node,
+            BindingPart::ShowWhen,
+            Some(false),
+            Some(true),
+            None,
+        );
+        assert_eq!(log.len(), 2);
+        // 同一 part 的第二次变化只更新最终值，保留首次 old。
+        log.record(
+            tree,
+            node,
+            BindingPart::Text,
+            Some(String::from("b")),
+            Some(String::from("c")),
+            None,
+        );
+        assert_eq!(log.len(), 2);
+
+        let patches = log.take();
+        assert!(log.parts().is_empty(), "taking the log empties it");
+        assert_eq!(patches.len(), 2);
+        assert_eq!(patches[0].part, BindingPart::ShowWhen);
+        assert_eq!(patches[1].part, BindingPart::Text);
+        let old = patches[1]
+            .old
+            .as_ref()
+            .and_then(|value| value.downcast_ref::<String>())
+            .map(String::as_str);
+        let new = patches[1]
+            .new
+            .as_ref()
+            .and_then(|value| value.downcast_ref::<String>())
+            .map(String::as_str);
+        assert_eq!(old, Some("a"));
+        assert_eq!(new, Some("c"));
+    }
+
+    #[test]
+    fn a_patch_that_returns_to_its_first_value_is_dropped() {
+        let tree = TreeKey::from_raw(4);
+        let node = NodeRef::new(2, 1).expect("node ref");
+        let mut log = BindingPatchLog::default();
+        log.record(
+            tree,
+            node,
+            BindingPart::Text,
+            Some(String::from("a")),
+            Some(String::from("b")),
+            None,
+        );
+        log.record(
+            tree,
+            node,
+            BindingPart::Text,
+            Some(String::from("b")),
+            Some(String::from("a")),
+            None,
+        );
+        assert_eq!(log.len(), 0, "the net change over the turn is zero");
+        assert!(log.take().is_empty());
+    }
+
+    #[test]
+    fn removing_a_released_node_drops_its_patches_and_rebuilds_the_index() {
+        let tree = TreeKey::from_raw(5);
+        let released = NodeRef::new(2, 1).expect("node ref");
+        let live = NodeRef::new(3, 1).expect("node ref");
+        let mut log = BindingPatchLog::default();
+        log.record(
+            tree,
+            released,
+            BindingPart::Text,
+            Some(String::from("a")),
+            Some(String::from("b")),
+            None,
+        );
+        log.record(
+            tree,
+            released,
+            BindingPart::ShowWhen,
+            Some(false),
+            Some(true),
+            None,
+        );
+        log.record(
+            tree,
+            live,
+            BindingPart::Text,
+            Some(String::from("x")),
+            Some(String::from("y")),
+            None,
+        );
+
+        log.remove_node(tree, released);
+        assert_eq!(
+            log.parts(),
+            vec![(tree, live, BindingPart::Text)],
+            "only the live node's patch remains"
+        );
+        // 索引已重建：再次记录同一节点会新增一条记录，而不是命中旧位置。
+        log.record(
+            tree,
+            released,
+            BindingPart::Text,
+            None,
+            Some(String::from("c")),
+            None,
+        );
+        assert_eq!(log.len(), 2);
     }
 
     #[test]

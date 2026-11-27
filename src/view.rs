@@ -2,13 +2,25 @@ use std::fmt;
 
 use zenui_core::{PanicInfo, RowSet};
 
-use zenui_style::{Color, Length, Opacity, Property, StyleDeclaration, StyleValue};
+use zenui_style::{Color, Length, Opacity, Property, StyleDeclaration};
 
 use crate::context::Phase;
+use crate::node::{BindingRef, BindingTable, BindingValue, ReadSlot};
 use crate::signal::{Memo, Once, ReactiveValue, Signal};
 use crate::store::{Field, FieldError, TodoId, WriteError};
 
 pub type MountResult<T> = Result<T, MountError>;
+
+#[cfg(test)]
+thread_local! {
+    /// 测试用：本轮动态绑定求值次数；用于证明同一 binding 每轮最多求值一次。
+    static BINDING_EVALUATIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn take_binding_evaluations() -> u64 {
+    BINDING_EVALUATIONS.with(|count| count.replace(0))
+}
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum MountError {
@@ -249,38 +261,67 @@ impl<T: ReactiveValue> Read<T> {
         self.read_once()
     }
 
-    /// 绑定求值；`Field` 失败返回 fault，调用方保留最后已提交值。
-    pub(crate) fn evaluate(&self) -> ReadValue<T> {
+    /// 挂载期把公开读源转成绑定槽。
+    ///
+    /// `Static`/`Once` 的值在这里写入 `BindingSlot.current`，之后不再求值；
+    /// 动态源只保存带 generation 的引用。静态值没有依赖，也不注册 `DepKey`。
+    pub(crate) fn into_binding(self, table: &mut BindingTable) -> BindingRef
+    where
+        T: BindingValue,
+    {
         match self {
-            Self::Static(value) => ReadValue::Value(value.clone()),
-            Self::Once(value) => ReadValue::Value(value.clone().into_inner()),
-            Self::Signal(signal) => match signal.try_get_once() {
+            Self::Static(value) => table.insert::<T>(ReadSlot::Static, Some(value), None),
+            Self::Once(value) => {
+                let origin = table.once_origin();
+                table.insert::<T>(ReadSlot::Once(origin), Some(value.into_inner()), None)
+            }
+            Self::Signal(signal) => {
+                table.insert::<T>(ReadSlot::Signal(signal.source()), None, None)
+            }
+            Self::Memo(memo) => table.insert::<T>(ReadSlot::Memo(memo.source()), None, None),
+            Self::Field(field) => table.insert::<T>(ReadSlot::Field(field.field_key()), None, None),
+        }
+    }
+}
+
+impl ReadSlot {
+    /// 求值一个动态绑定源；`Static`/`Once` 的值只在挂载时写入，调用方跳过。
+    ///
+    /// `Field` 缺失与已释放的源返回 typed fault；memo 计算 panic 仍按
+    /// `Memo::get` 的既有契约向上传播，由刷新边界 contain。
+    pub(crate) fn evaluate<T>(self) -> ReadValue<T>
+    where
+        T: BindingValue,
+    {
+        #[cfg(test)]
+        BINDING_EVALUATIONS.with(|count| count.set(count.get() + 1));
+        match self {
+            Self::Static | Self::Once(_) => {
+                unreachable!("a static binding slot is written once at mount")
+            }
+            Self::Signal(source) => match Signal::<T>::from_source(source).try_get_once() {
                 Ok(value) => ReadValue::Value(value),
                 Err(fault) => ReadValue::Fault(fault),
             },
-            Self::Memo(memo) => match memo.try_get_once() {
+            Self::Memo(source) => match Memo::<T>::from_source(source).try_get_once() {
                 Ok(value) => ReadValue::Value(value),
-                // 已释放的派生值降级为 typed fault，绑定保留最后值。
                 Err(ReadFault::Disposed) => ReadValue::Fault(ReadFault::Disposed),
-                // 计算 panic 仍走 `Memo::get` 的既有契约，由刷新边界 contain。
-                Err(_) => ReadValue::Value(memo.get()),
+                Err(_) => ReadValue::Value(Memo::<T>::from_source(source).get()),
             },
-            Self::Field(field) => match field.read_field() {
+            Self::Field(key) => match Field::<T>::from_key(key).read_field() {
                 Ok(value) => ReadValue::Value(value),
                 Err(error) => ReadValue::Fault(ReadFault::FieldMissing(error)),
             },
         }
     }
 
-    /// 值绑定的写入代数；静态值、once 与字段没有写入路径。
-    pub(crate) fn epoch(&self, state: &crate::runtime::State) -> Option<u64> {
+    /// 值绑定的写入代数；静态来源没有写入路径。
+    pub(crate) fn epoch(self, state: &crate::runtime::State) -> Option<u64> {
         match self {
-            Self::Static(_) | Self::Once(_) => None,
-            Self::Signal(signal) => Some(signal.write_epoch(state)),
-            Self::Memo(memo) => Some(memo.write_epoch(state)),
-            // 字段写入由 Store touch 推进；处理器只写字段时，编辑器仍要把
-            // 这次编辑归为“已结算”，不能回退尚未写回的本地文本。
-            Self::Field(field) => Some(state.field_write_epoch(field.id, field.kind)),
+            Self::Static | Self::Once(_) => None,
+            Self::Signal(source) => Some(state.source_write_epoch(source)),
+            Self::Memo(source) => Some(state.source_memo_revision(source)),
+            Self::Field(key) => Some(state.field_write_epoch(key.id, key.kind)),
         }
     }
 }
@@ -290,27 +331,6 @@ pub enum StyleSlot {
     Color(Read<Color>),
     Length(Read<Length>),
     Opacity(Read<Opacity>),
-}
-
-impl StyleSlot {
-    /// 求值；`Field` 变体目前不用于样式，但仍走统一契约。
-    pub(crate) fn evaluate(&self) -> ReadValue<StyleValue> {
-        match self {
-            Self::Color(slot) => map_read_value(slot.evaluate(), StyleValue::Color),
-            Self::Length(slot) => map_read_value(slot.evaluate(), StyleValue::Length),
-            Self::Opacity(slot) => {
-                map_read_value(slot.evaluate(), |value| StyleValue::Opacity(value.value()))
-            }
-        }
-    }
-}
-
-/// 把一次 typed 读取映射到样式值，fault 原样保留。
-fn map_read_value<T, U>(value: ReadValue<T>, map: impl FnOnce(T) -> U) -> ReadValue<U> {
-    match value {
-        ReadValue::Value(value) => ReadValue::Value(map(value)),
-        ReadValue::Fault(fault) => ReadValue::Fault(fault),
-    }
 }
 
 /// `ElementPlan` 里的一条 inline 声明。

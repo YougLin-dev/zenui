@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
 
 use zenui_core::{Counters, PanicInfo, RowSet, catch_panic};
-use zenui_style::{Length, Property, StyleValue};
+use zenui_style::{Color, Length, Opacity, Property, StyleValue};
 
 use crate::context::{self, ContextFault, DepKey, Phase, with_state};
 use crate::dispatch::{DispatchError, NodeOperation};
@@ -18,8 +18,10 @@ use crate::menu::{
     MenuSpec, MenuStateError, MenuStateHandler,
 };
 use crate::node::{
-    AttrListId, AuxHandles, BindingListId, EditStateId, ElementData, ElementFlags, EventListId,
-    NO_PAYLOAD, NodeKindTag, NodeRef, Pool, SemanticsId, SlotArena, StyleListId, TagId, TreeKey,
+    AttrListId, AuxHandles, BindingList, BindingListId, BindingPart, BindingPatchLog,
+    BindingPatchMark, BindingRef, BindingTable, BindingType, BindingValue, EditStateId,
+    ElementData, ElementFlags, EventListId, NO_PAYLOAD, NodeKindTag, NodeRef, PartId, Pool,
+    ReadSlot, SemanticsId, SlotArena, StyleListId, TagId, TreeKey,
 };
 use crate::presentation::{
     Appearance, NodeId, NodeStatus, PresentationSnapshot, SnapshotAction, SnapshotActions,
@@ -27,7 +29,7 @@ use crate::presentation::{
     TextEditState,
 };
 use crate::session::{SessionAction, SessionCtx, SessionError, SessionPolicy};
-use crate::signal::{Memo, MemoCell, SignalCell};
+use crate::signal::{MemoCell, SignalCell};
 use crate::store::{TodoId, WriteError};
 use crate::task::{TaskRecord, WakeCallback};
 use crate::text_edit::{self, Edit, Movement};
@@ -360,6 +362,8 @@ pub(crate) struct NodeArena {
     shows: Pool<ShowData>,
     forces: Pool<ForData>,
     aux: AuxArenas,
+    /// 每棵树一份绑定槽表；树关闭后随最后一个节点释放而丢弃。
+    binding_tables: BTreeMap<TreeKey, BindingTable>,
 }
 
 impl NodeArena {
@@ -374,6 +378,60 @@ impl NodeArena {
             shows: Pool::new(),
             forces: Pool::new(),
             aux: AuxArenas::new(),
+            binding_tables: BTreeMap::new(),
+        }
+    }
+
+    fn binding_table(&self, tree: TreeKey) -> Option<&BindingTable> {
+        self.binding_tables.get(&tree)
+    }
+
+    fn binding_table_mut(&mut self, tree: TreeKey) -> &mut BindingTable {
+        self.binding_tables
+            .entry(tree)
+            .or_insert_with(BindingTable::new)
+    }
+
+    /// 树的全部节点释放后丢弃绑定表；重新打开同一个树槽位会建立空表。
+    fn drop_binding_table(&mut self, tree: TreeKey) {
+        if let Some(table) = self.binding_tables.remove(&tree) {
+            debug_assert_eq!(
+                table.live(),
+                0,
+                "a retired tree releases every binding slot"
+            );
+        }
+    }
+
+    fn tree_of(&self, node: NodeRef) -> Option<TreeKey> {
+        self.slots.get(node).ok().map(|slot| slot.tree)
+    }
+
+    fn binding_list_mut(&mut self, id: BindingListId) -> &mut BindingList {
+        self.aux
+            .binding_lists
+            .get_mut(id.raw())
+            .expect("element binding-list handles stay live until the element is retired")
+    }
+
+    /// 释放一个直接引用；绑定表已随树丢弃时是静默无操作。
+    fn release_binding(&mut self, tree: TreeKey, reference: BindingRef) {
+        if let Some(table) = self.binding_tables.get_mut(&tree) {
+            let released = table.release(reference);
+            debug_assert!(released, "a mounted binding slot is live");
+        }
+    }
+
+    /// 释放元素的整张绑定列表和其中每个槽，列表本身由 `AuxArenas` 归还。
+    fn release_binding_list(&mut self, tree: TreeKey, id: BindingListId) {
+        let Some(list) = self.aux.binding_lists.get(id.raw()) else {
+            return;
+        };
+        if let Some(table) = self.binding_tables.get_mut(&tree) {
+            for (_, reference) in list.iter() {
+                let released = table.release(reference);
+                debug_assert!(released, "a mounted element binding slot is live");
+            }
         }
     }
 
@@ -413,11 +471,12 @@ impl NodeArena {
         self.slots.set_payload(node, payload)
     }
 
-    /// 释放节点身份、它的元素 payload 与辅助列表；重复释放无操作。
+    /// 释放节点身份、它的 payload、绑定槽与辅助列表；重复释放无操作。
     fn release(&mut self, node: NodeRef) {
         if let Ok(slot) = self.slots.get(node) {
             let kind = slot.kind;
             let payload = slot.payload;
+            let tree = slot.tree;
             match kind {
                 Some(NodeKindTag::Element) => {
                     if let Some(data) = self
@@ -425,17 +484,24 @@ impl NodeArena {
                         .get_mut(payload as usize)
                         .and_then(Option::take)
                     {
+                        self.release_binding_list(tree, data.aux.bindings);
                         self.aux.release(data.aux);
                     }
                 }
                 Some(NodeKindTag::Text) => {
-                    self.texts.release(payload);
+                    if let Some(data) = self.texts.release(payload) {
+                        self.release_binding(data.tree, data.binding);
+                    }
                 }
                 Some(NodeKindTag::Show) => {
-                    self.shows.release(payload);
+                    if let Some(data) = self.shows.release(payload) {
+                        self.release_binding(tree, data.when);
+                    }
                 }
                 Some(NodeKindTag::For) => {
-                    self.forces.release(payload);
+                    if let Some(data) = self.forces.release(payload) {
+                        self.release_binding(tree, data.each);
+                    }
                 }
                 _ => {}
             }
@@ -450,12 +516,6 @@ impl NodeArena {
     fn text(&self, payload: u32) -> &TextData {
         self.texts
             .get(payload)
-            .expect("a live text node has a text payload")
-    }
-
-    fn text_mut(&mut self, payload: u32) -> &mut TextData {
-        self.texts
-            .get_mut(payload)
             .expect("a live text node has a text payload")
     }
 
@@ -607,13 +667,13 @@ impl NodeArena {
     }
 }
 
-/// 文本节点的 payload：求值来源与已提交文本。
+/// 文本节点的 payload：绑定槽引用；已提交文本只在 `BindingSlot.current`。
 struct TextData {
-    source: Read<String>,
-    /// 最后已提交文本；读取失败时保持不变。
-    value: String,
-    /// 本次求值失败；可与 `value` 同时存在。
-    fault: Option<ReadFault>,
+    binding: BindingRef,
+    /// 所属树；绑定表按树索引。
+    tree: TreeKey,
+    /// 节点身份；补丁按 `(tree, node, part)` 去重。
+    node: NodeRef,
 }
 
 /// 元素挂载时一次性写入辅助 arena 的初始列表。
@@ -625,9 +685,6 @@ struct AuxSeed {
     edit: LocalState,
     semantics: SnapshotSemantics,
 }
-
-/// 绑定列表在绑定表切片（#336）填充；本切片只确保句柄与释放路径存在。
-struct BindingList;
 
 struct AuxArenas {
     attrs: Pool<Vec<MountedAttr>>,
@@ -659,7 +716,7 @@ impl AuxArenas {
             inline_styles: StyleListId::from_raw(self.inline_styles.reserve(seed.inline_styles)),
             events: EventListId::from_raw(self.events.reserve(seed.events)),
             edit: EditStateId::from_raw(self.edits.reserve(seed.edit)),
-            bindings: BindingListId::from_raw(self.binding_lists.reserve(BindingList)),
+            bindings: BindingListId::from_raw(self.binding_lists.reserve(BindingList::default())),
             semantics: SemanticsId::from_raw(self.semantics.reserve(seed.semantics)),
         }
     }
@@ -758,6 +815,10 @@ pub(crate) struct State {
     changed_trees: BTreeSet<TreeSlot>,
     /// 本次刷新观察到的读取失败；绑定保留最后值，诊断按值去重。
     pub(crate) read_faults: Vec<ReadFault>,
+    /// 本 turn 已提交的绑定补丁；按 `(tree, node, part)` 去重。
+    binding_patches: BindingPatchLog,
+    /// 刷新轮次；同一 binding 每轮最多求值一次，焦点结算会开启新一轮。
+    refresh_round: u64,
     /// 源写入代数；字段绑定用它辨认处理器是否写过这次编辑。
     pub(crate) write_epochs: BTreeMap<DepKey, u64>,
     pub(crate) write_error: Option<WriteError>,
@@ -826,6 +887,11 @@ pub(crate) struct State {
     refresh_focus: Option<usize>,
     /// 本帧窗口化 For 卸载了焦点所在行；刷新后清除焦点而不是结算到邻居。
     window_focus_dropped: Option<usize>,
+    /// 正在进行的 `set_row_window` tick 请求的行带；只有 tick 内的刷新
+    /// 需要报告请求窗口是否已经提交。
+    row_window_tick: Option<u64>,
+    /// tick 请求的行窗口是否已在本次刷新提交；tick 结束后清零。
+    row_window_commit: bool,
     pub(crate) tasks: BTreeMap<u32, TaskRecord>,
     pub(crate) next_task: u32,
     /// 已排队、等待宿主弹出的文件选择请求；任务本身在 `tasks` 中。
@@ -836,6 +902,17 @@ pub(crate) struct State {
     unmounts: u64,
     /// 文本编辑谱系归约的有界记录；测试据此刻画分类顺序，不是公开 API。
     text_trace: VecDeque<TextTrace>,
+}
+
+/// 拟议结构的回滚标记：补丁日志位置 + 当前树的 dirty 标记。
+///
+/// 被拒绝的 Show 分支或 For 行不可见，因此它们产生的补丁和“树已变化”
+/// 标记都必须回到拟议之前的状态，revision 不能因未提交的结构推进。
+#[derive(Clone, Copy)]
+struct SpeculationMark {
+    patches: BindingPatchMark,
+    tree: Option<TreeSlot>,
+    was_dirty: bool,
 }
 
 /// 旧焦点离开可见集合后的一次结算：旧目标（可选 blur）与接任目标。
@@ -909,10 +986,10 @@ impl RefreshReport {
     }
 }
 
-/// 记录一个 `Read` 源的 memo 槽位；其他来源没有 memo 依赖。
-fn collect_read_memo<T>(read: &Read<T>, live: &mut BTreeSet<u32>) {
-    if let Read::Memo(memo) = read {
-        live.insert(memo.memo_id());
+/// 记录一个绑定来源的 memo 槽位；其他来源没有 memo 依赖。
+fn collect_slot_memo(slot: Option<ReadSlot>, live: &mut BTreeSet<u32>) {
+    if let Some(ReadSlot::Memo(source)) = slot {
+        live.insert(source.id);
     }
 }
 
@@ -950,12 +1027,14 @@ fn actions_for_events(state: &State, events: &[usize]) -> SnapshotActions {
 impl State {
     /// 已挂载绑定与结构触发直接引用的 memo，加上它们的 memo 依赖闭包。
     ///
-    /// 这是 #336 BindingTable 之前的 liveness 近似：从当前保留树的 `Read`
-    /// 源出发，不把只被处理器读取的派生值提前结算。
+    /// liveness 从每棵树的绑定槽出发；被卸载分支的槽已经归还绑定表，因此不会
+    /// 把只被处理器或废弃节点读取的派生值提前结算。
     pub(crate) fn live_memo_set(&self) -> BTreeSet<u32> {
         let mut live = BTreeSet::new();
-        for tree in self.trees.values() {
-            self.collect_node_memos(&tree.nodes, &mut live);
+        for (slot, tree) in &self.trees {
+            if let Some(tree_key) = self.arena_trees.get(slot) {
+                self.collect_node_memos(*tree_key, &tree.nodes, &mut live);
+            }
         }
         let mut stack: Vec<u32> = live.iter().copied().collect();
         while let Some(memo) = stack.pop() {
@@ -970,43 +1049,40 @@ impl State {
         live
     }
 
-    fn collect_node_memos(&self, nodes: &[MountedNode], live: &mut BTreeSet<u32>) {
+    fn collect_node_memos(&self, tree: TreeKey, nodes: &[MountedNode], live: &mut BTreeSet<u32>) {
+        let table = self.nodes.binding_table(tree);
         for node in nodes {
             match node {
                 MountedNode::Text(payload) => {
-                    collect_read_memo(&self.nodes.text(*payload).source, live);
+                    let data = self.nodes.text(*payload);
+                    collect_slot_memo(table.and_then(|table| table.read_slot(data.binding)), live);
                 }
                 MountedNode::Element(id) => {
-                    for attr in self.element_attrs(*id) {
-                        match &attr.value {
-                            AttrValue::Text(read) => collect_read_memo(read, live),
-                            AttrValue::Bool(read) => collect_read_memo(read, live),
+                    if let Some(table) = table {
+                        for attr in self.element_attrs(*id) {
+                            collect_slot_memo(table.read_slot(attr.binding), live);
+                        }
+                        for style in self.element_inline_styles(*id) {
+                            collect_slot_memo(table.read_slot(style.binding), live);
                         }
                     }
-                    for style in self.element_inline_styles(*id) {
-                        match &style.slot {
-                            StyleSlot::Color(read) => collect_read_memo(read, live),
-                            StyleSlot::Length(read) => collect_read_memo(read, live),
-                            StyleSlot::Opacity(read) => collect_read_memo(read, live),
-                        }
-                    }
-                    self.collect_node_memos(&self.elements[*id].children, live);
+                    self.collect_node_memos(tree, &self.elements[*id].children, live);
                 }
                 MountedNode::Component(id) => {
-                    self.collect_node_memos(&self.components[*id].children, live);
+                    self.collect_node_memos(tree, &self.components[*id].children, live);
                 }
                 MountedNode::Show(payload) => {
                     let show = self.nodes.show(*payload);
-                    collect_read_memo(&show.when, live);
+                    collect_slot_memo(table.and_then(|table| table.read_slot(show.when)), live);
                     if let Some(branch) = &show.active {
-                        self.collect_node_memos(&branch.children, live);
+                        self.collect_node_memos(tree, &branch.children, live);
                     }
                 }
                 MountedNode::For(payload) => {
                     let data = self.nodes.for_node(*payload);
-                    live.insert(data.each.memo_id());
+                    collect_slot_memo(table.and_then(|table| table.read_slot(data.each)), live);
                     for item in data.items.values() {
-                        self.collect_node_memos(&item.children, live);
+                        self.collect_node_memos(tree, &item.children, live);
                     }
                 }
             }
@@ -1037,6 +1113,8 @@ impl State {
             dirty_trees: BTreeSet::new(),
             changed_trees: BTreeSet::new(),
             read_faults: Vec::new(),
+            binding_patches: BindingPatchLog::default(),
+            refresh_round: 0,
             write_epochs: BTreeMap::new(),
             write_error: None,
             core: zenui_core::Runtime::new(),
@@ -1085,6 +1163,8 @@ impl State {
             next_row_band: 1,
             refresh_focus: None,
             window_focus_dropped: None,
+            row_window_tick: None,
+            row_window_commit: false,
             tasks: BTreeMap::new(),
             next_task: 1,
             pending_file_dialogs: Vec::new(),
@@ -1306,6 +1386,39 @@ impl State {
         }
     }
 
+    /// 开启一个新的刷新轮次；同一 binding 每轮最多求值一次。
+    fn bump_refresh_round(&mut self) {
+        self.refresh_round = self.refresh_round.wrapping_add(1);
+    }
+
+    /// 记录拟议结构的起点；被拒绝时用 [`State::rollback_speculation`] 还原。
+    fn mark_speculation(&self) -> SpeculationMark {
+        let tree = self.building_tree;
+        SpeculationMark {
+            patches: self.binding_patches.mark(),
+            tree,
+            was_dirty: tree.is_some_and(|key| self.dirty_trees.contains(&key)),
+        }
+    }
+
+    /// 丢弃拟议结构记录的补丁；没有其他变化时同时撤销它的 dirty 标记。
+    fn rollback_speculation(&mut self, mark: SpeculationMark) {
+        self.binding_patches.rollback(mark.patches);
+        if let Some(tree) = mark.tree
+            && !mark.was_dirty
+        {
+            self.dirty_trees.remove(&tree);
+        }
+    }
+
+    /// 释放节点并丢弃它在本 turn 的补丁；日志只保留仍挂载的节点。
+    fn retire_node(&mut self, node: NodeRef) {
+        if let Some(tree) = self.nodes.tree_of(node) {
+            self.binding_patches.remove_node(tree, node);
+        }
+        self.nodes.release(node);
+    }
+
     /// 应用级变化（例如 appearance）影响所有已提交树。
     fn mark_all_trees_changed(&mut self) {
         let keys: Vec<TreeSlot> = self.trees.keys().copied().collect();
@@ -1428,26 +1541,59 @@ impl State {
     }
 
     fn element_label_text(&self, element: usize) -> Option<&str> {
-        self.element_attrs(element)
-            .iter()
-            .find(|attr| attr.name == "aria:label")
-            .and_then(|attr| attr.current.as_ref())
-            .and_then(|current| match current {
-                AttrCurrent::Text(text) => Some(text.as_str()),
-                AttrCurrent::Bool(_) => None,
-            })
+        self.element_attr_text(element, "aria:label")
     }
 
     /// 已提交的文本属性；`type` 等标记只读取当前值。
     fn element_attr_text(&self, element: usize, name: &str) -> Option<&str> {
-        self.element_attrs(element)
+        let attr = self
+            .element_attrs(element)
             .iter()
-            .find(|attr| attr.name == name)
-            .and_then(|attr| attr.current.as_ref())
-            .and_then(|current| match current {
-                AttrCurrent::Text(text) => Some(text.as_str()),
-                AttrCurrent::Bool(_) => None,
-            })
+            .find(|attr| attr.name == name)?;
+        self.element_binding_table(element)?
+            .text_current(attr.binding)
+    }
+
+    /// 元素所属树的绑定表；元素已释放时返回 `None`。
+    fn element_binding_table(&self, element: usize) -> Option<&BindingTable> {
+        let node = self.elements.get(element)?.id.node();
+        self.nodes.binding_table(self.nodes.tree_of(node)?)
+    }
+
+    /// 元素所属的 arena 树键。
+    fn element_tree(&self, element: usize) -> Option<TreeKey> {
+        let node = self.elements.get(element)?.id.node();
+        self.nodes.tree_of(node)
+    }
+
+    /// 已提交文本；首次求值失败、没有最后值时呈现为空串。
+    fn text_value(&self, payload: u32) -> String {
+        let data = self.nodes.text(payload);
+        self.nodes
+            .binding_table(data.tree)
+            .and_then(|table| table.slot::<String>(data.binding))
+            .and_then(|slot| slot.current.clone())
+            .unwrap_or_default()
+    }
+
+    /// 当前挂载/刷新树的绑定表键；没有树上下文时使用根树。
+    fn building_tree_key(&mut self) -> TreeKey {
+        let slot = self.building_tree.unwrap_or(TreeSlot::Root);
+        self.arena_tree(slot)
+    }
+
+    /// 记录一次已提交的绑定变化；补丁按 `(tree, node, part)` 去重。
+    fn record_binding_patch<T: BindingValue>(
+        &mut self,
+        tree: TreeKey,
+        node: NodeRef,
+        part: BindingPart,
+        old: Option<T>,
+        new: Option<T>,
+        fault: Option<ReadFault>,
+    ) {
+        self.binding_patches
+            .record(tree, node, part, old, new, fault);
     }
 
     fn has_event(&self, element: usize, kind: EventKind) -> bool {
@@ -1622,22 +1768,29 @@ impl State {
     }
 
     fn element_is_disabled(&self, element: usize) -> bool {
-        self.element_attrs(element)
+        let Some(attr) = self
+            .element_attrs(element)
             .iter()
             .find(|attr| attr.name == "disabled")
-            .and_then(|attr| attr.current.as_ref())
-            .is_some_and(|current| matches!(current, AttrCurrent::Bool(true)))
+        else {
+            return false;
+        };
+        self.element_binding_table(element)
+            .is_some_and(|table| table.bool_current(attr.binding) == Some(true))
     }
 
-    /// `value` 绑定的写入代数；静态值或缺失绑定返回 `None`。
+    /// `value` 绑定的写入代数；静态值与缺失绑定返回 `None`。
     fn element_value_epoch(&self, element: usize) -> Option<u64> {
-        self.element_attrs(element)
+        let attr = self
+            .element_attrs(element)
             .iter()
-            .find(|attr| attr.name == "value")
-            .and_then(|attr| match &attr.value {
-                AttrValue::Text(read) => read.epoch(self),
-                AttrValue::Bool(_) => None,
-            })
+            .find(|attr| attr.name == "value")?;
+        let table = self.element_binding_table(element)?;
+        if !table.is_text(attr.binding) {
+            return None;
+        }
+        let source = table.read_slot(attr.binding)?;
+        source.epoch(self)
     }
 
     /// 取得或分配一棵树的 arena 键；同一个 runtime 树槽位在存续期间保持稳定。
@@ -1847,7 +2000,7 @@ impl State {
                         self.free_events.push(event);
                     }
                 }
-                Resource::Node(node) => self.nodes.release(node),
+                Resource::Node(node) => self.retire_node(node),
             }
         }
     }
@@ -1859,6 +2012,19 @@ impl State {
             .map(|record| std::mem::take(&mut record.resources))
             .unwrap_or_default();
         self.release_resources(resources);
+        // 失败的根挂载把绑定表一并丢弃；已提交的根树保留自己的表。
+        if !self.trees.contains_key(&TreeSlot::Root)
+            && let Some(tree) = self.arena_trees.get(&TreeSlot::Root).copied()
+        {
+            self.nodes.drop_binding_table(tree);
+        }
+    }
+
+    /// 树的所有节点释放后丢弃它的绑定表；重新打开窗口会建立新表。
+    fn drop_tree_binding_table(&mut self, slot: TreeSlot) {
+        if let Some(tree) = self.arena_trees.get(&slot).copied() {
+            self.nodes.drop_binding_table(tree);
+        }
     }
 
     /// 读取外观；memo 计算期间记为依赖。
@@ -2559,23 +2725,327 @@ pub struct MountedElement {
 
 struct MountedInlineStyle {
     property: zenui_style::Property,
-    slot: StyleSlot,
-    current: Option<zenui_style::StyleValue>,
-    fault: Option<ReadFault>,
+    binding: BindingRef,
 }
 
 pub struct MountedAttr {
     name: &'static str,
-    value: AttrValue,
-    current: Option<AttrCurrent>,
-    /// 本次求值失败；`current` 仍是最后已提交值。
-    fault: Option<ReadFault>,
+    binding: BindingRef,
 }
 
+/// 已提交属性值的比较用投影；值本身只在 `BindingSlot.current`。
 #[derive(Clone, PartialEq, Eq)]
 enum AttrCurrent {
     Text(String),
     Bool(bool),
+}
+
+/// 一个属性绑定的求值计划；已提交值只用于比较，写回仍以槽位为唯一权威。
+struct AttrPlan {
+    name: &'static str,
+    binding: BindingRef,
+    source: ReadSlot,
+    value_type: BindingType,
+    committed: Option<AttrCurrent>,
+}
+
+impl AttrPlan {
+    fn describe(table: &BindingTable, name: &'static str, binding: BindingRef) -> Self {
+        let source = table
+            .read_slot(binding)
+            .expect("a mounted attribute binding is live");
+        let value_type = table
+            .kind(binding)
+            .expect("a mounted attribute binding has a value type");
+        let committed = match value_type {
+            BindingType::Text => table
+                .text_current(binding)
+                .map(|value| AttrCurrent::Text(value.to_owned())),
+            BindingType::Bool => table.bool_current(binding).map(AttrCurrent::Bool),
+            _ => unreachable!("an attribute binding is text or bool"),
+        };
+        Self {
+            name,
+            binding,
+            source,
+            value_type,
+            committed,
+        }
+    }
+
+    /// 静态/once 槽返回 `None`：值已在挂载时提交，永不重算。
+    fn evaluate(&self) -> Option<ReadValue<AttrCurrent>> {
+        if self.source.is_static() {
+            return None;
+        }
+        Some(match self.value_type {
+            BindingType::Text => match self.source.evaluate::<String>() {
+                ReadValue::Value(value) => ReadValue::Value(AttrCurrent::Text(value)),
+                ReadValue::Fault(fault) => ReadValue::Fault(fault),
+            },
+            BindingType::Bool => match self.source.evaluate::<bool>() {
+                ReadValue::Value(value) => ReadValue::Value(AttrCurrent::Bool(value)),
+                ReadValue::Fault(fault) => ReadValue::Fault(fault),
+            },
+            _ => unreachable!("an attribute binding is text or bool"),
+        })
+    }
+
+    fn mark_fault(&self, state: &mut State, tree: TreeKey, fault: ReadFault) {
+        match self.value_type {
+            BindingType::Text => {
+                if let Some(slot) = state
+                    .nodes
+                    .binding_table_mut(tree)
+                    .slot_mut::<String>(self.binding)
+                {
+                    slot.fault = Some(fault);
+                }
+            }
+            BindingType::Bool => {
+                if let Some(slot) = state
+                    .nodes
+                    .binding_table_mut(tree)
+                    .slot_mut::<bool>(self.binding)
+                {
+                    slot.fault = Some(fault);
+                }
+            }
+            _ => unreachable!("an attribute binding is text or bool"),
+        }
+    }
+
+    /// 写回求值结果；返回可见值是否变化。失败从不走到这里。
+    fn commit_value(
+        &self,
+        state: &mut State,
+        tree: TreeKey,
+        node: NodeRef,
+        next: AttrCurrent,
+    ) -> bool {
+        let part = BindingPart::Attr(self.name);
+        match (self.committed.clone(), next) {
+            (Some(AttrCurrent::Text(old)), AttrCurrent::Text(value)) => {
+                let changed = old != value;
+                if let Some(slot) = state
+                    .nodes
+                    .binding_table_mut(tree)
+                    .slot_mut::<String>(self.binding)
+                {
+                    slot.fault = None;
+                    if changed {
+                        slot.current = Some(value.clone());
+                    }
+                }
+                if changed {
+                    state.record_binding_patch(tree, node, part, Some(old), Some(value), None);
+                }
+                changed
+            }
+            (None, AttrCurrent::Text(value)) => {
+                if let Some(slot) = state
+                    .nodes
+                    .binding_table_mut(tree)
+                    .slot_mut::<String>(self.binding)
+                {
+                    slot.fault = None;
+                    slot.current = Some(value.clone());
+                }
+                state.record_binding_patch::<String>(tree, node, part, None, Some(value), None);
+                true
+            }
+            (Some(AttrCurrent::Bool(old)), AttrCurrent::Bool(value)) => {
+                let changed = old != value;
+                if let Some(slot) = state
+                    .nodes
+                    .binding_table_mut(tree)
+                    .slot_mut::<bool>(self.binding)
+                {
+                    slot.fault = None;
+                    if changed {
+                        slot.current = Some(value);
+                    }
+                }
+                if changed {
+                    state.record_binding_patch(tree, node, part, Some(old), Some(value), None);
+                }
+                changed
+            }
+            (None, AttrCurrent::Bool(value)) => {
+                if let Some(slot) = state
+                    .nodes
+                    .binding_table_mut(tree)
+                    .slot_mut::<bool>(self.binding)
+                {
+                    slot.fault = None;
+                    slot.current = Some(value);
+                }
+                state.record_binding_patch::<bool>(tree, node, part, None, Some(value), None);
+                true
+            }
+            _ => unreachable!("an attribute binding keeps one value type"),
+        }
+    }
+}
+
+/// 一条 inline style 绑定的求值计划。
+struct StylePlan {
+    property: Property,
+    binding: BindingRef,
+    source: ReadSlot,
+    value_type: BindingType,
+    committed: Option<StyleValue>,
+}
+
+impl StylePlan {
+    fn describe(table: &BindingTable, property: Property, binding: BindingRef) -> Self {
+        let source = table
+            .read_slot(binding)
+            .expect("a mounted style binding is live");
+        let value_type = table
+            .kind(binding)
+            .expect("a mounted style binding has a value type");
+        let committed = table.inline_style(binding);
+        Self {
+            property,
+            binding,
+            source,
+            value_type,
+            committed,
+        }
+    }
+
+    fn evaluate(&self) -> Option<ReadValue<StyleValue>> {
+        if self.source.is_static() {
+            return None;
+        }
+        Some(match self.value_type {
+            BindingType::Color => match self.source.evaluate::<Color>() {
+                ReadValue::Value(value) => ReadValue::Value(StyleValue::Color(value)),
+                ReadValue::Fault(fault) => ReadValue::Fault(fault),
+            },
+            BindingType::Length => match self.source.evaluate::<Length>() {
+                ReadValue::Value(value) => ReadValue::Value(StyleValue::Length(value)),
+                ReadValue::Fault(fault) => ReadValue::Fault(fault),
+            },
+            BindingType::Opacity => match self.source.evaluate::<Opacity>() {
+                ReadValue::Value(value) => ReadValue::Value(StyleValue::Opacity(value.value())),
+                ReadValue::Fault(fault) => ReadValue::Fault(fault),
+            },
+            _ => unreachable!("a style binding is color, length or opacity"),
+        })
+    }
+
+    fn mark_fault(&self, state: &mut State, tree: TreeKey, fault: ReadFault) {
+        match self.value_type {
+            BindingType::Color => {
+                if let Some(slot) = state
+                    .nodes
+                    .binding_table_mut(tree)
+                    .slot_mut::<Color>(self.binding)
+                {
+                    slot.fault = Some(fault);
+                }
+            }
+            BindingType::Length => {
+                if let Some(slot) = state
+                    .nodes
+                    .binding_table_mut(tree)
+                    .slot_mut::<Length>(self.binding)
+                {
+                    slot.fault = Some(fault);
+                }
+            }
+            BindingType::Opacity => {
+                if let Some(slot) = state
+                    .nodes
+                    .binding_table_mut(tree)
+                    .slot_mut::<Opacity>(self.binding)
+                {
+                    slot.fault = Some(fault);
+                }
+            }
+            _ => unreachable!("a style binding is color, length or opacity"),
+        }
+    }
+
+    /// 写回求值结果；返回可见样式是否变化。
+    fn commit_value(
+        &self,
+        state: &mut State,
+        tree: TreeKey,
+        node: NodeRef,
+        next: StyleValue,
+    ) -> bool {
+        let part = BindingPart::Style(self.property);
+        match next {
+            StyleValue::Color(value) => {
+                let old = match self.committed {
+                    Some(StyleValue::Color(old)) => Some(old),
+                    _ => None,
+                };
+                let changed = old != Some(value);
+                if let Some(slot) = state
+                    .nodes
+                    .binding_table_mut(tree)
+                    .slot_mut::<Color>(self.binding)
+                {
+                    slot.fault = None;
+                    slot.current = Some(value);
+                }
+                if changed {
+                    state.record_binding_patch(tree, node, part, old, Some(value), None);
+                }
+                changed
+            }
+            StyleValue::Length(value) => {
+                let old = match self.committed {
+                    Some(StyleValue::Length(old)) => Some(old),
+                    _ => None,
+                };
+                let changed = old != Some(value);
+                if let Some(slot) = state
+                    .nodes
+                    .binding_table_mut(tree)
+                    .slot_mut::<Length>(self.binding)
+                {
+                    slot.fault = None;
+                    slot.current = Some(value);
+                }
+                if changed {
+                    state.record_binding_patch(tree, node, part, old, Some(value), None);
+                }
+                changed
+            }
+            StyleValue::Opacity(value) => {
+                let old = match self.committed {
+                    Some(StyleValue::Opacity(old)) => Some(old),
+                    _ => None,
+                };
+                let changed = old != Some(value);
+                if let Some(slot) = state
+                    .nodes
+                    .binding_table_mut(tree)
+                    .slot_mut::<Opacity>(self.binding)
+                {
+                    slot.fault = None;
+                    slot.current = Some(Opacity::percent(value));
+                }
+                if changed {
+                    state.record_binding_patch(
+                        tree,
+                        node,
+                        part,
+                        old.map(Opacity::percent),
+                        Some(Opacity::percent(value)),
+                        None,
+                    );
+                }
+                changed
+            }
+            _ => unreachable!("a style binding keeps one value type"),
+        }
+    }
 }
 
 enum LocalState {
@@ -3124,10 +3594,14 @@ pub struct MountedComponent {
 struct ShowData {
     owner: u32,
     node: NodeRef,
-    when: Read<bool>,
+    when: BindingRef,
     then: ChildrenFactory,
     fallback: Option<ChildrenFactory>,
     active: Option<MountedBranch>,
+    /// 最近一次求值 `when` 的刷新轮次；同一轮不重复求值。
+    structure_round: u64,
+    /// 活动分支的值最近被预刷新的轮次；同一轮不再做一次值遍历。
+    values_round: u64,
 }
 
 pub struct MountedBranch {
@@ -3139,7 +3613,7 @@ pub struct MountedBranch {
 struct ForData {
     owner: u32,
     node: NodeRef,
-    each: Memo<RowSet>,
+    each: BindingRef,
     key: Box<dyn Fn(TodoId) -> TodoId>,
     item: Box<dyn Fn(TodoId) -> MountResult<MountPlan>>,
     /// 窗口化 For 的统一行高；`None` 挂载全部行（ADR-0010）。
@@ -3159,6 +3633,8 @@ struct ForData {
     items: BTreeMap<TodoId, MountedItem>,
     /// 当前已挂载的行键，按业务顺序；窗口外的行不在其中。
     order: Vec<TodoId>,
+    /// 最近一次求值 `each` 的刷新轮次；同一轮不重复求值。
+    structure_round: u64,
 }
 
 pub struct MountedItem {
@@ -3178,28 +3654,42 @@ fn rows_height(row_height: Length, rows: usize) -> Length {
 }
 
 /// 为窗口化 For 创建上下两个零高 spacer；高度由每次刷新按窗口更新。
+///
+/// spacer 是运行时自有的合成绑定：挂载时写入静态 `role` 与高度，之后高度由
+/// [`set_spacer_height`] 作为结构几何更新直接写回槽位。
 fn ensure_spacers(state: &mut State, owner: u32, parent: Option<NodeRef>) -> (usize, usize) {
+    let tree = state.building_tree_key();
     let mut make = || {
         let slot = state.reserve_element(owner);
         let id = state.mint_element_node(slot, owner, parent);
+        let (role_part, role, height_part, height) = {
+            let table = state.nodes.binding_table_mut(tree);
+            (
+                table.part_id(BindingPart::Attr("role")),
+                table.insert::<String>(ReadSlot::Static, Some(String::from("spacer")), None),
+                table.part_id(BindingPart::Style(Property::Height)),
+                table.insert::<Length>(ReadSlot::Static, Some(Length::px(0.0)), None),
+            )
+        };
         let aux = state.nodes.reserve_element_aux(AuxSeed {
             attrs: vec![MountedAttr {
                 name: "role",
-                value: AttrValue::Text(Read::Static(String::from("spacer"))),
-                current: Some(AttrCurrent::Text(String::from("spacer"))),
-                fault: None,
+                binding: role,
             }],
             class_styles: &[],
             inline_styles: vec![MountedInlineStyle {
                 property: Property::Height,
-                slot: StyleSlot::Length(Read::Static(Length::px(0.0))),
-                current: Some(StyleValue::Length(Length::px(0.0))),
-                fault: None,
+                binding: height,
             }],
             events: Vec::new(),
             edit: LocalState::None,
             semantics: SnapshotSemantics::new(false, SnapshotActions::default()),
         });
+        {
+            let list = state.nodes.binding_list_mut(aux.bindings);
+            debug_assert!(list.insert(role_part, role).is_none());
+            debug_assert!(list.insert(height_part, height).is_none());
+        }
         let tag = state.nodes.intern_tag("view");
         state.nodes.place_element_data(
             slot,
@@ -3225,21 +3715,41 @@ fn ensure_spacers(state: &mut State, owner: u32, parent: Option<NodeRef>) -> (us
 /// 更新 spacer 的已提交高度；数量和单位一起保留，em 在场景里按最终字号解析。
 fn set_spacer_height(state: &mut State, spacer: usize, rows: usize, row_height: Length) {
     let height = rows_height(row_height, rows);
-    let changed = {
-        let Some(style) = state
-            .element_inline_styles_mut(spacer)
-            .iter_mut()
-            .find(|style| style.property == Property::Height)
+    let Some(binding) = state
+        .element_inline_styles(spacer)
+        .iter()
+        .find(|style| style.property == Property::Height)
+        .map(|style| style.binding)
+    else {
+        return;
+    };
+    let Some(tree) = state.element_tree(spacer) else {
+        return;
+    };
+    let (changed, old) = {
+        let Some(slot) = state
+            .nodes
+            .binding_table_mut(tree)
+            .slot_mut::<Length>(binding)
         else {
             return;
         };
-        let next = Some(StyleValue::Length(height));
-        let changed = style.current != next;
-        style.current = next;
-        style.slot = StyleSlot::Length(Read::Static(height));
-        changed
+        let changed = slot.current != Some(height);
+        let old = slot.current;
+        slot.current = Some(height);
+        slot.fault = None;
+        (changed, old)
     };
     if changed {
+        let node = state.elements[spacer].id.node();
+        state.record_binding_patch(
+            tree,
+            node,
+            BindingPart::Style(Property::Height),
+            old,
+            Some(height),
+            None,
+        );
         state.mark_element_changed(spacer);
     }
 }
@@ -3441,12 +3951,12 @@ impl ElementScratchGuard {
         }
     }
 
-    fn attrs_mut(&mut self) -> &mut Vec<MountedAttr> {
-        self.attrs.as_mut().expect("element attrs are taken")
+    fn attrs(&self) -> &[MountedAttr] {
+        self.attrs.as_deref().expect("element attrs are taken")
     }
 
-    fn styles_mut(&mut self) -> &mut Vec<MountedInlineStyle> {
-        self.styles.as_mut().expect("element styles are taken")
+    fn styles(&self) -> &[MountedInlineStyle] {
+        self.styles.as_deref().expect("element styles are taken")
     }
 
     fn take_attrs(&mut self) -> Vec<MountedAttr> {
@@ -3625,7 +4135,7 @@ fn find_element(state: &State, nodes: &[MountedNode], target: &FindTarget) -> Op
                         matches!(
                             child,
                             MountedNode::Text(node)
-                                if state.nodes.text(*node).value == *text
+                                if state.text_value(*node) == *text
                         )
                     }),
                 };
@@ -3733,16 +4243,28 @@ impl Runtime {
             return Err(MountError::Component("root is already mounted"));
         }
         let state = self.state.clone();
-        context::install(&state, || {
-            with_state(|state| state.fault = None);
+        let result = context::install(&state, || {
+            // 失败的挂载把本 turn 已经记录的结构/值补丁一并回滚，不能把
+            // 已释放节点的补丁留给后续消费者。
+            let patch_mark = with_state(|state| state.binding_patches.mark());
+            with_state(|state| {
+                state.fault = None;
+                state.write_error = None;
+            });
             let plan = match with_owner(0, || catch_panic(root)) {
                 Ok(Ok(plan)) => plan,
                 Ok(Err(error)) => {
-                    with_state(State::release_root_resources);
+                    with_state(|state| {
+                        state.binding_patches.rollback(patch_mark);
+                        state.release_root_resources();
+                    });
                     return Err(error);
                 }
                 Err(panic) => {
-                    with_state(State::release_root_resources);
+                    with_state(|state| {
+                        state.binding_patches.rollback(patch_mark);
+                        state.release_root_resources();
+                    });
                     return Err(MountError::Panic(panic));
                 }
             };
@@ -3750,12 +4272,21 @@ impl Runtime {
                 match with_tree_context(TreeSlot::Root, || self.mount_plan(plan, 0, None)) {
                     Ok(tree) => tree,
                     Err(error) => {
-                        with_state(State::release_root_resources);
+                        with_state(|state| {
+                            state.binding_patches.rollback(patch_mark);
+                            state.release_root_resources();
+                        });
                         return Err(error);
                     }
                 };
             if let Some(fault) = with_state(|state| state.fault.take()) {
                 self.release_nodes(&mut tree);
+                with_state(|state| {
+                    state.binding_patches.rollback(patch_mark);
+                    // 根 factory 的 signal/memo 挂在 owner 0 上；失败的挂载
+                    // 必须释放它们，同时丢弃未提交的根绑定表。
+                    state.release_root_resources();
+                });
                 return Err(State::context_error(fault));
             }
             with_state(|state| {
@@ -3773,8 +4304,32 @@ impl Runtime {
                 state.mark_tree_changed(TreeSlot::Root);
                 state.phase = Phase::Idle;
             });
-            self.refresh_internal()
-        })
+            if let Err(error) = self.refresh_internal() {
+                // 首次刷新失败：根界面并未成功挂载，撤销这次提交，释放
+                // 它的节点、绑定表和 owner 0 资源，允许调用方重新 mount。
+                let nodes =
+                    with_state(|state| state.trees.remove(&TreeSlot::Root).map(|tree| tree.nodes));
+                if let Some(mut nodes) = nodes {
+                    self.release_nodes(&mut nodes);
+                }
+                with_state(|state| {
+                    state.binding_patches.rollback(patch_mark);
+                    state.release_root_resources();
+                    state.dirty_trees.remove(&TreeSlot::Root);
+                    state.changed_trees.remove(&TreeSlot::Root);
+                    state.phase = Phase::Idle;
+                });
+                return Err(error);
+            }
+            Ok(())
+        });
+        if result.is_err() {
+            // 失败的挂载不能把工厂/结算记录的旁路错误留给下一个 turn。
+            let mut state = self.state.borrow_mut();
+            state.fault = None;
+            state.write_error = None;
+        }
+        result
     }
 
     /// 失败的计划先撤销交付，再释放已创建的界面与 Owner。
@@ -3787,12 +4342,17 @@ impl Runtime {
     ) {
         with_state(|state| {
             state.abort_window(key, activation, owner);
+            // 被放弃的 activation 不能把 factory/memo 的错误旁路留给后续 turn。
             state.fault = None;
+            state.write_error = None;
         });
         if let Some(mut nodes) = tree {
             self.release_nodes(&mut nodes);
         }
-        with_state(|state| state.dispose_owner(owner));
+        with_state(|state| {
+            state.dispose_owner(owner);
+            state.drop_tree_binding_table(TreeSlot::Window(key));
+        });
     }
 
     /// 声明静态窗口目录；声明本身不运行 factory，也不挂载界面。
@@ -4103,7 +4663,13 @@ impl Runtime {
     ) -> Result<WindowCtx, WindowError> {
         let state = self.state.clone();
         context::install(&state, || {
-            with_state(|state| state.fault = None);
+            // 失败的窗口挂载回滚本次挂载记录的补丁，不把已释放节点的
+            // 记录留给后续消费者。
+            let patch_mark = with_state(|state| state.binding_patches.mark());
+            with_state(|state| {
+                state.fault = None;
+                state.write_error = None;
+            });
             let (activation, owner) = with_state(|state| state.begin_window(key));
             let window = WindowCtx::new(state.borrow().id, key, activation, owner);
             let plan = with_owner(owner, || {
@@ -4113,15 +4679,18 @@ impl Runtime {
             let plan = match plan {
                 Ok(Ok(plan)) => plan,
                 Ok(Err(error)) => {
+                    with_state(|state| state.binding_patches.rollback(patch_mark));
                     self.abort_open(key, activation, owner, None);
                     return Err(WindowError::Mount(error));
                 }
                 Err(panic) => {
+                    with_state(|state| state.binding_patches.rollback(patch_mark));
                     self.abort_open(key, activation, owner, None);
                     return Err(WindowError::Mount(MountError::Panic(panic)));
                 }
             };
             if let Some(id) = with_state(|state| state.missing_command_handler(key)) {
+                with_state(|state| state.binding_patches.rollback(patch_mark));
                 self.abort_open(key, activation, owner, None);
                 return Err(WindowError::Command(CommandError::MissingHandler(id)));
             }
@@ -4130,11 +4699,13 @@ impl Runtime {
             }) {
                 Ok(tree) => tree,
                 Err(error) => {
+                    with_state(|state| state.binding_patches.rollback(patch_mark));
                     self.abort_open(key, activation, owner, None);
                     return Err(WindowError::Mount(error));
                 }
             };
             if let Some(fault) = with_state(|state| state.fault.take()) {
+                with_state(|state| state.binding_patches.rollback(patch_mark));
                 self.abort_open(key, activation, owner, Some(tree));
                 return Err(WindowError::Mount(MountError::Context {
                     operation: fault.operation,
@@ -4931,6 +5502,7 @@ impl Runtime {
             self.release_nodes(&mut nodes);
             with_state(|state| {
                 state.dispose_owner(window.owner);
+                state.drop_tree_binding_table(TreeSlot::Window(window.key));
                 if state.focused_window == Some(window.key) {
                     state.focused_window = state.first_visible_window();
                 }
@@ -4979,17 +5551,61 @@ impl Runtime {
             if !with_state(|state| state.tree_has_band(key, band)) {
                 return Err(WindowError::Stale);
             }
+            // 请求本身不改 revision；只有刷新真的改变了呈现（行挂载/卸载、
+            // spacer 高度、值绑定）才由刷新路径标记 dirty。
+            let mut previous = None;
             let changed = with_state(|state| {
                 let request = RowWindow { first, count };
                 if state.row_windows.get(&band) == Some(&request) {
                     return false;
                 }
-                state.row_windows.insert(band, request);
-                state.mark_tree_changed(key);
+                previous = Some(state.row_windows.insert(band, request));
                 true
             });
             if changed {
-                self.refresh_tree_once(key).map_err(WindowError::Mount)?;
+                // 滚动 tick 是一个独立求值轮次；补丁日志按 (tree, node, part)
+                // 去重，释放的行由 retire_node 从日志移除，反复滚动不会累积。
+                // tick 状态只在这段调用内存活：refresh_for 据此报告请求窗口
+                // 是否已提交，调用结束即清零，不会随卸载的 For 累积。
+                with_state(|state| {
+                    state.bump_refresh_round();
+                    state.row_window_tick = Some(band);
+                    state.row_window_commit = false;
+                });
+                let result = self.refresh_tree_once(key).map_err(WindowError::Mount);
+                let committed = with_state(|state| {
+                    let committed = state.row_window_commit;
+                    state.row_window_tick = None;
+                    state.row_window_commit = false;
+                    committed
+                });
+                if let Err(error) = result {
+                    // 拟议窗口在失败前已提交（行工厂之后的行内结构错误、或
+                    // 后续兄弟节点失败）时，请求必须保留：回滚会让请求映射
+                    // 与已提交的 first_row/spacer 分叉，下一次普通刷新会把
+                    // 宿主没有请求过的窗口悄悄套上去。
+                    if !committed {
+                        // 窗口本身没有落地才回滚请求，宿主可以用同一个窗口
+                        // 重试，而不是被“请求已存在”的快速路径吞掉。行带
+                        // 若随 owner 卸载，请求已经一并丢弃，不再恢复。
+                        with_state(|state| {
+                            if !state.tree_has_band(key, band) {
+                                state.row_windows.remove(&band);
+                                return;
+                            }
+                            match previous {
+                                Some(Some(request)) => {
+                                    state.row_windows.insert(band, request);
+                                }
+                                Some(None) => {
+                                    state.row_windows.remove(&band);
+                                }
+                                None => {}
+                            }
+                        });
+                    }
+                    return Err(error);
+                }
             }
             Ok(changed)
         })
@@ -5008,7 +5624,12 @@ impl Runtime {
         if self.tree_keys().is_empty() {
             return Err(MountError::Component("no committed interface is mounted"));
         }
-        self.state.borrow_mut().read_faults.clear();
+        {
+            let mut state = self.state.borrow_mut();
+            state.read_faults.clear();
+            // 上一个 turn 的补丁已经交付；新 turn 从空日志开始。
+            let _ = state.binding_patches.take();
+        }
         self.settle_memos();
         // settle 在 Phase::Memo 中运行；非法写入要像刷新期写入一样冒泡为
         // Context 错误，而不是被随后每棵树的 fault 重置吞掉。
@@ -5086,10 +5707,22 @@ impl Runtime {
     }
 
     fn refresh_all_once(&mut self) -> Result<(), MountError> {
+        // 每轮开始新的求值轮次；同一 binding 每轮最多求值一次。
+        // 这里不在已安装的上下文里，直接借 state。
+        self.state.borrow_mut().bump_refresh_round();
+        // 一棵树的错误只影响它自己：后续树仍然刷新，错误在最后统一报告。
+        let mut first_error = None;
         for key in self.tree_keys() {
-            self.refresh_tree_once(key)?;
+            if let Err(error) = self.refresh_tree_once(key)
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
         }
-        Ok(())
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     /// 刷新一棵树；返回本次是否推进了这棵树的 revision。
@@ -5276,6 +5909,18 @@ impl Runtime {
         Ok(nodes)
     }
 
+    /// 挂载期求值 Show/For 触发：memo 的 panic 属于挂载失败，不能穿过
+    /// `Runtime::mount`/窗口挂载等公开入口；调用方负责释放 owner。
+    fn mount_refresh(
+        &mut self,
+        refresh: impl FnOnce(&mut Self) -> Result<(), MountError>,
+    ) -> Result<(), MountError> {
+        match catch_panic(std::panic::AssertUnwindSafe(|| refresh(self))) {
+            Ok(result) => result,
+            Err(panic) => Err(MountError::Panic(panic)),
+        }
+    }
+
     fn mount_node(
         &mut self,
         node: PlanNode,
@@ -5285,11 +5930,16 @@ impl Runtime {
         match node {
             PlanNode::Text(slot) => {
                 let payload = with_state(|state| {
+                    let tree = state.building_tree_key();
                     let node = state.register_node(NodeKindTag::Text, parent, parent_node);
+                    let binding = {
+                        let table = state.nodes.binding_table_mut(tree);
+                        slot.into_binding(table)
+                    };
                     let payload = state.nodes.reserve_text(TextData {
-                        source: slot,
-                        value: String::new(),
-                        fault: None,
+                        binding,
+                        tree,
+                        node,
                     });
                     state
                         .nodes
@@ -5318,16 +5968,33 @@ impl Runtime {
                     };
                 let tag = plan.tag;
                 let id = with_state(|state| {
-                    let mut attrs = Vec::new();
+                    let tree = state.building_tree_key();
+                    let mut attrs: Vec<MountedAttr> = Vec::new();
                     let mut events = Vec::new();
+                    let mut bindings: Vec<(PartId, BindingRef)> = Vec::new();
                     for attr in plan.attrs {
                         match attr {
-                            Attr::Value { name, value } => attrs.push(MountedAttr {
-                                name,
-                                value,
-                                current: None,
-                                fault: None,
-                            }),
+                            Attr::Value { name, value } => {
+                                let (part, binding) = {
+                                    let table = state.nodes.binding_table_mut(tree);
+                                    let part = table.part_id(BindingPart::Attr(name));
+                                    let binding = match value {
+                                        AttrValue::Text(read) => read.into_binding(table),
+                                        AttrValue::Bool(read) => read.into_binding(table),
+                                    };
+                                    (part, binding)
+                                };
+                                // 同名属性以最后一个声明为准；先归还被替换的
+                                // 槽，保证元素分配的每个槽都在它的绑定列表里。
+                                if let Some(index) = attrs.iter().position(|attr| attr.name == name)
+                                {
+                                    let replaced = attrs.remove(index);
+                                    bindings.retain(|(item, _)| *item != part);
+                                    state.nodes.release_binding(tree, replaced.binding);
+                                }
+                                attrs.push(MountedAttr { name, binding });
+                                bindings.push((part, binding));
+                            }
                             Attr::Event(event) => {
                                 let id = state.reserve_event(event);
                                 events.push(id);
@@ -5357,16 +6024,31 @@ impl Runtime {
                         "checkbox" => LocalState::Checkbox { checked: false },
                         _ => LocalState::None,
                     };
-                    let inline_styles = plan
-                        .inline_styles
-                        .into_iter()
-                        .map(|InlineStyle { property, slot }| MountedInlineStyle {
-                            property,
-                            slot,
-                            current: None,
-                            fault: None,
-                        })
-                        .collect();
+                    let mut inline_styles: Vec<MountedInlineStyle> =
+                        Vec::with_capacity(plan.inline_styles.len());
+                    for InlineStyle { property, slot } in plan.inline_styles {
+                        let (part, binding) = {
+                            let table = state.nodes.binding_table_mut(tree);
+                            let part = table.part_id(BindingPart::Style(property));
+                            let binding = match slot {
+                                StyleSlot::Color(read) => read.into_binding(table),
+                                StyleSlot::Length(read) => read.into_binding(table),
+                                StyleSlot::Opacity(read) => read.into_binding(table),
+                            };
+                            (part, binding)
+                        };
+                        // 同一 property 重复声明时最后一个生效，被替换的槽立即归还。
+                        if let Some(index) = inline_styles
+                            .iter()
+                            .position(|style| style.property == property)
+                        {
+                            let replaced: MountedInlineStyle = inline_styles.remove(index);
+                            bindings.retain(|(item, _)| *item != part);
+                            state.nodes.release_binding(tree, replaced.binding);
+                        }
+                        bindings.push((part, binding));
+                        inline_styles.push(MountedInlineStyle { property, binding });
+                    }
                     let semantics = SnapshotSemantics::new(
                         inherent_focusable(state, tag, &events),
                         actions_for_events(state, &events),
@@ -5379,6 +6061,21 @@ impl Runtime {
                         edit: local,
                         semantics,
                     });
+                    {
+                        let mut replaced = Vec::new();
+                        {
+                            let list = state.nodes.binding_list_mut(aux.bindings);
+                            for (part, binding) in bindings {
+                                if let Some(old) = list.insert(part, binding) {
+                                    replaced.push(old);
+                                }
+                            }
+                        }
+                        // 防御：任何替换都必须归还旧槽，不能留在表里。
+                        for old in replaced {
+                            state.nodes.release_binding(tree, old);
+                        }
+                    }
                     let tag_id = state.nodes.intern_tag(tag);
                     state.nodes.place_element_data(
                         slot,
@@ -5447,13 +6144,20 @@ impl Runtime {
                 let show_node =
                     with_state(|state| state.register_node(NodeKindTag::Show, owner, parent_node));
                 let payload = with_state(|state| {
+                    let tree = state.building_tree_key();
+                    let when = {
+                        let table = state.nodes.binding_table_mut(tree);
+                        plan.when.into_binding(table)
+                    };
                     let payload = state.nodes.reserve_show(ShowData {
                         owner,
                         node: show_node,
-                        when: plan.when,
+                        when,
                         then: plan.then,
                         fallback: plan.fallback,
                         active: None,
+                        structure_round: u64::MAX,
+                        values_round: u64::MAX,
                     });
                     state
                         .nodes
@@ -5461,8 +6165,12 @@ impl Runtime {
                         .expect("the Show node is live");
                     payload
                 });
-                if let Err(error) = self.refresh_show(payload) {
-                    with_state(|state| state.dispose_owner(owner));
+                let speculation = with_state(|state| state.mark_speculation());
+                if let Err(error) = self.mount_refresh(|state| state.refresh_show(payload)) {
+                    with_state(|state| {
+                        state.rollback_speculation(speculation);
+                        state.dispose_owner(owner);
+                    });
                     return Err(error);
                 }
                 Ok(MountedNode::Show(payload))
@@ -5478,10 +6186,15 @@ impl Runtime {
                     band
                 });
                 let payload = with_state(|state| {
+                    let tree = state.building_tree_key();
+                    let each = {
+                        let table = state.nodes.binding_table_mut(tree);
+                        Read::<RowSet>::from(plan.each).into_binding(table)
+                    };
                     let payload = state.nodes.reserve_for(ForData {
                         owner,
                         node: for_node,
-                        each: plan.each,
+                        each,
                         key: plan.key,
                         item: plan.item,
                         row_height: plan.row_height,
@@ -5494,6 +6207,7 @@ impl Runtime {
                         row_of: BTreeMap::new(),
                         items: BTreeMap::new(),
                         order: Vec::new(),
+                        structure_round: u64::MAX,
                     });
                     state
                         .nodes
@@ -5501,8 +6215,12 @@ impl Runtime {
                         .expect("the For node is live");
                     payload
                 });
-                if let Err(error) = self.refresh_for(payload) {
-                    with_state(|state| state.dispose_owner(owner));
+                let speculation = with_state(|state| state.mark_speculation());
+                if let Err(error) = self.mount_refresh(|state| state.refresh_for(payload)) {
+                    with_state(|state| {
+                        state.rollback_speculation(speculation);
+                        state.dispose_owner(owner);
+                    });
                     return Err(error);
                 }
                 Ok(MountedNode::For(payload))
@@ -5514,13 +6232,25 @@ impl Runtime {
         with_state(|state| clear_history_in_nodes(state, nodes));
         let nodes = std::mem::take(nodes);
         for node in nodes {
-            let owner = with_state(|state| match node {
-                MountedNode::Text(_) => None,
-                MountedNode::Element(id) => Some(state.element_owner(id)),
-                MountedNode::Component(id) => Some(state.components[id].owner),
-                MountedNode::Show(payload) => Some(state.nodes.show(payload).owner),
-                MountedNode::For(payload) => Some(state.nodes.for_node(payload).owner),
-            });
+            let owner = match node {
+                // 文本节点没有自己的 owner，登记在父 owner 下；根挂载失败时
+                // 父 owner 不会被释放，所以这里直接归还节点身份与绑定槽。
+                MountedNode::Text(payload) => {
+                    with_state(|state| {
+                        let node = state.nodes.text(payload).node;
+                        state.retire_node(node);
+                    });
+                    None
+                }
+                MountedNode::Element(id) => with_state(|state| Some(state.element_owner(id))),
+                MountedNode::Component(id) => with_state(|state| Some(state.components[id].owner)),
+                MountedNode::Show(payload) => {
+                    with_state(|state| Some(state.nodes.show(payload).owner))
+                }
+                MountedNode::For(payload) => {
+                    with_state(|state| Some(state.nodes.for_node(payload).owner))
+                }
+            };
             if let Some(owner) = owner {
                 with_state(|state| {
                     state.dispose_owner(owner);
@@ -5530,153 +6260,274 @@ impl Runtime {
         }
     }
 
+    /// 一个 turn 的绑定刷新：结构触发先求值并提交，然后才求值文本/属性/样式。
+    ///
+    /// 这保证结构补丁先于值补丁；同一 `(tree, node, part)` 的补丁在
+    /// `BindingPatchLog` 里去重一次。
     fn refresh_nodes(&mut self, nodes: &mut [MountedNode]) -> Result<(), MountError> {
+        // 结构触发失败不回滚其他节点的值绑定：值阶段仍然执行，错误在最后
+        // 报告。这样同一帧里已经可提交的属性（例如 disabled）不会丢失。
+        let structure = self.refresh_structure_nodes(nodes);
+        let values = self.refresh_value_nodes(nodes);
+        structure.and(values)
+    }
+
+    /// 求值一个节点列表的结构触发。一个失败的分支/行只影响它自己：
+    /// 后续兄弟仍在本轮求值，错误在遍历结束后统一报告。
+    fn refresh_structure_nodes(&mut self, nodes: &mut [MountedNode]) -> Result<(), MountError> {
+        let mut first_error = None;
         for node in nodes {
-            self.refresh_node(node)?;
+            let result = match node {
+                MountedNode::Text(_) => Ok(()),
+                MountedNode::Element(id) => {
+                    let mut guard = ChildrenGuard::take(ChildrenOwner::Element(*id));
+                    let result = self.refresh_structure_nodes(guard.children_mut());
+                    guard.restore();
+                    result
+                }
+                MountedNode::Component(id) => {
+                    let mut guard = ChildrenGuard::take(ChildrenOwner::Component(*id));
+                    let result = self.refresh_structure_nodes(guard.children_mut());
+                    guard.restore();
+                    result
+                }
+                MountedNode::Show(payload) => self.refresh_show(*payload),
+                MountedNode::For(payload) => self.refresh_for(*payload),
+            };
+            if let Err(error) = result
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    fn refresh_value_nodes(&mut self, nodes: &mut [MountedNode]) -> Result<(), MountError> {
+        for node in nodes {
+            match node {
+                MountedNode::Text(payload) => self.refresh_text(*payload)?,
+                MountedNode::Element(id) => {
+                    self.refresh_element(*id);
+                    let mut guard = ChildrenGuard::take(ChildrenOwner::Element(*id));
+                    let result = self.refresh_value_nodes(guard.children_mut());
+                    guard.restore();
+                    result?;
+                }
+                MountedNode::Component(id) => {
+                    let mut guard = ChildrenGuard::take(ChildrenOwner::Component(*id));
+                    let result = self.refresh_value_nodes(guard.children_mut());
+                    guard.restore();
+                    result?;
+                }
+                MountedNode::Show(payload) => self.refresh_show_values(*payload)?,
+                MountedNode::For(payload) => self.refresh_for_values(*payload)?,
+            }
         }
         Ok(())
     }
 
-    fn refresh_node(&mut self, node: &mut MountedNode) -> Result<(), MountError> {
-        match node {
-            MountedNode::Text(payload) => {
-                let source = with_state(|state| state.nodes.text(*payload).source.clone());
-                let next = source.evaluate();
-                let fault = with_state(|state| match next {
-                    ReadValue::Value(value) => {
-                        let changed = {
-                            let text = state.nodes.text_mut(*payload);
-                            text.fault = None;
-                            if text.value == value {
-                                false
-                            } else {
-                                text.value = value;
-                                true
-                            }
-                        };
-                        if changed {
-                            state.mark_building_tree_changed();
-                        }
-                        None
-                    }
-                    ReadValue::Fault(fault) => {
-                        // 读取失败保留最后已提交文本；fault 与值并列。
-                        state.nodes.text_mut(*payload).fault = Some(fault.clone());
-                        Some(fault)
-                    }
-                });
-                if let Some(fault) = fault {
-                    with_state(|state| state.record_read_fault(fault));
-                }
-                Ok(())
-            }
-            MountedNode::Element(id) => {
-                self.refresh_element(*id);
-                let mut guard = ChildrenGuard::take(ChildrenOwner::Element(*id));
-                let result = self.refresh_nodes(guard.children_mut());
-                guard.restore();
-                result
-            }
-            MountedNode::Component(id) => {
-                let mut guard = ChildrenGuard::take(ChildrenOwner::Component(*id));
-                let result = self.refresh_nodes(guard.children_mut());
-                guard.restore();
-                result
-            }
-            MountedNode::Show(payload) => self.refresh_show(*payload),
-            MountedNode::For(payload) => self.refresh_for(*payload),
+    /// 求值一个文本槽；`Static`/`Once` 在挂载时已提交，不再重算。
+    fn refresh_text(&mut self, payload: u32) -> Result<(), MountError> {
+        let (binding, source, tree, node) = with_state(|state| {
+            let data = state.nodes.text(payload);
+            let table = state
+                .nodes
+                .binding_table(data.tree)
+                .expect("a mounted text node has a binding table");
+            let slot = table
+                .slot::<String>(data.binding)
+                .expect("a mounted text binding slot is live");
+            (data.binding, slot.source, data.tree, data.node)
+        });
+        if source.is_static() {
+            return Ok(());
         }
+        let next = source.evaluate::<String>();
+        with_state(|state| {
+            let mut value_patch = None;
+            let mut fault = None;
+            {
+                let table = state.nodes.binding_table_mut(tree);
+                let Some(slot) = table.slot_mut::<String>(binding) else {
+                    return;
+                };
+                match next {
+                    ReadValue::Value(value) => {
+                        let old = slot.current.clone();
+                        if old.as_ref() != Some(&value) {
+                            slot.current = Some(value.clone());
+                            value_patch = Some((old, value));
+                        }
+                        slot.fault = None;
+                    }
+                    ReadValue::Fault(next_fault) => {
+                        // 读取失败保留最后已提交文本；没有最后值时呈现为空串。
+                        slot.fault = Some(next_fault.clone());
+                        fault = Some(next_fault);
+                    }
+                }
+            }
+            if let Some((old, value)) = value_patch {
+                state.record_binding_patch(tree, node, BindingPart::Text, old, Some(value), None);
+                state.mark_building_tree_changed();
+            }
+            if let Some(fault) = fault {
+                state.record_read_fault(fault);
+            }
+        });
+        Ok(())
+    }
+
+    /// 求值 Show 活动分支里的值绑定；结构阶段已经决定分支。
+    fn refresh_show_values(&mut self, payload: u32) -> Result<(), MountError> {
+        let data = with_state(|state| state.nodes.take_show(payload));
+        let mut guard = ShowPayloadGuard {
+            payload,
+            data: Some(data),
+        };
+        let round = with_state(|state| state.refresh_round);
+        let show = guard.data_mut();
+        // 结构阶段刚预刷新过这个分支时，值阶段不再把同一批 binding 求值一次。
+        if show.values_round == round {
+            return Ok(());
+        }
+        if let Some(branch) = &mut show.active {
+            self.refresh_value_nodes(&mut branch.children)?;
+        }
+        show.values_round = round;
+        Ok(())
+    }
+
+    /// 求值已挂载行的值绑定；结构阶段已经完成行的挂载/卸载。
+    fn refresh_for_values(&mut self, payload: u32) -> Result<(), MountError> {
+        let data = with_state(|state| state.nodes.take_for(payload));
+        let mut guard = ForPayloadGuard {
+            payload,
+            data: Some(data),
+        };
+        let data = guard.data_mut();
+        for key in &data.order {
+            if let Some(item) = data.items.get_mut(key) {
+                self.refresh_value_nodes(&mut item.children)?;
+            }
+        }
+        Ok(())
     }
 
     fn refresh_element(&mut self, id: usize) {
         // 属性求值会读取用户 memo；panic 时 guard 把旧 attrs/styles 放回元素，
         // 已提交界面因此保持完整。
         let mut scratch = ElementScratchGuard::take(id);
-        let mut attrs_changed = false;
-        let mut faults = Vec::new();
-        for attr in scratch.attrs_mut() {
-            let evaluated = match &attr.value {
-                AttrValue::Text(read) => match read.evaluate() {
-                    ReadValue::Value(value) => ReadValue::Value(AttrCurrent::Text(value)),
-                    ReadValue::Fault(fault) => ReadValue::Fault(fault),
-                },
-                AttrValue::Bool(read) => match read.evaluate() {
-                    ReadValue::Value(value) => ReadValue::Value(AttrCurrent::Bool(value)),
-                    ReadValue::Fault(fault) => ReadValue::Fault(fault),
-                },
+        let Some(tree) = with_state(|state| state.element_tree(id)) else {
+            return;
+        };
+        let node = with_state(|state| state.elements[id].id.node());
+
+        // 先收集槽来源与已提交值；求值用户闭包期间不持有 State 借用。
+        // 没有绑定（也没有 attribute/style）的树没有绑定表，直接跳过求值。
+        let attr_plans: Vec<AttrPlan> = with_state(|state| {
+            let Some(table) = state.nodes.binding_table(tree) else {
+                return Vec::new();
             };
-            match evaluated {
-                ReadValue::Value(next) => {
-                    let next = Some(next);
-                    if attr.current != next {
-                        attrs_changed = true;
-                    }
-                    attr.current = next;
-                    attr.fault = None;
-                }
-                ReadValue::Fault(fault) => {
-                    // 失败不替换 current：属性保持最后已提交值，首次失败则缺席。
-                    attr.fault = Some(fault.clone());
-                    faults.push(fault);
-                }
-            }
-        }
-        let mut styles_changed = false;
-        for style in scratch.styles_mut() {
-            match style.slot.evaluate() {
-                ReadValue::Value(value) => {
-                    let next = Some(value);
-                    if style.current != next {
-                        styles_changed = true;
-                    }
-                    style.current = next;
-                    style.fault = None;
-                }
-                ReadValue::Fault(fault) => {
-                    style.fault = Some(fault.clone());
-                    faults.push(fault);
-                }
-            }
-        }
-        if !faults.is_empty() {
-            with_state(|state| {
-                for fault in faults {
-                    state.record_read_fault(fault);
-                }
-            });
-        }
-        // 值绑定的写入代数要在同一份新属性上读取，且不能嵌套借用 State。
-        let (committed, epoch) = with_state(|state| {
-            let attrs = scratch.attrs_mut();
-            let committed = attrs
+            scratch
+                .attrs()
                 .iter()
-                .find(|attr| attr.name == "value")
-                .and_then(|attr| attr.current.as_ref())
-                .and_then(|current| match current {
-                    AttrCurrent::Text(text) => Some(text.as_str()),
-                    AttrCurrent::Bool(_) => None,
-                })
-                .unwrap_or_default()
-                .to_owned();
-            let epoch = attrs
-                .iter()
-                .find(|attr| attr.name == "value")
-                .and_then(|attr| match &attr.value {
-                    AttrValue::Text(read) => read.epoch(state),
-                    AttrValue::Bool(_) => None,
-                });
-            (committed, epoch)
+                .map(|attr| AttrPlan::describe(table, attr.name, attr.binding))
+                .collect()
         });
+        let attr_values: Vec<Option<ReadValue<AttrCurrent>>> =
+            attr_plans.iter().map(AttrPlan::evaluate).collect();
+        let style_plans: Vec<StylePlan> = with_state(|state| {
+            let Some(table) = state.nodes.binding_table(tree) else {
+                return Vec::new();
+            };
+            scratch
+                .styles()
+                .iter()
+                .map(|style| StylePlan::describe(table, style.property, style.binding))
+                .collect()
+        });
+        let style_values: Vec<Option<ReadValue<StyleValue>>> =
+            style_plans.iter().map(StylePlan::evaluate).collect();
+
+        let mut attrs_changed = false;
+        let mut styles_changed = false;
+        let mut faults = Vec::new();
+        with_state(|state| {
+            for (plan, next) in attr_plans.iter().zip(attr_values) {
+                match next {
+                    // 静态/once 值在挂载时已写入，永不重算。
+                    None => {}
+                    Some(ReadValue::Value(next)) => {
+                        attrs_changed |= plan.commit_value(state, tree, node, next);
+                    }
+                    Some(ReadValue::Fault(fault)) => {
+                        // 失败不替换 current：属性保持最后已提交值，首次失败则缺席。
+                        plan.mark_fault(state, tree, fault.clone());
+                        faults.push(fault);
+                    }
+                }
+            }
+            for (plan, next) in style_plans.iter().zip(style_values) {
+                match next {
+                    None => {}
+                    Some(ReadValue::Value(next)) => {
+                        styles_changed |= plan.commit_value(state, tree, node, next);
+                    }
+                    Some(ReadValue::Fault(fault)) => {
+                        plan.mark_fault(state, tree, fault.clone());
+                        faults.push(fault);
+                    }
+                }
+            }
+            for fault in faults {
+                state.record_read_fault(fault);
+            }
+        });
+
+        // 属性列表在 scratch 里，已提交值仍从绑定槽读取；文本编辑器据此
+        // 辨认模型写入。
+        let value_binding = scratch
+            .attrs()
+            .iter()
+            .find(|attr| attr.name == "value")
+            .map(|attr| attr.binding);
+        let (committed, epoch) = match value_binding {
+            Some(binding) => with_state(|state| {
+                let Some(table) = state.element_binding_table(id) else {
+                    return (String::new(), None);
+                };
+                let committed = table.text_current(binding).unwrap_or_default().to_owned();
+                // 只有文本 `value` 绑定有编辑器写入代数；bool 绑定不参与结算。
+                let epoch = if table.is_text(binding) {
+                    table.read_slot(binding).and_then(|slot| slot.epoch(state))
+                } else {
+                    None
+                };
+                (committed, epoch)
+            }),
+            None => (String::new(), None),
+        };
         with_state(|state| {
             let attrs = scratch.take_attrs();
             let styles = scratch.take_styles();
             let mut local_changed = false;
+            // 已提交的 `checked` 绑定先读出来，避免同时借用本地编辑状态。
+            let bound = attrs
+                .iter()
+                .find(|attr| attr.name == "checked")
+                .and_then(|attr| {
+                    state
+                        .element_binding_table(id)
+                        .and_then(|table| table.bool_current(attr.binding))
+                });
             let event = {
                 if let LocalState::Checkbox { checked } = state.element_local_mut(id)
-                    && let Some(AttrCurrent::Bool(value)) = attrs
-                        .iter()
-                        .find(|attr| attr.name == "checked")
-                        .and_then(|attr| attr.current.clone())
+                    && let Some(value) = bound
                     && *checked != value
                 {
                     *checked = value;
@@ -5714,19 +6565,79 @@ impl Runtime {
             data: Some(data),
         };
         let show = guard.data_mut();
-        // `when` 的求值可能读到毒化且没有最后值的 memo；旧分支保持挂载。
-        let active = match catch_panic(|| show.when.evaluate()) {
-            Ok(ReadValue::Value(active)) => active,
-            Ok(ReadValue::Fault(fault)) => {
-                // 读取失败不伪造 false：保持当前分支，并报告 typed fault。
-                // 分支里的其他绑定仍要在这一帧刷新，不能被结构触发冻结。
-                with_state(|state| state.record_read_fault(fault));
-                if let Some(branch) = &mut show.active {
-                    return self.refresh_nodes(&mut branch.children);
-                }
+        let round = with_state(|state| state.refresh_round);
+        // 同一触发每轮最多求值一次；本轮挂载的行/分支不会在尾随结构遍历里重跑。
+        if show.structure_round == round {
+            return Ok(());
+        }
+        show.structure_round = round;
+        let node = show.node;
+        let binding = show.when;
+        let tree = with_state(|state| state.nodes.tree_of(node))
+            .expect("a mounted Show node belongs to a tree");
+        let (source, committed) = with_state(|state| {
+            let table = state
+                .nodes
+                .binding_table(tree)
+                .expect("a mounted Show node has a binding table");
+            let slot = table
+                .slot::<bool>(binding)
+                .expect("a mounted Show binding slot is live");
+            (slot.source, slot.current)
+        });
+        // `Static`/`Once` 在挂载时提交；动态源失败时保持当前分支。
+        let active = if source.is_static() {
+            let Some(active) = committed else {
                 return Ok(());
+            };
+            active
+        } else {
+            match source.evaluate::<bool>() {
+                ReadValue::Value(value) => {
+                    let changed = committed != Some(value);
+                    with_state(|state| {
+                        if let Some(slot) = state
+                            .nodes
+                            .binding_table_mut(tree)
+                            .slot_mut::<bool>(binding)
+                        {
+                            slot.fault = None;
+                            if changed {
+                                slot.current = Some(value);
+                            }
+                        }
+                        if changed {
+                            state.record_binding_patch(
+                                tree,
+                                node,
+                                BindingPart::ShowWhen,
+                                committed,
+                                Some(value),
+                                None,
+                            );
+                        }
+                    });
+                    value
+                }
+                ReadValue::Fault(fault) => {
+                    // 读取失败不伪造 false：保持当前分支，并报告 typed fault。
+                    // 分支里的结构触发仍要在这一帧继续向下求值。
+                    with_state(|state| {
+                        if let Some(slot) = state
+                            .nodes
+                            .binding_table_mut(tree)
+                            .slot_mut::<bool>(binding)
+                        {
+                            slot.fault = Some(fault.clone());
+                        }
+                        state.record_read_fault(fault);
+                    });
+                    if let Some(branch) = &mut show.active {
+                        self.refresh_structure_nodes(&mut branch.children)?;
+                    }
+                    return Ok(());
+                }
             }
-            Err(panic) => return Err(MountError::Panic(panic)),
         };
         let wanted = if active {
             Some(true)
@@ -5737,12 +6648,16 @@ impl Runtime {
         };
         let branch_changed = show.active.as_ref().map(|branch| branch.which) != wanted;
         if !branch_changed {
+            // 分支保持挂载时，嵌套的 Show/For 触发仍属于结构阶段。
             if let Some(branch) = &mut show.active {
-                return self.refresh_nodes(&mut branch.children);
+                self.refresh_structure_nodes(&mut branch.children)?;
             }
             return Ok(());
         }
 
+        // 拟议分支的预挂载/预刷新会写补丁；被拒绝的分支必须把补丁和
+        // dirty 标记回滚到拟议之前，快照与 revision 都保持原样。
+        let speculation = with_state(|state| state.mark_speculation());
         let replacement = match wanted {
             Some(which) => {
                 let owner = with_state(|state| state.create_owner(Some(show.owner)));
@@ -5754,19 +6669,28 @@ impl Runtime {
                 let plan = match with_owner(owner, || catch_panic(|| factory.mount())) {
                     Ok(Ok(plan)) => plan,
                     Ok(Err(error)) => {
-                        with_state(|state| state.dispose_owner(owner));
-                        return Err(error);
+                        with_state(|state| {
+                            state.dispose_owner(owner);
+                            state.rollback_speculation(speculation);
+                        });
+                        return self.reject_show_branch(show, error);
                     }
                     Err(panic) => {
-                        with_state(|state| state.dispose_owner(owner));
-                        return Err(MountError::Panic(panic));
+                        with_state(|state| {
+                            state.dispose_owner(owner);
+                            state.rollback_speculation(speculation);
+                        });
+                        return self.reject_show_branch(show, MountError::Panic(panic));
                     }
                 };
                 let children = match self.mount_plan(plan, owner, Some(show.node)) {
                     Ok(children) => children,
                     Err(error) => {
-                        with_state(|state| state.dispose_owner(owner));
-                        return Err(error);
+                        with_state(|state| {
+                            state.dispose_owner(owner);
+                            state.rollback_speculation(speculation);
+                        });
+                        return self.reject_show_branch(show, error);
                     }
                 };
                 Some(MountedBranch {
@@ -5793,9 +6717,10 @@ impl Runtime {
                 with_state(|state| {
                     clear_history_in_nodes(state, &branch.children);
                     state.dispose_owner(branch.owner);
+                    state.rollback_speculation(speculation);
                     state.unmounts += 1;
                 });
-                return Err(error);
+                return self.reject_show_branch(show, error);
             }
         }
 
@@ -5808,11 +6733,29 @@ impl Runtime {
                 state.unmounts += 1;
             });
         }
+        // 拟议分支的预刷新已经提交了分支里的值；值阶段不再重跑这一轮。
+        if replacement.is_some() {
+            show.values_round = round;
+        }
         show.active = replacement;
         if branch_changed {
             with_state(State::mark_building_tree_changed);
         }
         Ok(())
+    }
+
+    /// 拟议分支被拒绝后的收尾：保留的旧分支仍是已提交结构，它里面的
+    /// Show/For 触发仍要在这一帧继续求值；拟议分支的错误保持为第一个
+    /// 错误，保留分支的错误留到下一轮重新报告。
+    fn reject_show_branch(
+        &mut self,
+        show: &mut ShowData,
+        error: MountError,
+    ) -> Result<(), MountError> {
+        if let Some(branch) = &mut show.active {
+            let _ = self.refresh_structure_nodes(&mut branch.children);
+        }
+        Err(error)
     }
 
     fn refresh_for(&mut self, payload: u32) -> Result<(), MountError> {
@@ -5822,14 +6765,76 @@ impl Runtime {
             data: Some(data),
         };
         let for_node = guard.data_mut();
-        // 源求值失败时旧行与旧窗口保持不变。
-        let rows: RowSet = match catch_panic(|| for_node.each.get()) {
-            Ok(rows) => rows,
-            Err(panic) => return Err(MountError::Panic(panic)),
+        let round = with_state(|state| state.refresh_round);
+        // 同一触发每轮最多求值一次；本轮挂载的行不会在尾随结构遍历里重跑。
+        if for_node.structure_round == round {
+            return Ok(());
+        }
+        for_node.structure_round = round;
+        let node = for_node.node;
+        let binding = for_node.each;
+        let tree = with_state(|state| state.nodes.tree_of(node))
+            .expect("a mounted For node belongs to a tree");
+        let (source, committed) = with_state(|state| {
+            let table = state
+                .nodes
+                .binding_table(tree)
+                .expect("a mounted For node has a binding table");
+            let slot = table
+                .slot::<RowSet>(binding)
+                .expect("a mounted For binding slot is live");
+            (slot.source, slot.current.clone())
+        });
+        // 源求值失败时旧行与旧窗口保持不变；首次失败视为空行集。
+        let rows: RowSet = if source.is_static() {
+            committed.unwrap_or_else(RowSet::empty)
+        } else {
+            match source.evaluate::<RowSet>() {
+                ReadValue::Value(rows) => {
+                    let changed = committed.as_ref() != Some(&rows);
+                    with_state(|state| {
+                        if let Some(slot) = state
+                            .nodes
+                            .binding_table_mut(tree)
+                            .slot_mut::<RowSet>(binding)
+                        {
+                            slot.fault = None;
+                            if changed {
+                                slot.current = Some(rows.clone());
+                            }
+                        }
+                        if changed {
+                            state.record_binding_patch(
+                                tree,
+                                node,
+                                BindingPart::ForEach,
+                                committed.clone(),
+                                Some(rows.clone()),
+                                None,
+                            );
+                        }
+                    });
+                    rows
+                }
+                ReadValue::Fault(fault) => {
+                    with_state(|state| {
+                        if let Some(slot) = state
+                            .nodes
+                            .binding_table_mut(tree)
+                            .slot_mut::<RowSet>(binding)
+                        {
+                            slot.fault = Some(fault.clone());
+                        }
+                        state.record_read_fault(fault);
+                    });
+                    committed.unwrap_or_else(RowSet::empty)
+                }
+            }
         };
         // 完整的 keyed 顺序只在 row set 投影变化时重建：重复键在窗口化之前
         // 就拒绝，窗口只影响挂载哪些行，绝不改变行顺序（ADR-0011）。key 只应
         // 依赖行身份，因此同一份投影可以复用映射结果；窗口更新是 O(窗口)。
+        let mut projection_failure = None;
         if for_node
             .rows
             .as_ref()
@@ -5842,20 +6847,33 @@ impl Runtime {
                 // key 选择器是用户代码；panic 时不改写已提交的行映射。
                 let mapped = match catch_panic(|| (for_node.key)(todo)) {
                     Ok(mapped) => mapped,
-                    Err(panic) => return Err(MountError::Panic(panic)),
+                    Err(panic) => {
+                        projection_failure = Some(MountError::Panic(panic));
+                        break;
+                    }
                 };
                 if !seen.insert(mapped) {
-                    return Err(MountError::DuplicateKey);
+                    projection_failure = Some(MountError::DuplicateKey);
+                    break;
                 }
                 entries.push((mapped, todo));
             }
-            for_node.row_of = entries
-                .iter()
-                .enumerate()
-                .map(|(index, (mapped, _))| (*mapped, index))
-                .collect();
-            for_node.entries = entries;
-            for_node.rows = Some(rows);
+            if projection_failure.is_none() {
+                for_node.row_of = entries
+                    .iter()
+                    .enumerate()
+                    .map(|(index, (mapped, _))| (*mapped, index))
+                    .collect();
+                for_node.entries = entries;
+                for_node.rows = Some(rows);
+            }
+        }
+        if let Some(error) = projection_failure {
+            // 拟议行集被拒绝：已提交的行映射、窗口与 spacer 保持原样。
+            // 保留行不是拟议结构，它们里面的 Show/For 触发仍要在这一帧
+            // 继续求值；拒绝本身的错误保持为第一个错误。
+            let _ = self.refresh_committed_for_rows(for_node);
+            return Err(error);
         }
         let total = for_node.entries.len();
         let previous_order = for_node.order.clone();
@@ -5906,6 +6924,10 @@ impl Runtime {
 
         let mut order = Vec::with_capacity(count);
         let mut fresh = Vec::new();
+        // 预挂载的 fresh 行会写入补丁和 dirty 标记；行挂载失败并释放时
+        // 一起回滚，未提交的行不影响 revision。
+        let speculation = with_state(|state| state.mark_speculation());
+        let mut mount_failure = None;
         for index in first..first + count {
             let (mapped, todo) = for_node.entries[index];
             order.push(mapped);
@@ -5917,21 +6939,21 @@ impl Runtime {
                 Ok(Ok(plan)) => plan,
                 Ok(Err(error)) => {
                     with_state(|state| state.dispose_owner(owner));
-                    self.release_items(&mut fresh);
-                    return Err(error);
+                    mount_failure = Some(error);
+                    break;
                 }
                 Err(panic) => {
                     with_state(|state| state.dispose_owner(owner));
-                    self.release_items(&mut fresh);
-                    return Err(MountError::Panic(panic));
+                    mount_failure = Some(MountError::Panic(panic));
+                    break;
                 }
             };
             let children = match self.mount_plan(plan, owner, Some(for_node.node)) {
                 Ok(children) => children,
                 Err(error) => {
                     with_state(|state| state.dispose_owner(owner));
-                    self.release_items(&mut fresh);
-                    return Err(error);
+                    mount_failure = Some(error);
+                    break;
                 }
             };
             let instance = with_state(|state| {
@@ -5948,6 +6970,14 @@ impl Runtime {
                     children,
                 },
             ));
+        }
+        if let Some(error) = mount_failure {
+            // 拟议窗口没有提交：丢弃预挂载行和它们的补丁/dirty 标记。
+            with_state(|state| state.rollback_speculation(speculation));
+            self.release_items(&mut fresh);
+            // 保留行不是拟议结构：它们里面的结构触发仍要在这一帧继续求值。
+            let _ = self.refresh_committed_for_rows(for_node);
+            return Err(error);
         }
 
         let keep: BTreeSet<TodoId> = order.iter().copied().collect();
@@ -5977,9 +7007,9 @@ impl Runtime {
         if structural_changed {
             with_state(State::mark_building_tree_changed);
         }
-        for item in for_node.items.values_mut() {
-            self.refresh_nodes(&mut item.children)?;
-        }
+        // 行内嵌套的 Show/For 触发仍属于结构阶段；值绑定由值阶段求值，
+        // 保证结构补丁先于值补丁。一行失败不影响后续行，错误在最后报告。
+        let first_error = self.refresh_committed_for_rows(for_node);
         if let (Some(row_height), Some((top, bottom))) = (for_node.row_height, for_node.spacers) {
             let mounted = for_node.order.len().min(total - first);
             with_state(|state| {
@@ -5989,7 +7019,38 @@ impl Runtime {
         }
         for_node.total_rows = total;
         for_node.first_row = first;
-        Ok(())
+        if for_node.row_height.is_some() {
+            // tick 请求的窗口已经消费并提交；失败的 tick 不能把它回滚成
+            // “宿主从未请求过”的状态，否则请求映射与已提交行窗口会长期
+            // 分叉。只有 tick 内的刷新才记录，普通刷新不留下任何标记。
+            let band = for_node.band;
+            with_state(|state| {
+                if state.row_window_tick == Some(band) {
+                    state.row_window_commit = true;
+                }
+            });
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    /// 继续求值已提交行里的嵌套结构触发，返回第一个错误。
+    ///
+    /// 拟议窗口被拒绝时，已提交的行不是拟议结构：它们不能随拟议一起冻结，
+    /// 否则失败行仍在行集里的每一帧都会跳过这些行里的 Show/For 触发。
+    fn refresh_committed_for_rows(&mut self, for_node: &mut ForData) -> Option<MountError> {
+        let mut first_error = None;
+        for key in &for_node.order {
+            if let Some(item) = for_node.items.get_mut(key)
+                && let Err(error) = self.refresh_structure_nodes(&mut item.children)
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+        first_error
     }
 
     fn release_items(&mut self, items: &mut Vec<(TodoId, MountedItem)>) {
@@ -8060,7 +9121,7 @@ fn collect_snapshot(state: &State, nodes: &[MountedNode], out: &mut Vec<Snapshot
     for node in nodes {
         match node {
             MountedNode::Text(payload) => {
-                out.push(SnapshotNode::Text(state.nodes.text(*payload).value.clone()));
+                out.push(SnapshotNode::Text(state.text_value(*payload)));
             }
             MountedNode::Element(id) => collect_element(state, *id, out),
             MountedNode::Component(id) => {
@@ -8174,27 +9235,35 @@ fn snapshot_styles(
     if inline_styles.is_empty() {
         return std::borrow::Cow::Borrowed(class_styles);
     }
+    let table = state.element_binding_table(element);
     let mut styles = class_styles.to_vec();
     styles.extend(inline_styles.iter().filter_map(|style| {
-        style
-            .current
-            .map(|value| zenui_style::StyleDeclaration::inline(style.property, value))
+        let value = table.and_then(|table| table.inline_style(style.binding))?;
+        Some(zenui_style::StyleDeclaration::inline(style.property, value))
     }));
     std::borrow::Cow::Owned(styles)
 }
 
 fn snapshot_attrs(state: &State, element: usize) -> Vec<SnapshotAttr> {
+    let table = state.element_binding_table(element);
     let mut attrs: Vec<SnapshotAttr> = state
         .element_attrs(element)
         .iter()
         .filter_map(|attr| {
-            attr.current.as_ref().map(|current| SnapshotAttr {
-                name: attr.name,
-                value: match current {
-                    AttrCurrent::Text(text) => SnapshotValue::Text(text.clone()),
-                    AttrCurrent::Bool(value) => SnapshotValue::Bool(*value),
-                },
-            })
+            let table = table?;
+            if table.is_text(attr.binding) {
+                table.text_current(attr.binding).map(|text| SnapshotAttr {
+                    name: attr.name,
+                    value: SnapshotValue::Text(text.to_owned()),
+                })
+            } else if table.is_bool(attr.binding) {
+                table.bool_current(attr.binding).map(|value| SnapshotAttr {
+                    name: attr.name,
+                    value: SnapshotValue::Bool(value),
+                })
+            } else {
+                None
+            }
         })
         .collect();
     // 无 `checked` 绑定的 checkbox 由本地编辑状态决定呈现；有绑定时两者在已提交帧一致。
@@ -8222,7 +9291,7 @@ fn snapshot_attrs(state: &State, element: usize) -> Vec<SnapshotAttr> {
 fn collect_texts(state: &State, nodes: &[MountedNode], texts: &mut Vec<String>) {
     for node in nodes {
         match node {
-            MountedNode::Text(payload) => texts.push(state.nodes.text(*payload).value.clone()),
+            MountedNode::Text(payload) => texts.push(state.text_value(*payload)),
             MountedNode::Element(id) => collect_texts(state, &state.elements[*id].children, texts),
             MountedNode::Component(id) => {
                 collect_texts(state, &state.components[*id].children, texts);
@@ -9296,5 +10365,1631 @@ mod arena_tests {
         assert_eq!(state.nodes.texts.live(), texts_before);
         assert_eq!(state.nodes.shows.live(), shows_before);
         assert_eq!(state.nodes.forces.live(), forces_before);
+    }
+}
+
+#[cfg(test)]
+mod binding_tests {
+    #![allow(unused_braces)]
+
+    use super::*;
+    use crate::prelude::*;
+    use crate::view::{attr, child, element, style_color, styled_element};
+
+    #[component]
+    fn PatchHost() -> MountResult<MountPlan> {
+        let expanded = signal(false);
+        let label = signal(String::from("a"));
+        view! {
+            <view>
+                <Show when={expanded}><text>"shown"</text></Show>
+                <text>{label}</text>
+                <button
+                    aria:label="go"
+                    on:click={move || {
+                        expanded.set(true);
+                        label.set(String::from("b"));
+                    }}
+                >"go"</button>
+            </view>
+        }
+    }
+
+    #[test]
+    fn a_turn_records_structure_patches_before_value_patches() {
+        let mut app = Runtime::new();
+        app.mount(|| view! { <PatchHost /> }).expect("mount");
+        app.click_label("go").expect("toggle the frame");
+
+        let mut state = app.state.borrow_mut();
+        let patches = state.binding_patches.take();
+        let show = patches
+            .iter()
+            .position(|patch| patch.part == BindingPart::ShowWhen)
+            .expect("the Show trigger changed");
+        let text = patches
+            .iter()
+            .position(|patch| patch.part == BindingPart::Text)
+            .expect("the text changed");
+        assert!(
+            show < text,
+            "structure patches precede value patches: {:?}",
+            patches.iter().map(|patch| patch.part).collect::<Vec<_>>()
+        );
+    }
+
+    #[component]
+    fn NestedShowHost() -> MountResult<MountPlan> {
+        let outer = signal(true);
+        let inner = signal(false);
+        view! {
+            <view>
+                <Show when={outer}>
+                    <Show when={inner}><text>"nested"</text></Show>
+                    <button
+                        aria:label="inner"
+                        on:click={move || inner.set(!inner.get())}
+                    >"toggle"</button>
+                </Show>
+                <button
+                    aria:label="outer"
+                    on:click={move || outer.set(!outer.get())}
+                >"outer"</button>
+            </view>
+        }
+    }
+
+    #[test]
+    fn a_nested_show_updates_while_the_outer_branch_stays_mounted() {
+        let mut app = Runtime::new();
+        app.mount(|| view! { <NestedShowHost /> }).expect("mount");
+        assert!(app.texts().iter().all(|text| text != "nested"));
+
+        app.click_label("inner").expect("show the nested branch");
+        assert!(
+            app.texts().iter().any(|text| text == "nested"),
+            "the nested Show re-evaluates while the outer branch is unchanged"
+        );
+        app.click_label("inner").expect("hide the nested branch");
+        assert!(app.texts().iter().all(|text| text != "nested"));
+    }
+
+    #[component]
+    fn ForNestedShowHost() -> MountResult<MountPlan> {
+        let store = Store::new();
+        let rows = memo(move || store.rows(Filter::All));
+        let inner = signal(false);
+        view! {
+            <view>
+                <button aria:label="seed" on:click={move || -> Result<(), WriteError> {
+                    Transaction::new().write(store.insert("row")).finish()?;
+                    Ok(())
+                }}>"seed"</button>
+                <For each={rows} key={|id: TodoId| id}>
+                    {move |_id: TodoId| view! {
+                        <view>
+                            <Show when={inner}><text>"row-inner"</text></Show>
+                            <text>"row"</text>
+                        </view>
+                    }}
+                </For>
+                <button
+                    aria:label="inner"
+                    on:click={move || inner.set(!inner.get())}
+                >"inner"</button>
+            </view>
+        }
+    }
+
+    #[test]
+    fn a_show_inside_a_for_row_updates_with_the_row_mounted() {
+        let mut app = Runtime::new();
+        app.mount(|| view! { <ForNestedShowHost /> })
+            .expect("mount");
+        app.click_label("seed").expect("seed a row");
+        assert_eq!(app.for_items().len(), 1);
+        assert!(app.texts().iter().all(|text| text != "row-inner"));
+
+        app.click_label("inner").expect("show the nested branch");
+        assert!(
+            app.texts().iter().any(|text| text == "row-inner"),
+            "structure triggers inside mounted rows still run"
+        );
+    }
+
+    #[test]
+    fn static_and_once_text_is_committed_at_mount_and_never_patched() {
+        let mut app = Runtime::new();
+        app.mount(|| {
+            view! {
+                <view>
+                    <text>"static"</text>
+                    <text>{once(String::from("snapshot"))}</text>
+                </view>
+            }
+        })
+        .expect("mount");
+        assert_eq!(
+            app.texts(),
+            vec![String::from("static"), String::from("snapshot")],
+            "static/once values are committed before the first refresh"
+        );
+
+        // 丢弃挂载期的补丁；下一次刷新不应再为静态槽产生任何补丁。
+        let _ = app.state.borrow_mut().binding_patches.take();
+        app.refresh().expect("refresh");
+        let mut state = app.state.borrow_mut();
+        assert!(
+            state.binding_patches.take().is_empty(),
+            "static and once slots are written once at mount"
+        );
+        for tree in state.trees.values() {
+            for node in &tree.nodes {
+                let MountedNode::Text(payload) = node else {
+                    continue;
+                };
+                let data = state.nodes.text(*payload);
+                let slot = state
+                    .nodes
+                    .binding_table(data.tree)
+                    .and_then(|table| table.slot::<String>(data.binding))
+                    .expect("a mounted text slot");
+                assert!(slot.source.is_static());
+                assert!(slot.current.is_some(), "the mount snapshot stays committed");
+            }
+        }
+    }
+
+    fn live_binding_slots(app: &Runtime) -> usize {
+        let state = app.state.borrow();
+        state
+            .nodes
+            .binding_tables
+            .values()
+            .map(BindingTable::live)
+            .sum()
+    }
+
+    #[component]
+    fn ToggleText() -> MountResult<MountPlan> {
+        let visible = signal(true);
+        let label = signal(String::from("branch"));
+        view! {
+            <view>
+                <Show when={visible}>
+                    <view aria:label="branch">
+                        <text>{label}</text>
+                        <button disabled={once(false)}>"inside"</button>
+                    </view>
+                </Show>
+                <button
+                    aria:label="toggle"
+                    on:click={move || visible.set(!visible.get())}
+                >"toggle"</button>
+            </view>
+        }
+    }
+
+    #[test]
+    fn a_show_branch_switch_returns_its_binding_slots() {
+        let mut app = Runtime::new();
+        app.mount(|| view! { <ToggleText /> }).expect("mount");
+        let mounted = live_binding_slots(&app);
+        assert!(mounted > 0);
+
+        app.click_label("toggle").expect("hide the branch");
+        let hidden = live_binding_slots(&app);
+        assert!(
+            hidden < mounted,
+            "hiding the branch returns its text and attr slots"
+        );
+        app.click_label("toggle").expect("show the branch");
+        assert_eq!(
+            live_binding_slots(&app),
+            mounted,
+            "the remounted branch allocates the same number of slots"
+        );
+        app.click_label("toggle").expect("hide the branch again");
+        assert_eq!(
+            live_binding_slots(&app),
+            hidden,
+            "repeated mount/unmount does not grow the binding table"
+        );
+    }
+
+    #[test]
+    fn closing_a_window_releases_every_binding_slot_and_list() {
+        let mut app = Runtime::new();
+        app.declare_windows(|catalog| {
+            catalog.window(WindowSpec::new("main").primary(), |_| {
+                view! {
+                    <view>
+                        <text>"hello"</text>
+                        <button
+                            aria:label="go"
+                            disabled={once(false)}
+                            style:width={once(px(10.0))}
+                        >"go"</button>
+                    </view>
+                }
+            })
+        })
+        .expect("declare the window");
+        let window = app.show("main").expect("show the window");
+        {
+            let state = app.state.borrow();
+            assert!(
+                state
+                    .nodes
+                    .binding_tables
+                    .values()
+                    .any(|table| table.live() > 0),
+                "the mount created typed binding slots"
+            );
+            assert!(
+                state.nodes.aux.binding_lists.live() > 0,
+                "elements keep their binding lists"
+            );
+        }
+
+        app.close_window(window).expect("close the window");
+        let state = app.state.borrow();
+        assert!(
+            state.nodes.binding_tables.is_empty(),
+            "the retired tree drops its binding table"
+        );
+        assert_eq!(
+            state.nodes.aux.binding_lists.live(),
+            0,
+            "every element returns its binding list"
+        );
+    }
+
+    #[component]
+    fn ForHost() -> MountResult<MountPlan> {
+        let store = Store::new();
+        let rows = memo(move || store.rows(Filter::All));
+        view! {
+            <view>
+                <button aria:label="Seed" on:click={move || -> Result<(), WriteError> {
+                    let mut transaction = Transaction::new();
+                    for index in 0..2 {
+                        transaction = transaction.write(store.insert(format!("r{index}")));
+                    }
+                    transaction.finish()?;
+                    Ok(())
+                }}>"Seed"</button>
+                <For each={rows} key={|id: TodoId| id}>
+                    {move |id: TodoId| view! { <text>{once(format!("row {}", id.raw()))}</text> }}
+                </For>
+            </view>
+        }
+    }
+
+    #[component]
+    fn PanicText() -> MountResult<MountPlan> {
+        let failing: Memo<String> = memo(|| panic!("virgin memo boom"));
+        view! { <text>{failing}</text> }
+    }
+
+    #[component]
+    fn RejectHost() -> MountResult<MountPlan> {
+        let label = signal(String::from("a"));
+        let open = signal(false);
+        view! {
+            <view>
+                <Show when={open}>
+                    <text>{label}</text>
+                    <PanicText />
+                </Show>
+                <button
+                    aria:label="go"
+                    on:click={move || {
+                        label.set(String::from("b"));
+                        open.set(true);
+                    }}
+                >"go"</button>
+            </view>
+        }
+    }
+
+    #[test]
+    fn a_rejected_show_branch_rolls_back_its_pre_refresh_patches() {
+        let mut app = Runtime::new();
+        app.mount(|| view! { <RejectHost /> }).expect("mount");
+        let _ = app.refresh().expect("drain the mount turn");
+        let revision = app.presentation_revision();
+        let before = app.presentation().expect("snapshot");
+        let failure = app
+            .click_label("go")
+            .expect_err("the proposed branch panics during pre-refresh");
+        assert!(matches!(failure, MountError::Panic(_)));
+        assert_eq!(
+            app.presentation_revision(),
+            revision,
+            "a rejected branch is not a visible change"
+        );
+        assert_eq!(
+            app.presentation().expect("snapshot"),
+            before,
+            "the snapshot is byte-identical after the rejection"
+        );
+
+        let mut state = app.state.borrow_mut();
+        let patches = state.binding_patches.take();
+        assert!(
+            patches.iter().all(|patch| patch.part != BindingPart::Text),
+            "patches for the rejected branch are rolled back: {:?}",
+            patches.iter().map(|patch| patch.part).collect::<Vec<_>>()
+        );
+        assert!(
+            patches
+                .iter()
+                .any(|patch| patch.part == BindingPart::ShowWhen),
+            "the committed trigger patch is kept"
+        );
+    }
+
+    #[test]
+    fn a_root_first_refresh_failure_rolls_back_the_committed_tree() {
+        let mut app = Runtime::new();
+        let error = app
+            .mount(|| view! { <PanicText /> })
+            .expect_err("the first refresh evaluates the poisoned memo");
+        assert!(matches!(error, MountError::Panic(_)));
+        {
+            let state = app.state.borrow();
+            assert!(
+                state.trees.is_empty(),
+                "a failed mount leaves no committed root tree"
+            );
+            assert_eq!(state.nodes.live(), 0, "every node is released");
+            assert!(
+                state.nodes.binding_tables.is_empty(),
+                "the failed root mount drops its binding table"
+            );
+            assert_eq!(
+                state.nodes.aux.binding_lists.live(),
+                0,
+                "every binding list is returned"
+            );
+        }
+        assert_eq!(app.live_memos(), 0, "the component memo is released");
+
+        app.mount(|| view! { <text>"calm"</text> })
+            .expect("the failed mount can be retried");
+        assert_eq!(app.texts(), vec![String::from("calm")]);
+    }
+
+    #[component]
+    fn WriteThenPanicShow() -> MountResult<MountPlan> {
+        let store = Store::new();
+        let failing: Memo<bool> = memo(move || {
+            let _ = Transaction::new().write(store.insert("ghost")).finish();
+            panic!("write then panic");
+        });
+        view! { <Show when={failing}><text>"x"</text></Show> }
+    }
+
+    #[test]
+    fn a_failed_window_activation_discards_its_write_error() {
+        let mut app = Runtime::new();
+        app.declare_windows(|catalog| {
+            catalog.window(WindowSpec::new("a").primary(), |_| {
+                view! { <text>"a"</text> }
+            })?;
+            catalog.window(WindowSpec::new("b"), |_| {
+                view! { <WriteThenPanicShow /> }
+            })?;
+            Ok(())
+        })
+        .expect("declare the windows");
+        app.show("a").expect("show the calm window");
+        let _ = app.refresh().expect("drain the mount report");
+        let error = app
+            .show("b")
+            .expect_err("the b source writes and then panics");
+        assert!(matches!(error, WindowError::Mount(MountError::Panic(_))));
+        let report = app
+            .refresh()
+            .expect("the aborted activation's write error is discarded");
+        assert!(!report.changed(), "nothing visible changed");
+    }
+
+    #[component]
+    fn LiveThenPanicText() -> MountResult<MountPlan> {
+        let live = signal(String::from("live"));
+        let failing: Memo<String> = memo(|| panic!("virgin memo boom"));
+        view! { <view><text>{live}</text><text>{failing}</text></view> }
+    }
+
+    #[test]
+    fn a_failed_window_first_refresh_removes_its_released_patches() {
+        let mut app = Runtime::new();
+        app.declare_windows(|catalog| {
+            catalog.window(WindowSpec::new("main").primary(), |_| {
+                view! { <LiveThenPanicText /> }
+            })
+        })
+        .expect("declare the window");
+        let error = app
+            .show("main")
+            .expect_err("the second text evaluates a poisoned memo");
+        assert!(matches!(error, WindowError::Mount(MountError::Panic(_))));
+        let mut state = app.state.borrow_mut();
+        assert!(
+            state.binding_patches.take().is_empty(),
+            "no patch survives the released window tree"
+        );
+        assert!(
+            state.nodes.binding_tables.is_empty(),
+            "the failed window mount drops its binding table"
+        );
+    }
+
+    #[component]
+    fn WindowedRowsHost() -> MountResult<MountPlan> {
+        let store = Store::new();
+        let rows = memo(move || store.rows(Filter::All));
+        view! {
+            <view>
+                <button aria:label="seed" on:click={move || -> Result<(), WriteError> {
+                    let mut transaction = Transaction::new();
+                    for index in 0..40 {
+                        transaction = transaction.write(store.insert(format!("r{index}")));
+                    }
+                    transaction.finish()?;
+                    Ok(())
+                }}>"seed"</button>
+                <For each={rows} key={|id: TodoId| id} row-height={px(20.0)}>
+                    {move |id: TodoId| view! { <text>{once(format!("row {}", id.raw()))}</text> }}
+                </For>
+            </view>
+        }
+    }
+
+    #[test]
+    fn row_window_ticks_do_not_accumulate_stale_patches() {
+        let mut app = Runtime::new();
+        app.declare_windows(|catalog| {
+            catalog.window(WindowSpec::new("main").primary(), |_| {
+                view! { <WindowedRowsHost /> }
+            })
+        })
+        .expect("declare the window");
+        let window = app.show("main").expect("show the window");
+        app.click_label("seed").expect("seed the rows");
+        let band = app.presentation_of(window).expect("snapshot").row_bands()[0].key();
+        for tick in 0..6 {
+            let revision = app.presentation_revision_of(window).expect("revision");
+            app.set_row_window(window, band, 4 + tick * 4, 4)
+                .expect("scroll down");
+            assert_ne!(
+                app.presentation_revision_of(window).expect("revision"),
+                revision,
+                "tick {tick} advances the revision for a changed window"
+            );
+            let mut state = app.state.borrow_mut();
+            let patches = state.binding_patches.parts();
+            assert!(
+                !patches.is_empty(),
+                "tick {tick} changes the spacer heights"
+            );
+            for (tree, node, part) in &patches {
+                assert!(
+                    state.nodes.get(*node).is_ok(),
+                    "tick {tick} left a patch for a released node: {part:?}"
+                );
+                assert_eq!(
+                    state.nodes.tree_of(*node),
+                    Some(*tree),
+                    "tick {tick} patch names its tree"
+                );
+            }
+            assert!(
+                patches.len() <= 8,
+                "tick {tick} keeps a bounded per-turn log: {}",
+                patches.len()
+            );
+            let _ = state.binding_patches.take();
+        }
+    }
+
+    #[component]
+    fn ShowTextHost() -> MountResult<MountPlan> {
+        let open = signal(false);
+        let label = signal(String::from("a"));
+        view! {
+            <view>
+                <Show when={open}><text>{label}</text></Show>
+                <button
+                    aria:label="open"
+                    on:click={move || {
+                        label.set(String::from("b"));
+                        open.set(true);
+                    }}
+                >"open"</button>
+            </view>
+        }
+    }
+
+    #[test]
+    fn a_show_mount_turn_evaluates_each_binding_once() {
+        let mut app = Runtime::new();
+        app.mount(|| view! { <ShowTextHost /> }).expect("mount");
+        let _ = app.refresh().expect("drain the mount turn");
+        let _ = crate::view::take_binding_evaluations();
+        app.click_label("open").expect("open the branch");
+        assert_eq!(
+            crate::view::take_binding_evaluations(),
+            2,
+            "one when evaluation and one text evaluation in the turn"
+        );
+    }
+
+    #[component]
+    fn ForShowHost() -> MountResult<MountPlan> {
+        let store = Store::new();
+        let rows = memo(move || store.rows(Filter::All));
+        let inner = signal(true);
+        view! {
+            <view>
+                <button aria:label="seed" on:click={move || -> Result<(), WriteError> {
+                    Transaction::new().write(store.insert("row")).finish()
+                }}>"seed"</button>
+                <For each={rows} key={|id: TodoId| id}>
+                    {move |_id: TodoId| view! {
+                        <Show when={inner}><text>"row"</text></Show>
+                    }}
+                </For>
+            </view>
+        }
+    }
+
+    #[test]
+    fn a_for_row_mount_evaluates_nested_triggers_once() {
+        let mut app = Runtime::new();
+        app.mount(|| view! { <ForShowHost /> }).expect("mount");
+        let _ = app.refresh().expect("drain the mount turn");
+        let _ = crate::view::take_binding_evaluations();
+        app.click_label("seed").expect("seed a row");
+        assert_eq!(
+            crate::view::take_binding_evaluations(),
+            2,
+            "one ForEach evaluation and one nested when evaluation in the turn"
+        );
+    }
+
+    #[component]
+    fn ForRejectHost() -> MountResult<MountPlan> {
+        let store = Store::new();
+        let rows = memo(move || store.rows(Filter::All));
+        let calls = Rc::new(Cell::new(0usize));
+        let item_calls = calls.clone();
+        view! {
+            <view>
+                <button aria:label="seed" on:click={move || -> Result<(), WriteError> {
+                    Transaction::new()
+                        .write(store.insert("A"))
+                        .write(store.insert("B"))
+                        .finish()
+                }}>"seed"</button>
+                <For each={rows} key={|id: TodoId| id}>
+                    {move |_id: TodoId| -> MountResult<MountPlan> {
+                        let index = item_calls.get();
+                        item_calls.set(index + 1);
+                        if index == 1 {
+                            return Err(MountError::Component("row factory boom"));
+                        }
+                        view! { <Show when={once(true)}><text>"row"</text></Show> }
+                    }}
+                </For>
+            </view>
+        }
+    }
+
+    #[test]
+    fn a_rejected_for_row_does_not_bump_the_tree_revision() {
+        let mut app = Runtime::new();
+        app.mount(|| view! { <ForRejectHost /> }).expect("mount");
+        let _ = app.refresh().expect("drain the mount turn");
+        let revision = app.presentation_revision();
+        let before = app.presentation().expect("snapshot");
+        let _ = app
+            .click_label("seed")
+            .expect_err("the second fresh row fails");
+        assert_eq!(
+            app.presentation_revision(),
+            revision,
+            "rejected rows are not a visible change"
+        );
+        assert_eq!(
+            app.presentation().expect("snapshot"),
+            before,
+            "the snapshot is unchanged after the rejected rows"
+        );
+    }
+
+    #[component]
+    fn FailingBranch() -> MountResult<MountPlan> {
+        Err(MountError::Component("branch boom"))
+    }
+
+    #[component]
+    fn BrokenShowHost() -> MountResult<MountPlan> {
+        let first = signal(false);
+        let second = signal(false);
+        view! {
+            <view>
+                <Show when={first}><FailingBranch /></Show>
+                <Show when={second}><text>"second shown"</text></Show>
+                <button
+                    aria:label="go"
+                    on:click={move || {
+                        first.set(true);
+                        second.set(true);
+                    }}
+                >"go"</button>
+            </view>
+        }
+    }
+
+    #[test]
+    fn a_rejected_branch_does_not_freeze_later_structure() {
+        let mut app = Runtime::new();
+        app.mount(|| view! { <BrokenShowHost /> }).expect("mount");
+        let _ = app.refresh().expect("drain the mount turn");
+        let failure = app
+            .click_label("go")
+            .expect_err("the first branch cannot mount");
+        assert!(
+            matches!(failure, MountError::Component("branch boom")),
+            "unexpected failure: {failure:?}"
+        );
+        assert!(
+            app.texts().iter().any(|text| text == "second shown"),
+            "the sibling Show still evaluates and mounts"
+        );
+
+        let failure = app
+            .refresh()
+            .expect_err("the broken branch is retried next turn");
+        assert!(matches!(failure, MountError::Component("branch boom")));
+        assert!(
+            app.texts().iter().any(|text| text == "second shown"),
+            "the sibling stays mounted while the failure persists"
+        );
+    }
+
+    #[component]
+    fn FailingWindowA(store: Store) -> MountResult<MountPlan> {
+        let open = signal(false);
+        view! {
+            <view>
+                <button aria:label="break" on:click={move || -> Result<(), WriteError> {
+                    Transaction::new().write(store.insert("row")).finish()?;
+                    open.set(true);
+                    Ok(())
+                }}>"break"</button>
+                <Show when={open}><FailingBranch /></Show>
+            </view>
+        }
+    }
+
+    #[component]
+    fn StatusWindowB(store: Store) -> MountResult<MountPlan> {
+        let status = memo(move || format!("{} rows", store.rows(Filter::All).len()));
+        view! { <text aria:label="status">{status}</text> }
+    }
+
+    fn status_text(app: &Runtime, window: WindowCtx) -> String {
+        app.presentation_of(window)
+            .expect("snapshot")
+            .find_label("status")
+            .expect("the status element")
+            .text()
+    }
+
+    #[test]
+    fn a_failing_window_does_not_freeze_other_windows() {
+        let mut app = Runtime::new();
+        let store = app.setup(Store::new).expect("application setup");
+        app.declare_windows(move |catalog| {
+            catalog.window(WindowSpec::new("a").primary(), move |_| {
+                view! { <FailingWindowA store={store} /> }
+            })?;
+            catalog.window(WindowSpec::new("b"), move |_| {
+                view! { <StatusWindowB store={store} /> }
+            })?;
+            Ok(())
+        })
+        .expect("declare the windows");
+        let a = app.show("a").expect("show window a");
+        let b = app.show("b").expect("show window b");
+        assert_eq!(status_text(&app, b), "0 rows");
+
+        let node = app
+            .presentation_of(a)
+            .expect("snapshot")
+            .find_label("break")
+            .expect("the break button")
+            .id();
+        let error = app.click_node(node).expect_err("the a branch fails");
+        assert!(
+            matches!(
+                error,
+                DispatchError::Command(MountError::Component("branch boom"))
+            ),
+            "unexpected failure: {error:?}"
+        );
+        assert_eq!(
+            status_text(&app, b),
+            "1 rows",
+            "the later window still refreshes in the failing turn"
+        );
+    }
+
+    #[component]
+    fn RowFaultWindow() -> MountResult<MountPlan> {
+        let store = Store::new();
+        let rows = memo(move || store.rows(Filter::All));
+        let calls = Rc::new(Cell::new(0usize));
+        let item_calls = calls.clone();
+        let armed = signal(false);
+        view! {
+            <view>
+                <button aria:label="seed" on:click={move || -> Result<(), WriteError> {
+                    let mut transaction = Transaction::new();
+                    for index in 0..40 {
+                        transaction = transaction.write(store.insert(format!("r{index}")));
+                    }
+                    transaction.finish()
+                }}>"seed"</button>
+                <button aria:label="arm" on:click={move || armed.set(true)}>"arm"</button>
+                <button aria:label="disarm" on:click={move || armed.set(false)}>"disarm"</button>
+                <For each={rows} key={|id: TodoId| id} row-height={px(20.0)}>
+                    {move |_id: TodoId| -> MountResult<MountPlan> {
+                        let index = item_calls.get();
+                        item_calls.set(index + 1);
+                        if armed.get() && index >= 34 {
+                            return Err(MountError::Component("row boom"));
+                        }
+                        view! { <text>"row"</text> }
+                    }}
+                </For>
+            </view>
+        }
+    }
+
+    #[test]
+    fn a_failed_row_window_tick_keeps_the_revision_and_can_retry() {
+        let mut app = Runtime::new();
+        app.declare_windows(|catalog| {
+            catalog.window(WindowSpec::new("main").primary(), |_| {
+                view! { <RowFaultWindow /> }
+            })
+        })
+        .expect("declare the window");
+        let window = app.show("main").expect("show the window");
+        app.click_label("seed").expect("seed the rows");
+        app.click_label("arm").expect("arm the row fault");
+        let band = app.presentation_of(window).expect("snapshot").row_bands()[0].key();
+        let revision = app.presentation_revision_of(window).expect("revision");
+
+        let failure = app
+            .set_row_window(window, band, 32, 8)
+            .expect_err("the fresh row fails");
+        assert!(
+            matches!(
+                failure,
+                WindowError::Mount(MountError::Component("row boom"))
+            ),
+            "unexpected failure: {failure:?}"
+        );
+        assert_eq!(
+            app.presentation_revision_of(window).expect("revision"),
+            revision,
+            "a rejected window request does not advance the revision"
+        );
+        assert_eq!(
+            app.presentation_of(window).expect("snapshot").row_bands()[0].first_row(),
+            0,
+            "the failed request is rolled back"
+        );
+
+        let failure = app
+            .set_row_window(window, band, 32, 8)
+            .expect_err("the retry still hits the armed fault");
+        assert!(
+            matches!(
+                failure,
+                WindowError::Mount(MountError::Component("row boom"))
+            ),
+            "an identical retry is not swallowed: {failure:?}"
+        );
+
+        app.click_label("disarm").expect("disarm the row fault");
+        assert!(
+            app.set_row_window(window, band, 32, 8)
+                .expect("the retry applies"),
+            "the window change is applied once the rows mount"
+        );
+        assert_eq!(
+            app.presentation_of(window).expect("snapshot").row_bands()[0].first_row(),
+            32
+        );
+    }
+
+    #[component]
+    fn CommittedTickWindow() -> MountResult<MountPlan> {
+        let store = Store::new();
+        let rows = memo(move || store.rows(Filter::All));
+        let broken = signal(false);
+        view! {
+            <view>
+                <button aria:label="seed" on:click={move || -> Result<(), WriteError> {
+                    let mut transaction = Transaction::new();
+                    for index in 0..40 {
+                        transaction = transaction.write(store.insert(format!("r{index}")));
+                    }
+                    transaction.finish()
+                }}>"seed"</button>
+                <button aria:label="break" on:click={move || broken.set(true)}>"break"</button>
+                <For each={rows} key={|id: TodoId| id} row-height={px(20.0)}>
+                    {move |_id: TodoId| view! { <text>"row"</text> }}
+                </For>
+                <Show when={broken}><FailingBranch /></Show>
+            </view>
+        }
+    }
+
+    fn row_band_first(app: &Runtime, window: WindowCtx) -> usize {
+        app.presentation_of(window).expect("snapshot").row_bands()[0].first_row()
+    }
+
+    #[test]
+    fn a_failed_tick_after_the_window_commit_keeps_the_request() {
+        let mut app = Runtime::new();
+        app.declare_windows(|catalog| {
+            catalog.window(WindowSpec::new("main").primary(), |_| {
+                view! { <CommittedTickWindow /> }
+            })
+        })
+        .expect("declare the window");
+        let window = app.show("main").expect("show the window");
+        app.click_label("seed").expect("seed the rows");
+        let band = app.presentation_of(window).expect("snapshot").row_bands()[0].key();
+        assert!(
+            app.set_row_window(window, band, 2, 8)
+                .expect("the first window applies")
+        );
+        assert_eq!(row_band_first(&app, window), 2);
+
+        // 后续兄弟节点失败，但请求的窗口在失败前已经提交。
+        let failure = app.click_label("break").expect_err("the show branch fails");
+        assert!(
+            matches!(failure, MountError::Component("branch boom")),
+            "unexpected failure: {failure:?}"
+        );
+        let revision = app.presentation_revision_of(window).expect("revision");
+        let failure = app
+            .set_row_window(window, band, 4, 8)
+            .expect_err("the later sibling fails the tick");
+        assert!(
+            matches!(
+                failure,
+                WindowError::Mount(MountError::Component("branch boom"))
+            ),
+            "unexpected failure: {failure:?}"
+        );
+        assert_eq!(
+            row_band_first(&app, window),
+            4,
+            "the committed window stands after the failed tick"
+        );
+        {
+            let state = app.state.borrow();
+            assert!(
+                state.row_window_tick.is_none() && !state.row_window_commit,
+                "the failed tick leaves no request marker behind"
+            );
+        }
+        assert_ne!(
+            app.presentation_revision_of(window).expect("revision"),
+            revision,
+            "the committed window advances the revision"
+        );
+        assert!(
+            !app.set_row_window(window, band, 4, 8)
+                .expect("the committed request is already applied"),
+            "a request whose window committed is not rolled back"
+        );
+
+        // 普通刷新失败也不能把窗口悄悄挪回默认值：请求映射必须描述
+        // 已提交的行窗口。
+        let _ = app.refresh().expect_err("the branch still fails");
+        assert_eq!(
+            row_band_first(&app, window),
+            4,
+            "a failing refresh keeps the committed window"
+        );
+
+        // 宿主显式请求旧窗口时，请求照常应用并记录下来，不会被
+        // “请求已存在”的快速路径吞掉。
+        let failure = app
+            .set_row_window(window, band, 2, 8)
+            .expect_err("the branch still fails the tick");
+        assert!(
+            matches!(
+                failure,
+                WindowError::Mount(MountError::Component("branch boom"))
+            ),
+            "unexpected failure: {failure:?}"
+        );
+        assert_eq!(
+            row_band_first(&app, window),
+            2,
+            "the explicit request applies despite the sibling failure"
+        );
+        assert!(
+            !app.set_row_window(window, band, 2, 8)
+                .expect("the restored request is recorded"),
+            "the applied request is stored"
+        );
+    }
+
+    #[component]
+    fn RetainedRowStructureHost() -> MountResult<MountPlan> {
+        let store = Store::new();
+        let rows = memo(move || store.rows(Filter::All));
+        let inner = signal(false);
+        let armed = signal(false);
+        view! {
+            <view>
+                <button aria:label="seed" on:click={move || -> Result<(), WriteError> {
+                    Transaction::new()
+                        .write(store.insert("a"))
+                        .write(store.insert("b"))
+                        .finish()
+                }}>"seed"</button>
+                <button aria:label="go" on:click={move || -> Result<(), WriteError> {
+                    Transaction::new().write(store.insert("c")).finish()?;
+                    armed.set(true);
+                    inner.set(true);
+                    Ok(())
+                }}>"go"</button>
+                <button aria:label="disarm" on:click={move || armed.set(false)}>"disarm"</button>
+                <For each={rows} key={|id: TodoId| id} row-height={px(20.0)}>
+                    {move |_id: TodoId| -> MountResult<MountPlan> {
+                        if armed.get() {
+                            return Err(MountError::Component("row boom"));
+                        }
+                        view! { <Show when={inner}><text>"row-inner"</text></Show> }
+                    }}
+                </For>
+            </view>
+        }
+    }
+
+    #[test]
+    fn a_failed_for_row_does_not_freeze_retained_row_structure() {
+        let mut app = Runtime::new();
+        app.mount(|| view! { <RetainedRowStructureHost /> })
+            .expect("mount");
+        let _ = app.refresh().expect("drain the mount turn");
+        app.click_label("seed").expect("seed the retained rows");
+
+        // 新插入的行挂载失败，但已提交行的嵌套 Show 仍要在这一帧求值。
+        let failure = app.click_label("go").expect_err("the fresh row fails");
+        assert!(
+            matches!(failure, MountError::Component("row boom")),
+            "unexpected failure: {failure:?}"
+        );
+        let inners = app
+            .texts()
+            .iter()
+            .filter(|text| text.as_str() == "row-inner")
+            .count();
+        assert_eq!(
+            inners, 2,
+            "both retained rows mount their nested branch in the failing turn"
+        );
+
+        let _ = app.refresh().expect_err("the fresh row still fails");
+        assert_eq!(
+            app.texts()
+                .iter()
+                .filter(|text| text.as_str() == "row-inner")
+                .count(),
+            2,
+            "the retained branches stay mounted while the failure persists"
+        );
+
+        app.click_label("disarm").expect("disarm the row fault");
+        assert_eq!(
+            app.texts()
+                .iter()
+                .filter(|text| text.as_str() == "row-inner")
+                .count(),
+            3,
+            "the fresh row mounts its nested branch once the fault clears"
+        );
+    }
+
+    #[component]
+    fn RetainedFallbackStructureHost() -> MountResult<MountPlan> {
+        let inner = signal(false);
+        let broken = signal(false);
+        view! {
+            <view>
+                <button aria:label="go" on:click={move || {
+                    broken.set(true);
+                    inner.set(true);
+                }}>"go"</button>
+                <Show when={broken} fallback={move || view! {
+                    <Show when={inner}><text>"fallback-inner"</text></Show>
+                }}>
+                    <FailingBranch />
+                </Show>
+            </view>
+        }
+    }
+
+    #[test]
+    fn a_failed_show_branch_does_not_freeze_the_retained_branch_structure() {
+        let mut app = Runtime::new();
+        app.mount(|| view! { <RetainedFallbackStructureHost /> })
+            .expect("mount");
+        let _ = app.refresh().expect("drain the mount turn");
+
+        let failure = app
+            .click_label("go")
+            .expect_err("the proposed branch cannot mount");
+        assert!(
+            matches!(failure, MountError::Component("branch boom")),
+            "unexpected failure: {failure:?}"
+        );
+        assert!(
+            app.texts().iter().any(|text| text == "fallback-inner"),
+            "the retained fallback still evaluates its nested Show"
+        );
+
+        let failure = app
+            .refresh()
+            .expect_err("the proposed branch is retried next turn");
+        assert!(matches!(failure, MountError::Component("branch boom")));
+        assert!(
+            app.texts().iter().any(|text| text == "fallback-inner"),
+            "the retained fallback stays mounted while the failure persists"
+        );
+    }
+
+    #[component]
+    fn RetainedThenStructureHost() -> MountResult<MountPlan> {
+        let inner = signal(false);
+        let shown = signal(true);
+        view! {
+            <view>
+                <button aria:label="go" on:click={move || {
+                    shown.set(false);
+                    inner.set(true);
+                }}>"go"</button>
+                <Show
+                    when={shown}
+                    fallback={move || -> MountResult<MountPlan> {
+                        Err(MountError::Component("fallback boom"))
+                    }}
+                >
+                    <Show when={inner}><text>"then-inner"</text></Show>
+                </Show>
+            </view>
+        }
+    }
+
+    #[test]
+    fn a_failed_fallback_factory_does_not_freeze_the_retained_then_branch() {
+        let mut app = Runtime::new();
+        app.mount(|| view! { <RetainedThenStructureHost /> })
+            .expect("mount");
+        let _ = app.refresh().expect("drain the mount turn");
+
+        let failure = app
+            .click_label("go")
+            .expect_err("the proposed fallback cannot mount");
+        assert!(
+            matches!(failure, MountError::Component("fallback boom")),
+            "unexpected failure: {failure:?}"
+        );
+        assert!(
+            app.texts().iter().any(|text| text == "then-inner"),
+            "the retained then branch still evaluates its nested Show"
+        );
+    }
+
+    #[component]
+    fn WindowedForInShowHost() -> MountResult<MountPlan> {
+        let store = Store::new();
+        let rows = memo(move || store.rows(Filter::All));
+        let open = signal(false);
+        view! {
+            <view>
+                <button aria:label="seed" on:click={move || -> Result<(), WriteError> {
+                    let mut transaction = Transaction::new();
+                    for index in 0..40 {
+                        transaction = transaction.write(store.insert(format!("r{index}")));
+                    }
+                    transaction.finish()
+                }}>"seed"</button>
+                <button aria:label="toggle" on:click={move || open.set(!open.get())}>"toggle"</button>
+                <Show when={open}>
+                    <For each={rows} key={|id: TodoId| id} row-height={px(20.0)}>
+                        {move |_id: TodoId| view! { <text>"row"</text> }}
+                    </For>
+                </Show>
+            </view>
+        }
+    }
+
+    fn assert_no_row_window_tick_state(app: &Runtime) {
+        let state = app.state.borrow();
+        assert!(
+            state.row_window_tick.is_none() && !state.row_window_commit,
+            "no row-window tick state survives its tick"
+        );
+    }
+
+    #[test]
+    fn row_window_tick_state_does_not_survive_or_accumulate() {
+        let mut app = Runtime::new();
+        app.declare_windows(|catalog| {
+            catalog.window(WindowSpec::new("main").primary(), |_| {
+                view! { <WindowedForInShowHost /> }
+            })
+        })
+        .expect("declare the window");
+        let window = app.show("main").expect("show the window");
+        app.click_label("seed").expect("seed the rows");
+        // 普通刷新（没有宿主 tick）不留下任何 tick 状态。
+        app.click_label("toggle").expect("open the windowed for");
+        assert_no_row_window_tick_state(&app);
+        let band = app.presentation_of(window).expect("snapshot").row_bands()[0].key();
+
+        // 成功的 tick 结束后同样清零，而不是把请求标记留给下一轮。
+        assert!(
+            app.set_row_window(window, band, 2, 4)
+                .expect("the tick applies")
+        );
+        assert_no_row_window_tick_state(&app);
+        assert_eq!(
+            app.presentation_of(window).expect("snapshot").row_bands()[0].first_row(),
+            2,
+            "the successful tick applies its window"
+        );
+
+        // 卸载/重挂多轮也不会累积 tick 状态；行带请求随 owner 释放。
+        for _ in 0..4 {
+            app.click_label("toggle").expect("close the windowed for");
+            app.click_label("toggle").expect("reopen the windowed for");
+            assert_no_row_window_tick_state(&app);
+        }
+        {
+            let state = app.state.borrow();
+            assert_eq!(
+                state.owner_bands.len(),
+                1,
+                "the live windowed for owns exactly one band"
+            );
+        }
+        app.click_label("toggle").expect("close the windowed for");
+        assert_no_row_window_tick_state(&app);
+        let state = app.state.borrow();
+        assert!(
+            state.row_windows.is_empty(),
+            "row-window requests die with their for"
+        );
+        assert!(
+            state.owner_bands.is_empty(),
+            "band ownership dies with its for"
+        );
+    }
+
+    fn first_for(state: &State, nodes: &[MountedNode]) -> Option<u32> {
+        for node in nodes {
+            match node {
+                MountedNode::Text(_) => {}
+                MountedNode::Element(id) => {
+                    if let Some(found) = first_for(state, &state.elements[*id].children) {
+                        return Some(found);
+                    }
+                }
+                MountedNode::Component(id) => {
+                    if let Some(found) = first_for(state, &state.components[*id].children) {
+                        return Some(found);
+                    }
+                }
+                MountedNode::Show(payload) => {
+                    let show = state.nodes.show(*payload);
+                    if let Some(branch) = &show.active
+                        && let Some(found) = first_for(state, &branch.children)
+                    {
+                        return Some(found);
+                    }
+                }
+                MountedNode::For(payload) => return Some(*payload),
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn duplicate_attribute_and_style_declarations_keep_one_live_slot() {
+        let mut app = Runtime::new();
+        app.declare_windows(|catalog| {
+            catalog.window(WindowSpec::new("main").primary(), |_| {
+                Ok(MountPlan::new(vec![
+                    element(
+                        "view",
+                        vec![attr("role", "a"), attr("role", "b")],
+                        vec![child("dup")],
+                    ),
+                    styled_element(
+                        "view",
+                        Vec::new(),
+                        &[],
+                        vec![
+                            style_color(once(Color::Literal([1, 2, 3, 255]))),
+                            style_color(once(Color::Literal([9, 8, 7, 255]))),
+                        ],
+                        Vec::new(),
+                    ),
+                ]))
+            })
+        })
+        .expect("declare the window");
+        let window = app.show("main").expect("show the window");
+        {
+            let state = app.state.borrow();
+            let tree = state
+                .trees
+                .get(&TreeSlot::Window("main"))
+                .expect("the window tree");
+            let MountedNode::Element(bound) = tree.nodes[0] else {
+                panic!("the first node is the bound element");
+            };
+            assert_eq!(
+                state.element_attrs(bound).len(),
+                1,
+                "duplicate attribute declarations collapse into one"
+            );
+            assert_eq!(
+                state.element_attr_text(bound, "role"),
+                Some("b"),
+                "the last attribute declaration wins"
+            );
+            let MountedNode::Element(styled) = tree.nodes[1] else {
+                panic!("the second node is the styled element");
+            };
+            let styles = state.element_inline_styles(styled);
+            assert_eq!(
+                styles.len(),
+                1,
+                "duplicate style declarations collapse into one"
+            );
+            let table = state
+                .element_binding_table(styled)
+                .expect("the styled element's binding table");
+            assert_eq!(
+                table.inline_style(styles[0].binding),
+                Some(StyleValue::Color(Color::Literal([9, 8, 7, 255]))),
+                "the last style declaration wins"
+            );
+            assert_eq!(
+                live_binding_slots(&app),
+                3,
+                "role, one text and one style slot stay live"
+            );
+        }
+
+        app.close_window(window).expect("close the window");
+        assert!(
+            app.state.borrow().nodes.binding_tables.is_empty(),
+            "the retired tree returned every slot before its table was dropped"
+        );
+    }
+
+    #[component]
+    fn PanicShow() -> MountResult<MountPlan> {
+        let failing: Memo<bool> = memo(|| panic!("show memo boom"));
+        view! { <Show when={failing}><text>"x"</text></Show> }
+    }
+
+    #[component]
+    fn PanicFor() -> MountResult<MountPlan> {
+        let failing: Memo<RowSet> = memo(|| panic!("for memo boom"));
+        view! {
+            <For each={failing} key={|id: TodoId| id}>
+                {move |_id: TodoId| view! { <text>"row"</text> }}
+            </For>
+        }
+    }
+
+    #[test]
+    fn a_show_source_panic_at_mount_is_a_contained_mount_error() {
+        let mut app = Runtime::new();
+        let error = app
+            .mount(|| view! { <PanicShow /> })
+            .expect_err("the memo panic fails the mount");
+        assert!(matches!(error, MountError::Panic(_)));
+        let state = app.state.borrow();
+        assert!(
+            state.nodes.binding_tables.is_empty(),
+            "the failed mount drops its binding table"
+        );
+        assert_eq!(state.nodes.live(), 0, "no node stays live");
+        assert_eq!(
+            state.nodes.aux.binding_lists.live(),
+            0,
+            "no binding list stays live"
+        );
+    }
+
+    #[test]
+    fn a_for_source_panic_at_mount_is_a_contained_mount_error() {
+        let mut app = Runtime::new();
+        let error = app
+            .mount(|| view! { <PanicFor /> })
+            .expect_err("the memo panic fails the mount");
+        assert!(matches!(error, MountError::Panic(_)));
+        let state = app.state.borrow();
+        assert!(
+            state.nodes.binding_tables.is_empty(),
+            "the failed mount drops its binding table"
+        );
+        assert_eq!(state.nodes.live(), 0, "no node stays live");
+    }
+
+    #[test]
+    fn a_root_mount_fault_releases_root_text_slots() {
+        let mut app = Runtime::new();
+        let error = app
+            .mount(|| {
+                let value = signal(0u32);
+                let _derived: Memo<u32> = memo(move || value.get() + 1);
+                value.set(1);
+                Ok(MountPlan::new(vec![child("root text")]))
+            })
+            .expect_err("an idle-phase write is a context fault");
+        assert!(matches!(error, MountError::Context { .. }));
+        {
+            let state = app.state.borrow();
+            assert!(
+                state.nodes.binding_tables.is_empty(),
+                "the faulted root mount drops its binding table"
+            );
+            assert_eq!(state.nodes.live(), 0, "the root text node is released");
+        }
+        assert_eq!(
+            app.live_signals(),
+            0,
+            "the failed mount releases owner-0 signals"
+        );
+        assert_eq!(
+            app.live_memos(),
+            0,
+            "the failed mount releases owner-0 memos"
+        );
+    }
+
+    #[component]
+    fn BrokenSibling() -> MountResult<MountPlan> {
+        Err(MountError::Component("broken sibling"))
+    }
+
+    #[component]
+    fn PatchLeakHost() -> MountResult<MountPlan> {
+        let open = signal(true);
+        view! {
+            <view>
+                <Show when={open}><text>"branch"</text></Show>
+                <BrokenSibling />
+            </view>
+        }
+    }
+
+    #[test]
+    fn a_failed_mount_rolls_back_the_patches_of_its_mounted_siblings() {
+        let mut app = Runtime::new();
+        let error = app
+            .mount(|| view! { <PatchLeakHost /> })
+            .expect_err("the sibling fails the mount");
+        assert!(matches!(error, MountError::Component("broken sibling")));
+        let mut state = app.state.borrow_mut();
+        assert!(
+            state.binding_patches.take().is_empty(),
+            "no patch survives for a released mount"
+        );
+        assert!(
+            state.nodes.binding_tables.is_empty(),
+            "the failed mount drops its binding table"
+        );
+    }
+
+    #[test]
+    fn a_failed_window_mount_rolls_back_its_patches() {
+        let mut app = Runtime::new();
+        app.declare_windows(|catalog| {
+            catalog.window(WindowSpec::new("main").primary(), |_| {
+                view! { <PatchLeakHost /> }
+            })
+        })
+        .expect("declare the window");
+        let error = app
+            .show("main")
+            .expect_err("the sibling fails the window mount");
+        assert!(matches!(
+            error,
+            WindowError::Mount(MountError::Component("broken sibling"))
+        ));
+        let mut state = app.state.borrow_mut();
+        assert!(
+            state.binding_patches.take().is_empty(),
+            "no patch survives for a released window mount"
+        );
+        assert!(
+            state.nodes.binding_tables.is_empty(),
+            "the failed window mount drops its binding table"
+        );
+    }
+
+    #[component]
+    fn StyledFaultHost() -> MountResult<MountPlan> {
+        let width = signal(px(10.0));
+        view! { <button aria:label="styled" style:width={width}>"styled"</button> }
+    }
+
+    fn styled_width(app: &Runtime) -> Option<StyleValue> {
+        let snapshot = app.presentation().expect("snapshot");
+        snapshot
+            .find_label("styled")
+            .expect("the styled element")
+            .styles()
+            .iter()
+            .find(|declaration| declaration.property() == Property::Width)
+            .map(|declaration| declaration.value())
+    }
+
+    /// 找到带 `aria:label` 的元素并释放它 `style:width` 的来源。
+    fn dispose_width_source(app: &Runtime, clear_current: bool) {
+        let mut state = app.state.borrow_mut();
+        let element = (0..state.elements.len())
+            .find(|element| state.element_attr_text(*element, "aria:label") == Some("styled"))
+            .expect("the styled element");
+        let tree = state
+            .element_tree(element)
+            .expect("the element belongs to a tree");
+        let binding = state
+            .element_inline_styles(element)
+            .iter()
+            .find(|style| style.property == Property::Width)
+            .expect("the width declaration")
+            .binding;
+        let slot = state
+            .nodes
+            .binding_table_mut(tree)
+            .slot_mut::<Length>(binding)
+            .expect("the width slot");
+        let ReadSlot::Signal(source) = slot.source else {
+            panic!("the width is bound to a signal");
+        };
+        if clear_current {
+            slot.current = None;
+            slot.fault = None;
+        }
+        state
+            .signals
+            .get_mut(source.id as usize)
+            .expect("the width signal")
+            .disposed = true;
+    }
+
+    #[test]
+    fn a_style_slot_keeps_its_last_committed_value_after_a_source_fault() {
+        let mut app = Runtime::new();
+        app.mount(|| view! { <StyledFaultHost /> }).expect("mount");
+        assert_eq!(
+            styled_width(&app),
+            Some(StyleValue::Length(px(10.0))),
+            "the mounted style is committed"
+        );
+
+        dispose_width_source(&app, false);
+        let report = app.refresh().expect("refresh reports the fault");
+        assert!(
+            report
+                .faults()
+                .iter()
+                .any(|fault| matches!(fault, ReadFault::Disposed)),
+            "the disposed style source is a typed fault: {:?}",
+            report.faults()
+        );
+        assert_eq!(
+            styled_width(&app),
+            Some(StyleValue::Length(px(10.0))),
+            "a later failure keeps the last committed style"
+        );
+    }
+
+    #[test]
+    fn a_first_style_failure_uses_the_intrinsic_default() {
+        let mut app = Runtime::new();
+        app.mount(|| view! { <StyledFaultHost /> }).expect("mount");
+        dispose_width_source(&app, true);
+
+        let report = app.refresh().expect("refresh reports the fault");
+        assert!(
+            report
+                .faults()
+                .iter()
+                .any(|fault| matches!(fault, ReadFault::Disposed)),
+            "the disposed style source is a typed fault: {:?}",
+            report.faults()
+        );
+        assert_eq!(
+            styled_width(&app),
+            None,
+            "a first failure falls back to the intrinsic default instead of a value"
+        );
+    }
+
+    #[test]
+    fn a_first_failed_for_evaluation_mounts_an_empty_row_set() {
+        let mut app = Runtime::new();
+        app.mount(|| view! { <ForHost /> }).expect("mount");
+        app.click_label("Seed").expect("seed the rows");
+        assert_eq!(app.for_items().len(), 2);
+
+        {
+            let mut state = app.state.borrow_mut();
+            let tree_key = state.arena_trees[&TreeSlot::Root];
+            let payload = {
+                let tree = state.trees.get(&TreeSlot::Root).expect("root tree");
+                first_for(&state, &tree.nodes).expect("the For node")
+            };
+            let binding = state.nodes.for_node(payload).each;
+            let slot = state
+                .nodes
+                .binding_table_mut(tree_key)
+                .slot_mut::<RowSet>(binding)
+                .expect("the For binding slot");
+            let ReadSlot::Memo(source) = slot.source else {
+                panic!("For is bound to a memo");
+            };
+            // 注入“首次求值前源已释放”：没有最后值，也没有可重算的 compute。
+            slot.current = None;
+            slot.fault = None;
+            let memo = state
+                .memos
+                .get_mut(source.id as usize)
+                .expect("the For memo cell");
+            memo.disposed = true;
+            memo.compute = None;
+            memo.value = None;
+            memo.dirty = true;
+            memo.poisoned = None;
+        }
+
+        let report = app.refresh().expect("refresh");
+        assert!(
+            app.for_items().is_empty(),
+            "a source that never produced rows mounts an empty row set"
+        );
+        assert!(
+            report
+                .faults()
+                .iter()
+                .any(|fault| matches!(fault, ReadFault::Disposed)),
+            "the disposed For source is a typed fault: {:?}",
+            report.faults()
+        );
     }
 }
