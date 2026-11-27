@@ -129,6 +129,20 @@ pub(super) fn plan(
                 });
             }
         } else {
+            // 添加/移除会移动余下子节点的位置；只有幸存子序列的相对顺序才
+            // 表示真正的重排，避免把位移误报成 ChildrenReordered。
+            let survivors_old: Vec<i32> = old_children
+                .iter()
+                .flatten()
+                .copied()
+                .filter(|id| new_ids.contains(id))
+                .collect();
+            let survivors_new: Vec<i32> = new_children
+                .iter()
+                .flatten()
+                .copied()
+                .filter(|id| old_ids.contains(id))
+                .collect();
             for child in removed {
                 events.push(Event::ChildRemoved {
                     parent: parent.runtime_id,
@@ -137,6 +151,11 @@ pub(super) fn plan(
             }
             for child in added {
                 events.push(Event::ChildAdded { child });
+            }
+            if survivors_old != survivors_new {
+                events.push(Event::ChildrenReordered {
+                    parent: parent.runtime_id,
+                });
             }
         }
     }
@@ -601,6 +620,32 @@ mod tests {
     }
 
     #[test]
+    fn a_reorder_coinciding_with_add_or_remove_is_still_reported() {
+        let old = tree(true, &[Spec::child(1), Spec::child(2), Spec::child(3)]);
+        let next = tree(true, &[Spec::child(3), Spec::child(1)]);
+        assert_eq!(
+            events(&old, &next, true),
+            [
+                Event::ChildRemoved {
+                    parent: None,
+                    child: 2,
+                },
+                Event::ChildrenReordered { parent: None },
+            ]
+        );
+
+        let old = tree(true, &[Spec::child(1), Spec::child(2)]);
+        let next = tree(true, &[Spec::child(3), Spec::child(2), Spec::child(1)]);
+        assert_eq!(
+            events(&old, &next, true),
+            [
+                Event::ChildAdded { child: 3 },
+                Event::ChildrenReordered { parent: None },
+            ]
+        );
+    }
+
+    #[test]
     fn a_new_or_removed_subtree_reports_only_its_top_level_child() {
         let old = tree(true, &[Spec::child(1)]);
         let next = tree(true, &[Spec::child(1), Spec::child(3), Spec::under(4, 1)]);
@@ -612,6 +657,49 @@ mod tests {
                 child: 3,
             }]
         );
+    }
+
+    #[test]
+    fn events_are_ordered_structure_then_property_then_focus() {
+        let old = tree(
+            true,
+            &[
+                Spec::child(1).focused().toggled(false),
+                Spec::child(2).toggled(false),
+            ],
+        );
+        let next = tree(
+            true,
+            &[Spec::child(2).toggled(true), Spec::child(3).focused()],
+        );
+        assert_eq!(
+            events(&old, &next, true),
+            [
+                Event::ChildRemoved {
+                    parent: None,
+                    child: 1,
+                },
+                Event::ChildAdded { child: 3 },
+                Event::Property {
+                    target: Some(2),
+                    change: PropertyChange::ToggleState {
+                        old: false,
+                        new: true,
+                    },
+                },
+                Event::Focus { node: 3 },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_new_node_reports_no_property_events_for_its_initial_state() {
+        let old = tree(true, &[Spec::child(1).valued("a")]);
+        let next = tree(
+            true,
+            &[Spec::child(1).valued("a"), Spec::child(2).valued("b")],
+        );
+        assert_eq!(events(&old, &next, true), [Event::ChildAdded { child: 2 }]);
     }
 
     #[test]
