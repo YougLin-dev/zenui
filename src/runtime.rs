@@ -8,6 +8,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
 
+use zenui_core::model::{FilterId, RowId, StoreId};
 use zenui_core::{Counters, PanicInfo, RowSet, catch_panic};
 use zenui_style::{Color, Length, Opacity, Property, StyleValue};
 
@@ -35,9 +36,10 @@ use crate::task::{TaskRecord, WakeCallback};
 use crate::text_edit::{self, Edit, Movement};
 use crate::tray::{TrayError, TraySpec};
 use crate::view::{
-    Attr, AttrValue, BlurEvent, ChildrenFactory, CompositionEvent, CompositionPhase, Event,
-    FocusCause, FocusEvent, HandlerError, HandlerOutcome, InlineStyle, Key, KeyEvent, MountError,
-    MountPlan, MountResult, PlanNode, Read, ReadFault, ReadValue, StyleSlot, SubmitEvent,
+    Attr, AttrValue, BlurEvent, ChildrenFactory, CompositionEvent, CompositionPhase, ErasedRowView,
+    ErasedStore, Event, FocusCause, FocusEvent, ForDriver, ForRows, HandlerError, HandlerOutcome,
+    InlineStyle, Key, KeyEvent, MountError, MountPlan, MountResult, PlanNode, ReadFault, ReadValue,
+    StyleSlot, SubmitEvent,
 };
 use crate::window::{
     CatalogEntry, CatalogError, CloseError, CloseEvent, CloseHandler, CloseOutcome, ClosePolicy,
@@ -499,8 +501,10 @@ impl NodeArena {
                     }
                 }
                 Some(NodeKindTag::For) => {
-                    if let Some(data) = self.forces.release(payload) {
-                        self.release_binding(tree, data.each);
+                    if let Some(data) = self.forces.release(payload)
+                        && let MountedForRows::Read(binding) = data.rows
+                    {
+                        self.release_binding(tree, binding);
                     }
                 }
                 _ => {}
@@ -950,7 +954,13 @@ struct CloseReplyRequest {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ItemInfo {
-    pub todo: TodoId,
+    /// 行数据来源 Store。
+    pub store: StoreId,
+    /// 行身份。
+    pub row: RowId,
+    /// 挂载时捕获的 Todo 业务键；第二个模型或非 Todo Store 的行返回 `None`。
+    /// 行被删除但旧映射仍保留时，这个键也不变。
+    pub todo: Option<TodoId>,
     pub instance: u64,
     pub owner: u32,
 }
@@ -1089,7 +1099,9 @@ impl State {
                 }
                 MountedNode::For(payload) => {
                     let data = self.nodes.for_node(*payload);
-                    collect_slot_memo(table.and_then(|table| table.read_slot(data.each)), live);
+                    if let MountedForRows::Read(binding) = data.rows {
+                        collect_slot_memo(table.and_then(|table| table.read_slot(binding)), live);
+                    }
                     for item in data.items.values() {
                         self.collect_node_memos(tree, &item.children, live);
                     }
@@ -3623,12 +3635,20 @@ pub struct MountedBranch {
     children: Vec<MountedNode>,
 }
 
+/// 已挂载 For 的行集来源：绑定槽，或跟随 Store 投影。
+pub(crate) enum MountedForRows {
+    Read(BindingRef),
+    Projection(FilterId),
+}
+
 struct ForData {
     owner: u32,
     node: NodeRef,
-    each: BindingRef,
-    key: Box<dyn Fn(TodoId) -> TodoId>,
-    item: Box<dyn Fn(TodoId) -> MountResult<MountPlan>>,
+    /// 行数据来源 Store；用于行集归属校验。
+    store: StoreId,
+    rows: MountedForRows,
+    /// 唯一持有 `R`/`K` 的驱动；键映射、快照与行 factory 都经它。
+    driver: Rc<dyn ForDriver>,
     /// 窗口化 For 的统一行高；`None` 挂载全部行（ADR-0010）。
     row_height: Option<Length>,
     /// 跨快照稳定的行带键；宿主按它声明行窗口。
@@ -3637,22 +3657,21 @@ struct ForData {
     first_row: usize,
     /// 窗口化 For 的上下 spacer 元素槽位；保持内容总高度不变。
     spacers: Option<(usize, usize)>,
-    /// 最近一次完整映射的 row set 投影；同一份投影不重复映射与查重。
-    rows: Option<RowSet>,
-    /// 完整的 keyed 顺序 `(mapped, todo)`，只在 row set 变化时重建。
-    entries: Vec<(TodoId, TodoId)>,
-    /// 完整顺序里每个 key 的行号；窗口更新与焦点 grace 的 O(log n) 查表。
-    row_of: BTreeMap<TodoId, usize>,
-    items: BTreeMap<TodoId, MountedItem>,
-    /// 当前已挂载的行键，按业务顺序；窗口外的行不在其中。
-    order: Vec<TodoId>,
+    /// 最近一次提交的完整投影；完整行顺序的唯一来源。
+    committed_rows: Option<RowSet>,
+    items: BTreeMap<RowId, MountedItem>,
+    /// 当前已挂载窗口的行身份，按呈现顺序；窗口外的行不在其中。
+    order: Vec<RowId>,
     /// 最近一次求值 `each` 的刷新轮次；同一轮不重复求值。
     structure_round: u64,
 }
 
 pub struct MountedItem {
     owner: u32,
-    todo: TodoId,
+    /// 已提交投影中的下标；焦点 grace 在投影未变时 O(1) 取用。
+    row_index: usize,
+    /// 挂载时捕获的 Todo 业务键；第二个模型为 None。行删除后保持稳定。
+    todo: Option<TodoId>,
     instance: u64,
     children: Vec<MountedNode>,
 }
@@ -6198,26 +6217,33 @@ impl Runtime {
                     state.owner_bands.entry(owner).or_default().push(band);
                     band
                 });
+                let crate::view::ForPlan {
+                    store,
+                    rows,
+                    driver,
+                    row_height,
+                } = plan;
                 let payload = with_state(|state| {
                     let tree = state.building_tree_key();
-                    let each = {
-                        let table = state.nodes.binding_table_mut(tree);
-                        Read::<RowSet>::from(plan.each).into_binding(table)
+                    let rows = match rows {
+                        ForRows::Read(read) => {
+                            let table = state.nodes.binding_table_mut(tree);
+                            MountedForRows::Read(read.into_binding(table))
+                        }
+                        ForRows::Projection(filter) => MountedForRows::Projection(filter),
                     };
                     let payload = state.nodes.reserve_for(ForData {
                         owner,
                         node: for_node,
-                        each,
-                        key: plan.key,
-                        item: plan.item,
-                        row_height: plan.row_height,
+                        store,
+                        rows,
+                        driver,
+                        row_height,
                         band,
                         total_rows: 0,
                         first_row: 0,
                         spacers: None,
-                        rows: None,
-                        entries: Vec::new(),
-                        row_of: BTreeMap::new(),
+                        committed_rows: None,
                         items: BTreeMap::new(),
                         order: Vec::new(),
                         structure_round: u64::MAX,
@@ -6785,100 +6811,135 @@ impl Runtime {
         }
         for_node.structure_round = round;
         let node = for_node.node;
-        let binding = for_node.each;
         let tree = with_state(|state| state.nodes.tree_of(node))
             .expect("a mounted For node belongs to a tree");
-        let (source, committed) = with_state(|state| {
-            let table = state
-                .nodes
-                .binding_table(tree)
-                .expect("a mounted For node has a binding table");
-            let slot = table
-                .slot::<RowSet>(binding)
-                .expect("a mounted For binding slot is live");
-            (slot.source, slot.current.clone())
-        });
-        // 源求值失败时旧行与旧窗口保持不变；首次失败视为空行集。
-        let rows: RowSet = if source.is_static() {
-            committed.unwrap_or_else(RowSet::empty)
-        } else {
-            match source.evaluate::<RowSet>() {
-                ReadValue::Value(rows) => {
-                    let changed = committed.as_ref() != Some(&rows);
-                    with_state(|state| {
-                        if let Some(slot) = state
-                            .nodes
-                            .binding_table_mut(tree)
-                            .slot_mut::<RowSet>(binding)
-                        {
-                            slot.fault = None;
-                            if changed {
-                                slot.current = Some(rows.clone());
-                            }
+        // 1) 求值行集来源。源失败时保留最后一次提交的行；首次失败视为空列表。
+        let mut source_error = None;
+        let rows: Option<RowSet> = match for_node.rows {
+            MountedForRows::Read(binding) => {
+                let (source, committed) = with_state(|state| {
+                    let table = state
+                        .nodes
+                        .binding_table(tree)
+                        .expect("a mounted For node has a binding table");
+                    let slot = table
+                        .slot::<RowSet>(binding)
+                        .expect("a mounted For binding slot is live");
+                    (slot.source, slot.current.clone())
+                });
+                if source.is_static() {
+                    committed
+                } else {
+                    match source.evaluate::<RowSet>() {
+                        ReadValue::Value(next) => {
+                            let changed = committed.as_ref() != Some(&next);
+                            with_state(|state| {
+                                if let Some(slot) = state
+                                    .nodes
+                                    .binding_table_mut(tree)
+                                    .slot_mut::<RowSet>(binding)
+                                {
+                                    slot.fault = None;
+                                    if changed {
+                                        slot.current = Some(next.clone());
+                                    }
+                                }
+                                if changed {
+                                    state.record_binding_patch(
+                                        tree,
+                                        node,
+                                        BindingPart::ForEach,
+                                        committed.clone(),
+                                        Some(next.clone()),
+                                        None,
+                                    );
+                                }
+                            });
+                            Some(next)
                         }
-                        if changed {
-                            state.record_binding_patch(
-                                tree,
-                                node,
-                                BindingPart::ForEach,
-                                committed.clone(),
-                                Some(rows.clone()),
-                                None,
-                            );
+                        ReadValue::Fault(fault) => {
+                            with_state(|state| {
+                                if let Some(slot) = state
+                                    .nodes
+                                    .binding_table_mut(tree)
+                                    .slot_mut::<RowSet>(binding)
+                                {
+                                    slot.fault = Some(fault.clone());
+                                }
+                                state.record_read_fault(fault);
+                            });
+                            // 槽位可能已写入一个被拒绝的拟议投影；源失败时回到
+                            // 最后一次真正提交的行集，而不是那个拟议值。
+                            for_node.committed_rows.clone()
                         }
-                    });
-                    rows
-                }
-                ReadValue::Fault(fault) => {
-                    with_state(|state| {
-                        if let Some(slot) = state
-                            .nodes
-                            .binding_table_mut(tree)
-                            .slot_mut::<RowSet>(binding)
-                        {
-                            slot.fault = Some(fault.clone());
-                        }
-                        state.record_read_fault(fault);
-                    });
-                    committed.unwrap_or_else(RowSet::empty)
+                    }
                 }
             }
+            MountedForRows::Projection(filter) => match for_node.driver.projection_rowset(filter) {
+                Ok(next) => Some(next),
+                Err(error) => {
+                    source_error = Some(MountError::Store(error));
+                    for_node.committed_rows.clone()
+                }
+            },
         };
-        // 完整的 keyed 顺序只在 row set 投影变化时重建：重复键在窗口化之前
-        // 就拒绝，窗口只影响挂载哪些行，绝不改变行顺序（ADR-0011）。key 只应
-        // 依赖行身份，因此同一份投影可以复用映射结果；窗口更新是 O(窗口)。
-        let mut projection_failure = None;
-        if for_node
-            .rows
-            .as_ref()
-            .is_none_or(|cached| !cached.shares_with(&rows))
+        if let Some(rows) = &rows
+            && rows.store() != for_node.store
         {
-            let mut entries = Vec::with_capacity(rows.len());
-            let mut seen = BTreeSet::new();
-            for key in rows.iter() {
-                let todo = TodoId::from_key(key);
+            let error = MountError::WrongStore {
+                expected: for_node.store,
+                found: rows.store(),
+            };
+            let _ = self.refresh_committed_for_rows(for_node);
+            return Err(error);
+        }
+        if let Some(error) = source_error {
+            let _ = self.refresh_committed_for_rows(for_node);
+            return Err(error);
+        }
+        // 2) 投影变化时用驱动快照重建键映射：重复键在任何行挂载之前拒绝。
+        // 同一份投影（含等价的独立 Arc）不重复运行用户 key 选择器。
+        let projection_changed = match (&rows, &for_node.committed_rows) {
+            (Some(next), Some(committed)) => next != committed,
+            (Some(_), None) | (None, Some(_)) => true,
+            (None, None) => false,
+        };
+        let driver = Rc::clone(&for_node.driver);
+        let mut projection_failure = None;
+        if projection_changed && let Some(next) = &rows {
+            let mut buckets: BTreeMap<u64, Vec<RowId>> = BTreeMap::new();
+            for id in next.ids().iter().copied() {
                 // key 选择器是用户代码；panic 时不改写已提交的行映射。
-                let mapped = match catch_panic(|| (for_node.key)(todo)) {
-                    Ok(mapped) => mapped,
+                let hash = match catch_panic(|| driver.key_hash(id)) {
+                    Ok(Some(hash)) => hash,
+                    // 已删除的行不再挂载；遗留身份的完整策略属于行身份工作。
+                    Ok(None) => continue,
                     Err(panic) => {
                         projection_failure = Some(MountError::Panic(panic));
                         break;
                     }
                 };
-                if !seen.insert(mapped) {
+                let mut panic = None;
+                let duplicate = buckets.get(&hash).is_some_and(|bucket| {
+                    bucket
+                        .iter()
+                        .any(|other| match catch_panic(|| driver.key_eq(*other, id)) {
+                            Ok(equal) => equal,
+                            Err(caught) => {
+                                panic = Some(caught);
+                                true
+                            }
+                        })
+                });
+                if let Some(panic) = panic {
+                    projection_failure = Some(MountError::Panic(panic));
+                    break;
+                }
+                if duplicate {
                     projection_failure = Some(MountError::DuplicateKey);
                     break;
                 }
-                entries.push((mapped, todo));
-            }
-            if projection_failure.is_none() {
-                for_node.row_of = entries
-                    .iter()
-                    .enumerate()
-                    .map(|(index, (mapped, _))| (*mapped, index))
-                    .collect();
-                for_node.entries = entries;
-                for_node.rows = Some(rows);
+                buckets.entry(hash).or_default().push(id);
             }
         }
         if let Some(error) = projection_failure {
@@ -6888,7 +6949,9 @@ impl Runtime {
             let _ = self.refresh_committed_for_rows(for_node);
             return Err(error);
         }
-        let total = for_node.entries.len();
+        // total 来自行集快照本身；静态快照里已删除的行不挂载，但仍计入声明范围，
+        // 窗口因此保留一个空槽而不是报错或回退。
+        let total = rows.as_ref().map_or(0, RowSet::len);
         let previous_order = for_node.order.clone();
         let previous_first = for_node.first_row;
         let previous_total = for_node.total_rows;
@@ -6918,71 +6981,117 @@ impl Runtime {
                         .items
                         .iter()
                         .find(|(_, item)| contains_element(state, &item.children, focused))
-                        .and_then(|(key, _)| for_node.row_of.get(key).copied())
+                        .map(|(id, _)| *id)
                 })
             });
             if let Some(row) = focused {
-                if row + 1 == first {
-                    first = row;
-                    count += 1;
-                } else if row == first + count {
-                    count += 1;
-                }
-                count = count.min(total - first);
-                if row < first || row >= first + count {
-                    with_state(|state| state.window_focus_dropped = state.refresh_focus);
+                // 投影变化时按新顺序定位；未变化时用已提交行下标，保持 O(窗口)。
+                let index = if projection_changed {
+                    rows.as_ref()
+                        .and_then(|rows| rows.ids().iter().position(|id| *id == row))
+                } else {
+                    for_node.items.get(&row).map(|item| item.row_index)
+                };
+                if let Some(index) = index {
+                    if index + 1 == first {
+                        first = index;
+                        count += 1;
+                    } else if index == first + count {
+                        count += 1;
+                    }
+                    count = count.min(total - first);
+                    if index < first || index >= first + count {
+                        with_state(|state| state.window_focus_dropped = state.refresh_focus);
+                    }
                 }
             }
         }
 
         let mut order = Vec::with_capacity(count);
         let mut fresh = Vec::new();
+        let mut row_indices = Vec::new();
         // 预挂载的 fresh 行会写入补丁和 dirty 标记；行挂载失败并释放时
         // 一起回滚，未提交的行不影响 revision。
         let speculation = with_state(|state| state.mark_speculation());
         let mut mount_failure = None;
-        for index in first..first + count {
-            let (mapped, todo) = for_node.entries[index];
-            order.push(mapped);
-            if for_node.items.contains_key(&mapped) {
-                continue;
+        if let Some(rows) = &rows {
+            for index in first..first + count {
+                let id = rows.ids()[index];
+                // 静态快照可能早于删除：已删除的行不再挂载，也不进入已提交顺序，
+                // 已挂载的旧项随普通卸载路径移除。遗留身份的完整策略属于行身份工作。
+                if !driver.row_live(id) {
+                    continue;
+                }
+                order.push(id);
+                if for_node.items.contains_key(&id) {
+                    row_indices.push((id, index));
+                    continue;
+                }
+                let owner = with_state(|state| state.create_owner(Some(for_node.owner)));
+                let snapshot = match catch_panic(|| driver.row_snapshot(id)) {
+                    Ok(Some(snapshot)) => snapshot,
+                    Ok(None) => {
+                        with_state(|state| state.dispose_owner(owner));
+                        order.pop();
+                        continue;
+                    }
+                    Err(panic) => {
+                        with_state(|state| state.dispose_owner(owner));
+                        mount_failure = Some(MountError::Panic(panic));
+                        break;
+                    }
+                };
+                let todo = with_state(|state| {
+                    if for_node.store == state.todo_store.id() {
+                        state.todo_store.key_of(id)
+                    } else {
+                        None
+                    }
+                });
+                let erased = ErasedRowView {
+                    id,
+                    store: ErasedStore {
+                        store: for_node.store,
+                    },
+                    row: snapshot,
+                };
+                let plan = match with_owner(owner, || catch_panic(|| driver.mount_row(erased))) {
+                    Ok(Ok(plan)) => plan,
+                    Ok(Err(error)) => {
+                        with_state(|state| state.dispose_owner(owner));
+                        mount_failure = Some(MountError::FactoryFailed(Box::new(error)));
+                        break;
+                    }
+                    Err(panic) => {
+                        with_state(|state| state.dispose_owner(owner));
+                        mount_failure = Some(MountError::FactoryPanicked(panic));
+                        break;
+                    }
+                };
+                let children = match self.mount_plan(plan, owner, Some(for_node.node)) {
+                    Ok(children) => children,
+                    Err(error) => {
+                        with_state(|state| state.dispose_owner(owner));
+                        mount_failure = Some(error);
+                        break;
+                    }
+                };
+                let instance = with_state(|state| {
+                    let instance = state.next_instance;
+                    state.next_instance += 1;
+                    instance
+                });
+                fresh.push((
+                    id,
+                    MountedItem {
+                        owner,
+                        row_index: index,
+                        todo,
+                        instance,
+                        children,
+                    },
+                ));
             }
-            let owner = with_state(|state| state.create_owner(Some(for_node.owner)));
-            let plan = match with_owner(owner, || catch_panic(|| (for_node.item)(todo))) {
-                Ok(Ok(plan)) => plan,
-                Ok(Err(error)) => {
-                    with_state(|state| state.dispose_owner(owner));
-                    mount_failure = Some(error);
-                    break;
-                }
-                Err(panic) => {
-                    with_state(|state| state.dispose_owner(owner));
-                    mount_failure = Some(MountError::Panic(panic));
-                    break;
-                }
-            };
-            let children = match self.mount_plan(plan, owner, Some(for_node.node)) {
-                Ok(children) => children,
-                Err(error) => {
-                    with_state(|state| state.dispose_owner(owner));
-                    mount_failure = Some(error);
-                    break;
-                }
-            };
-            let instance = with_state(|state| {
-                let instance = state.next_instance;
-                state.next_instance += 1;
-                instance
-            });
-            fresh.push((
-                mapped,
-                MountedItem {
-                    owner,
-                    todo,
-                    instance,
-                    children,
-                },
-            ));
         }
         if let Some(error) = mount_failure {
             // 拟议窗口没有提交：丢弃预挂载行和它们的补丁/dirty 标记。
@@ -6993,15 +7102,15 @@ impl Runtime {
             return Err(error);
         }
 
-        let keep: BTreeSet<TodoId> = order.iter().copied().collect();
-        let removed: Vec<TodoId> = for_node
+        let keep: BTreeSet<RowId> = order.iter().copied().collect();
+        let removed: Vec<RowId> = for_node
             .items
             .keys()
-            .filter(|key| !keep.contains(key))
+            .filter(|id| !keep.contains(id))
             .copied()
             .collect();
-        for key in removed {
-            if let Some(item) = for_node.items.remove(&key) {
+        for id in removed {
+            if let Some(item) = for_node.items.remove(&id) {
                 with_state(|state| clear_history_in_nodes(state, &item.children));
                 with_state(|state| {
                     state.dispose_owner(item.owner);
@@ -7009,10 +7118,17 @@ impl Runtime {
                 });
             }
         }
-        for (key, item) in fresh {
-            for_node.items.insert(key, item);
+        for (id, item) in fresh {
+            for_node.items.insert(id, item);
+        }
+        for (id, index) in row_indices {
+            if let Some(item) = for_node.items.get_mut(&id) {
+                item.row_index = index;
+            }
         }
         for_node.order = order;
+        // 投影只在窗口挂载成功后提交：失败帧不会留下新顺序与旧行下标的分叉。
+        for_node.committed_rows = rows;
         let structural_changed = previous_order != for_node.order
             || previous_first != first
             || previous_total != total
@@ -7066,7 +7182,7 @@ impl Runtime {
         first_error
     }
 
-    fn release_items(&mut self, items: &mut Vec<(TodoId, MountedItem)>) {
+    fn release_items(&mut self, items: &mut Vec<(RowId, MountedItem)>) {
         for (_, item) in items.drain(..) {
             with_state(|state| {
                 state.dispose_owner(item.owner);
@@ -9345,9 +9461,11 @@ fn collect_items(state: &State, nodes: &[MountedNode], items: &mut Vec<ItemInfo>
             }
             MountedNode::For(payload) => {
                 let for_node = state.nodes.for_node(*payload);
-                for key in &for_node.order {
-                    if let Some(item) = for_node.items.get(key) {
+                for id in &for_node.order {
+                    if let Some(item) = for_node.items.get(id) {
                         items.push(ItemInfo {
+                            store: for_node.store,
+                            row: *id,
                             todo: item.todo,
                             instance: item.instance,
                             owner: item.owner,
@@ -9707,18 +9825,21 @@ mod lineage_tests {
                         Transaction::new().write(store.insert("a")).finish()
                     }}
                 >"seed"</button>
-                <For each={rows} key={|id: TodoId| id}>
-                    {move |id: TodoId| view! {
-                        <text-input
-                            aria:label="store-same"
-                            value={store.title(id)}
-                            on:input={move |value: String| {
-                                let capped = value.chars().take(1).collect::<String>();
-                                let _ = Transaction::new()
-                                    .write(store.set_title(id, capped))
-                                    .finish();
-                            }}
-                        />
+                <For each={rows} store={store} key={|row: &TodoRow| row.id}>
+                    {move |row: RowView<TodoRow>| {
+                        let id = row.key();
+                        view! {
+                            <text-input
+                                aria:label="store-same"
+                                value={store.title(id)}
+                                on:input={move |value: String| {
+                                    let capped = value.chars().take(1).collect::<String>();
+                                    let _ = Transaction::new()
+                                        .write(store.set_title(id, capped))
+                                        .finish();
+                                }}
+                            />
+                        }
                     }}
                 </For>
             </view>
@@ -10082,8 +10203,10 @@ mod recycling_tests {
             <view role="main">
                 <button aria:label="Seed" on:click={move || seed()}>"Seed"</button>
                 <view class="gap-0">
-                    <For each={rows} key={|id: TodoId| id} row-height={px(20.0)}>
-                        {move |id: TodoId| view! { <RecycledRow id={id} store={store} /> }}
+                    <For each={rows} store={store} key={|row: &TodoRow| row.id} row-height={px(20.0)}>
+                        {move |row: RowView<TodoRow>| view! {
+                            <RecycledRow id={row.key()} store={store} />
+                        }}
                     </For>
                 </view>
             </view>
@@ -10225,8 +10348,10 @@ mod arena_tests {
                 <button aria:label="Seed" on:click={move || seed()}>"Seed"</button>
                 <text>"plain"</text>
                 <ArenaShow />
-                <For each={rows} key={|id: TodoId| id}>
-                    {move |id: TodoId| view! { <ArenaRow id={id} store={store} /> }}
+                <For each={rows} store={store} key={|row: &TodoRow| row.id}>
+                    {move |row: RowView<TodoRow>| view! {
+                        <ArenaRow id={row.key()} store={store} />
+                    }}
                 </For>
             </view>
         }
@@ -10546,8 +10671,8 @@ mod binding_tests {
                     Transaction::new().write(store.insert("row")).finish()?;
                     Ok(())
                 }}>"seed"</button>
-                <For each={rows} key={|id: TodoId| id}>
-                    {move |_id: TodoId| view! {
+                <For each={rows} store={store} key={|row: &TodoRow| row.id}>
+                    {move |_row: RowView<TodoRow>| view! {
                         <view>
                             <Show when={inner}><text>"row-inner"</text></Show>
                             <text>"row"</text>
@@ -10740,8 +10865,31 @@ mod binding_tests {
                     transaction.finish()?;
                     Ok(())
                 }}>"Seed"</button>
-                <For each={rows} key={|id: TodoId| id}>
-                    {move |id: TodoId| view! { <text>{once(format!("row {}", id.raw()))}</text> }}
+                <For each={rows} store={store} key={|row: &TodoRow| row.id}>
+                    {move |row: RowView<TodoRow>| view! {
+                        <text>{once(format!("row {}", row.key().raw()))}</text>
+                    }}
+                </For>
+            </view>
+        }
+    }
+
+    #[component]
+    fn FaultFallbackHost() -> MountResult<MountPlan> {
+        let store = Store::new();
+        let rows = memo(move || store.rows(Filter::All));
+        view! {
+            <view>
+                <button aria:label="seed" on:click={move || -> Result<(), WriteError> {
+                    Transaction::new().write(store.insert("a")).finish()
+                }}>"Seed"</button>
+                <button aria:label="duplicate" on:click={move || -> Result<(), WriteError> {
+                    Transaction::new().write(store.insert("b")).finish()
+                }}>"Duplicate"</button>
+                <For each={rows} store={store} key={|row: &TodoRow| row.title.len()}>
+                    {move |row: RowView<TodoRow>| view! {
+                        <text>{once(format!("row {}", row.get().title))}</text>
+                    }}
                 </For>
             </view>
         }
@@ -10922,8 +11070,10 @@ mod binding_tests {
                     transaction.finish()?;
                     Ok(())
                 }}>"seed"</button>
-                <For each={rows} key={|id: TodoId| id} row-height={px(20.0)}>
-                    {move |id: TodoId| view! { <text>{once(format!("row {}", id.raw()))}</text> }}
+                <For each={rows} store={store} key={|row: &TodoRow| row.id} row-height={px(20.0)}>
+                    {move |row: RowView<TodoRow>| view! {
+                        <text>{once(format!("row {}", row.key().raw()))}</text>
+                    }}
                 </For>
             </view>
         }
@@ -11018,8 +11168,8 @@ mod binding_tests {
                 <button aria:label="seed" on:click={move || -> Result<(), WriteError> {
                     Transaction::new().write(store.insert("row")).finish()
                 }}>"seed"</button>
-                <For each={rows} key={|id: TodoId| id}>
-                    {move |_id: TodoId| view! {
+                <For each={rows} store={store} key={|row: &TodoRow| row.id}>
+                    {move |_row: RowView<TodoRow>| view! {
                         <Show when={inner}><text>"row"</text></Show>
                     }}
                 </For>
@@ -11055,8 +11205,8 @@ mod binding_tests {
                         .write(store.insert("B"))
                         .finish()
                 }}>"seed"</button>
-                <For each={rows} key={|id: TodoId| id}>
-                    {move |_id: TodoId| -> MountResult<MountPlan> {
+                <For each={rows} store={store} key={|row: &TodoRow| row.id}>
+                    {move |_row: RowView<TodoRow>| -> MountResult<MountPlan> {
                         let index = item_calls.get();
                         item_calls.set(index + 1);
                         if index == 1 {
@@ -11228,8 +11378,8 @@ mod binding_tests {
                 }}>"seed"</button>
                 <button aria:label="arm" on:click={move || armed.set(true)}>"arm"</button>
                 <button aria:label="disarm" on:click={move || armed.set(false)}>"disarm"</button>
-                <For each={rows} key={|id: TodoId| id} row-height={px(20.0)}>
-                    {move |_id: TodoId| -> MountResult<MountPlan> {
+                <For each={rows} store={store} key={|row: &TodoRow| row.id} row-height={px(20.0)}>
+                    {move |_row: RowView<TodoRow>| -> MountResult<MountPlan> {
                         let index = item_calls.get();
                         item_calls.set(index + 1);
                         if armed.get() && index >= 34 {
@@ -11262,8 +11412,9 @@ mod binding_tests {
             .expect_err("the fresh row fails");
         assert!(
             matches!(
-                failure,
-                WindowError::Mount(MountError::Component("row boom"))
+                &failure,
+                WindowError::Mount(MountError::FactoryFailed(error))
+                    if **error == MountError::Component("row boom")
             ),
             "unexpected failure: {failure:?}"
         );
@@ -11283,8 +11434,9 @@ mod binding_tests {
             .expect_err("the retry still hits the armed fault");
         assert!(
             matches!(
-                failure,
-                WindowError::Mount(MountError::Component("row boom"))
+                &failure,
+                WindowError::Mount(MountError::FactoryFailed(error))
+                    if **error == MountError::Component("row boom")
             ),
             "an identical retry is not swallowed: {failure:?}"
         );
@@ -11316,8 +11468,8 @@ mod binding_tests {
                     transaction.finish()
                 }}>"seed"</button>
                 <button aria:label="break" on:click={move || broken.set(true)}>"break"</button>
-                <For each={rows} key={|id: TodoId| id} row-height={px(20.0)}>
-                    {move |_id: TodoId| view! { <text>"row"</text> }}
+                <For each={rows} store={store} key={|row: &TodoRow| row.id} row-height={px(20.0)}>
+                    {move |_row: RowView<TodoRow>| view! { <text>"row"</text> }}
                 </For>
                 <Show when={broken}><FailingBranch /></Show>
             </view>
@@ -11440,8 +11592,8 @@ mod binding_tests {
                     Ok(())
                 }}>"go"</button>
                 <button aria:label="disarm" on:click={move || armed.set(false)}>"disarm"</button>
-                <For each={rows} key={|id: TodoId| id} row-height={px(20.0)}>
-                    {move |_id: TodoId| -> MountResult<MountPlan> {
+                <For each={rows} store={store} key={|row: &TodoRow| row.id} row-height={px(20.0)}>
+                    {move |_row: RowView<TodoRow>| -> MountResult<MountPlan> {
                         if armed.get() {
                             return Err(MountError::Component("row boom"));
                         }
@@ -11463,7 +11615,7 @@ mod binding_tests {
         // 新插入的行挂载失败，但已提交行的嵌套 Show 仍要在这一帧求值。
         let failure = app.click_label("go").expect_err("the fresh row fails");
         assert!(
-            matches!(failure, MountError::Component("row boom")),
+            matches!(&failure, MountError::FactoryFailed(error) if **error == MountError::Component("row boom")),
             "unexpected failure: {failure:?}"
         );
         let inners = app
@@ -11603,8 +11755,8 @@ mod binding_tests {
                 }}>"seed"</button>
                 <button aria:label="toggle" on:click={move || open.set(!open.get())}>"toggle"</button>
                 <Show when={open}>
-                    <For each={rows} key={|id: TodoId| id} row-height={px(20.0)}>
-                        {move |_id: TodoId| view! { <text>"row"</text> }}
+                    <For each={rows} store={store} key={|row: &TodoRow| row.id} row-height={px(20.0)}>
+                        {move |_row: RowView<TodoRow>| view! { <text>"row"</text> }}
                     </For>
                 </Show>
             </view>
@@ -11684,8 +11836,7 @@ mod binding_tests {
                     Transaction::new().write(store.insert("row")).finish()
                 }}>"seed"</button>
                 <button aria:label="equal" on:click={move || -> Result<(), WriteError> {
-                    if let Some(key) = store.rows(Filter::All).as_slice().first().copied() {
-                        let id = TodoId::from_key(key);
+                    if let Some(id) = store.keys(Filter::All).into_iter().next() {
                         Transaction::new()
                             .write(store.set_title(id, "row"))
                             .write(store.set_completed(id, false))
@@ -11695,14 +11846,15 @@ mod binding_tests {
                     Ok(())
                 }}>"equal"</button>
                 <button aria:label="change" on:click={move || -> Result<(), WriteError> {
-                    if let Some(key) = store.rows(Filter::All).as_slice().first().copied() {
-                        let id = TodoId::from_key(key);
+                    if let Some(id) = store.keys(Filter::All).into_iter().next() {
                         Transaction::new().write(store.set_title(id, "changed")).finish()?;
                     }
                     Ok(())
                 }}>"change"</button>
-                <For each={rows} key={|id: TodoId| id}>
-                    {move |id: TodoId| view! { <text>{store.title(id)}</text> }}
+                <For each={rows} store={store} key={|row: &TodoRow| row.id}>
+                    {move |row: RowView<TodoRow>| view! {
+                        <text>{store.title(row.key())}</text>
+                    }}
                 </For>
             </view>
         }
@@ -11721,7 +11873,12 @@ mod binding_tests {
         .expect("declare the window");
         let window = app.show("main").expect("show the window");
         app.click_label("seed").expect("seed the row");
-        let id = app.for_items().first().expect("row item").todo;
+        let id = app
+            .for_items()
+            .first()
+            .expect("row item")
+            .todo
+            .expect("todo row");
         assert!(app.texts().iter().any(|text| text == "row"));
 
         let fields = [
@@ -11949,10 +12106,11 @@ mod binding_tests {
 
     #[component]
     fn PanicFor() -> MountResult<MountPlan> {
+        let store = Store::new();
         let failing: Memo<RowSet> = memo(|| panic!("for memo boom"));
         view! {
-            <For each={failing} key={|id: TodoId| id}>
-                {move |_id: TodoId| view! { <text>"row"</text> }}
+            <For each={failing} store={store} key={|row: &TodoRow| row.id}>
+                {move |_row: RowView<TodoRow>| view! { <text>"row"</text> }}
             </For>
         }
     }
@@ -12189,8 +12347,7 @@ mod binding_tests {
     fn a_first_failed_for_evaluation_mounts_an_empty_row_set() {
         let mut app = Runtime::new();
         app.mount(|| view! { <ForHost /> }).expect("mount");
-        app.click_label("Seed").expect("seed the rows");
-        assert_eq!(app.for_items().len(), 2);
+        assert!(app.for_items().is_empty());
 
         {
             let mut state = app.state.borrow_mut();
@@ -12199,7 +12356,9 @@ mod binding_tests {
                 let tree = state.trees.get(&TreeSlot::Root).expect("root tree");
                 first_for(&state, &tree.nodes).expect("the For node")
             };
-            let binding = state.nodes.for_node(payload).each;
+            let MountedForRows::Read(binding) = state.nodes.for_node(payload).rows else {
+                panic!("the For is bound to a memo");
+            };
             let slot = state
                 .nodes
                 .binding_table_mut(tree_key)
@@ -12235,5 +12394,122 @@ mod binding_tests {
             "the disposed For source is a typed fault: {:?}",
             report.faults()
         );
+    }
+
+    #[test]
+    fn a_disposed_for_source_keeps_the_committed_rows() {
+        let mut app = Runtime::new();
+        app.mount(|| view! { <ForHost /> }).expect("mount");
+        app.click_label("Seed").expect("seed the rows");
+        assert_eq!(app.for_items().len(), 2);
+
+        {
+            let mut state = app.state.borrow_mut();
+            let tree_key = state.arena_trees[&TreeSlot::Root];
+            let payload = {
+                let tree = state.trees.get(&TreeSlot::Root).expect("root tree");
+                first_for(&state, &tree.nodes).expect("the For node")
+            };
+            let MountedForRows::Read(binding) = state.nodes.for_node(payload).rows else {
+                panic!("the For is bound to a memo");
+            };
+            let slot = state
+                .nodes
+                .binding_table_mut(tree_key)
+                .slot_mut::<RowSet>(binding)
+                .expect("the For binding slot");
+            let ReadSlot::Memo(source) = slot.source else {
+                panic!("For is bound to a memo");
+            };
+            // 槽位没有最后值，但已提交投影仍在：失败帧必须保留它。
+            slot.current = None;
+            slot.fault = None;
+            state.memos[source.id as usize].disposed = true;
+        }
+
+        let report = app
+            .refresh()
+            .expect("a fault keeps the committed rows and reports the fault");
+        assert!(
+            report
+                .faults()
+                .iter()
+                .any(|fault| matches!(fault, ReadFault::Disposed)),
+            "the disposed source is still reported: {:?}",
+            report.faults()
+        );
+        assert_eq!(
+            app.for_items().len(),
+            2,
+            "a source fault keeps the last committed rows"
+        );
+    }
+
+    #[test]
+    fn a_faulting_for_source_keeps_the_committed_projection() {
+        let mut app = Runtime::new();
+        app.mount(|| view! { <FaultFallbackHost /> })
+            .expect("mount");
+        app.click_label("seed").expect("seed a");
+        let failure = app
+            .click_label("duplicate")
+            .expect_err("b collides with a by title length");
+        assert_eq!(failure, MountError::DuplicateKey);
+        assert_eq!(
+            app.for_items().len(),
+            1,
+            "the rejected frame kept the old mapping"
+        );
+
+        {
+            let mut state = app.state.borrow_mut();
+            let tree_key = state.arena_trees[&TreeSlot::Root];
+            let payload = {
+                let tree = state.trees.get(&TreeSlot::Root).expect("root tree");
+                first_for(&state, &tree.nodes).expect("the For node")
+            };
+            let MountedForRows::Read(binding) = state.nodes.for_node(payload).rows else {
+                panic!("the For is bound to a memo");
+            };
+            let memo_id = {
+                let slot = state
+                    .nodes
+                    .binding_table_mut(tree_key)
+                    .slot_mut::<RowSet>(binding)
+                    .expect("the For binding slot");
+                let ReadSlot::Memo(source) = slot.source else {
+                    panic!("For is bound to a memo");
+                };
+                source.id as usize
+            };
+            // 修复 b 的键，并在同一帧让源失效：失败帧不能把拟议行集变成已提交顺序。
+            let b = state.todo_store.ids()[1];
+            state
+                .todo_store
+                .update(b, |row| row.title = String::from("bb"))
+                .expect("heal b");
+            state.memos[memo_id].disposed = true;
+        }
+
+        let report = app.refresh().expect("a fault keeps the committed rows");
+        assert!(
+            report
+                .faults()
+                .iter()
+                .any(|fault| matches!(fault, ReadFault::Disposed)),
+            "the disposed source is still reported: {:?}",
+            report.faults()
+        );
+        assert_eq!(
+            app.for_items().len(),
+            1,
+            "the never-committed b row must not mount"
+        );
+        let rows: Vec<String> = app
+            .texts()
+            .into_iter()
+            .filter(|text| text.starts_with("row "))
+            .collect();
+        assert_eq!(rows, vec!["row a"]);
     }
 }

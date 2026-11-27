@@ -18,5 +18,5 @@ mod store;
 pub use change::ChangeSet;
 pub use id::{FieldId, FilterId, RowId, StoreId};
 pub use row::{FieldDef, FilterSpec, Row, RowKey, Schema, SchemaBuilder, SchemaError};
-pub use rows::{RowSetData, Rows};
+pub use rows::{RowSet, RowSetData, Rows};
 pub use store::{Commit, Store, StoreError, TransactionError, Tx};

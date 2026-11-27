@@ -224,14 +224,17 @@ fn duplicate_for_keys_fail_before_publication() {
                 }}>"Seed"</button>
                 <For
                     each={rows}
-                    key={move |id: TodoId| {
+                    store={store}
+                    key={move |row: &TodoRow| {
                         if first.get().is_none() {
-                            first.set(Some(id));
+                            first.set(Some(row.id));
                         }
                         first.get().expect("a first key")
                     }}
                 >
-                    {move |id: TodoId| view! { <text>{once(id.raw().to_string())}</text> }}
+                    {move |row: RowView<TodoRow>| view! {
+                        <text>{once(row.key().raw().to_string())}</text>
+                    }}
                 </For>
             </view>
         }
@@ -301,16 +304,19 @@ fn row_visits_counts_the_rows_a_filter_rebuild_scanned() {
                         .finish()
                 }}>"Seed"</button>
                 <text>{label}</text>
-                <For each={active} key={|id: TodoId| id}>
-                    {move |id: TodoId| view! {
-                        <button
-                            aria:label="done"
-                            on:click={move || -> Result<(), WriteError> {
-                                Transaction::new()
-                                    .write(store.set_completed(id, true))
-                                    .finish()
-                            }}
-                        >"Done"</button>
+                <For each={active} store={store} key={|row: &TodoRow| row.id}>
+                    {move |row: RowView<TodoRow>| {
+                        let id = row.key();
+                        view! {
+                            <button
+                                aria:label="done"
+                                on:click={move || -> Result<(), WriteError> {
+                                    Transaction::new()
+                                        .write(store.set_completed(id, true))
+                                        .finish()
+                                }}
+                            >"Done"</button>
+                        }
                     }}
                 </For>
             </view>
@@ -647,8 +653,9 @@ fn stale_field_and_write_errors_are_reported() {
                     }
                 }}>"DeleteAgain"</button>
                 <text>{shown}</text>
-                <For each={rows} key={|id: TodoId| id}>
-                    {move |id: TodoId| {
+                <For each={rows} store={store} key={|row: &TodoRow| row.id}>
+                    {move |row: RowView<TodoRow>| {
+                        let id = row.key();
                         item_last.set(Some(id));
                         view! { <text>{once(id.raw().to_string())}</text> }
                     }}
@@ -692,4 +699,64 @@ fn a_failing_root_plan_releases_its_setup_resources() {
     app.mount(|| view! { <Good /> })
         .expect("the same Runtime retries");
     assert_eq!(app.texts(), vec!["ok"]);
+}
+
+#[component]
+fn RetainedTodoRows() -> MountResult<MountPlan> {
+    let store = Store::new();
+    let rows = memo(move || store.rows(Filter::All));
+    view! {
+        <view>
+            <button aria:label="seed" on:click={move || -> Result<(), WriteError> {
+                Transaction::new()
+                    .write(store.insert("A"))
+                    .write(store.insert("B"))
+                    .finish()
+            }}>"Seed"</button>
+            <button aria:label="swap" on:click={move || -> Result<(), WriteError> {
+                let keys = store.keys(Filter::All);
+                Transaction::new()
+                    .write(store.remove(keys[0]))
+                    .write(store.insert("C"))
+                    .finish()
+            }}>"Swap"</button>
+            <For each={rows} store={store} key={|row: &TodoRow| row.id}>
+                {move |row: RowView<TodoRow>| {
+                    if row.get().title == "C" {
+                        return Err(MountError::Component("C boom"));
+                    }
+                    view! { <text>{once(format!("todo {}", row.key().raw()))}</text> }
+                }}
+            </For>
+        </view>
+    }
+}
+
+#[test]
+fn a_retained_mounted_row_keeps_its_captured_todo_key() {
+    let mut app = mount(|| view! { <RetainedTodoRows /> });
+    app.click_text("Seed").expect("seed two rows");
+    let before = app.for_items();
+    assert_eq!(before.len(), 2);
+    assert!(before.iter().all(|item| item.todo.is_some()));
+    let before_rows: Vec<RowId> = before.iter().map(|item| item.row).collect();
+    let before_keys: Vec<Option<TodoId>> = before.iter().map(|item| item.todo).collect();
+    let texts = app.texts();
+
+    let failure = app.click_text("Swap").expect_err("the fresh C row fails");
+    assert!(
+        matches!(&failure, MountError::FactoryFailed(error) if **error == MountError::Component("C boom")),
+        "unexpected failure: {failure:?}"
+    );
+    assert_eq!(app.texts(), texts, "the old mapping remains");
+    let after = app.for_items();
+    assert_eq!(
+        after.iter().map(|item| item.row).collect::<Vec<_>>(),
+        before_rows
+    );
+    assert_eq!(
+        after.iter().map(|item| item.todo).collect::<Vec<_>>(),
+        before_keys,
+        "a retained row keeps the business key captured when it mounted"
+    );
 }

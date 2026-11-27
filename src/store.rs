@@ -2,10 +2,10 @@ use std::fmt;
 use std::marker::PhantomData;
 
 use zenui_core::model::{
-    ChangeSet, Commit, FieldDef, FieldId, FilterId, FilterSpec, Row as ModelRow, SchemaBuilder,
-    StoreError as ModelError, TransactionError, Tx as ModelTx,
+    ChangeSet, Commit, FieldDef, FieldId, FilterId, FilterSpec, Row as ModelRow, RowId, RowSet,
+    SchemaBuilder, Store as ModelStore, StoreError as ModelError, TransactionError, Tx as ModelTx,
 };
-use zenui_core::{Fatal, Filter, RowKey, RowSet, ValueError};
+use zenui_core::{Fatal, Filter, RowKey, ValueError};
 
 use crate::context::{DepKey, FieldKind, Phase, filter_slot, with_state, with_state_of};
 
@@ -55,10 +55,10 @@ const fn field_kind(field: FieldId) -> FieldKind {
 
 /// Todo 作为通用行模型的第一个实例化：行身份是 `RowId`，业务键是 `TodoId`。
 #[derive(Clone, Debug)]
-pub(crate) struct TodoRow {
-    pub(crate) id: TodoId,
-    pub(crate) title: String,
-    pub(crate) completed: bool,
+pub struct TodoRow {
+    pub id: TodoId,
+    pub title: String,
+    pub completed: bool,
 }
 
 impl ModelRow for TodoRow {
@@ -153,6 +153,26 @@ impl Store {
 
     pub fn rows(self, filter: Filter) -> RowSet {
         with_state_of(self.runtime, |state| state.store_rows(filter))
+    }
+
+    /// 当前过滤结果的业务键，按 Store 顺序。
+    pub fn keys(self, filter: Filter) -> Vec<TodoId> {
+        with_state_of(self.runtime, |state| state.store_keys(filter))
+    }
+
+    /// 行身份对应的业务键；行已删除时返回 `None`。
+    pub fn key_of(self, row: RowId) -> Option<TodoId> {
+        with_state_of(self.runtime, |state| state.todo_store.key_of(row))
+    }
+
+    /// 业务键当前对应的行身份；键不在 Store 中时返回 `None`。
+    pub fn row_id(self, id: TodoId) -> Option<RowId> {
+        with_state_of(self.runtime, |state| state.todo_store.id_of_key(id))
+    }
+
+    /// 运行时持有的模型 Store 句柄；只在 SDK 内部用于 `For` 的行解析。
+    pub(crate) fn model_store(self) -> ModelStore<TodoRow> {
+        with_state_of(self.runtime, |state| state.todo_store.clone())
     }
 
     pub fn is_empty(self, filter: Filter) -> bool {
@@ -274,6 +294,19 @@ impl Store {
 impl Default for Store {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Todo 的 `For` 入口：`each` 读源与应用 Store 组合成 `ForSource<TodoRow>`，
+/// 模型 Store 句柄不经公开 API 泄漏。
+impl crate::view::ForStore for Store {
+    type Row = TodoRow;
+
+    fn for_source(
+        &self,
+        rows: impl Into<crate::view::Read<RowSet>>,
+    ) -> crate::view::ForSource<TodoRow> {
+        crate::view::ForSource::new(self.model_store(), rows)
     }
 }
 
@@ -531,26 +564,15 @@ impl crate::runtime::State {
             .todo_store
             .filter_is_empty(id)
             .expect("the Todo filter is registered");
-        let keys: Vec<RowKey> = if empty {
-            Vec::new()
-        } else {
+        let set = self
+            .todo_store
+            .rowset_from_filter(id)
+            .expect("the Todo filter is registered");
+        if !empty {
             self.store_counters.cache_builds += 1;
             self.store_counters.id_materializations += 1;
             self.store_counters.row_visits += self.todo_store.len() as u64;
-            self.todo_store
-                .projection(id)
-                .expect("the Todo filter is registered")
-                .ids()
-                .iter()
-                .map(|row| {
-                    self.todo_store
-                        .key_of(*row)
-                        .expect("a live row has its business key")
-                        .0
-                })
-                .collect()
-        };
-        let set = RowSet::from_keys(keys);
+        }
         self.rowset_cache[slot] = Some(CachedRowSet {
             membership,
             order,
@@ -560,6 +582,14 @@ impl crate::runtime::State {
             self.note_dep(DepKey::Rows(filter_slot(filter)));
         }
         set
+    }
+
+    pub(crate) fn store_keys(&mut self, filter: Filter) -> Vec<TodoId> {
+        self.store_rows(filter)
+            .ids()
+            .iter()
+            .filter_map(|row| self.todo_store.key_of(*row))
+            .collect()
     }
 
     pub(crate) fn store_is_empty(&mut self, filter: Filter) -> bool {

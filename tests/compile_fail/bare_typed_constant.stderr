@@ -8,6 +8,7 @@ error[E0277]: the trait bound `zenui::Read<zenui::Length>: From<zenui::Length>` 
   |                                     required by a bound introduced by this call
   |
   = help: the following other types implement trait `From<T>`:
+            `zenui::Read<RowSet>` implements `From<RowSet>`
             `zenui::Read<String>` implements `From<&str>`
             `zenui::Read<String>` implements `From<zenui::Once<&str>>`
             `zenui::Read<T>` implements `From<zenui::Field<T>>`

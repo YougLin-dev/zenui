@@ -581,9 +581,9 @@ fn Branchy() -> MountResult<MountPlan> {
                     .write(store.insert("B"))
                     .finish();
             }}>"Seed"</button>
-            <For each={rows} key={|id: TodoId| id}>
-                {move |todo: TodoId| view! {
-                    <text aria:label={once(format!("row {}", todo.raw()))} />
+            <For each={rows} store={store} key={|row: &TodoRow| row.id}>
+                {move |row: RowView<TodoRow>| view! {
+                    <text aria:label={once(format!("row {}", row.key().raw()))} />
                 }}
             </For>
         </view>

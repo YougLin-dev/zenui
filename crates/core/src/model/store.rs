@@ -9,7 +9,7 @@ use crate::handle::Generation;
 use super::change::ChangeSet;
 use super::id::{FieldId, FilterId, RowId, StoreId, next_generation};
 use super::row::{FieldDef, FilterDef, FilterSpec, Row, Schema};
-use super::rows::{RowSetData, Rows};
+use super::rows::{RowSet, RowSetData, Rows};
 
 /// 通用行模型的写事务错误。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -305,7 +305,47 @@ impl<R: Row> Store<R> {
         Ok(Rows::new(self.clone(), id))
     }
 
+    /// 从一个行身份集合构造 Store 拥有的快照；输出顺序恒为 Store 当前用户顺序。
+    ///
+    /// `ids` 是成员集合：输入顺序不生效，重复 id 被去掉；不在本 Store 存活的行
+    /// 是调用方错误（`#[track_caller]` panic）。空集合返回空的 Store 快照。
+    #[track_caller]
+    pub fn rowset(&self, ids: impl IntoIterator<Item = RowId>) -> RowSet {
+        let wanted: BTreeSet<RowId> = ids.into_iter().collect();
+        let data = self.inner.data.borrow();
+        let store = data.id;
+        if wanted.is_empty() {
+            return RowSet::from_data(Arc::new(RowSetData::new(store, Box::new([]))));
+        }
+        for id in &wanted {
+            assert!(
+                data.rows.get(*id).is_some(),
+                "row {id:?} is not live in this store"
+            );
+        }
+        let selected: Box<[RowId]> = data
+            .order
+            .iter()
+            .copied()
+            .filter(|id| wanted.contains(id))
+            .collect();
+        debug_assert_eq!(
+            selected.len(),
+            wanted.len(),
+            "every live row appears once in Store order"
+        );
+        RowSet::from_data(Arc::new(RowSetData::new(store, selected)))
+    }
+
+    /// 过滤投影的 [`RowSet`] 包装；同一 `(membership, order)` revision 复用同一 `Arc`。
+    pub fn rowset_from_filter(&self, filter: FilterId) -> Result<RowSet, StoreError> {
+        self.projection(filter).map(RowSet::from_data)
+    }
+
     /// 过滤投影；同一 `(membership_revision, order_revision)` 复用共享快照。
+    ///
+    /// 成员为空的 filter 与 order 无关：命中同 membership revision 的缓存即可
+    /// 复用，且从不扫描 Store order。
     pub fn projection(&self, filter: FilterId) -> Result<Arc<RowSetData>, StoreError> {
         let mut data = self.inner.data.borrow_mut();
         let entry = data
@@ -313,19 +353,23 @@ impl<R: Row> Store<R> {
             .get(&filter)
             .ok_or(StoreError::UnknownFilter(filter))?;
         let membership_revision = entry.membership_revision;
+        let membership_empty = entry.members.is_empty();
         let order_revision = data.order_revision;
         if let Some(cached) = data.projections.get(&filter)
             && cached.membership_revision == membership_revision
-            && cached.order_revision == order_revision
+            && (membership_empty || cached.order_revision == order_revision)
         {
             return Ok(Arc::clone(&cached.data));
         }
-        let ids: Box<[RowId]> = data
-            .order
-            .iter()
-            .copied()
-            .filter(|id| data.filters[&filter].members.contains(id))
-            .collect();
+        let ids: Box<[RowId]> = if membership_empty {
+            Box::new([])
+        } else {
+            data.order
+                .iter()
+                .copied()
+                .filter(|id| data.filters[&filter].members.contains(id))
+                .collect()
+        };
         let data_arc = Arc::new(RowSetData::new(data.id, ids));
         data.projections.insert(
             filter,

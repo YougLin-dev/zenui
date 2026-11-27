@@ -53,10 +53,18 @@ fn snapshot_node_ids_drive_the_todo_workflow() {
         .expect("filter all by node");
     assert_eq!(app.for_items().len(), 2);
 
-    let before: Vec<u64> = app.for_items().iter().map(|item| item.todo.raw()).collect();
+    let before: Vec<u64> = app
+        .for_items()
+        .iter()
+        .map(|item| item.todo.expect("todo row").raw())
+        .collect();
     app.click_node(node_with_text(&app, "Reverse"))
         .expect("reorder by node");
-    let after: Vec<u64> = app.for_items().iter().map(|item| item.todo.raw()).collect();
+    let after: Vec<u64> = app
+        .for_items()
+        .iter()
+        .map(|item| item.todo.expect("todo row").raw())
+        .collect();
     assert_eq!(
         after,
         before.iter().rev().copied().collect::<Vec<_>>(),

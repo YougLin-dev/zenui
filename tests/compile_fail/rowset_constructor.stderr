@@ -1,0 +1,16 @@
+error[E0599]: no associated function or constant named `default` found for struct `zenui::RowSet` in the current scope
+ --> tests/compile_fail/rowset_constructor.rs:4:21
+  |
+4 |     let _ = RowSet::default();
+  |                     ^^^^^^^ associated function or constant not found in `zenui::RowSet`
+
+error[E0599]: no associated function or constant named `empty` found for struct `zenui::RowSet` in the current scope
+ --> tests/compile_fail/rowset_constructor.rs:5:21
+  |
+5 |     let _ = RowSet::empty();
+  |                     ^^^^^ associated function or constant not found in `zenui::RowSet`
+  |
+help: there is a method `is_empty` with a similar name
+  |
+5 |     let _ = RowSet::is_empty();
+  |                     +++

@@ -7,7 +7,7 @@ use zenui::prelude::*;
 
 fn panic_message(error: MountError) -> String {
     match error {
-        MountError::Panic(panic) => panic.message().to_owned(),
+        MountError::Panic(panic) | MountError::FactoryPanicked(panic) => panic.message().to_owned(),
         other => panic!("expected a contained panic, got {other:?}"),
     }
 }
@@ -209,13 +209,13 @@ fn a_panicking_for_factory_keeps_old_rows_and_releases_the_proposed_owner() {
                     let _ = Transaction::new().write(store.insert("A")).finish();
                 }}>"Seed"</button>
                 <button on:click={move || armed.set(false)}>"Disarm"</button>
-                <For each={rows} key={|id: TodoId| id}>
-                    {move |id: TodoId| {
+                <For each={rows} store={store} key={|row: &TodoRow| row.id}>
+                    {move |row: RowView<TodoRow>| {
                         if item_armed.get() {
                             let _probe = signal(1);
                             panic!("for factory boom");
                         }
-                        view! { <text>{once(format!("row {}", id.raw()))}</text> }
+                        view! { <text>{once(format!("row {}", row.key().raw()))}</text> }
                     }}
                 </For>
             </view>
