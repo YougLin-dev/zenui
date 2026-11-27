@@ -762,3 +762,198 @@ fn todo_rows_still_mount_through_for_source_and_row_view() {
         2
     );
 }
+
+fn editor(app: &Runtime, label: &str) -> NodeId {
+    app.presentation()
+        .expect("snapshot")
+        .find_label(label)
+        .expect("the note editor")
+        .id()
+}
+
+/// 行数据来自应用自己的模型；业务 key 由应用定义，因此可以同 key 重建。
+///
+/// `reinsert` 用不同正文重建，证明新行读取自己的快照而不是复用旧缓存；
+/// `swap` 在同一帧里先删后建并保持相同正文，用来验证仅按业务 key 合并的路径。
+#[component]
+fn EditableNotes(store: RowStore<Note>) -> MountResult<MountPlan> {
+    let rows = store.rows(AllNotes)?;
+    let delete_store = store.clone();
+    let reinsert_store = store.clone();
+    let swap_store = store.clone();
+    view! {
+        <view>
+            <button aria:label="delete" on:click={move || {
+                if let Some(id) = delete_store.id_of_key(1) {
+                    delete_store.remove(id).expect("delete note 1");
+                }
+            }}>"Delete"</button>
+            <button aria:label="reinsert" on:click={move || {
+                reinsert_store.insert(note(1, "omega")).expect("reinsert note 1");
+            }}>"Reinsert"</button>
+            <button aria:label="swap" on:click={move || {
+                if let Some(id) = swap_store.id_of_key(1) {
+                    swap_store.remove(id).expect("remove note 1");
+                    swap_store.insert(note(1, "alpha")).expect("reinsert note 1");
+                }
+            }}>"Swap"</button>
+            <For each={rows} key={|note: &Note| note.key}>
+                {move |row: RowView<Note>| {
+                    let key = row.key();
+                    // 可编辑的 value 需要动态来源；静态值会在刷新时把本地编辑
+                    // 当成外部重置。
+                    let value = signal(row.get().text.clone());
+                    view! {
+                        <text-input
+                            aria:label={once(format!("note {key}"))}
+                            value={value}
+                            on:input={move |_text: String| {}}
+                        />
+                    }
+                }}
+            </For>
+        </view>
+    }
+}
+
+#[test]
+fn delete_and_reinsert_of_the_same_model_key_starts_a_fresh_row() {
+    let store = note_store();
+    let old_row = insert(&store, note(1, "alpha"));
+    let other = insert(&store, note(2, "beta"));
+
+    let mut app = Runtime::new();
+    app.mount({
+        let store = store.clone();
+        move || view! { <EditableNotes store={store} /> }
+    })
+    .expect("mount the note list");
+    assert_eq!(rows_of(&app), vec![old_row, other]);
+    let old_node = editor(&app, "note 1");
+    let other_node = editor(&app, "note 2");
+    let baseline_signals = app.live_signals();
+    let old_item = app.for_items()[0];
+
+    app.focus("note 1").expect("focus note 1");
+    app.set_caret_node(old_node, 1).expect("place the caret");
+    app.insert_text_node(old_node, "X")
+        .expect("edit the old note");
+    assert_eq!(
+        app.presentation()
+            .expect("snapshot")
+            .find_label("note 1")
+            .expect("the old editor")
+            .text_value(),
+        Some("aXlpha")
+    );
+
+    app.click_label("delete").expect("delete note 1");
+    assert_eq!(app.node_status(old_node), NodeStatus::Stale);
+    assert_eq!(rows_of(&app), vec![other]);
+    assert!(store.id_of_key(1).is_none());
+    assert_eq!(
+        app.live_signals(),
+        baseline_signals - 1,
+        "the deleted row's owner resources are released"
+    );
+    assert_eq!(
+        app.presentation().expect("snapshot").focus(),
+        Some(other_node),
+        "deleting the focused row settles focus on the surviving editor"
+    );
+
+    app.click_label("reinsert")
+        .expect("reinsert the same business key");
+    let new_row = store.id_of_key(1).expect("note 1 is back");
+    assert_ne!(new_row, old_row, "the same key gets a new RowId");
+    assert_eq!(rows_of(&app), vec![other, new_row]);
+
+    let new_node = editor(&app, "note 1");
+    assert_ne!(new_node, old_node, "the reinserted row mounts a fresh node");
+    assert_eq!(app.node_status(old_node), NodeStatus::Stale);
+    assert_eq!(
+        app.live_signals(),
+        baseline_signals,
+        "the reinserted row owns exactly one fresh signal"
+    );
+    let new_item = app.for_items()[1];
+    assert_ne!(new_item.instance, old_item.instance, "fresh instance");
+    assert_ne!(new_item.owner, old_item.owner, "fresh owner");
+
+    let snapshot = app.presentation().expect("snapshot");
+    assert_eq!(
+        snapshot.focus(),
+        Some(other_node),
+        "the reinserted row does not inherit focus"
+    );
+    let element = snapshot.find_label("note 1").expect("the new editor");
+    assert_eq!(
+        element.text_value(),
+        Some("omega"),
+        "the fresh row reads its own snapshot, not the deleted row's"
+    );
+    let edit = element.edit().expect("edit state");
+    assert_eq!(edit.caret(), 0);
+    assert_eq!(edit.selection(), None);
+    assert_eq!(
+        app.insert_text_node(old_node, "Z"),
+        Err(DispatchError::StaleNode(old_node)),
+        "the old mount rejects delivery"
+    );
+}
+
+#[test]
+fn deleting_and_reinserting_the_same_key_in_one_turn_mounts_a_fresh_row() {
+    let store = note_store();
+    let old_row = insert(&store, note(1, "alpha"));
+    let other = insert(&store, note(2, "beta"));
+
+    let mut app = Runtime::new();
+    app.mount({
+        let store = store.clone();
+        move || view! { <EditableNotes store={store} /> }
+    })
+    .expect("mount the note list");
+    let old_node = editor(&app, "note 1");
+    let other_node = editor(&app, "note 2");
+    let baseline_signals = app.live_signals();
+    let old_item = app.for_items()[0];
+    app.focus("note 1").expect("focus note 1");
+    app.set_caret_node(old_node, 1).expect("place the caret");
+    app.insert_text_node(old_node, "X")
+        .expect("edit the old note");
+
+    app.click_label("swap")
+        .expect("delete and reinsert the same key in one turn");
+    let new_row = store.id_of_key(1).expect("note 1 is back");
+    assert_ne!(new_row, old_row, "the same key gets a new RowId");
+    assert_eq!(rows_of(&app), vec![other, new_row]);
+
+    let new_node = editor(&app, "note 1");
+    assert_ne!(new_node, old_node, "the frame mounts a fresh row element");
+    assert_eq!(app.node_status(old_node), NodeStatus::Stale);
+    assert_eq!(
+        app.live_signals(),
+        baseline_signals,
+        "the swap releases the old row owner and allocates one for the new row"
+    );
+    let new_item = app.for_items()[1];
+    assert_ne!(new_item.instance, old_item.instance, "fresh instance");
+    assert_ne!(new_item.owner, old_item.owner, "fresh owner");
+
+    let snapshot = app.presentation().expect("snapshot");
+    assert_eq!(
+        snapshot.focus(),
+        Some(other_node),
+        "stale focus settles on the surviving editor, not the reinserted row"
+    );
+    let element = snapshot.find_label("note 1").expect("the new editor");
+    assert_eq!(element.text_value(), Some("alpha"));
+    let edit = element.edit().expect("edit state");
+    assert_eq!(edit.caret(), 0);
+    assert_eq!(edit.selection(), None);
+    assert_eq!(
+        app.insert_text_node(old_node, "Z"),
+        Err(DispatchError::StaleNode(old_node))
+    );
+}

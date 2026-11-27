@@ -365,6 +365,7 @@ fn focus_and_local_text_edit_state_appear_in_the_snapshot() {
         .edit()
         .expect("edit state");
     assert_eq!(edit.caret(), 1, "local edit state survives reorder");
+    assert_eq!(edit.selection(), Some((1, 1)), "selection survives reorder");
 
     app.blur().expect("clear focus");
     assert_eq!(app.presentation().expect("snapshot").focus(), None);

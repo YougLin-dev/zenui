@@ -4,7 +4,7 @@ use zenui::prelude::*;
 
 /// 一个窗口化列表夹具：固定 20 点行高的 `For`，每行一个带标签按钮。
 ///
-/// 行集通过 Seed / Reverse 按钮在事件阶段修改；测试只通过公开的
+/// 行集通过 Seed / Swap / Reverse 按钮在事件阶段修改；测试只通过公开的
 /// runtime/窗口接口观察挂载窗口、Node 身份与焦点。
 #[component]
 fn WindowedList(store: Store) -> MountResult<MountPlan> {
@@ -16,6 +16,13 @@ fn WindowedList(store: Store) -> MountResult<MountPlan> {
         }
         let _ = transaction.finish();
     };
+    let swap = move || {
+        let mut ids: Vec<TodoId> = store.keys(Filter::All);
+        if ids.len() >= 2 {
+            ids.swap(0, 1);
+            let _ = Transaction::new().write(store.reorder(&ids)).finish();
+        }
+    };
     let reverse = move || {
         let ids: Vec<TodoId> = store.keys(Filter::All);
         let reversed: Vec<TodoId> = ids.into_iter().rev().collect();
@@ -26,6 +33,7 @@ fn WindowedList(store: Store) -> MountResult<MountPlan> {
         <view role="main">
             <text aria:label="Header">"windowed"</text>
             <button aria:label="Seed" on:click={move || seed()}>"Seed"</button>
+            <button aria:label="Swap" on:click={move || swap()}>"Swap"</button>
             <button aria:label="Reverse" on:click={move || reverse()}>"Reverse"</button>
             <view class="gap-0">
                 <For each={rows} store={store} key={|row: &TodoRow| row.id} row-height={px(20.0)}>
@@ -66,6 +74,16 @@ fn band(app: &Runtime, window: WindowCtx) -> SnapshotRowBand {
     app.presentation_of(window)
         .expect("window snapshot")
         .row_bands()[0]
+}
+
+fn label_order(app: &Runtime, window: WindowCtx, wanted: &[&str]) -> Vec<String> {
+    app.presentation_of(window)
+        .expect("window snapshot")
+        .elements()
+        .filter_map(SnapshotElement::label)
+        .filter(|label| wanted.contains(label))
+        .map(str::to_owned)
+        .collect()
 }
 
 #[test]
@@ -230,5 +248,58 @@ fn reordering_rows_rewindows_without_duplicating_keys() {
         app.for_items().len(),
         10,
         "the window still mounts ten unique rows"
+    );
+}
+
+#[test]
+fn reorder_keeps_an_in_window_focused_row_and_drops_one_that_leaves() {
+    let (mut app, window) = fixture();
+    let band = band(&app, window);
+    app.set_row_window(window, band.key(), 0, 10)
+        .expect("keep the first window");
+
+    let snapshot = app.presentation_of(window).expect("snapshot");
+    let first = snapshot.find_label("Row r0").expect("row zero").id();
+    let focused = snapshot.find_label("Row r1").expect("row one").id();
+    app.focus("Row r1").expect("focus the second row");
+
+    app.click_label("Swap").expect("swap the first two rows");
+    assert_eq!(
+        label_order(&app, window, &["Row r0", "Row r1"]),
+        vec![String::from("Row r1"), String::from("Row r0")],
+        "a non-reversal reorder really swaps the mounted rows"
+    );
+    let snapshot = app.presentation_of(window).expect("snapshot");
+    assert_eq!(
+        snapshot.find_label("Row r1").expect("row one").id(),
+        focused,
+        "an in-window reorder keeps the row's mounted node"
+    );
+    assert_eq!(
+        snapshot.find_label("Row r0").expect("row zero").id(),
+        first,
+        "the other swapped row keeps its node too"
+    );
+    assert_eq!(
+        snapshot.focus(),
+        Some(focused),
+        "focus follows the row identity through an in-window reorder"
+    );
+
+    app.click_label("Reverse").expect("reverse the whole model");
+    let snapshot = app.presentation_of(window).expect("snapshot");
+    assert_eq!(
+        app.node_status(focused),
+        NodeStatus::Stale,
+        "the focused row leaves the window"
+    );
+    assert_eq!(
+        snapshot.focus(),
+        None,
+        "focus is dropped instead of settling on a stale node"
+    );
+    assert!(
+        snapshot.find_label("Row r99").is_some(),
+        "the window rewinds to the new head"
     );
 }
