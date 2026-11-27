@@ -770,15 +770,26 @@ impl WindowHost {
 ///
 /// 树与场景来自同一份快照，因此名称、状态和边界始终对应屏幕上这一帧。
 /// 所有呈现路径都经这里提交，避免新增路径只更新其中一个发布物。
-fn commit_scene(window: &mut WindowHost, snapshot: &PresentationSnapshot, scene: Scene) {
-    let tree = accessibility::build_tree(
-        snapshot,
-        &scene,
-        &window.title,
-        window.enabled,
-        &mut window.accessibility_ids,
-    );
-    window.accessibility.publish(tree, snapshot.revision());
+fn commit_scene(
+    host: &Host,
+    window: &mut WindowHost,
+    snapshot: &PresentationSnapshot,
+    scene: Scene,
+) {
+    // 隐藏或已请求关闭的窗口不发布可访问性树。守卫放在所有提交路径共用的
+    // 这里，缓存重绘等路径不会在清除之后重新发布。
+    if window.close_requested || !host.runtime.window_visible(window.ctx) {
+        window.accessibility.clear();
+    } else {
+        let tree = accessibility::build_tree(
+            snapshot,
+            &scene,
+            &window.title,
+            window.enabled,
+            &mut window.accessibility_ids,
+        );
+        window.accessibility.publish(tree, snapshot.revision());
+    }
     window.scene = Some(scene);
 }
 
@@ -2146,7 +2157,7 @@ impl Host {
                     .runtime
                     .presentation_revision_of(window.ctx)
                     .unwrap_or(window.snapshot_revision);
-                commit_scene(window, &snapshot, scene);
+                commit_scene(self, window, &snapshot, scene);
                 window.preserve_press_on_next_rebuild = false;
                 window.last_snapshot = Some(snapshot);
                 Ok(())
@@ -2460,7 +2471,7 @@ impl Host {
                 self.recovery_attempts = 0;
                 self.attempt_adapter = None;
             }
-            commit_scene(window, snapshot, scene);
+            commit_scene(self, window, snapshot, scene);
             // 本帧的全部场景构建（首遍与行窗口第二遍）都已完成；按压保留
             // 只覆盖这一次滚动帧，不延续到之后的无关重建。
             window.preserve_press_on_next_rebuild = false;
@@ -3489,7 +3500,7 @@ impl Host {
         // 离屏读回不是呈现：不清除 damage，屏幕上仍是上一帧。场景与缓存
         // 同步供输入与后续绘制使用，避免下一次呈现把同一快照当成新快照
         // 并再次清空滚轮 residue。
-        commit_scene(window, &snapshot, scene);
+        commit_scene(self, window, &snapshot, scene);
         window.snapshot_revision = self
             .runtime
             .presentation_revision_of(window.ctx)
@@ -7790,6 +7801,126 @@ mod tests {
                 .iter()
                 .any(|element| element.hovered()),
             "the hover visual is presented"
+        );
+    }
+
+    #[test]
+    fn every_scene_commit_replaces_the_publication_atomically() {
+        let mut host = open_host();
+        host.resize(MAIN, 320, 100).expect("shrink the window");
+        host.render().expect("render the small window");
+        let first = host.accessibility_tree(MAIN).expect("tree");
+        with_main(&mut host, |host, window| {
+            host.explicit_scroll(window, 40);
+            Ok(())
+        });
+        host.render().expect("scroll frame");
+        let second = host.accessibility_tree(MAIN).expect("tree");
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "a scroll commit publishes a new immutable tree instead of mutating the old one"
+        );
+        let old_draft = first
+            .find_name("What needs to be done?")
+            .expect("the draft in the old tree");
+        let new_draft = second
+            .find_name("What needs to be done?")
+            .expect("the draft in the new tree");
+        assert_ne!(
+            first.logical_rect(old_draft).y,
+            second.logical_rect(new_draft).y,
+            "the old publication keeps its pre-scroll geometry"
+        );
+    }
+
+    #[test]
+    fn a_close_pending_window_never_publishes_or_keeps_actions() {
+        let mut host = open_host();
+        host.render().expect("render the window");
+        let (snapshot, scene) = {
+            let window = host.windows.get_mut(MAIN).expect("window");
+            (
+                window.last_snapshot.take().expect("the cached snapshot"),
+                window.scene.take().expect("the committed scene"),
+            )
+        };
+        let node = snapshot
+            .find_label("What needs to be done?")
+            .expect("the draft")
+            .id();
+        assert!(
+            host.windows[MAIN]
+                .accessibility
+                .enqueue_node(UiAction::Invoke { node })
+        );
+        host.windows.get_mut(MAIN).expect("window").close_requested = true;
+        host.sync_accessibility();
+        assert!(
+            host.accessibility_tree(MAIN).is_none(),
+            "a closing window clears its publication"
+        );
+        with_main(&mut host, |host, window| {
+            commit_scene(host, window, &snapshot, scene);
+            Ok(())
+        });
+        assert!(
+            host.accessibility_tree(MAIN).is_none(),
+            "a closing window never republishes a tree"
+        );
+        assert!(
+            host.windows[MAIN].accessibility.take_actions().is_empty(),
+            "closing clears pending provider actions"
+        );
+    }
+
+    #[test]
+    fn a_zero_client_area_clears_the_publication() {
+        let mut host = open_host();
+        host.render().expect("render the window");
+        assert!(host.accessibility_tree(MAIN).is_some());
+        host.resize(MAIN, 0, 0).expect("zero resize");
+        host.render().expect("zero frame");
+        assert!(
+            host.accessibility_tree(MAIN).is_none(),
+            "a zero client area publishes no tree"
+        );
+    }
+
+    #[test]
+    fn a_hidden_window_never_republishes_a_tree() {
+        let mut host = open_host();
+        host.render().expect("render the window");
+        assert!(
+            host.accessibility_tree(MAIN).is_some(),
+            "a visible window publishes"
+        );
+        let snapshot = host
+            .windows
+            .get_mut(MAIN)
+            .expect("window")
+            .last_snapshot
+            .take()
+            .expect("the cached snapshot");
+        let scene = host
+            .windows
+            .get_mut(MAIN)
+            .expect("window")
+            .scene
+            .take()
+            .expect("the committed scene");
+        host.hide(MAIN).expect("hide the window");
+        assert!(
+            host.accessibility_tree(MAIN).is_none(),
+            "hiding clears the publication"
+        );
+        // 任何提交路径（包括缓存重绘）都不能把隐藏窗口的树重新发布。
+        with_main(&mut host, |host, window| {
+            commit_scene(host, window, &snapshot, scene);
+            Ok(())
+        });
+        assert!(
+            host.accessibility_tree(MAIN).is_none(),
+            "a hidden window never republishes a tree"
         );
     }
 

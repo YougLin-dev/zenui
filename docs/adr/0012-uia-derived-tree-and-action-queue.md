@@ -66,7 +66,7 @@ The scrollbar is a host overlay, not an accessibility element. No scrollbar Node
 ## Events
 
 - Events are derived by comparing two adjacent publications. Identity is the provider-local runtime ID; a node present in both publications is the same element.
-- Structure changes are raised at one level: `ChildAdded` on the new child, `ChildRemoved` on the parent carrying the removed child's runtime ID, `ChildrenReordered` on the parent when keyed order changes. A newly added subtree reports only its top-level addition.
+- Structure changes are raised at one level: `ChildAdded` on the new child, `ChildRemoved` on the parent carrying the removed child's runtime ID, `ChildrenReordered` on the parent when keyed order changes. A reorder is reported independently of additions and removals in the same publication: the surviving children's relative order is compared, so a keyed reorder that shifts surviving siblings past each other is not lost. A newly added subtree reports only its top-level addition.
 - `IsEnabled`, ToggleState and Value property changes are compared only for nodes present in both publications. The window root's IsEnabled is raised by the host window provider path, not duplicated by the planner.
 - Focus is raised only when the publishing window is foreground. A focus change while the window is background produces no event, and later activation does not replay it; a cleared focus has no event, and clients observe `GetFocus` as empty.
 - The fixed order is structure, property, focus. Events are raised after the publication lock is released; one failed raise does not stop later events.
@@ -74,7 +74,7 @@ The scrollbar is a host overlay, not an accessibility element. No scrollbar Node
 
 ## Hidden and suspended windows
 
-- Hidden, closing and zero-client-area windows publish no tree and clear pending actions. Re-showing publishes again on the first committed scene.
+- Hidden, closing and zero-client-area windows publish no tree and clear pending actions. The publication guard sits at the scene-commit boundary, so a cached repaint or any other commit path cannot republish a tree after the clear. Re-showing publishes again on the first committed scene.
 - A close confirmation keeps the parent published but reports it disabled: the tree retains its nodes, elements and root return IsEnabled=false and IsKeyboardFocusable=false, and writes are rejected. The confirmation window has its own root.
 - A natively disabled window combines its disabled state with the tree's; actions report `UIA_E_ELEMENTNOTAVAILABLE`. A window that is merely background keeps its tree and reads normally, but focus properties and focus events follow the foreground rules above.
 
