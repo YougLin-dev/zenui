@@ -1,3 +1,5 @@
+#![allow(unused_braces)]
+
 //! #343 验收：renderer 的 `applied_revision` 与 delta 追赶协议。
 //!
 //! 连续 delta 与按最新根全量重建产生同一场景；断档时丢弃 delta，按最新根
@@ -129,6 +131,43 @@ fn a_contiguous_delta_builds_the_same_scene_as_a_full_root() {
         scene_signature(&full),
         "a contiguous delta and a full rebuild agree"
     );
+}
+
+#[component]
+fn RootToggle() -> MountResult<MountPlan> {
+    let show = signal(false);
+    view! {
+        <Show when={show}><text aria:label="first">"first"</text></Show>
+        <text aria:label="second">"second"</text>
+        <button aria:label="toggle" on:click={move || show.set(!show.get())}>"toggle"</button>
+    }
+}
+
+#[test]
+fn a_full_root_publication_rebuilds_the_view() {
+    let mut app = Runtime::new();
+    app.mount(|| view! { <RootToggle /> }).expect("mount");
+    let first = app.presentation_update().expect("the first publication");
+    let mut view = PresentationView::new(first.into_snapshot());
+    let before = view.applied_revision();
+
+    app.click_label("toggle")
+        .expect("change the top-level root list");
+    let update = app
+        .presentation_update()
+        .expect("the full-root publication");
+    assert!(
+        update.delta().is_none(),
+        "a top-level root list change publishes a full root"
+    );
+    assert_ne!(update.snapshot().revision(), before);
+    assert_eq!(view.apply(update), PresentationApply::FullRebuild);
+    assert_eq!(view.applied_revision(), app.presentation_revision());
+
+    let latest = app.presentation().expect("the latest root");
+    let rebuilt = build_scene(view.snapshot());
+    let full = build_scene(&latest);
+    assert_eq!(scene_signature(&rebuilt), scene_signature(&full));
 }
 
 #[test]

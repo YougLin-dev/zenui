@@ -73,7 +73,7 @@ _Avoid_: render tree, view tree, frame
 _Avoid_: diff, patch
 
 **Presentation update**:
-`PresentationSnapshot` 与可选 `PresentationDelta` 的发布单位。delta 为 `None` 表示完整根：首次发布、隐藏窗口重新显示后的首次发布或无法安全累计时使用。renderer 侧的 `PresentationView` 维护 `applied_revision`，只接受与已应用 revision 连续且与快照同代的 delta；断档时丢弃 delta、按最新根全量重建。
+`PresentationSnapshot` 与可选 `PresentationDelta` 的发布单位。delta 为 `None` 表示完整根：首次发布、隐藏窗口重新显示后的首次发布、顶层根序列变化或无法安全累计时使用。renderer 侧的 `PresentationView` 维护 `applied_revision`，只接受与已应用 revision 连续且与快照同代的 delta；断档时丢弃 delta、按最新根全量重建。
 _Avoid_: frame packet, sync message
 
 **Windowed For**:

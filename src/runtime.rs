@@ -11320,6 +11320,226 @@ mod binding_tests {
     }
 
     #[component]
+    fn RootShowHost() -> MountResult<MountPlan> {
+        let show = signal(false);
+        view! {
+            <Show when={show}><text aria:label="first">"first"</text></Show>
+            <text aria:label="second">"second"</text>
+            <button
+                aria:label="toggle"
+                on:click={move || show.set(!show.get())}
+            >"toggle"</button>
+        }
+    }
+
+    #[test]
+    fn a_root_list_change_publishes_a_full_root_instead_of_an_empty_delta() {
+        let mut app = Runtime::new();
+        app.mount(|| view! { <RootShowHost /> }).expect("mount");
+        let first = app.presentation_update().expect("the first publication");
+        assert!(first.delta().is_none());
+        let before = first.snapshot().roots().len();
+
+        app.click_label("toggle").expect("add a top-level root");
+        let update = app.presentation_update().expect("the changed publication");
+        assert!(
+            update.delta().is_none(),
+            "a top-level root list change has no keyed representation"
+        );
+        assert_eq!(update.snapshot().roots().len(), before + 1);
+    }
+
+    #[component]
+    fn NestedToggleHost() -> MountResult<MountPlan> {
+        let show = signal(true);
+        view! {
+            <view>
+                <Show when={show}><text aria:label="detail">"detail"</text></Show>
+                <button
+                    aria:label="toggle"
+                    on:click={move || show.set(!show.get())}
+                >"toggle"</button>
+            </view>
+        }
+    }
+
+    #[test]
+    fn a_nested_removal_publishes_removed_keys_and_flags() {
+        let mut app = Runtime::new();
+        app.mount(|| view! { <NestedToggleHost /> }).expect("mount");
+        let first = app.presentation_update().expect("the first publication");
+        assert!(first.delta().is_none());
+        let root = first
+            .snapshot()
+            .roots()
+            .first()
+            .and_then(SnapshotNode::as_element)
+            .expect("the root view");
+        let root_key = root.key();
+        assert_eq!(first.snapshot().roots().len(), 1, "the view stays the root");
+
+        app.click_label("toggle").expect("remove the detail text");
+        let update = app.presentation_update().expect("the changed publication");
+        let delta = update.delta().expect("a cumulative delta");
+        assert!(
+            !delta.removed().is_empty(),
+            "the removed element and its text node are listed"
+        );
+        assert_eq!(
+            delta.removed_subtrees().len(),
+            1,
+            "the removed subtree has one root"
+        );
+        assert!(
+            delta
+                .removed_subtrees()
+                .iter()
+                .all(|key| delta.removed().contains(key)),
+            "subtree roots are part of the removed set"
+        );
+        assert!(
+            delta.changed().contains(&root_key),
+            "the surviving parent is on the changed path"
+        );
+        assert_eq!(
+            delta.layout_roots(),
+            &[root_key],
+            "the topmost dirty node is the surviving root view"
+        );
+    }
+
+    #[test]
+    fn a_focus_change_publishes_its_flag() {
+        let mut app = Runtime::new();
+        app.mount(|| view! { <NestedToggleHost /> }).expect("mount");
+        let first = app.presentation_update().expect("the first publication");
+        assert!(first.delta().is_none());
+        let button = first
+            .snapshot()
+            .find_label("toggle")
+            .expect("the toggle button")
+            .id();
+
+        app.focus_node(button).expect("focus the button");
+        let update = app.presentation_update().expect("the changed publication");
+        let delta = update.delta().expect("a delta");
+        assert!(delta.focus_changed(), "the committed focus moved");
+        assert_eq!(update.snapshot().focus(), Some(button));
+    }
+
+    #[test]
+    fn an_appearance_change_publishes_its_flag() {
+        let mut app = Runtime::new();
+        app.mount(|| view! { <NestedToggleHost /> }).expect("mount");
+        let first = app.presentation_update().expect("the first publication");
+        assert!(first.delta().is_none());
+
+        app.set_appearance(Appearance::Dark)
+            .expect("switch the appearance");
+        let update = app.presentation_update().expect("the changed publication");
+        let delta = update.delta().expect("a delta");
+        assert!(delta.appearance_changed());
+        assert_eq!(update.snapshot().appearance(), Appearance::Dark);
+    }
+
+    #[test]
+    fn a_row_window_change_publishes_row_band_and_node_changes() {
+        let (mut app, window, bands) = two_band_fixture();
+        let first = app
+            .presentation_update_of(window)
+            .expect("the first publication");
+        assert!(first.delta().is_none());
+
+        app.set_row_window(window, bands[0], 4, 8)
+            .expect("scroll the first band");
+        let update = app
+            .presentation_update_of(window)
+            .expect("the changed publication");
+        let delta = update.delta().expect("a delta");
+        assert!(delta.row_bands_changed(), "the row band metadata changed");
+        assert!(
+            !delta.changed().is_empty()
+                || !delta.inserted().is_empty()
+                || !delta.removed().is_empty(),
+            "entering and leaving rows are keyed"
+        );
+    }
+
+    #[component]
+    fn TwoTaskHost(window: WindowCtx) -> MountResult<MountPlan> {
+        let left = signal(String::from("left-0"));
+        let right = signal(String::from("right-0"));
+        let scope = window.task_scope();
+        view! {
+            <view>
+                <text aria:label="left">{left}</text>
+                <text aria:label="right">{right}</text>
+                <button
+                    aria:label="spawn"
+                    on:click={move || {
+                        if let Ok(task) = scope.spawn(|_| String::from("left-1")) {
+                            let _ = task.on_done(move |value| {
+                                left.set(value);
+                                Ok(())
+                            });
+                        }
+                        if let Ok(task) = scope.spawn(|_| String::from("right-1")) {
+                            let _ = task.on_done(move |value| {
+                                right.set(value);
+                                Ok(())
+                            });
+                        }
+                    }}
+                >"spawn"</button>
+            </view>
+        }
+    }
+
+    #[test]
+    fn multiple_delivery_commits_publish_one_cumulative_delta() {
+        let mut app = Runtime::new();
+        app.declare_windows(|catalog| {
+            catalog.window(WindowSpec::new("main").primary(), |window| {
+                view! { <TwoTaskHost window={window} /> }
+            })
+        })
+        .expect("declare the window");
+        let window = app.show("main").expect("show the window");
+        let first = app
+            .presentation_update_of(window)
+            .expect("the first publication");
+        assert!(first.delta().is_none());
+        let from = first.snapshot().revision();
+
+        app.click_label("spawn").expect("spawn both tasks");
+        let before_settle = app.presentation_revision_of(window).expect("revision");
+        app.settle_tasks().expect("deliver both results");
+        let after_settle = app.presentation_revision_of(window).expect("revision");
+        assert!(
+            after_settle >= before_settle + 2,
+            "each delivery commits its own revision"
+        );
+
+        let update = app
+            .presentation_update_of(window)
+            .expect("the cumulative publication");
+        let delta = update.delta().expect("a cumulative delta");
+        assert_eq!(
+            delta.from_revision(),
+            from,
+            "the delta starts at the last publication, not the last commit"
+        );
+        assert_eq!(delta.to_revision(), after_settle);
+        for label in ["left", "right"] {
+            let key = update.snapshot().find_label(label).expect("label").key();
+            assert!(
+                delta.changed().contains(&key),
+                "both delivery commits are in the delta: {label}"
+            );
+        }
+    }
+
+    #[component]
     fn NestedShowHost() -> MountResult<MountPlan> {
         let outer = signal(true);
         let inner = signal(false);

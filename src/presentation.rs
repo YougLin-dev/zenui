@@ -313,6 +313,15 @@ impl PresentationDelta {
         if previous.revision() == current.revision() {
             return None;
         }
+        // 顶层根列表没有呈现键：插入、移除或重排会改变绘制与命中顺序，
+        // 但没有任何父节点可以标记。发布完整根，而不是一个漏掉顺序的 delta。
+        let old_roots: Vec<PresentationKey> =
+            previous.roots().iter().map(SnapshotNode::key).collect();
+        let new_roots: Vec<PresentationKey> =
+            current.roots().iter().map(SnapshotNode::key).collect();
+        if old_roots != new_roots {
+            return None;
+        }
         let old = SnapshotIndex::new(previous);
         let new = SnapshotIndex::new(current);
 
