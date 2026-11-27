@@ -71,6 +71,11 @@ pub(crate) fn installed_runtime() -> Option<u32> {
     state.and_then(|state| state.try_borrow().ok().map(|state| state.id))
 }
 
+/// 当前安装的 runtime 状态；只用于在构造期安装不借用 State 的回调。
+pub(crate) fn current_state() -> Option<Rc<RefCell<State>>> {
+    CURRENT.with(|current| current.borrow().last().cloned())
+}
+
 pub(crate) fn with_state<R>(f: impl FnOnce(&mut State) -> R) -> R {
     let state = CURRENT.with(|current| current.borrow().last().cloned());
     let state = state.expect("state access requires an installed ZenUI runtime");

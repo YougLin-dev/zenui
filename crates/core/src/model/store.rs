@@ -105,6 +105,13 @@ impl<R: Row> fmt::Debug for Commit<R> {
     }
 }
 
+/// Store 提交观察者：Runtime 在挂载 `For` 时安装，用于累积 `PendingChanges`。
+///
+/// 观察者在事务应用后同步调用，参数是本次提交的净变化；返回 `false` 表示
+/// 观察者已失效，Store 会把它移除。观察者按调用方提供的键注册，同一个
+/// Store 可以同时被多个 runtime 观察。普通应用代码不应依赖这个钩子。
+pub type CommitObserver = Rc<dyn Fn(StoreId, &ChangeSet) -> bool>;
+
 /// 通用行 Store：共享句柄，数据由同一 runtime 的消费者共同持有。
 ///
 /// 句柄是 `Clone` 而不是 `Copy`；这是跨 Store 读取、`ForSource` 共享与
@@ -117,6 +124,7 @@ pub struct Store<R: Row> {
 struct StoreInner<R: Row> {
     data: RefCell<StoreData<R>>,
     active: Cell<bool>,
+    commits: RefCell<BTreeMap<u32, CommitObserver>>,
 }
 
 struct StoreData<R: Row> {
@@ -195,12 +203,30 @@ impl<R: Row> Store<R> {
                     order_revision: 0,
                 }),
                 active: Cell::new(false),
+                commits: RefCell::new(BTreeMap::new()),
             }),
         }
     }
 
     pub fn id(&self) -> StoreId {
         self.inner.data.borrow().id
+    }
+
+    /// 以 `key` 注册或移除提交观察者。
+    ///
+    /// Runtime 用它把自上次 flush 以来的所有提交累积为 `PendingChanges`。
+    /// 观察者在事务提交后才运行，不能修改本 Store，也不能读已发布快照；
+    /// 返回 `false` 的观察者会在本次提交后被移除。
+    pub fn set_commit_observer(&self, key: u32, observer: Option<CommitObserver>) {
+        let mut commits = self.inner.commits.borrow_mut();
+        match observer {
+            Some(observer) => {
+                commits.insert(key, observer);
+            }
+            None => {
+                commits.remove(&key);
+            }
+        }
     }
 
     /// 一次原子事务：闭包返回 `Ok` 时提交，返回 `Err` 或 panic 时回滚。
@@ -729,8 +755,30 @@ impl<R: Row> Tx<'_, R> {
         self.finished = true;
         self.draft.reserved.clear();
         self.apply();
+        let changes = std::mem::take(&mut self.plan_changes);
+        // 观察者只能看到已应用的净变化，不能借用 Store 的写事务。
+        let observers: Vec<(u32, CommitObserver)> = self
+            .store
+            .inner
+            .commits
+            .borrow()
+            .iter()
+            .map(|(key, observer)| (*key, Rc::clone(observer)))
+            .collect();
+        if !observers.is_empty() {
+            let alive: Vec<u32> = observers
+                .into_iter()
+                .filter(|(_, observer)| observer(self.store.id(), &changes))
+                .map(|(key, _)| key)
+                .collect();
+            self.store
+                .inner
+                .commits
+                .borrow_mut()
+                .retain(|key, _| alive.contains(key));
+        }
         Ok(Commit {
-            changes: std::mem::take(&mut self.plan_changes),
+            changes,
             keys: std::mem::take(&mut self.plan_keys),
         })
     }

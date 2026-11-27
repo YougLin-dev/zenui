@@ -583,12 +583,18 @@ impl<R: Row, K: RowKey> For<R, K> {
         } = self;
         let store = source.store.clone();
         let store_id = store.id();
+        let attach_store = store.clone();
+        // 观察者必须在挂载期安装：`ForSource` 可以在 runtime 外构造，
+        // 但只有真正挂载的行才需要进入 `PendingChanges`。
+        let attach: Rc<dyn Fn()> =
+            Rc::new(move || crate::runtime::observe_store_commits(&attach_store));
         let driver: Rc<dyn ForDriver> = Rc::new(TypedForDriver { store, key, item });
         ForPlan {
             store: store_id,
             rows: source.rows,
             driver,
             row_height,
+            attach,
         }
     }
 }
@@ -605,6 +611,8 @@ pub struct ForPlan {
     pub(crate) rows: ForRows,
     pub(crate) driver: Rc<dyn ForDriver>,
     pub(crate) row_height: Option<Length>,
+    /// 挂载期把 Store 提交接入当前 runtime 的 `PendingChanges`。
+    pub(crate) attach: Rc<dyn Fn()>,
 }
 
 /// 行的 store 归属；行身份本身已在本 runtime 内全局唯一。

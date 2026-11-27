@@ -8,7 +8,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
 
-use zenui_core::model::{FilterId, RowId, StoreId};
+use zenui_core::model::{ChangeSet, FilterId, Row, RowId, StoreId};
 use zenui_core::{Counters, PanicInfo, RowSet, catch_panic};
 use zenui_style::{Color, Length, Opacity, Property, StyleValue};
 
@@ -799,6 +799,81 @@ struct SessionState {
     requests: Vec<SessionAction>,
 }
 
+/// 自上次 flush 以来所有 Store 提交的累计净变化。
+///
+/// 以日志形式保存每次提交：flush 开始时记下长度，成功结束后只丢弃本次
+/// flush 已经消费的前缀。结构/工厂执行中产生的新提交留给下一次 flush 的
+/// step 0（与重新执行结构遍历相比，这是不丢删除行的最小正确行为）。
+#[derive(Default)]
+struct PendingChanges {
+    log: Vec<(StoreId, ChangeSet)>,
+}
+
+impl PendingChanges {
+    fn record(&mut self, store: StoreId, changes: &ChangeSet) {
+        if changes.is_empty() {
+            return;
+        }
+        self.log.push((store, changes.clone()));
+    }
+
+    fn removed(&self) -> impl Iterator<Item = RowId> + '_ {
+        self.log
+            .iter()
+            .flat_map(|(_, changes)| changes.removed.iter().copied())
+    }
+
+    /// 成员真正迁移过的 Store。
+    fn changed_stores(&self) -> impl Iterator<Item = StoreId> + '_ {
+        self.log
+            .iter()
+            .filter(|(_, changes)| !changes.membership.is_empty())
+            .map(|(store, _)| *store)
+    }
+
+    fn mark(&self) -> usize {
+        self.log.len()
+    }
+
+    /// 丢弃本次 flush 开始时已经存在的提交；之后追加的提交保留。
+    fn drain_consumed(&mut self, mark: usize) {
+        self.log.drain(..mark.min(self.log.len()));
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.log.len()
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.log.is_empty()
+    }
+}
+
+/// 把 Store 的提交累计到当前 runtime 的 `PendingChanges`。
+///
+/// 在 `For` 计划挂载时安装（`ForPlan::attach`）。观察者按 runtime 身份
+/// 注册，多个 runtime 可以同时观察同一个 Store；观察者只持弱引用，runtime
+/// 释放后返回 `false`，Store 会把它移除。
+pub(crate) fn observe_store_commits<R: Row>(store: &zenui_core::model::Store<R>) {
+    let Some(state) = context::current_state() else {
+        return;
+    };
+    let key = state.borrow().id;
+    let pending = Rc::downgrade(&state.borrow().pending);
+    store.set_commit_observer(
+        key,
+        Some(Rc::new(move |store, changes| {
+            let Some(pending) = pending.upgrade() else {
+                return false;
+            };
+            pending.borrow_mut().record(store, changes);
+            true
+        })),
+    );
+}
+
 pub(crate) struct State {
     pub(crate) id: u32,
     pub(crate) read_only: u32,
@@ -821,6 +896,9 @@ pub(crate) struct State {
     pub(crate) read_faults: Vec<ReadFault>,
     /// 本 turn 已提交的绑定补丁；按 `(tree, node, part)` 去重。
     binding_patches: BindingPatchLog,
+    /// 自上次 flush 以来的 Store 提交；观察者持弱引用，避免在写事务内
+    /// 再次借用 State。
+    pending: Rc<RefCell<PendingChanges>>,
     /// 刷新轮次；同一 binding 每轮最多求值一次，焦点结算会开启新一轮。
     refresh_round: u64,
     /// 脏依赖代数；值绑定不直接读它，相等写入不推进。
@@ -1047,12 +1125,14 @@ impl State {
     /// 已挂载绑定与结构触发直接引用的 memo，加上它们的 memo 依赖闭包。
     ///
     /// liveness 从每棵树的绑定槽出发；被卸载分支的槽已经归还绑定表，因此不会
-    /// 把只被处理器或废弃节点读取的派生值提前结算。
-    pub(crate) fn live_memo_set(&self) -> BTreeSet<u32> {
+    /// 把只被处理器或废弃节点读取的派生值提前结算。`quarantined` 行上的绑定
+    /// 在本轮视为 non-live：它们的子树不再作为种子，只服务这些行的 memo
+    /// （包括上游依赖）因此不会进入 worklist，边与订阅保留到结构提交。
+    pub(crate) fn live_memo_set(&self, quarantined: &BTreeSet<RowId>) -> BTreeSet<u32> {
         let mut live = BTreeSet::new();
         for (slot, tree) in &self.trees {
             if let Some(tree_key) = self.arena_trees.get(slot) {
-                self.collect_node_memos(*tree_key, &tree.nodes, &mut live);
+                self.collect_node_memos(*tree_key, &tree.nodes, quarantined, &mut live);
             }
         }
         let mut stack: Vec<u32> = live.iter().copied().collect();
@@ -1068,7 +1148,63 @@ impl State {
         live
     }
 
-    fn collect_node_memos(&self, tree: TreeKey, nodes: &[MountedNode], live: &mut BTreeSet<u32>) {
+    /// flush step 0：本帧需要 quarantine 的行。
+    ///
+    /// 已删除行来自累计的 `ChangeSet.removed`；成员迁移只带 filter 身份，
+    /// 因此对成员变化的 Store 上的所有已挂载行做保守隔离，结构提交确认后
+    /// 保留的行自然恢复（它们的 memo 在值阶段按需求值）。
+    fn quarantined_rows(&self) -> BTreeSet<RowId> {
+        let pending = self.pending.borrow();
+        let mut rows: BTreeSet<RowId> = pending.removed().collect();
+        let changed_stores: BTreeSet<StoreId> = pending.changed_stores().collect();
+        drop(pending);
+        if changed_stores.is_empty() {
+            return rows;
+        }
+        for tree in self.trees.values() {
+            self.walk_for_rows(&tree.nodes, &mut |store, row| {
+                if changed_stores.contains(&store) {
+                    rows.insert(row);
+                }
+            });
+        }
+        rows
+    }
+
+    /// 遍历所有已挂载的 For 行：`(行 Store, RowId)`；嵌套 For 一并遍历。
+    fn walk_for_rows(&self, nodes: &[MountedNode], visit: &mut impl FnMut(StoreId, RowId)) {
+        for node in nodes {
+            match node {
+                MountedNode::Text(_) => {}
+                MountedNode::Element(id) => {
+                    self.walk_for_rows(&self.elements[*id].children, visit);
+                }
+                MountedNode::Component(id) => {
+                    self.walk_for_rows(&self.components[*id].children, visit);
+                }
+                MountedNode::Show(payload) => {
+                    if let Some(branch) = &self.nodes.show(*payload).active {
+                        self.walk_for_rows(&branch.children, visit);
+                    }
+                }
+                MountedNode::For(payload) => {
+                    let data = self.nodes.for_node(*payload);
+                    for (row, item) in &data.items {
+                        visit(data.store, *row);
+                        self.walk_for_rows(&item.children, visit);
+                    }
+                }
+            }
+        }
+    }
+
+    fn collect_node_memos(
+        &self,
+        tree: TreeKey,
+        nodes: &[MountedNode],
+        quarantined: &BTreeSet<RowId>,
+        live: &mut BTreeSet<u32>,
+    ) {
         let table = self.nodes.binding_table(tree);
         for node in nodes {
             match node {
@@ -1085,16 +1221,21 @@ impl State {
                             collect_slot_memo(table.read_slot(style.binding), live);
                         }
                     }
-                    self.collect_node_memos(tree, &self.elements[*id].children, live);
+                    self.collect_node_memos(tree, &self.elements[*id].children, quarantined, live);
                 }
                 MountedNode::Component(id) => {
-                    self.collect_node_memos(tree, &self.components[*id].children, live);
+                    self.collect_node_memos(
+                        tree,
+                        &self.components[*id].children,
+                        quarantined,
+                        live,
+                    );
                 }
                 MountedNode::Show(payload) => {
                     let show = self.nodes.show(*payload);
                     collect_slot_memo(table.and_then(|table| table.read_slot(show.when)), live);
                     if let Some(branch) = &show.active {
-                        self.collect_node_memos(tree, &branch.children, live);
+                        self.collect_node_memos(tree, &branch.children, quarantined, live);
                     }
                 }
                 MountedNode::For(payload) => {
@@ -1102,8 +1243,13 @@ impl State {
                     if let MountedForRows::Read(binding) = data.rows {
                         collect_slot_memo(table.and_then(|table| table.read_slot(binding)), live);
                     }
-                    for item in data.items.values() {
-                        self.collect_node_memos(tree, &item.children, live);
+                    // quarantined 行上的绑定本轮视为 non-live：整棵行子树都不
+                    // 作为 liveness 种子，只有外部消费者能把这些 memo 拉回。
+                    for (row, item) in &data.items {
+                        if quarantined.contains(row) {
+                            continue;
+                        }
+                        self.collect_node_memos(tree, &item.children, quarantined, live);
                     }
                 }
             }
@@ -1135,6 +1281,7 @@ impl State {
             changed_trees: BTreeSet::new(),
             read_faults: Vec::new(),
             binding_patches: BindingPatchLog::default(),
+            pending: Rc::new(RefCell::new(PendingChanges::default())),
             refresh_round: 0,
             write_epochs: BTreeMap::new(),
             field_writes: BTreeMap::new(),
@@ -5656,15 +5803,43 @@ impl Runtime {
         if self.tree_keys().is_empty() {
             return Err(MountError::Component("no committed interface is mounted"));
         }
-        {
+        let consumed = {
             let mut state = self.state.borrow_mut();
             state.read_faults.clear();
             // 上一个 turn 的补丁已经交付；新 turn 从空日志开始。
             let _ = state.binding_patches.take();
+            state.pending.borrow().mark()
+        };
+        self.settle_quarantined_memos();
+        self.take_flush_faults()?;
+        if let Err(error) = self.refresh_all_once() {
+            // 结构提交失败时旧行保留；memo worklist 只在本轮开始时运行，
+            // flush 在错误处结束，因此本帧后续不会再结算这些行的 memo。
+            // 已完成的窗口保留本帧结果；不能让焦点身份停留在已被移除或禁用的旧目标上。
+            self.clear_invalid_focus();
+            return Err(error);
         }
-        self.settle_memos();
-        // settle 在 Phase::Memo 中运行；非法写入要像刷新期写入一样冒泡为
-        // Context 错误，而不是被随后每棵树的 fault 重置吞掉。
+        self.settle_focus()?;
+        // step 6：flush 完整结束后才丢弃本次消费的提交。提前返回的错误帧
+        // 保留 PendingChanges；flush 执行中（结构/工厂）产生的提交也保留到
+        // 下一次 flush 的 step 0，下一次 flush 仍能看到这些删除行。
+        self.state
+            .borrow()
+            .pending
+            .borrow_mut()
+            .drain_consumed(consumed);
+        Ok(())
+    }
+
+    /// flush step 0 + 1：按累计提交计算 quarantine，再结算可达的脏 memo。
+    fn settle_quarantined_memos(&mut self) {
+        let quarantined = self.state.borrow().quarantined_rows();
+        self.settle_memos(&quarantined);
+    }
+
+    /// settle 在 Phase::Memo 中运行；非法写入要像刷新期写入一样冒泡为
+    /// Context 错误，而不是被随后每棵树的 fault 重置吞掉。
+    fn take_flush_faults(&mut self) -> Result<(), MountError> {
         let fault = self.state.borrow_mut().fault.take();
         if let Some(fault) = fault {
             self.clear_invalid_focus();
@@ -5675,12 +5850,7 @@ impl Runtime {
             self.clear_invalid_focus();
             return Err(MountError::Write(error));
         }
-        if let Err(error) = self.refresh_all_once() {
-            // 已完成的窗口保留本帧结果；不能让焦点身份停留在已被移除或禁用的旧目标上。
-            self.clear_invalid_focus();
-            return Err(error);
-        }
-        self.settle_focus()
+        Ok(())
     }
 
     /// 取走累计的树 revision 变化，组装公开报告。
@@ -5712,11 +5882,13 @@ impl Runtime {
     /// flush step 1：只结算仍被已挂载消费者可达的脏 memo。
     ///
     /// 一个 memo 重算相等时不会传播，因此下游不会被拉进 worklist；只被事件
-    /// 处理器读取的 memo 保持惰性，也不会有挂载期副作用。
-    fn settle_memos(&mut self) {
+    /// 处理器读取的 memo 保持惰性，也不会有挂载期副作用。`quarantined` 行上的
+    /// 绑定不作为 liveness 种子：只服务这些行的 memo 本轮跳过，边保留到结构
+    /// 提交确认卸载。
+    fn settle_memos(&mut self, quarantined: &BTreeSet<RowId>) {
         let state = self.state.clone();
         context::install(&state, || {
-            let live = with_state(|state| state.live_memo_set());
+            let live = with_state(|state| state.live_memo_set(quarantined));
             let mut settled = BTreeSet::new();
             while let Some(id) = with_state(|state| state.next_dirty_live_memo(&live)) {
                 // 无环图里每个 memo 一拍最多结算一次：依赖都在读取时先结算，
@@ -5828,6 +6000,9 @@ impl Runtime {
     }
 
     /// 结构变化后的焦点结算只做一次批量决定；handler 造成的进一步变化在下一轮结算。
+    ///
+    /// blur/focus 处理器可能提交 Store；每一轮在结构刷新之前重新执行
+    /// step 0/1，让焦点结算产生的删除行先进入 quarantine 再求值 memo。
     fn settle_focus(&mut self) -> Result<(), MountError> {
         const MAX_SETTLEMENTS: usize = 8;
 
@@ -5837,10 +6012,14 @@ impl Runtime {
                 if !self.settle_round(true)? {
                     return Ok(());
                 }
+                self.settle_quarantined_memos();
+                self.take_flush_faults()?;
                 self.refresh_all_once()?;
             }
             // 第 8 轮恰好收敛时焦点仍然有效；只有确实还有待结算的目标才做兜底清理。
             if self.settle_round(false)? {
+                self.settle_quarantined_memos();
+                self.take_flush_faults()?;
                 self.refresh_all_once()?;
             }
             Ok(())
@@ -6222,7 +6401,10 @@ impl Runtime {
                     rows,
                     driver,
                     row_height,
+                    attach,
                 } = plan;
+                // 挂载期安装提交观察者：构造 `ForSource` 可以早于 runtime。
+                attach();
                 let payload = with_state(|state| {
                     let tree = state.building_tree_key();
                     let rows = match rows {
@@ -10581,6 +10763,53 @@ mod binding_tests {
     use super::*;
     use crate::prelude::*;
     use crate::view::{attr, child, element, style_color, styled_element};
+
+    #[test]
+    fn a_completed_flush_drains_pending_changes() {
+        #[component]
+        fn PendingHost(probe: Rc<Cell<usize>>) -> MountResult<MountPlan> {
+            let store = Store::new();
+            let rows = memo(move || store.rows(Filter::All));
+
+            view! {
+                <view>
+                    <button aria:label="commit" on:click={move || {
+                        Transaction::new()
+                            .write(store.insert("A"))
+                            .finish()
+                            .expect("seed the row");
+                        // 处理器执行时 flush 尚未开始：累计器已经看到提交。
+                        crate::context::with_state(|state| {
+                            probe.set(state.pending.borrow().len());
+                        });
+                    }}>"Commit"</button>
+                    <For each={rows} store={store} key={|row: &TodoRow| row.id}>
+                        {move |_row: RowView<TodoRow>| view! { <text>"row"</text> }}
+                    </For>
+                </view>
+            }
+        }
+
+        let probe = Rc::new(Cell::new(0usize));
+        let mut app = Runtime::new();
+        app.mount({
+            let probe = Rc::clone(&probe);
+            move || view! { <PendingHost probe={probe} /> }
+        })
+        .expect("mount");
+        let pending = Rc::clone(&app.state.borrow().pending);
+
+        app.click_label("commit").expect("commit during the turn");
+        assert_eq!(
+            probe.get(),
+            1,
+            "the handler observes the commit before the flush"
+        );
+        assert!(
+            pending.borrow().is_empty(),
+            "the completed flush drains the consumed PendingChanges"
+        );
+    }
 
     #[component]
     fn PatchHost() -> MountResult<MountPlan> {
