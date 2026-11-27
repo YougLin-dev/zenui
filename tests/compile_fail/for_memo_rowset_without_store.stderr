@@ -1,0 +1,64 @@
+warning: unnecessary braces around function argument
+ --> tests/compile_fail/for_memo_rowset_without_store.rs:5:19
+  |
+5 |         <For each={rows} key={|row: &TodoRow| row.id}>
+  |                   ^    ^
+  |
+  = note: `#[warn(unused_braces)]` (part of `#[warn(unused)]`) on by default
+help: remove these braces
+  |
+5 -         <For each={rows} key={|row: &TodoRow| row.id}>
+5 +         <For each=rows key={|row: &TodoRow| row.id}>
+  |
+
+warning: unnecessary braces around function argument
+ --> tests/compile_fail/for_memo_rowset_without_store.rs:5:30
+  |
+5 |         <For each={rows} key={|row: &TodoRow| row.id}>
+  |                              ^                      ^
+  |
+help: remove these braces
+  |
+5 -         <For each={rows} key={|row: &TodoRow| row.id}>
+5 +         <For each={rows} key=|row: &TodoRow| row.id>
+  |
+
+warning: unnecessary braces around function argument
+ --> tests/compile_fail/for_memo_rowset_without_store.rs:6:13
+  |
+6 |             {|_row: RowView<TodoRow>| view! { <text>"row"</text> }}
+  |             ^                                                     ^
+  |
+help: remove these braces
+  |
+6 -             {|_row: RowView<TodoRow>| view! { <text>"row"</text> }}
+6 +             |_row: RowView<TodoRow>| view! { <text>"row"</text> }
+  |
+
+error[E0277]: `For` needs a store to resolve row data
+ --> tests/compile_fail/for_memo_rowset_without_store.rs:5:19
+  |
+5 |         <For each={rows} key={|row: &TodoRow| row.id}>
+  |         -         ^----^
+  |         |         ||
+  |         |         |this tail expression is of type `Memo<RowSet>`
+  |         |         this row source has no Store handle
+  |         required by a bound introduced by this call
+  |
+  = help: the trait `IntoForSource` is not implemented for `zenui::Memo<zenui::RowSet>`
+  = note: pass the `store` attribute alongside `each`, or use a `Rows` source that carries its Store
+help: the following other types implement trait `IntoForSource`
+ --> src/view.rs
+  |
+  | impl<R: Row> IntoForSource for ForSource<R> {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `ForSource<R>`
+...
+  | impl<R: Row, F: FilterSpec<R>> IntoForSource for Rows<R, F> {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `Rows<R, F>`
+note: required by a bound in `zenui::view::for_each`
+ --> src/view.rs
+  |
+  | pub fn for_each<R: Row, K: RowKey>(
+  |        -------- required by a bound in this function
+  |     source: impl IntoForSource<Row = R>,
+  |                  ^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `for_each`

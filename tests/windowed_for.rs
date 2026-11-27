@@ -17,11 +17,7 @@ fn WindowedList(store: Store) -> MountResult<MountPlan> {
         let _ = transaction.finish();
     };
     let reverse = move || {
-        let ids: Vec<TodoId> = store
-            .rows(Filter::All)
-            .iter()
-            .map(TodoId::from_key)
-            .collect();
+        let ids: Vec<TodoId> = store.keys(Filter::All);
         let reversed: Vec<TodoId> = ids.into_iter().rev().collect();
         let _ = Transaction::new().write(store.reorder(&reversed)).finish();
     };
@@ -32,8 +28,9 @@ fn WindowedList(store: Store) -> MountResult<MountPlan> {
             <button aria:label="Seed" on:click={move || seed()}>"Seed"</button>
             <button aria:label="Reverse" on:click={move || reverse()}>"Reverse"</button>
             <view class="gap-0">
-                <For each={rows} key={|id: TodoId| id} row-height={px(20.0)}>
-                    {move |id: TodoId| {
+                <For each={rows} store={store} key={|row: &TodoRow| row.id} row-height={px(20.0)}>
+                    {move |row: RowView<TodoRow>| {
+                        let id = row.key();
                         let title = store.title(id).read_once()?;
                         let label = format!("Row {title}");
                         view! {

@@ -179,9 +179,9 @@ fn OrderFixture() -> MountResult<MountPlan> {
             <Show when={shown}>
                 <button aria:label="shown">"Shown"</button>
             </Show>
-            <For each={rows} key={|id: TodoId| id}>
-                {move |todo: TodoId| view! {
-                    <button aria:label={once(format!("row {}", todo.raw()))}>"row"</button>
+            <For each={rows} store={store} key={|row: &TodoRow| row.id}>
+                {move |row: RowView<TodoRow>| view! {
+                    <button aria:label={once(format!("row {}", row.key().raw()))}>"row"</button>
                 }}
             </For>
             <button aria:label="last">"Last"</button>
@@ -194,7 +194,11 @@ fn tab_and_arrow_traversal_follow_the_mounted_order() {
     let mut app = Runtime::new();
     app.mount(|| view! { <OrderFixture /> }).expect("mount");
     app.click_text("Seed").expect("seed two rows");
-    let ids: Vec<u64> = app.for_items().iter().map(|item| item.todo.raw()).collect();
+    let ids: Vec<u64> = app
+        .for_items()
+        .iter()
+        .map(|item| item.todo.expect("todo row").raw())
+        .collect();
     assert_eq!(ids.len(), 2);
 
     app.focus("first").expect("focus first");
@@ -283,14 +287,18 @@ fn Rows() -> MountResult<MountPlan> {
                     .finish();
             }}>"Seed"</button>
             <button aria:label="reverse" on:click={move || {
-                let mut ids: Vec<TodoId> =
-                    rows.get().iter().map(TodoId::from_key).collect();
+                let mut ids: Vec<TodoId> = rows
+                    .get()
+                    .ids()
+                    .iter()
+                    .filter_map(|row| store.key_of(*row))
+                    .collect();
                 ids.reverse();
                 let _ = Transaction::new().write(store.reorder(&ids)).finish();
             }}>"Reverse"</button>
-            <For each={rows} key={|id: TodoId| id}>
-                {move |todo: TodoId| view! {
-                    <text-input aria:label={once(format!("row {}", todo.raw()))} />
+            <For each={rows} store={store} key={|row: &TodoRow| row.id}>
+                {move |row: RowView<TodoRow>| view! {
+                    <text-input aria:label={once(format!("row {}", row.key().raw()))} />
                 }}
             </For>
         </view>
@@ -302,12 +310,20 @@ fn reorder_keeps_focus_on_the_same_control() {
     let mut app = Runtime::new();
     app.mount(|| view! { <Rows /> }).expect("mount");
     app.click_text("Seed").expect("seed");
-    let before: Vec<u64> = app.for_items().iter().map(|item| item.todo.raw()).collect();
+    let before: Vec<u64> = app
+        .for_items()
+        .iter()
+        .map(|item| item.todo.expect("todo row").raw())
+        .collect();
 
     app.focus(&format!("row {}", before[0])).expect("focus");
     app.click_text("Reverse").expect("reorder");
 
-    let after: Vec<u64> = app.for_items().iter().map(|item| item.todo.raw()).collect();
+    let after: Vec<u64> = app
+        .for_items()
+        .iter()
+        .map(|item| item.todo.expect("todo row").raw())
+        .collect();
     assert_eq!(after[1], before[0], "the row really moved");
     assert_eq!(
         app.focused().and_then(|focus| focus.label),
@@ -339,15 +355,16 @@ fn DeletableRows(
                     .write(store.insert("B"))
                     .finish();
             }}>"Seed"</button>
-            <For each={rows} key={|id: TodoId| id}>
-                {move |todo: TodoId| {
+            <For each={rows} store={store} key={|row: &TodoRow| row.id}>
+                {move |row: RowView<TodoRow>| {
+                    let todo = row.key();
                     let focus_count = focuses.clone();
                     let blur_count = blurs.clone();
                     let cause_slot = cause.clone();
                     view! {
                         <view>
                             <text-input
-                                aria:label={once(format!("row {}", todo.raw()))}
+                                aria:label={once(format!("row {}", row.key().raw()))}
                                 on:focus={move |event: FocusEvent| {
                                     cause_slot.set(Some(event.cause()));
                                     focus_count.set(focus_count.get() + 1);
@@ -384,7 +401,11 @@ fn deleting_the_focused_row_settles_once_to_a_surviving_control() {
     })
     .expect("mount");
     app.click_text("Seed").expect("seed");
-    let ids: Vec<u64> = app.for_items().iter().map(|item| item.todo.raw()).collect();
+    let ids: Vec<u64> = app
+        .for_items()
+        .iter()
+        .map(|item| item.todo.expect("todo row").raw())
+        .collect();
 
     app.focus(&format!("row {}", ids[1])).expect("focus B");
     assert_eq!(focuses.get(), 1);
@@ -822,14 +843,17 @@ fn CascadingRows(
                 }
                 let _ = transaction.finish();
             }}>"Seed"</button>
-            <For each={rows} key={|id: TodoId| id}>
-                {move |todo: TodoId| view! {
-                    <button
-                        aria:label={once(format!("row {}", todo.raw()))}
-                        on:focus={move |_event: FocusEvent| {
-                            let _ = Transaction::new().write(store.remove(todo)).finish();
-                        }}
-                    >"row"</button>
+            <For each={rows} store={store} key={|row: &TodoRow| row.id}>
+                {move |row: RowView<TodoRow>| {
+                    let todo = row.key();
+                    view! {
+                        <button
+                            aria:label={once(format!("row {}", todo.raw()))}
+                            on:focus={move |_event: FocusEvent| {
+                                let _ = Transaction::new().write(store.remove(todo)).finish();
+                            }}
+                        >"row"</button>
+                    }
                 }}
             </For>
             <button
@@ -866,7 +890,7 @@ fn cascade(rows: usize) -> (Runtime, Rc<Cell<u32>>, Rc<Cell<u32>>) {
 #[test]
 fn a_cascade_that_converges_on_the_cap_keeps_its_valid_target() {
     let (mut app, last_focuses, last_blurs) = cascade(8);
-    let first = app.for_items()[0].todo;
+    let first = app.for_items()[0].todo.expect("todo row");
     app.focus(&format!("row {}", first.raw()))
         .expect("focus the first row");
 
@@ -883,7 +907,7 @@ fn a_cascade_that_converges_on_the_cap_keeps_its_valid_target() {
     );
 
     let (mut app, last_focuses, last_blurs) = cascade(7);
-    let first = app.for_items()[0].todo;
+    let first = app.for_items()[0].todo.expect("todo row");
     app.focus(&format!("row {}", first.raw()))
         .expect("focus the first row");
     assert_eq!(

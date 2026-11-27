@@ -8,8 +8,8 @@ use super::store::{Store, StoreError};
 
 /// 一个过滤投影的共享快照：来源 store 与按 Store 当前顺序排列的行身份。
 ///
-/// `Arc` 共享让同一 revision 的消费者拿到同一份投影；`#338` 会在它外面加
-/// `RowSet` newtype，本类型不做 UI/绑定依赖。
+/// `Arc` 共享让同一 revision 的消费者拿到同一份投影；[`RowSet`] 是它对外
+/// 的 newtype，本类型不做 UI/绑定依赖。
 #[derive(Clone, PartialEq, Eq)]
 pub struct RowSetData {
     store: StoreId,
@@ -47,6 +47,65 @@ impl fmt::Debug for RowSetData {
         f.debug_struct("RowSetData")
             .field("store", &self.store)
             .field("ids", &self.ids)
+            .finish()
+    }
+}
+
+/// 一个 Store 拥有的行身份快照；`ids` 顺序恒为 Store 当前用户顺序。
+///
+/// 不是 `Arc<RowSetData>` 的类型别名：newtype 才能提供 [`RowSet::shares_with`]
+/// 与顺序敏感的自定义 `PartialEq`，同时继续命中 `ReactiveValue` 的 blanket impl。
+/// 只能由 [`super::Store::rowset`] 或 [`super::Store::rowset_from_filter`] 构造，
+/// 因此集合总带有真实来源与合法顺序。
+#[repr(transparent)]
+#[derive(Clone)]
+pub struct RowSet(Arc<RowSetData>);
+
+impl RowSet {
+    pub(crate) fn from_data(data: Arc<RowSetData>) -> Self {
+        Self(data)
+    }
+
+    pub fn store(&self) -> StoreId {
+        self.0.store()
+    }
+
+    pub fn ids(&self) -> &[RowId] {
+        self.0.ids()
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = RowId> + '_ {
+        self.0.ids().iter().copied()
+    }
+
+    /// 同一份共享投影（`Arc` 指针相同）时返回真；O(1)。
+    pub fn shares_with(&self, other: &Self) -> bool {
+        self.0.shares_with(&other.0)
+    }
+}
+
+/// 先比较共享身份，再比较来源 store 与**顺序**；纯重排因此改变相等性。
+impl PartialEq for RowSet {
+    fn eq(&self, other: &Self) -> bool {
+        self.shares_with(other) || (self.store() == other.store() && self.ids() == other.ids())
+    }
+}
+
+impl Eq for RowSet {}
+
+impl fmt::Debug for RowSet {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RowSet")
+            .field("store", &self.store())
+            .field("ids", &self.ids())
             .finish()
     }
 }

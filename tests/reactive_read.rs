@@ -373,10 +373,9 @@ fn a_missing_field_keeps_the_last_value_and_reports_a_typed_fault() {
                 <button aria:label="seed" on:click={move || -> Result<(), WriteError> {
                     Transaction::new().write(store.insert("row")).finish()?;
                     let id = store
-                        .rows(Filter::All)
-                        .iter()
+                        .keys(Filter::All)
+                        .into_iter()
                         .next()
-                        .map(TodoId::from_key)
                         .expect("the inserted row");
                     ids.set(Some(id));
                     seed_seen.set(Some(id));

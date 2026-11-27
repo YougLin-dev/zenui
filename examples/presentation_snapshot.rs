@@ -37,11 +37,14 @@ fn Demo() -> MountResult<MountPlan> {
             <Show when={empty}>
                 <text>"Nothing here yet"</text>
             </Show>
-            <For each={rows} key={|todo: TodoId| todo}>
-                {move |todo: TodoId| view! {
-                    <text aria:label={once(format!("row {}", todo.raw()))}>
-                        {once(todos.title(todo).read_once()?)}
-                    </text>
+            <For each={rows} store={todos} key={|row: &TodoRow| row.id}>
+                {move |row: RowView<TodoRow>| {
+                    let todo = row.key();
+                    view! {
+                        <text aria:label={once(format!("row {}", todo.raw()))}>
+                            {once(todos.title(todo).read_once()?)}
+                        </text>
+                    }
                 }}
             </For>
         </view>

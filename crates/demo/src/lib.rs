@@ -112,9 +112,9 @@ fn read_titles(fields: impl IntoIterator<Item = Field<String>>) -> Result<Vec<St
 fn committed_titles(todos: Store) -> Result<Vec<String>, String> {
     read_titles(
         todos
-            .rows(Filter::All)
-            .iter()
-            .map(|key| todos.title(TodoId::from_key(key))),
+            .keys(Filter::All)
+            .into_iter()
+            .map(|id| todos.title(id)),
     )
 }
 
@@ -482,7 +482,12 @@ pub fn TodoApp(window: WindowCtx, state: TodoState) -> MountResult<MountPlan> {
         }
     };
     let reverse = move || {
-        let mut ids: Vec<TodoId> = visible.get().iter().map(TodoId::from_key).collect();
+        let mut ids: Vec<TodoId> = visible
+            .get()
+            .ids()
+            .iter()
+            .filter_map(|row| todos.key_of(*row))
+            .collect();
         ids.reverse();
         let _ = Transaction::new().write(todos.reorder(&ids)).finish();
     };
@@ -619,10 +624,10 @@ pub fn TodoApp(window: WindowCtx, state: TodoState) -> MountResult<MountPlan> {
                 <text>"Nothing matches"</text>
             </Show>
             <view class="gap-0">
-                <For each={visible} key={|id: TodoId| id} row-height={em(2.5)}>
-                    {move |todo: TodoId| view! {
+                <For each={visible} store={todos} key={|row: &TodoRow| row.id} row-height={em(2.5)}>
+                    {move |row: RowView<TodoRow>| view! {
                         <view style:height={once(em(2.5))}>
-                            <TodoItem todo={todo} todos={todos} />
+                            <TodoItem todo={row.key()} todos={todos} />
                         </view>
                     }}
                 </For>
@@ -679,8 +684,10 @@ pub fn TodoDetails(window: WindowCtx, state: TodoState) -> MountResult<MountPlan
                 on:input={move |value: String| note.set(value)}
             />
             <view role="list" aria:label="Details rows" class="gap-0">
-                <For each={visible} key={|id: TodoId| id} row-height={em(2.5)}>
-                    {move |todo: TodoId| view! { <TodoDetailRow todo={todo} todos={todos} /> }}
+                <For each={visible} store={todos} key={|row: &TodoRow| row.id} row-height={em(2.5)}>
+                    {move |row: RowView<TodoRow>| view! {
+                        <TodoDetailRow todo={row.key()} todos={todos} />
+                    }}
                 </For>
             </view>
             <Show when={no_tasks}>
@@ -788,13 +795,7 @@ mod tests {
             let _ = Transaction::new()
                 .write(state.todos.insert("gone"))
                 .finish();
-            let Some(id) = state
-                .todos
-                .rows(Filter::All)
-                .iter()
-                .map(TodoId::from_key)
-                .next()
-            else {
+            let Some(id) = state.todos.keys(Filter::All).into_iter().next() else {
                 return;
             };
             let _ = Transaction::new().write(state.todos.remove(id)).finish();

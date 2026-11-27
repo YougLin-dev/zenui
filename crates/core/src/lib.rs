@@ -23,9 +23,10 @@ pub use handle::{
     RuntimeId, SignalId, SlotIndex, ViewId,
 };
 pub use metrics::Counters;
+pub use model::RowSet;
 pub use owner::{OwnerError, OwnerTree};
 pub use panic::{PanicInfo, catch_panic};
-pub use query::{Filter, RowSet};
+pub use query::{Filter, RowSet as LegacyRowSet};
 pub use runtime::Runtime;
 pub use store::{Row, RowId, Store, StoreError};
 pub use txn::{

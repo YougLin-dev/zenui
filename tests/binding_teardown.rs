@@ -39,12 +39,8 @@ fn TeardownWindow(store: Store) -> MountResult<MountPlan> {
                 Ok(())
             }}>"Seed"</button>
             <button aria:label="Remove" on:click={move || -> Result<(), WriteError> {
-                let ids: Vec<TodoId> = store
-                    .rows(Filter::All)
-                    .iter()
-                    .map(TodoId::from_key)
-                    .take(5)
-                    .collect();
+                let ids: Vec<TodoId> =
+                    store.keys(Filter::All).into_iter().take(5).collect();
                 let mut transaction = Transaction::new();
                 for id in ids {
                     transaction = transaction.write(store.remove(id));
@@ -53,16 +49,19 @@ fn TeardownWindow(store: Store) -> MountResult<MountPlan> {
             }}>"Remove"</button>
             <button aria:label="Toggle" on:click={move || visible.set(!visible.get())}>"Toggle"</button>
             <view class="gap-0">
-                <For each={rows} key={|id: TodoId| id} row-height={px(20.0)}>
-                    {move |id: TodoId| view! {
-                        <view style:height={once(px(20.0))}>
-                            <Show when={visible}>
-                                <view aria:label={once(format!("Inner {}", id.raw()))}>
-                                    <text>{store.title(id)}</text>
-                                </view>
-                            </Show>
-                            <button aria:label={once(format!("Row {}", id.raw()))}>"row"</button>
-                        </view>
+                <For each={rows} store={store} key={|row: &TodoRow| row.id} row-height={px(20.0)}>
+                    {move |row: RowView<TodoRow>| {
+                        let id = row.key();
+                        view! {
+                            <view style:height={once(px(20.0))}>
+                                <Show when={visible}>
+                                    <view aria:label={once(format!("Inner {}", id.raw()))}>
+                                        <text>{store.title(id)}</text>
+                                    </view>
+                                </Show>
+                                <button aria:label={once(format!("Row {}", id.raw()))}>"row"</button>
+                            </view>
+                        }
                     }}
                 </For>
             </view>
@@ -157,8 +156,10 @@ fn RowsThenBroken(store: Store) -> MountResult<MountPlan> {
     let rows = memo(move || store.rows(Filter::All));
     view! {
         <view>
-            <For each={rows} key={|id: TodoId| id} row-height={px(20.0)}>
-                {move |id: TodoId| view! { <text>{once(format!("row {}", id.raw()))}</text> }}
+            <For each={rows} store={store} key={|row: &TodoRow| row.id} row-height={px(20.0)}>
+                {move |row: RowView<TodoRow>| view! {
+                    <text>{once(format!("row {}", row.key().raw()))}</text>
+                }}
             </For>
             <Broken />
         </view>
@@ -230,8 +231,10 @@ fn a_root_context_fault_with_structure_releases_the_table() {
                     <Show when={shown}>
                         <text>{once("branch text")}</text>
                     </Show>
-                    <For each={rows} key={|id: TodoId| id} row-height={px(20.0)}>
-                        {move |id: TodoId| view! { <text>{once(format!("row {}", id.raw()))}</text> }}
+                    <For each={rows} store={store} key={|row: &TodoRow| row.id} row-height={px(20.0)}>
+                        {move |row: RowView<TodoRow>| view! {
+                            <text>{once(format!("row {}", row.key().raw()))}</text>
+                        }}
                     </For>
                 </view>
             }

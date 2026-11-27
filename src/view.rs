@@ -1,13 +1,21 @@
+use std::any::Any;
+use std::collections::hash_map::DefaultHasher;
 use std::fmt;
+use std::hash::Hasher;
+use std::rc::Rc;
 
-use zenui_core::{PanicInfo, RowSet};
+use zenui_core::PanicInfo;
+use zenui_core::model::{
+    FilterId, FilterSpec, Row, RowId, RowKey, RowSet, Rows, Store as ModelStore, StoreError,
+    StoreId,
+};
 
 use zenui_style::{Color, Length, Opacity, Property, StyleDeclaration};
 
 use crate::context::Phase;
 use crate::node::{BindingRef, BindingTable, BindingValue, ReadSlot};
-use crate::signal::{Memo, Once, ReactiveValue, Signal};
-use crate::store::{Field, FieldError, TodoId, WriteError};
+use crate::signal::{Memo, Once, ReactiveValue, Signal, once};
+use crate::store::{Field, FieldError, WriteError};
 
 pub type MountResult<T> = Result<T, MountError>;
 
@@ -34,6 +42,17 @@ pub enum MountError {
     Read(ReadFault),
     DuplicateKey,
     Write(WriteError),
+    /// Store 拒绝的读取或投影。
+    Store(StoreError),
+    /// 行集来自另一个 Store；`ForSource` 的 store 与它不匹配。
+    WrongStore {
+        expected: StoreId,
+        found: StoreId,
+    },
+    /// 行 factory 返回 `Err`；拟议行已释放，旧行映射保留。
+    FactoryFailed(Box<MountError>),
+    /// 行 factory panic；拟议行已释放，旧行映射保留。
+    FactoryPanicked(PanicInfo),
     Delivery(&'static str),
     Component(&'static str),
     Setup(&'static str),
@@ -60,6 +79,13 @@ impl fmt::Display for MountError {
             Self::Read(fault) => write!(f, "{fault}"),
             Self::DuplicateKey => f.write_str("duplicate For key before interface publication"),
             Self::Write(error) => write!(f, "{error}"),
+            Self::Store(error) => write!(f, "{error}"),
+            Self::WrongStore { expected, found } => write!(
+                f,
+                "For rows belong to store {found:?}, expected {expected:?}"
+            ),
+            Self::FactoryFailed(error) => write!(f, "For row factory failed: {error}"),
+            Self::FactoryPanicked(panic) => write!(f, "For row factory panicked: {panic}"),
             Self::Delivery(message) => f.write_str(message),
             Self::Component(label) => write!(f, "component {label} rejected its mount"),
             Self::Setup(message) => f.write_str(message),
@@ -85,6 +111,12 @@ impl From<ReadFault> for MountError {
 impl From<WriteError> for MountError {
     fn from(error: WriteError) -> Self {
         Self::Write(error)
+    }
+}
+
+impl From<StoreError> for MountError {
+    fn from(error: StoreError) -> Self {
+        Self::Store(error)
     }
 }
 
@@ -238,6 +270,14 @@ impl From<&'static str> for Read<String> {
 impl From<Once<&'static str>> for Read<String> {
     fn from(value: Once<&'static str>) -> Self {
         Self::Once(crate::signal::once(value.into_inner().to_owned()))
+    }
+}
+
+/// 一个 `RowSet` 是 Store 构造的不可变快照，因此可以显式成为读源；
+/// 裸 `RowSet` 仍不会自动出现在 `each` 位置——那需要同时给出 `store`。
+impl From<RowSet> for Read<RowSet> {
+    fn from(value: RowSet) -> Self {
+        Self::Once(once(value))
     }
 }
 
@@ -398,12 +438,251 @@ pub struct ShowPlan {
     pub(crate) fallback: Option<ChildrenFactory>,
 }
 
-pub struct ForPlan {
-    pub(crate) each: Memo<RowSet>,
-    pub(crate) key: Box<dyn Fn(TodoId) -> TodoId>,
-    pub(crate) item: Box<dyn Fn(TodoId) -> MountResult<MountPlan>>,
+/// `For` 的行集来源：显式读源，或跟随 Store 当前投影的 `Rows`。
+pub(crate) enum ForRows {
+    Read(Read<RowSet>),
+    Projection(FilterId),
+}
+
+/// `For` 的唯一数据入口：行 Store 与行集来源。
+///
+/// `ForSource::new` 接受任意 `Read<RowSet>`（Signal/Memo/Once/Static）；
+/// [`Rows<R, F>`] 自带 store，经 `From` 转为跟随投影的来源，无需安装 runtime。
+pub struct ForSource<R: Row> {
+    store: ModelStore<R>,
+    rows: ForRows,
+}
+
+impl<R: Row> ForSource<R> {
+    pub fn new(store: ModelStore<R>, rows: impl Into<Read<RowSet>>) -> Self {
+        Self {
+            store,
+            rows: ForRows::Read(rows.into()),
+        }
+    }
+}
+
+impl<R: Row, F: FilterSpec<R>> From<Rows<R, F>> for ForSource<R> {
+    fn from(rows: Rows<R, F>) -> Self {
+        Self {
+            store: rows.store(),
+            rows: ForRows::Projection(rows.filter()),
+        }
+    }
+}
+
+/// 一个已解析行的挂载快照：`id()` 是行身份，`key()` 是业务键，`get()` 是行数据。
+///
+/// 快照不随后续 Store 写入变化；响应式字段读取由后续版本的行字段句柄承担。
+#[derive(Clone)]
+pub struct RowView<R: Row> {
+    id: RowId,
+    snapshot: R,
+}
+
+impl<R: Row> RowView<R> {
+    pub(crate) fn new(id: RowId, snapshot: R) -> Self {
+        Self { id, snapshot }
+    }
+
+    pub const fn id(&self) -> RowId {
+        self.id
+    }
+
+    pub fn key(&self) -> R::Key {
+        self.snapshot.key()
+    }
+
+    pub fn get(&self) -> &R {
+        &self.snapshot
+    }
+}
+
+/// `store` 属性可接受的行 Store：`ModelStore<R>` 自身，或应用对它的封装。
+pub trait ForStore {
+    type Row: Row;
+
+    fn for_source(&self, rows: impl Into<Read<RowSet>>) -> ForSource<Self::Row>;
+}
+
+impl<R: Row> ForStore for ModelStore<R> {
+    type Row = R;
+
+    fn for_source(&self, rows: impl Into<Read<RowSet>>) -> ForSource<R> {
+        ForSource::new(self.clone(), rows)
+    }
+}
+
+/// `For` 的输入：`ForSource` 本身，或自带 store 的 [`Rows`]。
+///
+/// 裸 `RowSet`/`Memo<RowSet>` 不会实现本 trait，因此必须配 `store` 属性。
+#[diagnostic::on_unimplemented(
+    message = "`For` needs a store to resolve row data",
+    label = "this row source has no Store handle",
+    note = "pass the `store` attribute alongside `each`, or use a `Rows` source that carries its Store"
+)]
+pub trait IntoForSource {
+    type Row: Row;
+
+    fn into_for_source(self) -> ForSource<Self::Row>;
+}
+
+impl<R: Row> IntoForSource for ForSource<R> {
+    type Row = R;
+
+    fn into_for_source(self) -> ForSource<R> {
+        self
+    }
+}
+
+impl<R: Row, F: FilterSpec<R>> IntoForSource for Rows<R, F> {
+    type Row = R;
+
+    fn into_for_source(self) -> ForSource<R> {
+        self.into()
+    }
+}
+
+/// 泛型 `For`：行集来源 + 业务键选择 + 行 factory + 可选统一行高。
+///
+/// 键选择器接收已解析的行快照；投影变化时会重跑，因此必须是纯函数。
+/// 挂载时被擦除为 [`ForPlan`]；`R`/`K` 只存在于驱动对象内部。
+pub struct For<R: Row, K: RowKey> {
+    source: ForSource<R>,
+    key: Rc<dyn Fn(&R) -> K>,
+    item: Rc<dyn Fn(RowView<R>) -> MountResult<MountPlan>>,
+    row_height: Option<Length>,
+}
+
+impl<R: Row, K: RowKey> For<R, K> {
+    pub fn new(
+        source: impl IntoForSource<Row = R>,
+        key: impl Fn(&R) -> K + 'static,
+        item: impl Fn(RowView<R>) -> MountResult<MountPlan> + 'static,
+    ) -> Self {
+        Self {
+            source: source.into_for_source(),
+            key: Rc::new(key),
+            item: Rc::new(item),
+            row_height: None,
+        }
+    }
+
     /// 窗口化 For 的统一行高；`None` 保持全量挂载（ADR-0010）。
+    pub fn row_height(mut self, height: Length) -> Self {
+        self.row_height = Some(height);
+        self
+    }
+
+    fn into_plan(self) -> ForPlan {
+        let Self {
+            source,
+            key,
+            item,
+            row_height,
+        } = self;
+        let store = source.store.clone();
+        let store_id = store.id();
+        let driver: Rc<dyn ForDriver> = Rc::new(TypedForDriver { store, key, item });
+        ForPlan {
+            store: store_id,
+            rows: source.rows,
+            driver,
+            row_height,
+        }
+    }
+}
+
+impl<R: Row, K: RowKey> IntoNode for For<R, K> {
+    fn into_node(self) -> PlanNode {
+        PlanNode::For(self.into_plan())
+    }
+}
+
+/// 擦除后的 `For` 计划；`NodeArena` 只保存它，不接触 `R`/`K`。
+pub struct ForPlan {
+    pub(crate) store: StoreId,
+    pub(crate) rows: ForRows,
+    pub(crate) driver: Rc<dyn ForDriver>,
     pub(crate) row_height: Option<Length>,
+}
+
+/// 行的 store 归属；行身份本身已在本 runtime 内全局唯一。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ErasedStore {
+    pub(crate) store: StoreId,
+}
+
+/// 交给驱动的行挂载请求；`row` 是拥有所有权的行快照。
+pub(crate) struct ErasedRowView {
+    pub(crate) id: RowId,
+    pub(crate) store: ErasedStore,
+    pub(crate) row: Rc<dyn Any>,
+}
+
+/// 唯一持有 `R`/`K` 的边界：键映射、行快照与行 factory 全在 typed driver 内。
+pub(crate) trait ForDriver {
+    fn row_snapshot(&self, id: RowId) -> Option<Rc<dyn Any>>;
+
+    /// 行是否仍存活；静态快照可能早于删除。
+    fn row_live(&self, id: RowId) -> bool;
+
+    fn key_hash(&self, id: RowId) -> Option<u64>;
+
+    fn key_eq(&self, a: RowId, b: RowId) -> bool;
+
+    fn projection_rowset(&self, filter: FilterId) -> Result<RowSet, StoreError>;
+
+    fn mount_row(&self, view: ErasedRowView) -> MountResult<MountPlan>;
+}
+
+struct TypedForDriver<R: Row, K: RowKey> {
+    store: ModelStore<R>,
+    key: Rc<dyn Fn(&R) -> K>,
+    item: Rc<dyn Fn(RowView<R>) -> MountResult<MountPlan>>,
+}
+
+impl<R: Row, K: RowKey> ForDriver for TypedForDriver<R, K> {
+    fn row_snapshot(&self, id: RowId) -> Option<Rc<dyn Any>> {
+        self.store.get(id).map(|row| Rc::new(row) as Rc<dyn Any>)
+    }
+
+    fn row_live(&self, id: RowId) -> bool {
+        self.store.contains(id)
+    }
+
+    /// 先克隆行再运行用户选择器，避免在 Store 的 `RefCell` 借用内重入读取。
+    fn key_hash(&self, id: RowId) -> Option<u64> {
+        let row = self.store.get(id)?;
+        let mut hasher = DefaultHasher::new();
+        (self.key)(&row).hash(&mut hasher);
+        Some(hasher.finish())
+    }
+
+    fn key_eq(&self, a: RowId, b: RowId) -> bool {
+        let (Some(a), Some(b)) = (self.store.get(a), self.store.get(b)) else {
+            return false;
+        };
+        (self.key)(&a) == (self.key)(&b)
+    }
+
+    fn projection_rowset(&self, filter: FilterId) -> Result<RowSet, StoreError> {
+        self.store.rowset_from_filter(filter)
+    }
+
+    fn mount_row(&self, view: ErasedRowView) -> MountResult<MountPlan> {
+        debug_assert_eq!(
+            view.store.store,
+            self.store.id(),
+            "a For driver only mounts rows from its own store"
+        );
+        let row = view
+            .row
+            .downcast::<R>()
+            .expect("a For driver only receives its own row type");
+        let snapshot = Rc::try_unwrap(row).unwrap_or_else(|row| (*row).clone());
+        (self.item)(RowView::new(view.id, snapshot))
+    }
 }
 
 pub struct Children {
@@ -814,35 +1093,34 @@ pub fn show(
     })
 }
 
-pub fn for_each(
-    each: Memo<RowSet>,
-    key: impl Fn(TodoId) -> TodoId + 'static,
-    item: impl Fn(TodoId) -> MountResult<MountPlan> + 'static,
+pub fn for_each<R: Row, K: RowKey>(
+    source: impl IntoForSource<Row = R>,
+    key: impl Fn(&R) -> K + 'static,
+    item: impl Fn(RowView<R>) -> MountResult<MountPlan> + 'static,
 ) -> PlanNode {
-    PlanNode::For(ForPlan {
-        each,
-        key: Box::new(key),
-        item: Box::new(item),
-        row_height: None,
-    })
+    For::new(source, key, item).into_node()
+}
+
+/// 把 `store` 属性与 `each` 读源组合成唯一的 `For` 数据入口。
+///
+/// 只借用 Store，因此同一份 Store 句柄仍可在同一声明里的其他节点使用。
+pub fn for_source<S: ForStore>(store: &S, rows: impl Into<Read<RowSet>>) -> ForSource<S::Row> {
+    store.for_source(rows)
 }
 
 /// 窗口化 `For`：只挂载宿主声明的可见行窗口，行槽高由 `row_height` 声明。
 ///
 /// 行高是每行的外层高度，父容器必须是零间距的纵向布局；For 用上下两个
 /// spacer 保持 `总行数 × row_height` 的声明范围（ADR-0011）。
-pub fn for_each_windowed(
-    each: Memo<RowSet>,
-    key: impl Fn(TodoId) -> TodoId + 'static,
+pub fn for_each_windowed<R: Row, K: RowKey>(
+    source: impl IntoForSource<Row = R>,
+    key: impl Fn(&R) -> K + 'static,
     row_height: Length,
-    item: impl Fn(TodoId) -> MountResult<MountPlan> + 'static,
+    item: impl Fn(RowView<R>) -> MountResult<MountPlan> + 'static,
 ) -> PlanNode {
-    PlanNode::For(ForPlan {
-        each,
-        key: Box::new(key),
-        item: Box::new(item),
-        row_height: Some(row_height),
-    })
+    For::new(source, key, item)
+        .row_height(row_height)
+        .into_node()
 }
 
 pub fn on_click<R>(mut handler: impl FnMut() -> R + 'static) -> Attr

@@ -26,10 +26,9 @@ fn Host() -> MountResult<MountPlan> {
             <button aria:label="seed" on:click={move || -> Result<(), WriteError> {
                 Transaction::new().write(store.insert("row")).finish()?;
                 let id = store
-                    .rows(Filter::All)
-                    .iter()
+                    .keys(Filter::All)
+                    .into_iter()
                     .next()
-                    .map(TodoId::from_key)
                     .expect("the inserted row");
                 target.set(Some(id));
                 Ok(())
@@ -56,10 +55,9 @@ fn KeepHost() -> MountResult<MountPlan> {
             <button aria:label="seed" on:click={move || -> Result<(), WriteError> {
                 Transaction::new().write(store.insert("row")).finish()?;
                 let id = store
-                    .rows(Filter::All)
-                    .iter()
+                    .keys(Filter::All)
+                    .into_iter()
                     .next()
-                    .map(TodoId::from_key)
                     .expect("the inserted row");
                 target.set(Some(id));
                 Ok(())

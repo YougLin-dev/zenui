@@ -4,7 +4,7 @@ use quote::{format_ident, quote, quote_spanned};
 use rstml::node::{
     KVAttributeValue, KeyedAttributeValue, Node, NodeAttribute, NodeBlock, NodeElement,
 };
-use syn::{Block, Expr, FnArg, ItemFn, Pat, ReturnType, Type, spanned::Spanned};
+use syn::{Block, Expr, FnArg, ItemFn, Pat, ReturnType, Stmt, Type, spanned::Spanned};
 use zenui_style::{Condition, Property, StyleDeclaration, StyleValue};
 
 #[proc_macro]
@@ -431,6 +431,21 @@ fn expression(attribute: &rstml::node::KeyedAttribute) -> syn::Result<&Expr> {
     }
 }
 
+/// `attr={expr}` 解析为单表达式块；取出尾部表达式，让 `&expr` 借用变量本身，
+/// 而不是把变量移动进块临时值。带语句的块保持原样。
+fn block_tail(expression: &Expr) -> &Expr {
+    let Expr::Block(block) = expression else {
+        return expression;
+    };
+    if block.label.is_some() || block.block.stmts.len() != 1 {
+        return expression;
+    }
+    match &block.block.stmts[0] {
+        Stmt::Expr(tail, None) => tail,
+        _ => expression,
+    }
+}
+
 fn lower_component(
     element: &NodeElement<rstml::Infallible>,
     tag: &str,
@@ -508,6 +523,7 @@ fn lower_for(element: &NodeElement<rstml::Infallible>) -> syn::Result<TokenStrea
     let mut each = None;
     let mut key = None;
     let mut row_height = None;
+    let mut store = None;
     for attribute in element.attributes() {
         let NodeAttribute::Attribute(attribute) = attribute else {
             return Err(syn::Error::new_spanned(
@@ -515,16 +531,24 @@ fn lower_for(element: &NodeElement<rstml::Infallible>) -> syn::Result<TokenStrea
                 "For does not implement spread attributes",
             ));
         };
-        match attribute.key.to_string().as_str() {
-            "each" => each = Some(expression(attribute)?),
-            "key" => key = Some(expression(attribute)?),
-            "row-height" => row_height = Some(expression(attribute)?),
+        let name = attribute.key.to_string();
+        let slot = match name.as_str() {
+            "each" => &mut each,
+            "key" => &mut key,
+            "row-height" => &mut row_height,
+            "store" => &mut store,
             other => {
                 return Err(syn::Error::new_spanned(
                     &attribute.key,
                     format!("unsupported For attribute `{other}`"),
                 ));
             }
+        };
+        if slot.replace(expression(attribute)?).is_some() {
+            return Err(syn::Error::new_spanned(
+                &attribute.key,
+                format!("duplicate For attribute `{name}`"),
+            ));
         }
     }
     let each = each.ok_or_else(|| syn::Error::new_spanned(element.name(), "For needs `each`"))?;
@@ -547,11 +571,32 @@ fn lower_for(element: &NodeElement<rstml::Infallible>) -> syn::Result<TokenStrea
             "For expects one row factory closure",
         ));
     };
-    Ok(match row_height {
-        Some(row_height) => quote_spanned! {element.span()=>
+    Ok(match (store, row_height) {
+        (Some(store), Some(row_height)) => {
+            let store = block_tail(store);
+            quote_spanned! {element.span()=>
+                ::zenui::view::for_each_windowed(
+                    ::zenui::view::for_source(&#store, #each),
+                    #key,
+                    #row_height,
+                    #block,
+                )
+            }
+        }
+        (Some(store), None) => {
+            let store = block_tail(store);
+            quote_spanned! {element.span()=>
+                ::zenui::view::for_each(
+                    ::zenui::view::for_source(&#store, #each),
+                    #key,
+                    #block,
+                )
+            }
+        }
+        (None, Some(row_height)) => quote_spanned! {element.span()=>
             ::zenui::view::for_each_windowed(#each, #key, #row_height, #block)
         },
-        None => quote_spanned! {element.span()=>
+        (None, None) => quote_spanned! {element.span()=>
             ::zenui::view::for_each(#each, #key, #block)
         },
     })

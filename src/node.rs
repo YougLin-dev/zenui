@@ -11,7 +11,7 @@ use std::fmt;
 use std::num::NonZeroU64;
 use std::sync::Arc;
 
-use zenui_core::RowSet;
+use zenui_core::model::RowSet;
 use zenui_style::{Color, Length, Opacity, Property, StyleValue};
 
 use crate::context::FieldKind;

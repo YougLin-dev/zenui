@@ -45,13 +45,14 @@ pub use runtime::{
 };
 pub use session::{SessionCtx, SessionError, SessionPolicy};
 pub use signal::{Memo, MemoCompute, Once, ReactiveValue, Signal, memo, once, signal};
-pub use store::{Field, FieldError, Store, TodoId, Transaction, WriteError, WriteOp};
+pub use store::{Field, FieldError, Store, TodoId, TodoRow, Transaction, WriteError, WriteOp};
 pub use task::{DeliveryReport, Task, TaskError, TaskScope, TaskStatus, TaskToken};
 pub use tray::{TrayError, TraySpec};
 pub use view::{
     BlurEvent, Children, ChildrenFactory, CompositionEvent, CompositionPhase, FocusCause,
-    FocusEvent, HandlerError, HandlerOutcome, IntoHandlerOutcome, Key, KeyEvent, MountError,
-    MountPlan, MountResult, Read, ReadFault, ReadValue, SubmitEvent,
+    FocusEvent, For, ForSource, ForStore, HandlerError, HandlerOutcome, IntoForSource,
+    IntoHandlerOutcome, Key, KeyEvent, MountError, MountPlan, MountResult, Read, ReadFault,
+    ReadValue, RowView, SubmitEvent,
 };
 pub use window::{
     CatalogError, CloseError, CloseEvent, CloseOutcome, ClosePolicy, CloseRequest, CloseSource,
@@ -59,6 +60,10 @@ pub use window::{
     WindowSpec,
 };
 pub use zenui_core::PanicInfo;
+pub use zenui_core::model;
+pub use zenui_core::model::{
+    FieldId, FilterId, Row, RowId, RowKey, RowSet, Store as RowStore, StoreId,
+};
 pub use zenui_macro::{component, view};
 pub use zenui_style as style;
 pub use zenui_style::{
@@ -73,17 +78,18 @@ pub mod prelude {
         CommandEvent, CommandSource, CompositionEvent, CompositionPhase, Condition, DeliveryReport,
         DispatchError, DropError, DropEvent, EventSource, EventTarget, Field, FieldError,
         FileDialogError, FileDialogKind, FileDialogOptions, FileDialogOutcome, FileDialogRequest,
-        FileDialogRequestError, FileFilter, FocusCause, FocusEvent, FocusInfo, HandlerError,
-        HandlerOutcome, Intent, IntentPayload, IntoHandlerOutcome, Key, KeyEvent, Length,
-        LengthUnit, Memo, MemoCompute, MenuCommand, MenuCommandState, MenuItem, MenuShortcut,
-        MenuSpec, MenuStateError, Modifiers, MountError, MountPlan, MountResult, NodeId,
-        NodeOperation, NodeStatus, Once, Opacity, PanicInfo, PresentationKey, PresentationSnapshot,
-        Property, ReactiveValue, Read, ReadFault, ReadValue, RefreshReport, Runtime, SessionCtx,
+        FileDialogRequestError, FileFilter, FocusCause, FocusEvent, FocusInfo, For, ForSource,
+        ForStore, HandlerError, HandlerOutcome, Intent, IntentPayload, IntoForSource,
+        IntoHandlerOutcome, Key, KeyEvent, Length, LengthUnit, Memo, MemoCompute, MenuCommand,
+        MenuCommandState, MenuItem, MenuShortcut, MenuSpec, MenuStateError, Modifiers, MountError,
+        MountPlan, MountResult, NodeId, NodeOperation, NodeStatus, Once, Opacity, PanicInfo,
+        PresentationKey, PresentationSnapshot, Property, ReactiveValue, Read, ReadFault, ReadValue,
+        RefreshReport, Row, RowId, RowKey, RowSet, RowStore, RowView, Runtime, SessionCtx,
         SessionError, SessionPolicy, ShortcutError, ShortcutKey, Signal, SnapshotAction,
         SnapshotActions, SnapshotAttr, SnapshotElement, SnapshotNode, SnapshotRowBand,
         SnapshotSemantics, SnapshotValue, Store, StyleDeclaration, StyleOrigin, StyleValue,
         Submenu, SubmitEvent, Task, TaskError, TaskScope, TaskStatus, TaskToken, TextEditState,
-        TodoId, Transaction, TrayError, TraySpec, TurnError, TurnOutcome, TurnReport,
+        TodoId, TodoRow, Transaction, TrayError, TraySpec, TurnError, TurnOutcome, TurnReport,
         WindowCatalog, WindowCtx, WindowError, WindowInfo, WindowRole, WindowSpec, WriteError,
         WriteOp, component, em, memo, once, px, signal, view,
     };
