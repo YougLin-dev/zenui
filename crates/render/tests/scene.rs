@@ -2417,7 +2417,8 @@ fn a_windowed_list_keeps_its_declared_extent_and_band_geometry() {
 
     assert!(
         app.set_row_window(window, snapshot.row_bands()[0].key(), 40, 10)
-            .expect("apply the row window"),
+            .expect("apply the row window")
+            .changed(),
         "the requested window differs"
     );
     let snapshot = app.presentation().expect("window snapshot");
@@ -2476,7 +2477,8 @@ fn offscreen_rows_keep_geometry_but_skip_glyphs() {
     let band = app.presentation().expect("snapshot").row_bands()[0].key();
     assert!(
         app.set_row_window(window, band, 0, 60)
-            .expect("mount every row"),
+            .expect("mount every row")
+            .changed(),
         "the requested window differs from the default"
     );
     let snapshot = app.presentation().expect("snapshot");
