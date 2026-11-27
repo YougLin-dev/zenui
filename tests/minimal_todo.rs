@@ -292,6 +292,26 @@ fn clearing_completed_rows_updates_the_model_and_interface() {
 }
 
 #[test]
+fn completing_a_visible_row_under_a_filter_is_an_effective_change() {
+    let mut app = runtime();
+    add(&mut app, "A");
+    app.click_text("Active").expect("filter active");
+
+    let report = app
+        .change("Complete A", true)
+        .expect("complete the only visible row");
+    assert!(
+        report.changed(),
+        "the row leaving the filter is an effective change"
+    );
+    assert!(
+        !app.texts().iter().any(|text| text == "A"),
+        "the completed row is filtered out"
+    );
+    assert!(app.texts().iter().any(|text| text == "Nothing matches"));
+}
+
+#[test]
 fn empty_and_no_match_states_stay_distinct() {
     let mut app = runtime();
     add(&mut app, "A");

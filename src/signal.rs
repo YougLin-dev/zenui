@@ -201,6 +201,12 @@ impl<T: ReactiveValue> Memo<T> {
 
     /// memo 读取的唯一实现；`track` 决定是否向正在计算的父 memo 注册依赖。
     fn read_result(self, track: bool) -> Result<T, crate::view::ReadFault> {
+        // 差分 oracle：绕过生产 memo 缓存与 dirty 标记，按 oracle 自己的
+        // 拓扑重算值；生产缓存必须保持原样，否则比较的两个结果会互相污染。
+        #[cfg(test)]
+        if let Some(result) = crate::oracle::memo_read(self.runtime, self.id) {
+            return result;
+        }
         let ready = with_state_of(self.runtime, |state| state.memo_try_ready::<T>(self.id))?;
         if let Some(value) = ready {
             if track && with_state_of(self.runtime, |state| state.phase) == Phase::Memo {

@@ -824,6 +824,21 @@ impl<T> BindingArena<T> {
     pub(crate) const fn live(&self) -> usize {
         self.live
     }
+
+    /// 测试/差分 oracle：按槽位顺序枚举 live 值；generation 来自槽位本身。
+    #[cfg(test)]
+    pub(crate) fn live_slots(&self) -> impl Iterator<Item = (u32, u32, &BindingSlot<T>)> + '_ {
+        self.cells
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, cell)| match cell {
+                BindingCell::Live(value) => {
+                    let slot = u32::try_from(slot).expect("binding slot index fits u32");
+                    Some((slot, value.generation, value))
+                }
+                BindingCell::Vacant { .. } => None,
+            })
+    }
 }
 
 /// 让 `BindingTable` 按值类型分表；`PartId` 决定类型，`BindingRef.table` 必须匹配。
@@ -1034,6 +1049,29 @@ impl BindingTable {
             + self.lengths.live()
             + self.opacities.live()
             + self.row_sets.live()
+    }
+
+    /// 测试/差分 oracle：枚举一种值类型的全部 live 槽。
+    ///
+    /// 返回已提交值、来源与 fault。静态/once 槽没有可重算的来源，调用方跳过
+    /// 它们的重新求值；它们渲染出的快照仍由参考挂载比较覆盖。
+    #[cfg(test)]
+    pub(crate) fn oracle_entries<T: BindingValue>(
+        &self,
+    ) -> Vec<(BindingRef, ReadSlot, Option<T>, Option<ReadFault>)> {
+        T::arena(self)
+            .live_slots()
+            .map(|(slot, generation, value)| {
+                let reference = BindingRef::new(T::TABLE, slot, generation)
+                    .expect("a live binding slot encodes");
+                (
+                    reference,
+                    value.source,
+                    value.current.clone(),
+                    value.fault.clone(),
+                )
+            })
+            .collect()
     }
 }
 
