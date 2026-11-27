@@ -775,6 +775,10 @@ struct MountedTree {
     settle_before: Option<Vec<usize>>,
     /// 只在这棵树出现有效呈现变化时取新值；不同树互不影响。
     revision: u64,
+    /// 最近一次构建的呈现快照；revision 仍匹配时重复读取共享同一个 `Arc`
+    /// 根。隐藏树在 flush 推进 revision 后保留旧根，快照构建延迟到第一次
+    /// 读取（show 或任何呈现读取入口）。
+    snapshot: RefCell<Option<PresentationSnapshot>>,
 }
 
 /// 一个窗口化 `For` 的挂载窗口：从 `first` 行开始挂载 `count` 行。
@@ -2098,9 +2102,15 @@ impl State {
     }
 
     fn snapshot(&self, key: TreeSlot) -> Option<PresentationSnapshot> {
+        let tree = self.tree(key)?;
+        // revision 未推进时已构建的根仍然精确；重复读取只克隆 `Arc`。
+        if let Some(cached) = tree.snapshot.borrow().as_ref()
+            && cached.revision() == tree.revision
+        {
+            return Some(cached.clone());
+        }
         self.presentation_builds
             .set(self.presentation_builds.get().wrapping_add(1));
-        let tree = self.tree(key)?;
         let mut roots = Vec::new();
         collect_snapshot(self, &tree.nodes, &mut roots);
         let mut row_bands = Vec::new();
@@ -2108,12 +2118,10 @@ impl State {
         let focus = self
             .presented_focus_in(key)
             .map(|element| self.elements[element].id);
-        Some(PresentationSnapshot {
-            roots,
-            focus,
-            appearance: self.appearance,
-            row_bands,
-        })
+        let snapshot =
+            PresentationSnapshot::new(roots, focus, self.appearance, row_bands, tree.revision);
+        *tree.snapshot.borrow_mut() = Some(snapshot.clone());
+        Some(snapshot)
     }
 
     pub(crate) fn attach_to_owner(&mut self, resource: Resource) {
@@ -4523,6 +4531,7 @@ impl Runtime {
                         focused_tag: None,
                         settle_before: None,
                         revision: 0,
+                        snapshot: RefCell::new(None),
                     },
                 );
                 state.mark_tree_changed(TreeSlot::Root);
@@ -4946,6 +4955,7 @@ impl Runtime {
                         focused_tag: None,
                         settle_before: None,
                         revision: 0,
+                        snapshot: RefCell::new(None),
                     },
                 );
                 state.mark_tree_changed(TreeSlot::Window(key));
@@ -9302,7 +9312,8 @@ impl Runtime {
             .ok_or(WindowError::Stale)
     }
 
-    /// 已构建的 presentation snapshot 次数；用于验证滚动与指针输入不重建快照。
+    /// 实际构建 presentation snapshot 根的总次数；revision 未变的读取复用
+    /// 共享根、不计数。用于验证滚动与指针输入不重建快照。
     pub fn presentation_builds(&self) -> u64 {
         self.state.borrow().presentation_builds.get()
     }

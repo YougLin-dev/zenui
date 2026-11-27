@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::fmt;
+use std::sync::Arc;
 
 use zenui_style::{Length, StyleDeclaration};
 
@@ -69,13 +70,41 @@ pub enum Appearance {
     Dark,
 }
 
-/// 从已提交界面生成的一次性只读描述；不包含几何、闭包或平台句柄。
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PresentationSnapshot {
+/// 一棵已提交树的呈现数据根；只在 crate 内可见，对外由
+/// [`PresentationSnapshot`] 发布。
+///
+/// `revision` 是构建快照时该树的 revision。树提交了新的有效变化会分配新
+/// revision，旧根不再匹配；没有变化时重复读取共享同一个 `Arc`，旧根在最后
+/// 一个引用释放后回收。
+#[derive(Debug)]
+pub(crate) struct SnapshotRoot {
     pub(crate) roots: Vec<SnapshotNode>,
     pub(crate) focus: Option<NodeId>,
     pub(crate) appearance: Appearance,
     pub(crate) row_bands: Vec<SnapshotRowBand>,
+    pub(crate) revision: u64,
+}
+
+/// 内容等价；版本语义由 [`PresentationSnapshot`] 的相等性负责。
+impl PartialEq for SnapshotRoot {
+    fn eq(&self, other: &Self) -> bool {
+        self.roots == other.roots
+            && self.focus == other.focus
+            && self.appearance == other.appearance
+            && self.row_bands == other.row_bands
+    }
+}
+
+impl Eq for SnapshotRoot {}
+
+/// 从已提交界面生成的不可变呈现单位；同一 revision 的快照共享一个数据根。
+///
+/// 这是唯一对外发布的呈现单位；内部数据根 `SnapshotRoot` 不通过公开 API
+/// 暴露。`Clone` 只增加 `Arc` 引用计数。相等性先走 `Arc::ptr_eq` 快路径，
+/// 再比较 revision；只有 revision 相同而根不同时才深入比较内容。
+#[derive(Clone, Debug)]
+pub struct PresentationSnapshot {
+    pub(crate) root: Arc<SnapshotRoot>,
 }
 
 /// 一个窗口化 `For` 的行带元数据；宿主据此把滚动偏移换算成行窗口。
@@ -120,29 +149,52 @@ impl SnapshotRowBand {
 }
 
 impl PresentationSnapshot {
+    pub(crate) fn new(
+        roots: Vec<SnapshotNode>,
+        focus: Option<NodeId>,
+        appearance: Appearance,
+        row_bands: Vec<SnapshotRowBand>,
+        revision: u64,
+    ) -> Self {
+        Self {
+            root: Arc::new(SnapshotRoot {
+                roots,
+                focus,
+                appearance,
+                row_bands,
+                revision,
+            }),
+        }
+    }
+
+    /// 构建本快照的树 revision；树提交有效变化后推进。
+    pub fn revision(&self) -> u64 {
+        self.root.revision
+    }
+
     /// 已提交的应用外观。
-    pub const fn appearance(&self) -> Appearance {
-        self.appearance
+    pub fn appearance(&self) -> Appearance {
+        self.root.appearance
     }
 
     /// 已提交的根节点，保持挂载顺序。
     pub fn roots(&self) -> &[SnapshotNode] {
-        &self.roots
+        &self.root.roots
     }
 
     /// 当前焦点元素；没有可聚焦的已提交目标时为 `None`。
-    pub const fn focus(&self) -> Option<NodeId> {
-        self.focus
+    pub fn focus(&self) -> Option<NodeId> {
+        self.root.focus
     }
 
     /// 窗口化 `For` 的行带，保持挂载顺序；没有窗口化 `For` 时为空。
     pub fn row_bands(&self) -> &[SnapshotRowBand] {
-        &self.row_bands
+        &self.root.row_bands
     }
 
     /// 先序遍历全部已提交元素。
     pub fn elements(&self) -> impl Iterator<Item = &SnapshotElement> {
-        let mut stack: Vec<&SnapshotNode> = self.roots.iter().rev().collect();
+        let mut stack: Vec<&SnapshotNode> = self.root.roots.iter().rev().collect();
         std::iter::from_fn(move || {
             while let Some(node) = stack.pop() {
                 if let SnapshotNode::Element(element) = node {
@@ -165,6 +217,25 @@ impl PresentationSnapshot {
             .find(|element| element.label() == Some(label))
     }
 }
+
+impl PartialEq for PresentationSnapshot {
+    fn eq(&self, other: &Self) -> bool {
+        // 同一个已发布根的快照直接相等；内容没变时运行时复用同一个 Arc。
+        if Arc::ptr_eq(&self.root, &other.root) {
+            return true;
+        }
+        // revision 是全局分配、跨树不撞号的值：不同 revision 的已提交状态
+        // 不可能等价，不必深比较。
+        if self.root.revision != other.root.revision {
+            return false;
+        }
+        // 相同 revision 但不同根只可能来自防御性构造；退化为内容比较，
+        // 保持相等关系的自反与传递语义。
+        self.root == other.root
+    }
+}
+
+impl Eq for PresentationSnapshot {}
 
 /// 已提交界面中的一个节点：带 Node ID 的元素或不携带身份的文本节点。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -466,11 +537,11 @@ impl SnapshotValue {
 /// 不是可用于派发的 Node ID。
 impl fmt::Display for PresentationSnapshot {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.focus {
+        match self.root.focus {
             Some(id) => writeln!(f, "focus=#{}", id.slot())?,
             None => writeln!(f, "focus=-")?,
         }
-        for node in &self.roots {
+        for node in &self.root.roots {
             write_node(f, node, 0)?;
         }
         Ok(())
@@ -514,8 +585,8 @@ mod tests {
     use std::borrow::Cow;
 
     use super::{
-        NodeId, SnapshotAction, SnapshotActions, SnapshotAttr, SnapshotElement, SnapshotSemantics,
-        SnapshotValue,
+        Appearance, NodeId, PresentationSnapshot, SnapshotAction, SnapshotActions, SnapshotAttr,
+        SnapshotElement, SnapshotNode, SnapshotSemantics, SnapshotValue,
     };
     use crate::node::NodeRef;
 
@@ -581,6 +652,45 @@ mod tests {
             element.toggle_state(),
             Some(false),
             "checked wins over aria:pressed"
+        );
+    }
+
+    fn snapshot(revision: u64, text: &str) -> PresentationSnapshot {
+        PresentationSnapshot::new(
+            vec![SnapshotNode::Text(text.to_owned())],
+            None,
+            Appearance::Light,
+            Vec::new(),
+            revision,
+        )
+    }
+
+    #[test]
+    fn snapshots_with_the_same_revision_and_content_are_equal() {
+        let first = snapshot(7, "same");
+        assert_eq!(first, first.clone(), "clones share the published root");
+        assert_eq!(
+            first,
+            snapshot(7, "same"),
+            "equal revisions compare content"
+        );
+    }
+
+    #[test]
+    fn a_different_revision_is_not_equal_even_with_equal_content() {
+        assert_ne!(
+            snapshot(7, "same"),
+            snapshot(8, "same"),
+            "revision alone decides inequality before any deep comparison"
+        );
+    }
+
+    #[test]
+    fn equal_revisions_still_compare_content_defensively() {
+        assert_ne!(
+            snapshot(7, "left"),
+            snapshot(7, "right"),
+            "independent roots at one revision cannot be assumed equal"
         );
     }
 }

@@ -47,8 +47,8 @@ fn an_empty_click_does_not_bump_the_tree_revision() {
     );
     assert_eq!(
         app.presentation_builds(),
-        builds + 2,
-        "only the two explicit reads built snapshots"
+        builds + 1,
+        "the first read built the root; the second shared it"
     );
 }
 

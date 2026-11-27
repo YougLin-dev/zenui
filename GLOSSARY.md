@@ -65,7 +65,7 @@ _Avoid_: host worker, UI task, dialog task, file drop
 _Avoid_: platform backend, shell
 
 **Presentation snapshot**:
-从已提交界面状态生成的一次性只读描述，含稳定 node ID、tag、渲染所需属性、文本与本地编辑状态；不含几何、闭包或句柄，也不是第二棵保留树。
+从已提交界面状态生成的不可变、结构共享的派生描述，含稳定 node ID、tag、渲染所需属性、文本与本地编辑状态；不含几何、闭包或句柄，也不是第二棵保留树。对外唯一发布的单位是 `PresentationSnapshot`，它包裹内部的 `Arc<SnapshotRoot>`：同一树 revision 的读取共享同一个根，`Clone` 只增加引用计数，旧根在最后一个引用释放后回收；相等性先比较 revision 与指针身份，再退化到内容比较。
 _Avoid_: render tree, view tree, frame
 
 **Windowed For**:
