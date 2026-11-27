@@ -65,8 +65,16 @@ _Avoid_: host worker, UI task, dialog task, file drop
 _Avoid_: platform backend, shell
 
 **Presentation snapshot**:
-从已提交界面状态生成的不可变、结构共享的派生描述，含稳定 node ID、tag、渲染所需属性、文本与本地编辑状态；不含几何、闭包或句柄，也不是第二棵保留树。对外唯一发布的单位是 `PresentationSnapshot`，它包裹内部的 `Arc<SnapshotRoot>`：同一树 revision 的读取共享同一个根，`Clone` 只增加引用计数，旧根在最后一个引用释放后回收；相等性先比较 revision 与指针身份，再退化到内容比较。
+从已提交界面状态生成的不可变、结构共享的派生描述，含稳定 node ID、tag、渲染所需属性、文本与本地编辑状态；不含几何、闭包或句柄，也不是第二棵保留树。对外唯一发布的单位是 `PresentationSnapshot`，它包裹内部的 `Arc<SnapshotRoot>`：同一树 revision 的读取共享同一个根，`Clone` 只增加引用计数，旧根在最后一个引用释放后回收；相等性先比较 revision 与指针身份，再退化到内容比较。元素与文本节点都携带跨快照稳定的 `PresentationKey`。
 _Avoid_: render tree, view tree, frame
+
+**Presentation delta**:
+一次提交相对上次成功发布的累计变化，按 `PresentationKey` 给出 changed（含祖先路径）、inserted、removed、removed subtrees 与 layout roots，以及焦点/外观/行带标志；不携带旧值或父链。renderer 用它失效增量缓存，UIA 不消费 delta。
+_Avoid_: diff, patch
+
+**Presentation update**:
+`PresentationSnapshot` 与可选 `PresentationDelta` 的发布单位。delta 为 `None` 表示完整根：首次发布、隐藏窗口重新显示后的首次发布、顶层根序列变化或无法安全累计时使用。renderer 侧的 `PresentationView` 维护 `applied_revision`，只接受与已应用 revision 连续且与快照同代的 delta；断档时丢弃 delta、按最新根全量重建。
+_Avoid_: frame packet, sync message
 
 **Windowed For**:
 声明 `row-height` 的 `For`：只挂载宿主行窗口内的行，上下两个 spacer 保持 `总行数 × 行高` 的声明范围；不声明 `row-height` 的 `For` 继续全量挂载。

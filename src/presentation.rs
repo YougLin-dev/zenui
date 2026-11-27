@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
 
@@ -237,11 +238,280 @@ impl PartialEq for PresentationSnapshot {
 
 impl Eq for PresentationSnapshot {}
 
-/// 已提交界面中的一个节点：带 Node ID 的元素或不携带身份的文本节点。
+/// 一次提交相对上次成功发布的呈现变化。
+///
+/// delta 只携带呈现键，不携带旧值或父链；renderer 用它失效缓存，再从最新
+/// 快照根读取节点。`from_revision` 是上次成功发布的 revision，`to_revision`
+/// 与携带它的 [`PresentationUpdate`] 的快照 revision 相同。UIA 不消费 delta。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PresentationDelta {
+    from_revision: u64,
+    to_revision: u64,
+    changed: Vec<PresentationKey>,
+    inserted: Vec<PresentationKey>,
+    removed: Vec<PresentationKey>,
+    removed_subtrees: Vec<PresentationKey>,
+    layout_roots: Vec<PresentationKey>,
+    focus_changed: bool,
+    appearance_changed: bool,
+    row_bands_changed: bool,
+}
+
+impl PresentationDelta {
+    /// 上次成功发布的 revision；宿主跳帧或批量提交时它可能早于 `to - 1`。
+    pub const fn from_revision(&self) -> u64 {
+        self.from_revision
+    }
+
+    /// 本 delta 对应的快照 revision。
+    pub const fn to_revision(&self) -> u64 {
+        self.to_revision
+    }
+
+    /// 属性、文本或直接子序变化的节点，包含这些变化的所有祖先路径。
+    pub fn changed(&self) -> &[PresentationKey] {
+        &self.changed
+    }
+
+    /// 新子树里的每个节点。
+    pub fn inserted(&self) -> &[PresentationKey] {
+        &self.inserted
+    }
+
+    /// 被移除子树里的每个节点。
+    pub fn removed(&self) -> &[PresentationKey] {
+        &self.removed
+    }
+
+    /// 被移除子树的根；renderer 可据此快速丢弃整棵缓存。
+    pub fn removed_subtrees(&self) -> &[PresentationKey] {
+        &self.removed_subtrees
+    }
+
+    /// 需要重新布局的最高变化节点；祖先不再重复出现。
+    pub fn layout_roots(&self) -> &[PresentationKey] {
+        &self.layout_roots
+    }
+
+    pub const fn focus_changed(&self) -> bool {
+        self.focus_changed
+    }
+
+    pub const fn appearance_changed(&self) -> bool {
+        self.appearance_changed
+    }
+
+    pub const fn row_bands_changed(&self) -> bool {
+        self.row_bands_changed
+    }
+
+    /// 计算两棵已发布根之间的累计变化；revision 相同则没有新 delta。
+    pub(crate) fn between(
+        previous: &PresentationSnapshot,
+        current: &PresentationSnapshot,
+    ) -> Option<Self> {
+        if previous.revision() == current.revision() {
+            return None;
+        }
+        // 顶层根列表没有呈现键：插入、移除或重排会改变绘制与命中顺序，
+        // 但没有任何父节点可以标记。发布完整根，而不是一个漏掉顺序的 delta。
+        let old_roots: Vec<PresentationKey> =
+            previous.roots().iter().map(SnapshotNode::key).collect();
+        let new_roots: Vec<PresentationKey> =
+            current.roots().iter().map(SnapshotNode::key).collect();
+        if old_roots != new_roots {
+            return None;
+        }
+        let old = SnapshotIndex::new(previous);
+        let new = SnapshotIndex::new(current);
+
+        let mut inserted_keys = BTreeSet::new();
+        for key in new.nodes.keys() {
+            if !old.nodes.contains_key(key) {
+                inserted_keys.insert(*key);
+            }
+        }
+        let mut removed_keys = BTreeSet::new();
+        for key in old.nodes.keys() {
+            if !new.nodes.contains_key(key) {
+                removed_keys.insert(*key);
+            }
+        }
+        let removed_subtrees: Vec<PresentationKey> = removed_keys
+            .iter()
+            .copied()
+            .filter(|key| {
+                old.parent(*key)
+                    .is_none_or(|parent| !removed_keys.contains(&parent))
+            })
+            .collect();
+
+        let mut changed = BTreeSet::new();
+        for (key, old_node) in &old.nodes {
+            let Some(new_node) = new.nodes.get(key) else {
+                continue;
+            };
+            if shallow_changed(old_node, new_node) || old.child_keys(*key) != new.child_keys(*key) {
+                changed.insert(*key);
+            }
+        }
+        // 结构或文本变化沿祖先链上传：renderer 只需按 key 失效路径。
+        let mut ancestors = changed.iter().copied().collect::<Vec<_>>();
+        while let Some(key) = ancestors.pop() {
+            let mut parent = new.parent(key);
+            while let Some(key) = parent {
+                if !changed.insert(key) {
+                    break;
+                }
+                ancestors.push(key);
+                parent = new.parent(key);
+            }
+        }
+
+        let mut layout = changed.clone();
+        for key in &inserted_keys {
+            if new
+                .parent(*key)
+                .is_none_or(|parent| !inserted_keys.contains(&parent))
+            {
+                layout.insert(*key);
+            }
+        }
+        layout.extend(removed_subtrees.iter().copied());
+        let layout_roots: Vec<PresentationKey> = layout
+            .iter()
+            .copied()
+            .filter(|key| {
+                let mut parent = parent_of(&old, &new, *key);
+                while let Some(key) = parent {
+                    if layout.contains(&key) {
+                        return false;
+                    }
+                    parent = parent_of(&old, &new, key);
+                }
+                true
+            })
+            .collect();
+
+        Some(Self {
+            from_revision: previous.revision(),
+            to_revision: current.revision(),
+            changed: changed.into_iter().collect(),
+            inserted: inserted_keys.into_iter().collect(),
+            removed: removed_keys.into_iter().collect(),
+            removed_subtrees,
+            layout_roots,
+            focus_changed: previous.focus() != current.focus(),
+            appearance_changed: previous.appearance() != current.appearance(),
+            row_bands_changed: previous.row_bands() != current.row_bands(),
+        })
+    }
+}
+
+/// 宿主/renderer 消费的唯一发布单位；`delta: None` 表示完整根。
+///
+/// 首次发布、隐藏窗口重新显示后的首次发布以及无法安全累计时都发布完整根。
+#[derive(Clone, Debug)]
+pub struct PresentationUpdate {
+    snapshot: PresentationSnapshot,
+    delta: Option<PresentationDelta>,
+}
+
+impl PresentationUpdate {
+    pub(crate) fn new(snapshot: PresentationSnapshot, delta: Option<PresentationDelta>) -> Self {
+        Self { snapshot, delta }
+    }
+
+    pub fn snapshot(&self) -> &PresentationSnapshot {
+        &self.snapshot
+    }
+
+    /// 相对上次成功发布的累计 delta；`None` 表示必须按根全量重建。
+    pub fn delta(&self) -> Option<&PresentationDelta> {
+        self.delta.as_ref()
+    }
+
+    pub fn into_snapshot(self) -> PresentationSnapshot {
+        self.snapshot
+    }
+}
+
+/// 按呈现键索引的只读快照视图；只用于计算 delta。
+struct SnapshotIndex<'a> {
+    nodes: BTreeMap<PresentationKey, &'a SnapshotNode>,
+    parents: BTreeMap<PresentationKey, Option<PresentationKey>>,
+    children: BTreeMap<PresentationKey, Vec<PresentationKey>>,
+}
+
+impl<'a> SnapshotIndex<'a> {
+    fn new(snapshot: &'a PresentationSnapshot) -> Self {
+        let mut index = Self {
+            nodes: BTreeMap::new(),
+            parents: BTreeMap::new(),
+            children: BTreeMap::new(),
+        };
+        for node in snapshot.roots() {
+            index.collect(node, None);
+        }
+        index
+    }
+
+    fn collect(&mut self, node: &'a SnapshotNode, parent: Option<PresentationKey>) {
+        let key = node.key();
+        self.nodes.insert(key, node);
+        self.parents.insert(key, parent);
+        if let SnapshotNode::Element(element) = node {
+            let children: Vec<PresentationKey> =
+                element.children.iter().map(SnapshotNode::key).collect();
+            self.children.insert(key, children);
+            for child in &element.children {
+                self.collect(child, Some(key));
+            }
+        }
+    }
+
+    fn parent(&self, key: PresentationKey) -> Option<PresentationKey> {
+        self.parents.get(&key).copied().flatten()
+    }
+
+    fn child_keys(&self, key: PresentationKey) -> &[PresentationKey] {
+        self.children.get(&key).map_or(&[], Vec::as_slice)
+    }
+}
+
+fn parent_of(
+    old: &SnapshotIndex<'_>,
+    new: &SnapshotIndex<'_>,
+    key: PresentationKey,
+) -> Option<PresentationKey> {
+    if new.nodes.contains_key(&key) {
+        new.parent(key)
+    } else {
+        old.parent(key)
+    }
+}
+
+/// 节点自身的内容是否变化；子节点变化由调用方单独比较。
+fn shallow_changed(left: &SnapshotNode, right: &SnapshotNode) -> bool {
+    match (left, right) {
+        (SnapshotNode::Element(left), SnapshotNode::Element(right)) => {
+            left.id != right.id
+                || left.tag != right.tag
+                || left.attrs != right.attrs
+                || left.styles != right.styles
+                || left.edit != right.edit
+                || left.semantics != right.semantics
+        }
+        (SnapshotNode::Text(left), SnapshotNode::Text(right)) => left.text != right.text,
+        _ => true,
+    }
+}
+
+/// 已提交界面中的一个节点：元素或文本，二者都带跨快照稳定的呈现身份。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SnapshotNode {
     Element(SnapshotElement),
-    Text(String),
+    Text(SnapshotText),
 }
 
 impl SnapshotNode {
@@ -255,12 +525,39 @@ impl SnapshotNode {
     pub fn as_text(&self) -> Option<&str> {
         match self {
             Self::Element(_) => None,
-            Self::Text(text) => Some(text),
+            Self::Text(text) => Some(text.text()),
         }
     }
 
     pub fn id(&self) -> Option<NodeId> {
         self.as_element().map(SnapshotElement::id)
+    }
+
+    /// 呈现身份；结构节点在快照中透明，元素与文本都直接携带 key。
+    pub fn key(&self) -> PresentationKey {
+        match self {
+            Self::Element(element) => element.key(),
+            Self::Text(text) => text.key(),
+        }
+    }
+}
+
+/// 一个已提交的文本节点：呈现身份与已提交文本内容。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SnapshotText {
+    pub(crate) key: PresentationKey,
+    pub(crate) text: String,
+}
+
+impl SnapshotText {
+    /// 跨快照稳定的呈现身份，用作布局与增量缓存键。
+    pub const fn key(&self) -> PresentationKey {
+        self.key
+    }
+
+    /// 已提交文本。
+    pub fn text(&self) -> &str {
+        &self.text
     }
 }
 
@@ -279,6 +576,11 @@ pub struct SnapshotElement {
 impl SnapshotElement {
     pub const fn id(&self) -> NodeId {
         self.id
+    }
+
+    /// 呈现身份；与 `id.presentation_key()` 相同，便于与文本节点统一处理。
+    pub const fn key(&self) -> PresentationKey {
+        self.id.presentation_key()
     }
 
     pub const fn tag(&self) -> &'static str {
@@ -350,7 +652,7 @@ impl SnapshotElement {
         let mut text = String::new();
         for child in &self.children {
             if let SnapshotNode::Text(value) = child {
-                text.push_str(value);
+                text.push_str(value.text());
             }
         }
         text
@@ -553,7 +855,7 @@ fn write_node(f: &mut fmt::Formatter<'_>, node: &SnapshotNode, depth: usize) -> 
         f.write_str("  ")?;
     }
     match node {
-        SnapshotNode::Text(text) => writeln!(f, "{text:?}"),
+        SnapshotNode::Text(text) => writeln!(f, "{:?}", text.text()),
         SnapshotNode::Element(element) => {
             write!(f, "{}#{}", element.tag, element.id.slot())?;
             for attr in &element.attrs {
@@ -586,9 +888,9 @@ mod tests {
 
     use super::{
         Appearance, NodeId, PresentationSnapshot, SnapshotAction, SnapshotActions, SnapshotAttr,
-        SnapshotElement, SnapshotNode, SnapshotSemantics, SnapshotValue,
+        SnapshotElement, SnapshotNode, SnapshotSemantics, SnapshotText, SnapshotValue,
     };
-    use crate::node::NodeRef;
+    use crate::node::{NodeRef, PresentationKey};
 
     fn element(semantics: SnapshotSemantics) -> SnapshotElement {
         SnapshotElement {
@@ -655,9 +957,17 @@ mod tests {
         );
     }
 
+    fn text_node(slot: u32, text: &str) -> SnapshotNode {
+        let node = NodeRef::new(slot, 1).expect("test node");
+        SnapshotNode::Text(SnapshotText {
+            key: PresentationKey::from_node(node),
+            text: text.to_owned(),
+        })
+    }
+
     fn snapshot(revision: u64, text: &str) -> PresentationSnapshot {
         PresentationSnapshot::new(
-            vec![SnapshotNode::Text(text.to_owned())],
+            vec![text_node(0, text)],
             None,
             Appearance::Light,
             Vec::new(),

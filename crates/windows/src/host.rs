@@ -772,7 +772,7 @@ fn commit_scene(window: &mut WindowHost, snapshot: &PresentationSnapshot, scene:
         window.enabled,
         &mut window.accessibility_ids,
     );
-    window.accessibility.publish(tree);
+    window.accessibility.publish(tree, snapshot.revision());
     window.scene = Some(scene);
 }
 
@@ -7575,6 +7575,46 @@ mod tests {
                 .iter()
                 .any(|element| element.hovered()),
             "the hover visual is presented"
+        );
+    }
+
+    #[test]
+    fn accessibility_records_the_published_snapshot_revision() {
+        let mut host = open_host();
+        host.render().expect("render");
+        let window = host.windows.get(MAIN).expect("window");
+        let published = window
+            .accessibility
+            .last_published_revision()
+            .expect("a published revision");
+        assert_eq!(
+            published,
+            host.runtime
+                .presentation_revision_of(window.ctx)
+                .expect("revision"),
+            "UIA records the revision of the snapshot it published"
+        );
+        assert!(
+            window.accessibility.tree().is_some(),
+            "the published tree and its revision travel together"
+        );
+
+        host.runtime
+            .input("What needs to be done?", "revision row")
+            .expect("input");
+        host.runtime.submit("Add task").expect("add a row");
+        host.render().expect("republish");
+        let window = host.windows.get(MAIN).expect("window");
+        let next = window
+            .accessibility
+            .last_published_revision()
+            .expect("the republished revision");
+        assert!(next > published, "a scene commit advances the publication");
+        assert_eq!(
+            next,
+            host.runtime
+                .presentation_revision_of(window.ctx)
+                .expect("revision")
         );
     }
 
