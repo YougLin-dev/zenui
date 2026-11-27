@@ -33,7 +33,7 @@ impl NodeId {
         PresentationKey::from_node(self.node)
     }
 
-    pub(crate) const fn runtime_id(self) -> u32 {
+    pub const fn runtime_id(self) -> u32 {
         self.runtime
     }
 

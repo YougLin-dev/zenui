@@ -15,8 +15,8 @@ use windows::Win32::UI::Accessibility::{
 use windows::core::{BOOL, Result as WinResult, implement};
 
 use super::{
-    AccessibilityAction, AccessibilityTree, ScrollCommand, WindowAccessibility,
-    element_not_available, invalid_operation, window_enabled,
+    AccessibilityTree, ScrollCommand, WindowAccessibility, element_not_available,
+    invalid_operation, window_enabled,
 };
 
 pub(super) fn provider(window: Weak<WindowAccessibility>) -> IScrollProvider {
@@ -47,7 +47,7 @@ impl ScrollPatternProvider {
     }
 
     fn enqueue(&self, window: &WindowAccessibility, command: ScrollCommand) -> WinResult<()> {
-        if !window.enqueue(AccessibilityAction::Scroll(command)) {
+        if !window.enqueue_scroll(command) {
             return Err(element_not_available());
         }
         Ok(())

@@ -42,9 +42,10 @@ use crate::view::{
     StyleSlot, SubmitEvent,
 };
 use crate::window::{
-    CatalogEntry, CatalogError, CloseError, CloseEvent, CloseHandler, CloseOutcome, ClosePolicy,
-    CloseReply, CloseRequest, CloseSource, DropError, DropEvent, DropHandler, WindowAction,
-    WindowCatalog, WindowCtx, WindowError, WindowInfo, WindowRecord, WindowRequest, WindowRole,
+    ActivationId, CatalogEntry, CatalogError, CloseError, CloseEvent, CloseHandler, CloseOutcome,
+    ClosePolicy, CloseReply, CloseRequest, CloseSource, DropError, DropEvent, DropHandler,
+    WindowAction, WindowCatalog, WindowCtx, WindowError, WindowInfo, WindowRecord, WindowRequest,
+    WindowRole,
 };
 
 /// 路由型输入的来源；指针、键盘、菜单等共享同一套目标校验与错误通道。
@@ -1062,6 +1063,8 @@ pub(crate) struct State {
     catalog_declared: bool,
     focused_window: Option<&'static str>,
     windows: BTreeMap<&'static str, WindowRecord>,
+    /// runtime 全局窗口槽分配器；槽位单调递增、不复用。
+    next_activation_slot: u32,
     /// UI 处理期排队、在事件/交付结算后执行的窗口生命周期请求。
     window_requests: Vec<WindowRequest>,
     /// 每个 activation 在 factory 中注册的关闭处理器，随窗口关闭释放。
@@ -1435,6 +1438,7 @@ impl State {
             catalog_declared: false,
             focused_window: None,
             windows: BTreeMap::new(),
+            next_activation_slot: 1,
             window_requests: Vec::new(),
             close_handlers: BTreeMap::new(),
             drop_handlers: BTreeMap::new(),
@@ -1604,7 +1608,7 @@ impl State {
         let record = self.windows.get(key)?;
         let live = self.window_is_live(key, record.activation, record.owner)
             && self.trees.contains_key(&TreeSlot::Window(key));
-        live.then(|| WindowCtx::new(self.id, key, record.activation, record.owner))
+        live.then(|| WindowCtx::new(self.id, key, record.activation, record.owner, record.id))
     }
 
     pub(crate) fn window_is_visible(&self, key: &'static str) -> bool {
@@ -2422,29 +2426,34 @@ impl State {
         false
     }
 
-    pub(crate) fn begin_window(&mut self, key: &'static str) -> (u32, u32) {
+    pub(crate) fn begin_window(&mut self, key: &'static str) -> (ActivationId, u32) {
         self.window_factory_ran = true;
         // 旧 activation 的处理器不能进入新 factory；正常关闭已经清理过。
         self.drop_handlers.remove(key);
         self.keydown_handlers.remove(key);
         self.command_handlers.remove(key);
         self.menu_state_handlers.remove(key);
-        let activation = self
+        let generation = self
             .windows
             .get(key)
             .map_or(1, |record| record.activation + 1);
+        // 槽位是 runtime 全局的：同一次目录打开得到不同令牌，重新打开换新槽。
+        let slot = self.next_activation_slot;
+        self.next_activation_slot = self.next_activation_slot.saturating_add(1).max(1);
+        let id = ActivationId::new(slot, generation);
         let owner = self.create_owner(Some(0));
         self.windows.insert(
             key,
             WindowRecord {
-                activation,
+                activation: generation,
+                id,
                 owner,
                 open: true,
                 visible: true,
             },
         );
         self.bump_window_revision();
-        (activation, owner)
+        (id, owner)
     }
 
     pub(crate) fn mark_window_closed(&mut self, key: &'static str) {
@@ -5038,8 +5047,9 @@ impl Runtime {
                 state.fault = None;
                 state.write_error = None;
             });
-            let (activation, owner) = with_state(|state| state.begin_window(key));
-            let window = WindowCtx::new(state.borrow().id, key, activation, owner);
+            let (activation_id, owner) = with_state(|state| state.begin_window(key));
+            let activation = activation_id.generation();
+            let window = WindowCtx::new(state.borrow().id, key, activation, owner, activation_id);
             let plan = with_owner(owner, || {
                 let _phase = PhaseGuard::enter(Phase::Setup);
                 catch_panic(|| factory(window))
