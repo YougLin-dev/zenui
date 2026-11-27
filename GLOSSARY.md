@@ -68,6 +68,14 @@ _Avoid_: platform backend, shell
 从已提交界面状态生成的不可变、结构共享的派生描述，含稳定 node ID、tag、渲染所需属性、文本与本地编辑状态；不含几何、闭包或句柄，也不是第二棵保留树。对外唯一发布的单位是 `PresentationSnapshot`，它包裹内部的 `Arc<SnapshotRoot>`：同一树 revision 的读取共享同一个根，`Clone` 只增加引用计数，旧根在最后一个引用释放后回收；相等性先比较 revision 与指针身份，再退化到内容比较。元素与文本节点都携带跨快照稳定的 `PresentationKey`。
 _Avoid_: render tree, view tree, frame
 
+**Interaction paths**:
+宿主逐帧维护的 hover/press/focus“最深节点 → 根”路径集合，按 `Arc<[NodeId]>` 共享。`hover:`/`active:` 条件对路径内任意元素成立，内建 hover/pressed 视觉只落在最深节点；路径不进入 presentation snapshot 或响应式图。路径内容变化推进 `generation`，与快照 revision、环境代际一起构成场景缓存键。
+_Avoid_: hover node, hit path
+
+**Environment generation**:
+每个窗口独立的呈现环境代际，随系统偏好、DPI、滚动偏移与焦点 modality 变化递增；它不是树 revision，也不进入快照。文本缩放/DPI 变化据此重建布局、整形与行带，高对比度据此重建调色板与场景，而 `tree.revision` 保持不变。
+_Avoid_: env version, ui revision
+
 **Presentation delta**:
 一次提交相对上次成功发布的累计变化，按 `PresentationKey` 给出 changed（含祖先路径）、inserted、removed、removed subtrees 与 layout roots，以及焦点/外观/行带标志；不携带旧值或父链。renderer 用它失效增量缓存，UIA 不消费 delta。
 _Avoid_: diff, patch

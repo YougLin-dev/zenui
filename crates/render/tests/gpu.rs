@@ -510,11 +510,18 @@ fn hovering_and_pressing_a_control_change_its_pixels() {
     let snapshot = app.presentation().expect("snapshot");
     let id = by_text(&snapshot, "button", "Reverse");
     let viewport = || Viewport::new(256.0, 256.0, 1.0).expect("viewport");
-    let plain = Scene::build_with(&snapshot, viewport(), &SceneEnv::default()).expect("scene");
+    let plain = Scene::build_with(
+        &snapshot,
+        viewport(),
+        &SceneEnv::default(),
+        &zenui_render::InteractionPaths::default(),
+    )
+    .expect("scene");
     let hovered = Scene::build_with(
         &snapshot,
         viewport(),
         &SceneEnv::default().with_hovered(Some(id)),
+        &zenui_render::InteractionPaths::default(),
     )
     .expect("scene");
     let pressed = Scene::build_with(
@@ -523,6 +530,7 @@ fn hovering_and_pressing_a_control_change_its_pixels() {
         &SceneEnv::default()
             .with_hovered(Some(id))
             .with_pressed(Some(id)),
+        &zenui_render::InteractionPaths::default(),
     )
     .expect("scene");
     assert!(
@@ -673,6 +681,7 @@ fn the_scrollbar_thumb_paints_at_top_middle_and_bottom_at_both_scales() {
                 &snapshot,
                 viewport,
                 &SceneEnv::default().with_scroll_offset(offset),
+                &zenui_render::InteractionPaths::default(),
             )
             .expect("scene");
             let bar = scene.scrollbar().expect("scrollbar");

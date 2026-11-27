@@ -26,8 +26,8 @@ pub use gpu::{
 };
 pub use parley::FontData;
 pub use scene::{
-    Decoration, DecorationKind, PositionedGlyph, ResolvedStyle, Scene, SceneCache, SceneElement,
-    SceneEnv, SceneRowBand, TextRun, Visual,
+    Decoration, DecorationKind, InteractionPaths, PositionedGlyph, ResolvedStyle, Scene,
+    SceneCache, SceneElement, SceneEnv, SceneKey, SceneRowBand, TextRun, Visual,
 };
 pub use scrollbar::Scrollbar;
 pub use text_assets::{FontAsset, TextAssetError, TextAssets};

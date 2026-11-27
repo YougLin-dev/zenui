@@ -76,9 +76,9 @@ use crate::tray::{
     NativeTrayPresenter, TrayIconRequest, TrayMenuRequest, TrayPresenter, TrayTooltipRequest,
 };
 use zenui_render::{
-    GpuRenderer, HighContrastColors, Point, Rect, RenderPalette, RenderTargetConfig, Scene,
-    SceneCache, SceneElement, SceneEnv, SceneRowBand, Scrollbar, TextAssets, Viewport, Visual,
-    wgpu,
+    GpuRenderer, HighContrastColors, InteractionPaths, Point, Rect, RenderPalette,
+    RenderTargetConfig, Scene, SceneCache, SceneElement, SceneEnv, SceneRowBand, Scrollbar,
+    TextAssets, Viewport, Visual, wgpu,
 };
 
 /// 宿主私有的窗口消息注册表；其他模块不得自行定义 `WM_APP + N`。
@@ -719,6 +719,11 @@ struct WindowHost {
     wheel: WheelScroll,
     /// 最近一次构建的逻辑 viewport；resize/DPI 变化时丢弃滚轮 residue。
     last_viewport: Option<Viewport>,
+    /// 每个窗口独立的呈现环境代际；系统偏好、DPI、滚动与焦点 modality
+    /// 变化时递增。它不是树 revision，也不进入快照。
+    env_generation: u64,
+    /// 最近一次场景构建使用的交互路径；路径变化时推进 generation。
+    interaction: InteractionPaths,
     /// 滚动触发的重建只更新 hover，不清除 capture-based 的按压目标。
     preserve_press_on_next_rebuild: bool,
     /// 滚动条 thumb 拖动中指针相对 thumb 顶部的逻辑偏移；捕获与它同生共死。
@@ -1120,6 +1125,9 @@ impl Host {
         self.system_preferences = preferences;
         for window in self.windows.values_mut() {
             window.paint_requested = true;
+            // 文本缩放与高对比度不进入快照；环境代际推进让场景、布局与
+            // 无障碍几何在 revision 不变时也能失效。
+            bump_env_generation(window);
         }
         true
     }
@@ -1737,9 +1745,11 @@ impl Host {
             // 滚轮行数按 activation 缓存；系统广播设置变化时重新读取，
             // 值变化会丢弃未应用的 residue。
             window.wheel.set_lines(system_wheel_lines());
-            // 高对比度与文本缩放也随广播变化；当前窗口已从 map 取出，单独标记。
+            // 高对比度与文本缩放也随广播变化；当前窗口已从 map 取出，
+            // 不在批量循环内，单独标记重绘并推进环境代际。
             if self.refresh_system_preferences(self.current_system_preferences()) {
                 window.paint_requested = true;
+                bump_env_generation(window);
             }
             return Ok(());
         }
@@ -1761,10 +1771,12 @@ impl Host {
             if !window.keyboard_modality {
                 window.keyboard_modality = true;
                 window.paint_requested = true;
+                bump_env_generation(window);
             }
         } else if message == WM_LBUTTONDOWN && window.keyboard_modality {
             window.keyboard_modality = false;
             window.paint_requested = true;
+            bump_env_generation(window);
         }
         if matches!(
             message,
@@ -2742,9 +2754,10 @@ impl Host {
 
     /// 显式滚动落点：丢弃待决显露与滚轮 residue，保留 capture-based 按压目标。
     fn explicit_scroll(&mut self, window: &mut WindowHost, offset: i32) {
+        let max = window.scene.as_ref().map_or(0, Scene::max_scroll_offset);
         window.reveal_requested = false;
         window.wheel.reset();
-        window.scroll_offset = offset;
+        set_scroll_offset(window, offset.clamp(0, max));
         window.preserve_press_on_next_rebuild = true;
         window.paint_requested = true;
     }
@@ -2807,9 +2820,17 @@ impl Host {
         if step == 0 {
             return Ok(());
         }
+        // 与内容范围对齐后再记录偏移；越界部分丢弃滚轮 residue，避免下一次
+        // 反向滚动先补掉未应用的距离。
+        let max = window.scene.as_ref().map_or(0, Scene::max_scroll_offset);
+        let requested = window.scroll_offset.saturating_sub(step);
+        let target = requested.clamp(0, max);
+        if target != requested {
+            window.wheel.reset();
+        }
         // 显式滚动优先：丢弃尚未应用的显露请求。
         window.reveal_requested = false;
-        window.scroll_offset = window.scroll_offset.saturating_sub(step);
+        set_scroll_offset(window, target);
         window.preserve_press_on_next_rebuild = true;
         window.paint_requested = true;
         Ok(())
@@ -4163,19 +4184,25 @@ impl Host {
         let viewport = Viewport::new(width as f32 / scale, height as f32 / scale, scale)
             .map_err(HostError::Scene)?;
         if window.last_viewport != Some(viewport) {
+            let scale_changed = viewport_scale_changed(window.last_viewport, viewport);
             window.last_viewport = Some(viewport);
             window.wheel.reset();
+            if scale_changed {
+                bump_env_generation(window);
+            }
         }
         // 快照变化（增删、过滤、重排）也丢弃未应用的滚轮 residue。
         if snapshot_changed {
             window.wheel.reset();
         }
+        refresh_interaction_paths(snapshot, window);
         let requested = window.scroll_offset;
         let preserve_press = window.preserve_press_on_next_rebuild;
         let mut scene = Scene::build_cached(
             snapshot,
             viewport,
             &scene_env(window, self.system_preferences),
+            &window.interaction,
             &mut self.scene_cache,
         )
         .map_err(HostError::Scene)?;
@@ -4183,10 +4210,12 @@ impl Host {
         // 新场景可能已经移走或卸载了指针下的节点；失效目标不能继续高亮。
         // 滚动触发的重建保留 capture-based 的按压目标。
         if self.revalidate_pointer(window, &scene, !preserve_press) {
+            refresh_interaction_paths(snapshot, window);
             scene = Scene::build_cached(
                 snapshot,
                 viewport,
                 &scene_env(window, self.system_preferences),
+                &window.interaction,
                 &mut self.scene_cache,
             )
             .map_err(HostError::Scene)?;
@@ -4223,13 +4252,13 @@ impl Host {
         let before = window.scroll_offset;
         let used_caret = scene.caret(focused).is_some();
         if let Some(target) = reveal_target(&scene, focused) {
-            window.scroll_offset = target;
+            set_scroll_offset(window, target);
             scene = self.build_scene(window, snapshot, width, height, false)?;
             if !used_caret
                 && scene.caret(focused).is_some()
                 && let Some(target) = reveal_target(&scene, focused)
             {
-                window.scroll_offset = target;
+                set_scroll_offset(window, target);
                 scene = self.build_scene(window, snapshot, width, height, false)?;
             }
         }
@@ -4848,6 +4877,8 @@ impl WindowHost {
             scroll_offset: 0,
             wheel: WheelScroll::from_system(),
             last_viewport: None,
+            env_generation: 0,
+            interaction: InteractionPaths::default(),
             preserve_press_on_next_rebuild: false,
             scrollbar_drag: None,
             reveal_requested: false,
@@ -4922,6 +4953,14 @@ fn reveal_offset(viewport_height: f32, rect: Rect, applied: i32, max: i32) -> Op
     (target != applied).then_some(target)
 }
 
+/// 新 viewport 是否改变了 Window scale。
+///
+/// 纯尺寸变化（resize）只重建逻辑视口；只有 scale 变化才推进环境代际，
+/// 因为那意味着同一逻辑尺寸对应了不同的物理像素。
+fn viewport_scale_changed(previous: Option<Viewport>, next: Viewport) -> bool {
+    previous.is_none_or(|last| last.scale() != next.scale())
+}
+
 /// ADR-0010 的翻页步长：保留 24 逻辑像素重叠，至少 1 像素。
 fn page_step(scene: Option<&Scene>) -> i32 {
     scene.map_or(1, |scene| {
@@ -4989,8 +5028,19 @@ fn scrollbar_drag_offset(
 fn adopt_scroll_offset(window: &mut WindowHost, scene: &Scene, requested: i32) {
     let applied = scene.scroll_offset();
     if applied != requested {
-        window.scroll_offset = applied;
+        set_scroll_offset(window, applied);
         window.wheel.reset();
+    }
+}
+
+/// 更新已应用的滚动偏移；变化推进环境代际，让场景键跟随平移。
+///
+/// 显式滚动在输入处理时就按当前内容范围夹取，因此场景构建拿到的是最终
+/// 偏移与已推进的代际；这里的夹取分支只处理内容范围本身变化后的修正。
+fn set_scroll_offset(window: &mut WindowHost, offset: i32) {
+    if window.scroll_offset != offset {
+        window.scroll_offset = offset;
+        bump_env_generation(window);
     }
 }
 
@@ -5001,6 +5051,54 @@ fn scene_env(window: &WindowHost, preferences: SystemPreferences) -> SceneEnv {
         .with_focus_visible(window.keyboard_modality)
         .with_scroll_offset(window.scroll_offset)
         .with_text_scale_percent(preferences.text_scale_percent())
+        .with_high_contrast(preferences.high_contrast())
+        .with_env_generation(window.env_generation)
+}
+
+fn bump_env_generation(window: &mut WindowHost) {
+    window.env_generation = window.env_generation.wrapping_add(1);
+}
+
+/// 快照中从根到目标节点的路径；目标不在快照中时返回空。
+fn node_path(snapshot: &PresentationSnapshot, target: Option<NodeId>) -> Vec<NodeId> {
+    fn find(nodes: &[SnapshotNode], target: NodeId, path: &mut Vec<NodeId>) -> bool {
+        for node in nodes {
+            if let SnapshotNode::Element(element) = node {
+                path.push(element.id());
+                if element.id() == target || find(element.children(), target, path) {
+                    return true;
+                }
+                path.pop();
+            }
+        }
+        false
+    }
+
+    let Some(target) = target else {
+        return Vec::new();
+    };
+    let mut path = Vec::new();
+    if find(snapshot.roots(), target, &mut path) {
+        path.reverse();
+        path
+    } else {
+        Vec::new()
+    }
+}
+
+/// 用当前快照与宿主瞬态刷新交互路径；路径内容变化时推进 generation。
+fn refresh_interaction_paths(snapshot: &PresentationSnapshot, window: &mut WindowHost) {
+    let hover = node_path(snapshot, window.hovered);
+    let press = node_path(snapshot, window.pressed);
+    let focus = node_path(snapshot, snapshot.focus());
+    if window.interaction.hover_path() == hover.as_slice()
+        && window.interaction.press_path() == press.as_slice()
+        && window.interaction.focus_path() == focus.as_slice()
+    {
+        return;
+    }
+    let generation = window.interaction.generation().wrapping_add(1);
+    window.interaction = InteractionPaths::new(hover, press, focus, generation);
 }
 
 impl Drop for Host {
@@ -10116,6 +10214,7 @@ mod tests {
     #[test]
     fn a_settings_broadcast_applies_a_new_text_scale() {
         let mut host = open_host();
+        let env_generation = host.windows.get(MAIN).expect("window").env_generation;
         host.settings_sample = Some(SystemPreferences::new(false, 225));
         host.with_window(MAIN, |host, window| {
             host.handle_window_message(window, WM_SETTINGCHANGE, WPARAM(0), LPARAM(0))
@@ -10129,6 +10228,10 @@ mod tests {
         assert!(
             host.windows.get(MAIN).expect("window").paint_requested,
             "the broadcast requests a repaint"
+        );
+        assert!(
+            host.windows.get(MAIN).expect("window").env_generation > env_generation,
+            "the receiving window advances its environment generation"
         );
         host.render().expect("render at the new scale");
         let node = host
@@ -10150,6 +10253,14 @@ mod tests {
                 .abs()
                 < 0.01,
             "the render uses the sampled scale"
+        );
+        assert_eq!(
+            host.scene(MAIN)
+                .expect("scene")
+                .cache_key()
+                .env_generation(),
+            host.windows.get(MAIN).expect("window").env_generation,
+            "the rebuilt scene carries the broadcast generation"
         );
     }
 
@@ -10182,6 +10293,9 @@ mod tests {
             )
         };
         let revision = host.runtime.presentation_revision();
+        let env_generation = host.windows.get(MAIN).expect("window").env_generation;
+        let tree = host.accessibility_tree(MAIN).expect("tree");
+        let base_bounds = tree.logical_rect(tree.node(node).expect("draft node"));
 
         host.set_system_preferences(SystemPreferences::new(false, 225));
         host.render().expect("render at 225%");
@@ -10204,6 +10318,23 @@ mod tests {
             host.runtime.presentation_revision(),
             revision,
             "text scale does not enter the presentation snapshot"
+        );
+        assert!(
+            host.windows.get(MAIN).expect("window").env_generation > env_generation,
+            "text scale advances the environment generation"
+        );
+        let tree = host.accessibility_tree(MAIN).expect("tree");
+        let scaled_bounds = tree.logical_rect(tree.node(node).expect("draft node"));
+        assert!(
+            scaled_bounds.height > base_bounds.height,
+            "accessibility bounds follow the scaled layout"
+        );
+        assert_eq!(
+            host.scene(MAIN)
+                .expect("scene")
+                .cache_key()
+                .env_generation(),
+            host.windows.get(MAIN).expect("window").env_generation
         );
         assert_eq!(
             host.runtime
@@ -10248,6 +10379,288 @@ mod tests {
         assert_eq!(
             host.windows[MAIN].scroll_offset, short_max,
             "the stored offset is re-clamped to the smaller extent"
+        );
+    }
+
+    #[component]
+    fn HoverPathHost() -> MountResult<MountPlan> {
+        view! {
+            <view aria:label="row" class="bg-surface hover:bg-accent">
+                <text aria:label="child">"child"</text>
+            </view>
+        }
+    }
+
+    #[test]
+    fn a_hover_path_styles_the_ancestor_without_a_snapshot_change() {
+        let mut runtime = Runtime::new();
+        runtime
+            .declare_windows(|catalog| {
+                catalog.window(WindowSpec::new(MAIN).primary().sized(300, 200), |_| {
+                    view! { <HoverPathHost /> }
+                })
+            })
+            .expect("declare the window");
+        runtime.show(MAIN).expect("show the window");
+        let mut host = Host::open(runtime, HostConfig::hidden()).expect("open the host");
+        host.render().expect("the first frame");
+        let revision = host
+            .runtime
+            .presentation_revision_of(host.windows[MAIN].ctx)
+            .expect("revision");
+        let snapshot = host.runtime.presentation().expect("snapshot");
+        let row = snapshot.find_label("row").expect("row").id();
+        let child = snapshot.find_label("child").expect("child").id();
+        let rect = host
+            .scene(MAIN)
+            .expect("scene")
+            .node(child)
+            .expect("child geometry")
+            .rect();
+        host.windows.get_mut(MAIN).expect("window").pointer = Some(Point::new(
+            rect.x + rect.width / 2.0,
+            rect.y + rect.height / 2.0,
+        ));
+        host.render().expect("the hover frame");
+
+        let window = host.windows.get(MAIN).expect("window");
+        assert_eq!(window.hovered, Some(child), "the pointer hits the child");
+        assert_eq!(
+            window.interaction.hover_path(),
+            [child, row].as_slice(),
+            "the hover path is deepest → root"
+        );
+        assert!(
+            window.interaction.generation() > 0,
+            "a changed path advances the interaction generation"
+        );
+        let scene = host.scene(MAIN).expect("hover scene");
+        assert_eq!(
+            scene
+                .node(row)
+                .expect("row geometry")
+                .resolved_style()
+                .background(),
+            Some(Color::Role(ColorRole::Accent)),
+            "hover: applies to the ancestor in the path"
+        );
+        assert!(
+            scene.node(child).expect("child geometry").hovered(),
+            "the built-in hover visual stays on the deepest hit"
+        );
+        assert_eq!(
+            host.runtime
+                .presentation_revision_of(window.ctx)
+                .expect("revision"),
+            revision,
+            "a hover path never touches the snapshot revision"
+        );
+        assert_eq!(
+            scene.cache_key().interaction_generation(),
+            window.interaction.generation()
+        );
+        assert_eq!(scene.cache_key().env_generation(), window.env_generation);
+    }
+
+    #[test]
+    fn keyboard_modality_advances_the_env_generation() {
+        let mut host = open_host();
+        host.render().expect("the first frame");
+        let revision = host.runtime.presentation_revision();
+        let env_generation = host.windows.get(MAIN).expect("window").env_generation;
+        send_msg(
+            &mut host,
+            MSG {
+                message: WM_KEYDOWN,
+                ..Default::default()
+            },
+        );
+        let window = host.windows.get(MAIN).expect("window");
+        assert!(window.keyboard_modality, "a key switches the modality");
+        assert!(
+            window.env_generation > env_generation,
+            "focus modality advances the environment generation"
+        );
+        assert_eq!(
+            host.runtime.presentation_revision(),
+            revision,
+            "modality does not touch the snapshot revision"
+        );
+    }
+
+    #[test]
+    fn high_contrast_repaints_without_relayout_or_a_revision_change() {
+        let mut host = open_host();
+        host.render().expect("the first frame");
+        let revision = host.runtime.presentation_revision();
+        let window = host.windows.get(MAIN).expect("window");
+        let env_generation = window.env_generation;
+        let geometry: Vec<_> = host
+            .scene(MAIN)
+            .expect("scene")
+            .elements()
+            .iter()
+            .map(|element| (element.id(), element.rect()))
+            .collect();
+        let input = host
+            .runtime
+            .presentation()
+            .expect("snapshot")
+            .find_label("What needs to be done?")
+            .expect("draft")
+            .id();
+        let before_tree = host.accessibility_tree(MAIN).expect("tree");
+        let bounds = before_tree.logical_rect(before_tree.node(input).expect("input bounds"));
+
+        host.set_system_preferences(SystemPreferences::new(true, 100));
+        host.render().expect("the high-contrast frame");
+        let window = host.windows.get(MAIN).expect("window");
+        assert!(
+            window.env_generation > env_generation,
+            "high contrast advances the environment generation"
+        );
+        assert_eq!(
+            host.runtime.presentation_revision(),
+            revision,
+            "high contrast does not touch the snapshot revision"
+        );
+        assert_eq!(
+            host.scene(MAIN)
+                .expect("scene")
+                .elements()
+                .iter()
+                .map(|element| (element.id(), element.rect()))
+                .collect::<Vec<_>>(),
+            geometry,
+            "high contrast does not relayout"
+        );
+        let tree = host.accessibility_tree(MAIN).expect("tree");
+        assert_eq!(
+            tree.logical_rect(tree.node(input).expect("input")),
+            bounds,
+            "high contrast leaves accessibility bounds unchanged"
+        );
+        assert_eq!(
+            host.scene(MAIN)
+                .expect("scene")
+                .cache_key()
+                .env_generation(),
+            window.env_generation
+        );
+    }
+
+    #[test]
+    fn a_dpi_scale_change_bumps_the_env_generation_without_a_revision_change() {
+        let mut host = open_host();
+        host.render().expect("the first frame");
+        let revision = host.runtime.presentation_revision();
+        let real_scale = host.scene(MAIN).expect("scene").viewport().scale();
+        // 隐藏窗口无法改变机器的真实 DPI；写入一个确定不同于真实值的上次
+        // scale，让下一次构建观察到 scale 变化，无论本机 DPI 是多少。
+        let fake_scale = if (real_scale - 1.0).abs() < f32::EPSILON {
+            2.0
+        } else {
+            1.0
+        };
+        let window = host.windows.get_mut(MAIN).expect("window");
+        let env_generation = window.env_generation;
+        window.last_viewport = Some(Viewport::new(480.0, 360.0, fake_scale).expect("viewport"));
+        host.render().expect("the scaled frame");
+        let scene = host.scene(MAIN).expect("scene");
+        let window = host.windows.get(MAIN).expect("window");
+        assert!(fake_scale != real_scale, "the test forces a scale change");
+        assert!(
+            window.env_generation > env_generation,
+            "a viewport scale change advances the environment generation"
+        );
+        assert_eq!(
+            host.runtime.presentation_revision(),
+            revision,
+            "DPI does not touch the snapshot revision"
+        );
+        assert_eq!(
+            scene.viewport().scale(),
+            real_scale,
+            "the scene is rebuilt at the window's true scale"
+        );
+        assert_eq!(
+            host.accessibility_tree(MAIN).expect("tree").scale(),
+            real_scale,
+            "the accessibility tree publishes the rebuilt scale"
+        );
+        assert_eq!(scene.cache_key().env_generation(), window.env_generation);
+    }
+
+    #[test]
+    fn only_a_scale_change_in_the_viewport_advances_the_environment() {
+        let base = Viewport::new(480.0, 360.0, 1.0).expect("viewport");
+        assert!(
+            viewport_scale_changed(None, base),
+            "the first viewport establishes the scale"
+        );
+        assert!(
+            !viewport_scale_changed(
+                Some(base),
+                Viewport::new(600.0, 400.0, 1.0).expect("resize")
+            ),
+            "a same-scale resize keeps the environment generation"
+        );
+        assert!(
+            viewport_scale_changed(Some(base), Viewport::new(480.0, 360.0, 2.0).expect("dpi")),
+            "a scale change advances the environment generation"
+        );
+    }
+
+    #[test]
+    fn scrolling_advances_the_env_generation_and_the_scene_key() {
+        let mut host = open_host();
+        for index in 0..100 {
+            host.runtime
+                .input("What needs to be done?", &format!("Task {index}"))
+                .expect("fill the draft");
+            host.runtime.submit("Add task").expect("add a row");
+        }
+        host.render().expect("render the tall window");
+        host.windows.get_mut(MAIN).expect("the main window").wheel = wheel(WheelLines::Lines(3));
+        let revision = host.runtime.presentation_revision();
+        let base_key = host.scene(MAIN).expect("scene").cache_key();
+        let env_generation = host.windows.get(MAIN).expect("window").env_generation;
+        // 只滚几像素，停在已挂载的行内：跨行会另起结构 turn，这里的断言只
+        // 针对纯平移。
+        send_msg(
+            &mut host,
+            MSG {
+                message: WM_MOUSEWHEEL,
+                wParam: WPARAM(((-8i16 as u16) as u32 as usize) << 16),
+                ..Default::default()
+            },
+        );
+        let scene = host.scene(MAIN).expect("scrolled scene");
+        let window = host.windows.get(MAIN).expect("window");
+        assert!(scene.scroll_offset() > 0, "the wheel tick really scrolled");
+        assert_eq!(
+            scene.scroll_offset(),
+            window.scroll_offset,
+            "the stored offset is the applied offset"
+        );
+        assert!(
+            window.env_generation > env_generation,
+            "a scroll advances the environment generation"
+        );
+        assert_ne!(
+            scene.cache_key(),
+            base_key,
+            "the scene key tracks the translated geometry"
+        );
+        assert_eq!(
+            scene.cache_key().env_generation(),
+            window.env_generation,
+            "the built scene carries the advanced generation"
+        );
+        assert_eq!(
+            host.runtime.presentation_revision(),
+            revision,
+            "scrolling does not touch the snapshot revision"
         );
     }
 
@@ -12238,7 +12651,13 @@ mod tests {
     #[test]
     fn a_reveal_that_moves_the_offset_resets_the_wheel_residue() {
         let mut host = open_host();
-        host.render().expect("render the initial window");
+        for index in 0..40 {
+            host.runtime
+                .input("What needs to be done?", &format!("Task {index}"))
+                .expect("fill the draft");
+            host.runtime.submit("Add task").expect("add a row");
+        }
+        host.render().expect("render the tall window");
         host.windows.get_mut(MAIN).expect("the main window").wheel = wheel(WheelLines::Lines(3));
         let sub_notch = WPARAM((((-24i16) as u16 as u32) << 16) as usize);
         with_main(&mut host, |host, window| {
@@ -12253,6 +12672,8 @@ mod tests {
         });
 
         // 把草稿输入滚出视口后再聚焦：显露会把它拉回顶部并改变偏移。
+        // runtime 的 reveal 上报在 #345 接入；这里直接置位宿主标志，
+        // 验证两遍协议本身。
         with_main(&mut host, |_host, window| {
             window.scroll_offset = 400;
             Ok(())
@@ -12261,6 +12682,10 @@ mod tests {
         host.runtime
             .focus("What needs to be done?")
             .expect("focus the offscreen draft");
+        with_main(&mut host, |_host, window| {
+            window.reveal_requested = true;
+            Ok(())
+        });
         host.render().expect("reveal the draft");
 
         let window = &host.windows[MAIN];

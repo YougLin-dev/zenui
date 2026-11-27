@@ -65,26 +65,49 @@ fn main() {
         let mut cache = SceneCache::new();
         let cold = {
             let start = Instant::now();
-            let _ = Scene::build_cached(&snapshot, viewport, &SceneEnv::default(), &mut cache)
-                .expect("scene");
+            let _ = Scene::build_cached(
+                &snapshot,
+                viewport,
+                &SceneEnv::default(),
+                &zenui_render::InteractionPaths::default(),
+                &mut cache,
+            )
+            .expect("scene");
             start.elapsed()
         };
         let warm = measure(REPETITIONS, || {
-            let _ = Scene::build_cached(&snapshot, viewport, &SceneEnv::default(), &mut cache)
-                .expect("scene");
+            let _ = Scene::build_cached(
+                &snapshot,
+                viewport,
+                &SceneEnv::default(),
+                &zenui_render::InteractionPaths::default(),
+                &mut cache,
+            )
+            .expect("scene");
         });
         app.input("What needs to be done?", "x").expect("type");
         let input_snapshot = app.presentation().expect("presentation");
         let input_rebuild = {
             let start = Instant::now();
-            let _ =
-                Scene::build_cached(&input_snapshot, viewport, &SceneEnv::default(), &mut cache)
-                    .expect("scene");
+            let _ = Scene::build_cached(
+                &input_snapshot,
+                viewport,
+                &SceneEnv::default(),
+                &zenui_render::InteractionPaths::default(),
+                &mut cache,
+            )
+            .expect("scene");
             start.elapsed()
         };
         let elements = input_snapshot.elements().count();
-        let base = Scene::build_cached(&input_snapshot, viewport, &SceneEnv::default(), &mut cache)
-            .expect("base scene");
+        let base = Scene::build_cached(
+            &input_snapshot,
+            viewport,
+            &SceneEnv::default(),
+            &zenui_render::InteractionPaths::default(),
+            &mut cache,
+        )
+        .expect("base scene");
         let max_offset = base.max_scroll_offset();
         let offset = max_offset / 2;
         let band = base.row_bands()[0];
@@ -99,12 +122,24 @@ fn main() {
         let scroll_env = SceneEnv::default().with_scroll_offset(offset);
         let scroll_build = {
             let start = Instant::now();
-            let _ = Scene::build_cached(&mid_snapshot, viewport, &scroll_env, &mut cache)
-                .expect("scroll scene");
+            let _ = Scene::build_cached(
+                &mid_snapshot,
+                viewport,
+                &scroll_env,
+                &zenui_render::InteractionPaths::default(),
+                &mut cache,
+            )
+            .expect("scroll scene");
             start.elapsed()
         };
-        let scroll_scene = Scene::build_cached(&mid_snapshot, viewport, &scroll_env, &mut cache)
-            .expect("scroll scene");
+        let scroll_scene = Scene::build_cached(
+            &mid_snapshot,
+            viewport,
+            &scroll_env,
+            &zenui_render::InteractionPaths::default(),
+            &mut cache,
+        )
+        .expect("scroll scene");
         // 跨行边界的一次窗口更新：刷新挂载窗口并重建一次快照。
         let mut crossing = first;
         let window_update = measure(REPETITIONS, || {

@@ -3,7 +3,8 @@
 use zenui::prelude::*;
 use zenui_demo::*;
 use zenui_render::{
-    DecorationKind, Point, Rect, Scene, SceneCache, SceneElement, SceneEnv, SceneError, Viewport,
+    DecorationKind, InteractionPaths, Point, Rect, Scene, SceneCache, SceneElement, SceneEnv,
+    SceneError, Viewport,
 };
 
 fn runtime() -> Runtime {
@@ -30,6 +31,7 @@ fn build_scaled(snapshot: &PresentationSnapshot, width: f32, percent: u16) -> Sc
         snapshot,
         viewport(width),
         &SceneEnv::default().with_text_scale_percent(percent),
+        &zenui_render::InteractionPaths::default(),
     )
     .expect("scaled scene")
 }
@@ -1315,7 +1317,13 @@ fn pointer_and_modality_conditions_select_from_the_scene_environment() {
             .background()
     };
 
-    let plain = Scene::build_with(&snapshot, viewport, &SceneEnv::default()).expect("scene");
+    let plain = Scene::build_with(
+        &snapshot,
+        viewport,
+        &SceneEnv::default(),
+        &zenui_render::InteractionPaths::default(),
+    )
+    .expect("scene");
     assert_eq!(
         background(&plain, button),
         Some(Color::Role(ColorRole::Control))
@@ -1330,6 +1338,7 @@ fn pointer_and_modality_conditions_select_from_the_scene_environment() {
         &snapshot,
         viewport,
         &SceneEnv::default().with_hovered(Some(button)),
+        &zenui_render::InteractionPaths::default(),
     )
     .expect("scene");
     assert_eq!(
@@ -1345,6 +1354,7 @@ fn pointer_and_modality_conditions_select_from_the_scene_environment() {
         &SceneEnv::default()
             .with_hovered(Some(button))
             .with_pressed(Some(button)),
+        &zenui_render::InteractionPaths::default(),
     )
     .expect("scene");
     assert_eq!(
@@ -1358,6 +1368,7 @@ fn pointer_and_modality_conditions_select_from_the_scene_environment() {
         &snapshot,
         viewport,
         &SceneEnv::default().with_focus_visible(true),
+        &zenui_render::InteractionPaths::default(),
     )
     .expect("scene");
     assert_eq!(
@@ -1375,7 +1386,13 @@ fn dark_conditions_follow_the_snapshot_appearance() {
     let snapshot = app.presentation().expect("snapshot");
     let viewport = viewport(400.0);
     let id = snapshot.find_label("themed").expect("themed view").id();
-    let light = Scene::build_with(&snapshot, viewport, &SceneEnv::default()).expect("scene");
+    let light = Scene::build_with(
+        &snapshot,
+        viewport,
+        &SceneEnv::default(),
+        &zenui_render::InteractionPaths::default(),
+    )
+    .expect("scene");
     assert_eq!(
         light
             .node(id)
@@ -1388,7 +1405,13 @@ fn dark_conditions_follow_the_snapshot_appearance() {
     app.set_appearance(Appearance::Dark).expect("switch theme");
     let dark = app.presentation().expect("snapshot");
     assert_eq!(dark.appearance(), Appearance::Dark);
-    let scene = Scene::build_with(&dark, viewport, &SceneEnv::default()).expect("scene");
+    let scene = Scene::build_with(
+        &dark,
+        viewport,
+        &SceneEnv::default(),
+        &zenui_render::InteractionPaths::default(),
+    )
+    .expect("scene");
     assert_eq!(
         scene
             .node(id)
@@ -1582,10 +1605,22 @@ fn a_scene_cache_reuses_layouts_without_changing_the_scene() {
 
     let fresh = Scene::build(&snapshot, base_viewport).expect("fresh scene");
     let mut cache = SceneCache::new();
-    let first = Scene::build_cached(&snapshot, base_viewport, &SceneEnv::default(), &mut cache)
-        .expect("cached scene");
-    let second = Scene::build_cached(&snapshot, base_viewport, &SceneEnv::default(), &mut cache)
-        .expect("cached scene again");
+    let first = Scene::build_cached(
+        &snapshot,
+        base_viewport,
+        &SceneEnv::default(),
+        &zenui_render::InteractionPaths::default(),
+        &mut cache,
+    )
+    .expect("cached scene");
+    let second = Scene::build_cached(
+        &snapshot,
+        base_viewport,
+        &SceneEnv::default(),
+        &zenui_render::InteractionPaths::default(),
+        &mut cache,
+    )
+    .expect("cached scene again");
     let fingerprint = scene_fingerprint(&fresh);
     assert_eq!(fingerprint, scene_fingerprint(&first));
     assert_eq!(fingerprint, scene_fingerprint(&second));
@@ -1593,8 +1628,14 @@ fn a_scene_cache_reuses_layouts_without_changing_the_scene() {
     app.input("What needs to be done?", "changed")
         .expect("changed draft");
     let changed = app.presentation().expect("snapshot");
-    let cached = Scene::build_cached(&changed, base_viewport, &SceneEnv::default(), &mut cache)
-        .expect("cached changed scene");
+    let cached = Scene::build_cached(
+        &changed,
+        base_viewport,
+        &SceneEnv::default(),
+        &zenui_render::InteractionPaths::default(),
+        &mut cache,
+    )
+    .expect("cached changed scene");
     let fresh = Scene::build(&changed, base_viewport).expect("fresh changed scene");
     let changed_fingerprint = scene_fingerprint(&fresh);
     assert_eq!(changed_fingerprint, scene_fingerprint(&cached));
@@ -1604,8 +1645,14 @@ fn a_scene_cache_reuses_layouts_without_changing_the_scene() {
     );
 
     let narrow = viewport(500.0);
-    let cached = Scene::build_cached(&changed, narrow, &SceneEnv::default(), &mut cache)
-        .expect("cached narrow scene");
+    let cached = Scene::build_cached(
+        &changed,
+        narrow,
+        &SceneEnv::default(),
+        &zenui_render::InteractionPaths::default(),
+        &mut cache,
+    )
+    .expect("cached narrow scene");
     let fresh = Scene::build(&changed, narrow).expect("fresh narrow scene");
     assert_eq!(
         scene_fingerprint(&fresh),
@@ -1673,6 +1720,7 @@ fn scroll_translates_every_rect_and_reports_extent() {
         &snapshot,
         viewport,
         &SceneEnv::default(),
+        &zenui_render::InteractionPaths::default(),
         &mut SceneCache::new(),
     )
     .expect("base scene");
@@ -1687,6 +1735,7 @@ fn scroll_translates_every_rect_and_reports_extent() {
         &snapshot,
         viewport,
         &SceneEnv::default().with_scroll_offset(offset),
+        &zenui_render::InteractionPaths::default(),
         &mut SceneCache::new(),
     )
     .expect("scrolled scene");
@@ -1724,6 +1773,7 @@ fn scroll_clamps_requests_to_the_content_extent() {
         &snapshot,
         viewport,
         &SceneEnv::default().with_scroll_offset(max + 10_000),
+        &zenui_render::InteractionPaths::default(),
     )
     .expect("overscrolled scene");
     assert_eq!(overscrolled.scroll_offset(), max);
@@ -1731,6 +1781,7 @@ fn scroll_clamps_requests_to_the_content_extent() {
         &snapshot,
         viewport,
         &SceneEnv::default().with_scroll_offset(max),
+        &zenui_render::InteractionPaths::default(),
     )
     .expect("max scene");
     assert_eq!(
@@ -1743,6 +1794,7 @@ fn scroll_clamps_requests_to_the_content_extent() {
         &snapshot,
         viewport,
         &SceneEnv::default().with_scroll_offset(-10_000),
+        &zenui_render::InteractionPaths::default(),
     )
     .expect("negative scroll scene");
     assert_eq!(clamped_low.scroll_offset(), 0);
@@ -1763,6 +1815,7 @@ fn scroll_clamps_requests_to_the_content_extent() {
         &short_snapshot,
         viewport,
         &SceneEnv::default().with_scroll_offset(500),
+        &zenui_render::InteractionPaths::default(),
     )
     .expect("fitting scene");
     assert_eq!(fits.max_scroll_offset(), 0);
@@ -1833,6 +1886,7 @@ fn the_scrollbar_track_and_thumb_follow_the_scroll_metrics() {
         &snapshot,
         viewport,
         &SceneEnv::default().with_scroll_offset(max / 2),
+        &zenui_render::InteractionPaths::default(),
     )
     .expect("middle scene");
     let middle_bar = middle.scrollbar().expect("middle scrollbar");
@@ -1848,6 +1902,7 @@ fn the_scrollbar_track_and_thumb_follow_the_scroll_metrics() {
         &snapshot,
         viewport,
         &SceneEnv::default().with_scroll_offset(max),
+        &zenui_render::InteractionPaths::default(),
     )
     .expect("bottom scene");
     let bottom_bar = bottom.scrollbar().expect("bottom scrollbar");
@@ -1882,6 +1937,7 @@ fn the_scrollbar_is_absent_when_content_fits_and_adds_no_element() {
         &snapshot,
         viewport,
         &SceneEnv::default().with_scroll_offset(top.max_scroll_offset()),
+        &zenui_render::InteractionPaths::default(),
     )
     .expect("scrolled scene");
     assert_eq!(
@@ -1918,6 +1974,7 @@ fn the_scrollbar_thumb_has_a_documented_minimum() {
         &snapshot,
         narrow,
         &SceneEnv::default().with_scroll_offset(0),
+        &zenui_render::InteractionPaths::default(),
     )
     .expect("narrow scene");
     assert_eq!(
@@ -2003,6 +2060,7 @@ fn a_zero_area_viewport_culls_everything_and_hit_tests_nothing() {
         &snapshot,
         viewport,
         &SceneEnv::default().with_scroll_offset(scene.max_scroll_offset()),
+        &zenui_render::InteractionPaths::default(),
     )
     .expect("scrolled zero scene");
     assert!(scrolled.node(id).expect("input").text().is_empty());
@@ -2017,6 +2075,7 @@ fn a_zero_area_viewport_culls_everything_and_hit_tests_nothing() {
             &snapshot,
             viewport,
             &SceneEnv::default().with_scroll_offset(offset),
+            &zenui_render::InteractionPaths::default(),
         )
         .expect("straddling scene");
         assert!(
@@ -2083,6 +2142,7 @@ fn scroll_culls_runs_and_moves_caret_and_decorations() {
         &snapshot,
         viewport,
         &SceneEnv::default().with_scroll_offset(8),
+        &zenui_render::InteractionPaths::default(),
     )
     .expect("partly scrolled scene");
     let partly_input = partly.node(id).expect("editor");
@@ -2137,6 +2197,7 @@ fn scroll_culls_runs_and_moves_caret_and_decorations() {
         &snapshot,
         viewport,
         &SceneEnv::default().with_scroll_offset(100),
+        &zenui_render::InteractionPaths::default(),
     )
     .expect("scrolled scene");
     let input = offscreen.node(id).expect("offscreen rect is kept");
@@ -2187,6 +2248,7 @@ fn scroll_culls_runs_and_moves_caret_and_decorations() {
         &composing,
         viewport,
         &SceneEnv::default().with_scroll_offset(8),
+        &zenui_render::InteractionPaths::default(),
     )
     .expect("partly scrolled composition");
     let partly_underlines = underlines(&comp_partly);
@@ -2210,6 +2272,7 @@ fn scroll_culls_runs_and_moves_caret_and_decorations() {
         &composing,
         viewport,
         &SceneEnv::default().with_scroll_offset(100),
+        &zenui_render::InteractionPaths::default(),
     )
     .expect("offscreen composition");
     assert!(underlines(&comp_offscreen).is_empty());
@@ -2225,6 +2288,7 @@ fn scroll_hit_testing_uses_translated_geometry_and_stays_inside_the_viewport() {
         &snapshot,
         viewport,
         &SceneEnv::default().with_scroll_offset(100),
+        &zenui_render::InteractionPaths::default(),
     )
     .expect("scrolled scene");
 
@@ -2263,6 +2327,7 @@ fn the_visible_index_keeps_paint_order_and_offscreen_elements_queryable() {
         &snapshot,
         viewport,
         &SceneEnv::default().with_scroll_offset(100),
+        &zenui_render::InteractionPaths::default(),
     )
     .expect("scrolled scene");
 
@@ -2318,6 +2383,7 @@ fn visible_hit_testing_matches_a_full_reverse_scan_at_half_open_edges() {
             &snapshot,
             viewport,
             &SceneEnv::default().with_scroll_offset(offset),
+            &zenui_render::InteractionPaths::default(),
         )
         .expect("scrolled scene");
         let mut points = Vec::new();
@@ -2373,6 +2439,7 @@ fn the_synthetic_root_gap_is_not_hit_testable() {
         &snapshot,
         viewport,
         &SceneEnv::default().with_scroll_offset(offset),
+        &zenui_render::InteractionPaths::default(),
     )
     .expect("scrolled scene");
 
@@ -2600,8 +2667,13 @@ fn text_scale_grows_row_bands_and_scroll_extent() {
     let env = SceneEnv::default()
         .with_text_scale_percent(225)
         .with_scroll_offset(100_000);
-    let clamped =
-        Scene::build_with(&snapshot, viewport(800.0), &env).expect("clamped scaled scene");
+    let clamped = Scene::build_with(
+        &snapshot,
+        viewport(800.0),
+        &env,
+        &zenui_render::InteractionPaths::default(),
+    )
+    .expect("clamped scaled scene");
     assert_eq!(
         clamped.scroll_offset(),
         clamped.max_scroll_offset(),
@@ -2615,12 +2687,19 @@ fn a_shared_cache_does_not_serve_layouts_from_another_text_scale() {
     add(&mut app, "Write tests");
     let snapshot = app.presentation().expect("snapshot");
     let mut cache = SceneCache::new();
-    let base = Scene::build_cached(&snapshot, viewport(800.0), &SceneEnv::default(), &mut cache)
-        .expect("base scene");
+    let base = Scene::build_cached(
+        &snapshot,
+        viewport(800.0),
+        &SceneEnv::default(),
+        &zenui_render::InteractionPaths::default(),
+        &mut cache,
+    )
+    .expect("base scene");
     let large = Scene::build_cached(
         &snapshot,
         viewport(800.0),
         &SceneEnv::default().with_text_scale_percent(225),
+        &zenui_render::InteractionPaths::default(),
         &mut cache,
     )
     .expect("scaled scene");
@@ -2683,5 +2762,132 @@ fn text_scale_outside_the_supported_range_falls_back_to_100() {
             .with_text_scale_percent(225)
             .text_scale_percent(),
         225
+    );
+}
+
+#[test]
+fn hover_and_press_paths_style_ancestors_and_reach_the_cache_key() {
+    #[component]
+    fn PathHost() -> MountResult<MountPlan> {
+        view! {
+            <view aria:label="row" class="bg-surface hover:bg-accent active:bg-control-pressed">
+                <text aria:label="child">"child"</text>
+            </view>
+        }
+    }
+
+    let mut app = Runtime::new();
+    app.mount(|| view! { <PathHost /> }).expect("mount");
+    let snapshot = app.presentation().expect("snapshot");
+    let row = snapshot.find_label("row").expect("row").id();
+    let child = snapshot.find_label("child").expect("child").id();
+    let env = SceneEnv::default();
+    let background = |scene: &Scene, node| {
+        scene
+            .node(node)
+            .expect("scene element")
+            .resolved_style()
+            .background()
+    };
+
+    let plain = Scene::build_with(
+        &snapshot,
+        viewport(400.0),
+        &env,
+        &InteractionPaths::default(),
+    )
+    .expect("plain scene");
+    assert_eq!(
+        background(&plain, row),
+        Some(Color::Role(ColorRole::Surface))
+    );
+    assert_eq!(plain.cache_key().interaction_generation(), 0);
+
+    let hover_only = InteractionPaths::new(vec![child, row], Vec::new(), Vec::new(), 3);
+    let hovered =
+        Scene::build_with(&snapshot, viewport(400.0), &env, &hover_only).expect("hover-only scene");
+    assert_eq!(
+        background(&hovered, row),
+        Some(Color::Role(ColorRole::Accent)),
+        "hover: applies to the ancestor in the path"
+    );
+
+    let paths = InteractionPaths::new(vec![child, row], vec![child, row], Vec::new(), 7);
+    let active = Scene::build_with(&snapshot, viewport(400.0), &env, &paths).expect("hover scene");
+    assert_eq!(
+        background(&active, row),
+        Some(Color::Role(ColorRole::ControlPressed)),
+        "press outranks hover on an ancestor in the path"
+    );
+    assert!(active.node(child).expect("child").hovered());
+    assert!(active.node(child).expect("child").pointer_pressed());
+    assert!(
+        !active.node(row).expect("row").hovered(),
+        "the built-in hover visual stays on the deepest hit"
+    );
+    assert_eq!(
+        active.cache_key().interaction_generation(),
+        7,
+        "the interaction-path generation reaches the cache key"
+    );
+    assert_eq!(
+        active.cache_key().snapshot_revision(),
+        snapshot.revision(),
+        "the scene key carries the snapshot revision"
+    );
+    assert_eq!(
+        active.cache_key().env_generation(),
+        0,
+        "the scene key carries the host env generation"
+    );
+}
+
+#[test]
+fn env_generations_invalidate_the_scene_key_without_changing_geometry() {
+    let mut app = Runtime::new();
+    app.mount(|| view! { <view aria:label="stable" class="bg-surface" /> })
+        .expect("mount");
+    let snapshot = app.presentation().expect("snapshot");
+    let env = SceneEnv::default();
+    let paths = InteractionPaths::default();
+    let base = Scene::build_with(&snapshot, viewport(400.0), &env, &paths).expect("base scene");
+    let node = snapshot.find_label("stable").expect("stable").id();
+    let rect = base.node(node).expect("element").rect();
+
+    let inflated = Scene::build_with(
+        &snapshot,
+        viewport(400.0),
+        &env.with_env_generation(3).with_high_contrast(true),
+        &paths,
+    )
+    .expect("env scene");
+    assert_eq!(
+        inflated.cache_key().env_generation(),
+        3,
+        "env generation reaches the key"
+    );
+    assert_eq!(
+        inflated.cache_key().snapshot_revision(),
+        base.cache_key().snapshot_revision(),
+        "a high-contrast/env change does not touch the snapshot revision"
+    );
+    assert_eq!(
+        inflated.node(node).expect("element").rect(),
+        rect,
+        "high contrast and env generation do not relayout"
+    );
+
+    let repathed = Scene::build_with(
+        &snapshot,
+        viewport(400.0),
+        &env,
+        &paths.clone().with_generation(9),
+    )
+    .expect("repathed scene");
+    assert_eq!(repathed.cache_key().interaction_generation(), 9);
+    assert_ne!(
+        repathed.cache_key(),
+        base.cache_key(),
+        "path generation alone changes the cache key"
     );
 }

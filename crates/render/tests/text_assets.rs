@@ -28,7 +28,14 @@ fn viewport(width: f32) -> Viewport {
 }
 
 fn build(cache: &mut SceneCache, snapshot: &PresentationSnapshot, width: f32) -> Scene {
-    Scene::build_cached(snapshot, viewport(width), &SceneEnv::default(), cache).expect("scene")
+    Scene::build_cached(
+        snapshot,
+        viewport(width),
+        &SceneEnv::default(),
+        &zenui_render::InteractionPaths::default(),
+        cache,
+    )
+    .expect("scene")
 }
 
 fn by_text<'a>(snapshot: &'a PresentationSnapshot, tag: &str, text: &str) -> &'a SnapshotElement {

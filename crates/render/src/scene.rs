@@ -1,6 +1,7 @@
 //! 从 presentation snapshot 构建平台无关的场景。
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use taffy::prelude::{
     AlignItems, AvailableSpace, Display, FlexDirection, FlexWrap, JustifyContent, Style, TaffyTree,
@@ -144,6 +145,8 @@ pub struct SceneEnv {
     focus_visible: bool,
     scroll_offset: i32,
     text_scale_percent: u16,
+    high_contrast: bool,
+    env_generation: u64,
 }
 
 impl Default for SceneEnv {
@@ -154,6 +157,8 @@ impl Default for SceneEnv {
             focus_visible: false,
             scroll_offset: 0,
             text_scale_percent: 100,
+            high_contrast: false,
+            env_generation: 0,
         }
     }
 }
@@ -221,6 +226,142 @@ impl SceneEnv {
     /// 辅助功能文本缩放百分比。
     pub const fn text_scale_percent(self) -> u16 {
         self.text_scale_percent
+    }
+
+    /// 系统高对比度开关；不进入快照，宿主据此选择覆盖调色板。
+    pub const fn with_high_contrast(mut self, high_contrast: bool) -> Self {
+        self.high_contrast = high_contrast;
+        self
+    }
+
+    /// 本窗口的系统高对比度状态。
+    pub const fn high_contrast(self) -> bool {
+        self.high_contrast
+    }
+
+    /// 每个窗口独立的环境代际；系统偏好、DPI、滚动或焦点 modality 变化时
+    /// 由宿主递增。它不是树 revision，也不进入快照。
+    pub const fn with_env_generation(mut self, generation: u64) -> Self {
+        self.env_generation = generation;
+        self
+    }
+
+    /// 本窗口的环境代际。
+    pub const fn env_generation(self) -> u64 {
+        self.env_generation
+    }
+}
+
+/// 逐帧交互路径：最深命中节点 → 根。
+///
+/// `hover:`/`active:` 条件对路径内任意元素成立，因此整行 hover 不需要给
+/// 每个子节点声明样式。路径不进入快照或响应式图；`generation` 在路径变化时
+/// 由宿主递增，与快照 revision 和环境代际一起构成场景缓存键。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct InteractionPaths {
+    hover_path: Arc<[NodeId]>,
+    press_path: Arc<[NodeId]>,
+    focus_path: Arc<[NodeId]>,
+    generation: u64,
+}
+
+impl InteractionPaths {
+    /// 由三条“最深节点 → 根”的路径构造；`generation` 由宿主维护。
+    pub fn new(
+        hover_path: impl Into<Arc<[NodeId]>>,
+        press_path: impl Into<Arc<[NodeId]>>,
+        focus_path: impl Into<Arc<[NodeId]>>,
+        generation: u64,
+    ) -> Self {
+        Self {
+            hover_path: hover_path.into(),
+            press_path: press_path.into(),
+            focus_path: focus_path.into(),
+            generation,
+        }
+    }
+
+    /// 推进路径代际；路径内容不变时用于让缓存键失效。
+    pub const fn with_generation(mut self, generation: u64) -> Self {
+        self.generation = generation;
+        self
+    }
+
+    /// 最深命中节点到根的路径；空表示没有 hover。
+    pub fn hover_path(&self) -> &[NodeId] {
+        &self.hover_path
+    }
+
+    /// press 目标到根的路径；空表示没有 press。
+    pub fn press_path(&self) -> &[NodeId] {
+        &self.press_path
+    }
+
+    /// 焦点节点到根的路径；空表示没有焦点。
+    pub fn focus_path(&self) -> &[NodeId] {
+        &self.focus_path
+    }
+
+    /// 最深命中节点，驱动内建 hover 视觉。
+    pub fn hovered(&self) -> Option<NodeId> {
+        self.hover_path.first().copied()
+    }
+
+    /// press 目标，驱动内建按下视觉。
+    pub fn pressed(&self) -> Option<NodeId> {
+        self.press_path.first().copied()
+    }
+
+    /// 焦点节点。
+    pub fn focused(&self) -> Option<NodeId> {
+        self.focus_path.first().copied()
+    }
+
+    /// 路径代际；路径内容变化时由宿主递增。
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
+/// 场景缓存键：快照 revision、宿主环境代际与交互路径代际。
+///
+/// 三者独立：外观走快照 revision，系统偏好/DPI/滚动/焦点 modality 走环境
+/// 代际，hover/press/focus 路径走交互代际。快照未变时环境变化仍必须重建
+/// 场景与无障碍几何。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SceneKey {
+    snapshot_revision: u64,
+    env_generation: u64,
+    interaction_generation: u64,
+}
+
+impl SceneKey {
+    /// 由构建本次场景的三个代际组成。
+    pub const fn new(
+        snapshot_revision: u64,
+        env_generation: u64,
+        interaction_generation: u64,
+    ) -> Self {
+        Self {
+            snapshot_revision,
+            env_generation,
+            interaction_generation,
+        }
+    }
+
+    /// 构建本次场景的已发布快照 revision。
+    pub const fn snapshot_revision(self) -> u64 {
+        self.snapshot_revision
+    }
+
+    /// 构建本次场景时的宿主环境代际。
+    pub const fn env_generation(self) -> u64 {
+        self.env_generation
+    }
+
+    /// 构建本次场景时的交互路径代际。
+    pub const fn interaction_generation(self) -> u64 {
+        self.interaction_generation
     }
 }
 
@@ -542,6 +683,8 @@ impl SceneRowBand {
 /// 一次完整重排的结果；几何都是逻辑像素与绝对坐标。
 #[derive(Clone, Debug)]
 pub struct Scene {
+    /// 构建这份场景的缓存键；快照 revision、环境代际与交互路径代际。
+    key: SceneKey,
     viewport: Viewport,
     content_extent: Rect,
     scroll_offset: i32,
@@ -559,21 +702,30 @@ pub struct Scene {
 }
 
 impl Scene {
-    /// 用默认环境完整重排一次快照；没有指针瞬态。
+    /// 用默认环境完整重排一次快照；没有指针瞬态与交互路径。
     pub fn build(snapshot: &PresentationSnapshot, viewport: Viewport) -> Result<Self, SceneError> {
-        Self::build_with(snapshot, viewport, &SceneEnv::default())
+        Self::build_with(
+            snapshot,
+            viewport,
+            &SceneEnv::default(),
+            &InteractionPaths::default(),
+        )
     }
 
-    /// 用宿主提供的呈现环境完整重排一次快照：指针瞬态、键盘模态与滚动偏移。
+    /// 用宿主提供的呈现环境与交互路径完整重排一次快照。
+    ///
     /// 每次调用都重新构建 Taffy 树，Node ID 原样保留；请求的偏移会夹到内容
-    /// 范围，实际值见 [`Scene::scroll_offset`]。
+    /// 范围，实际值见 [`Scene::scroll_offset`]。`env.hovered/pressed` 是内建
+    /// 视觉的派生值；路径为空时按单个节点处理，非空时 `hover:`/`active:`
+    /// 条件对路径内任意元素成立。
     pub fn build_with(
         snapshot: &PresentationSnapshot,
         viewport: Viewport,
         env: &SceneEnv,
+        paths: &InteractionPaths,
     ) -> Result<Self, SceneError> {
         let mut cache = SceneCache::new();
-        Self::build_cached(snapshot, viewport, env, &mut cache)
+        Self::build_cached(snapshot, viewport, env, paths, &mut cache)
     }
 
     /// 与 [`Scene::build_with`] 相同，但复用调用方持有的文本布局缓存。
@@ -584,9 +736,15 @@ impl Scene {
         snapshot: &PresentationSnapshot,
         viewport: Viewport,
         env: &SceneEnv,
+        paths: &InteractionPaths,
         cache: &mut SceneCache,
     ) -> Result<Self, SceneError> {
-        Builder::new(snapshot, *env).build(viewport, cache)
+        Builder::new(snapshot, *env, paths).build(viewport, cache)
+    }
+
+    /// 构建这份场景的缓存键：快照 revision、环境代际与交互路径代际。
+    pub const fn cache_key(&self) -> SceneKey {
+        self.key
     }
 
     /// 构建该场景的 viewport；scale 未参与布局。
@@ -705,7 +863,8 @@ impl TextContext {
     }
 }
 
-/// 一条声明在解析时能看到的控件状态；来自已提交的快照，不含宿主瞬态。
+/// 一条声明在解析时能看到的控件状态：语义字段来自已提交的快照，
+/// hover/press 来自宿主交互路径。
 #[derive(Clone, Copy, Debug, Default)]
 struct ElementState {
     dark: bool,
@@ -754,6 +913,7 @@ struct EditView<'a> {
 struct Builder<'a> {
     snapshot: &'a PresentationSnapshot,
     env: SceneEnv,
+    paths: &'a InteractionPaths,
     tree: TaffyTree<TextContext>,
     kinds: HashMap<TaffyNodeId, Kind>,
     resolved: HashMap<TaffyNodeId, ResolvedStyle>,
@@ -762,10 +922,11 @@ struct Builder<'a> {
 }
 
 impl<'a> Builder<'a> {
-    fn new(snapshot: &'a PresentationSnapshot, env: SceneEnv) -> Self {
+    fn new(snapshot: &'a PresentationSnapshot, env: SceneEnv, paths: &'a InteractionPaths) -> Self {
         Self {
             snapshot,
             env,
+            paths,
             tree: TaffyTree::new(),
             kinds: HashMap::new(),
             resolved: HashMap::new(),
@@ -773,6 +934,42 @@ impl<'a> Builder<'a> {
                 .elements()
                 .map(|element| (element.id(), element))
                 .collect(),
+        }
+    }
+
+    /// hover 条件是否命中该元素：路径非空时对路径内任意元素成立。
+    fn hovered_path_contains(&self, id: NodeId) -> bool {
+        if self.paths.hover_path().is_empty() {
+            self.env.hovered() == Some(id)
+        } else {
+            self.paths.hover_path().contains(&id)
+        }
+    }
+
+    /// active 条件是否命中该元素：路径非空时对路径内任意元素成立。
+    fn press_path_contains(&self, id: NodeId) -> bool {
+        if self.paths.press_path().is_empty() {
+            self.env.pressed() == Some(id)
+        } else {
+            self.paths.press_path().contains(&id)
+        }
+    }
+
+    /// 内建 hover 视觉只落在最深命中节点。
+    fn hovered_self(&self, id: NodeId) -> bool {
+        if self.paths.hover_path().is_empty() {
+            self.env.hovered() == Some(id)
+        } else {
+            self.paths.hovered() == Some(id)
+        }
+    }
+
+    /// 内建按下视觉只落在 press 目标本身。
+    fn pressed_self(&self, id: NodeId) -> bool {
+        if self.paths.press_path().is_empty() {
+            self.env.pressed() == Some(id)
+        } else {
+            self.paths.pressed() == Some(id)
         }
     }
 
@@ -813,6 +1010,11 @@ impl<'a> Builder<'a> {
         let max_scroll_offset = (content_extent.height - viewport.height()).max(0.0) as i32;
         let scroll_offset = self.env.scroll_offset.clamp(0, max_scroll_offset);
         let mut scene = Scene {
+            key: SceneKey::new(
+                self.snapshot.revision(),
+                self.env.env_generation(),
+                self.paths.generation(),
+            ),
             viewport,
             content_extent,
             scroll_offset,
@@ -888,10 +1090,10 @@ impl<'a> Builder<'a> {
         };
         let state = ElementState {
             dark: self.snapshot.appearance() == Appearance::Dark,
-            hovered: self.env.hovered == Some(element.id()),
+            hovered: self.hovered_path_contains(element.id()),
             focus: self.snapshot.focus() == Some(element.id()),
             focus_visible: self.env.focus_visible && self.snapshot.focus() == Some(element.id()),
-            pressed: self.env.pressed == Some(element.id()),
+            pressed: self.press_path_contains(element.id()),
             disabled: element.disabled(),
             checked: element.checked().unwrap_or(false),
             aria_pressed: element.pressed(),
@@ -1069,8 +1271,8 @@ impl<'a> Builder<'a> {
                     visual: visual(intrinsic, element),
                     resolved,
                     disabled: element.disabled(),
-                    hovered: self.env.hovered == Some(id),
-                    pointer_pressed: self.env.pressed == Some(id),
+                    hovered: self.hovered_self(id),
+                    pointer_pressed: self.pressed_self(id),
                     focused,
                     text: runs,
                     caret_stops,
