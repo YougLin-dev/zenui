@@ -17,6 +17,7 @@ mod scene;
 mod scrollbar;
 mod text;
 mod text_assets;
+mod view;
 
 pub use error::SceneError;
 pub use geometry::{Point, Rect, Viewport};
@@ -30,4 +31,5 @@ pub use scene::{
 };
 pub use scrollbar::Scrollbar;
 pub use text_assets::{FontAsset, TextAssetError, TextAssets};
+pub use view::{PresentationApply, PresentationView};
 pub use wgpu;

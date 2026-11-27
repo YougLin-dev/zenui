@@ -25,6 +25,7 @@ mod text;
 
 use std::collections::{HashMap, VecDeque};
 use std::mem::ManuallyDrop;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock, Weak};
 
 use windows::Win32::Foundation::{
@@ -462,6 +463,9 @@ pub(crate) const MAX_PENDING_ACTIONS: usize = 1024;
 pub(crate) struct WindowAccessibility {
     hwnd: WindowHandle,
     published: RwLock<Option<Arc<AccessibilityTree>>>,
+    /// 最后一次发布对应的快照 revision；UIA 不维护 `applied_revision`，
+    /// 因为 delta 不服务无障碍树。
+    last_published_revision: AtomicU64,
     actions: Mutex<VecDeque<AccessibilityAction>>,
 }
 
@@ -470,6 +474,7 @@ impl WindowAccessibility {
         Self {
             hwnd: WindowHandle(hwnd),
             published: RwLock::new(None),
+            last_published_revision: AtomicU64::new(0),
             actions: Mutex::new(VecDeque::new()),
         }
     }
@@ -478,7 +483,9 @@ impl WindowAccessibility {
     ///
     /// 差异在发布锁释放后规划与投递：UIA 可能在事件回调中同步查询 provider，
     /// 持锁投递会与属性读取互相等待。首次发布没有上一棵树，不产生事件。
-    pub(crate) fn publish(self: &Arc<Self>, tree: AccessibilityTree) {
+    pub(crate) fn publish(self: &Arc<Self>, tree: AccessibilityTree, revision: u64) {
+        self.last_published_revision
+            .store(revision, Ordering::Relaxed);
         let next = Arc::new(tree);
         let previous = {
             let mut slot = self
@@ -501,10 +508,20 @@ impl WindowAccessibility {
             .write()
             .unwrap_or_else(PoisonError::into_inner);
         *slot = None;
+        self.last_published_revision.store(0, Ordering::Relaxed);
         self.actions
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clear();
+    }
+
+    /// 最后一次发布对应的快照 revision；从未发布或已清空时为 `None`。
+    #[cfg(test)]
+    pub(crate) fn last_published_revision(&self) -> Option<u64> {
+        match self.last_published_revision.load(Ordering::Relaxed) {
+            0 => None,
+            revision => Some(revision),
+        }
     }
 
     pub(crate) fn tree(&self) -> Option<Arc<AccessibilityTree>> {

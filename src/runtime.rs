@@ -22,12 +22,12 @@ use crate::node::{
     AttrListId, AuxHandles, BindingList, BindingListId, BindingPart, BindingPatchLog,
     BindingPatchMark, BindingRef, BindingTable, BindingType, BindingValue, EditStateId,
     ElementData, ElementFlags, EventListId, NO_PAYLOAD, NodeKindTag, NodeRef, PartId, Pool,
-    ReadSlot, SemanticsId, SlotArena, StyleListId, TagId, TreeKey,
+    PresentationKey, ReadSlot, SemanticsId, SlotArena, StyleListId, TagId, TreeKey,
 };
 use crate::presentation::{
-    Appearance, NodeId, NodeStatus, PresentationSnapshot, SnapshotAction, SnapshotActions,
-    SnapshotAttr, SnapshotElement, SnapshotNode, SnapshotRowBand, SnapshotSemantics, SnapshotValue,
-    TextEditState,
+    Appearance, NodeId, NodeStatus, PresentationDelta, PresentationSnapshot, PresentationUpdate,
+    SnapshotAction, SnapshotActions, SnapshotAttr, SnapshotElement, SnapshotNode, SnapshotRowBand,
+    SnapshotSemantics, SnapshotText, SnapshotValue, TextEditState,
 };
 use crate::session::{SessionAction, SessionCtx, SessionError, SessionPolicy};
 use crate::signal::{MemoCell, SignalCell};
@@ -779,6 +779,9 @@ struct MountedTree {
     /// 根。隐藏树在 flush 推进 revision 后保留旧根，快照构建延迟到第一次
     /// 读取（show 或任何呈现读取入口）。
     snapshot: RefCell<Option<PresentationSnapshot>>,
+    /// 上次成功发布的快照；`presentation_update` 据此计算累计 delta。
+    /// 隐藏窗口在 hide 时清空，重新显示后的首次发布因此是完整根。
+    published: RefCell<Option<PresentationSnapshot>>,
 }
 
 /// 一个窗口化 `For` 的挂载窗口：从 `first` 行开始挂载 `count` 行。
@@ -1549,6 +1552,11 @@ impl State {
             self.bump_window_revision();
             self.mark_tree_changed(TreeSlot::Window(key));
             self.commit_tree_revision(TreeSlot::Window(key));
+            // 隐藏窗口不再发布呈现：清空发布基线，重新显示后的首次发布
+            // 必须是完整根，不能用隐藏期间的旧 revision 猜 delta。
+            if let Some(tree) = self.trees.get(&TreeSlot::Window(key)) {
+                *tree.published.borrow_mut() = None;
+            }
         }
     }
 
@@ -2122,6 +2130,21 @@ impl State {
             PresentationSnapshot::new(roots, focus, self.appearance, row_bands, tree.revision);
         *tree.snapshot.borrow_mut() = Some(snapshot.clone());
         Some(snapshot)
+    }
+
+    /// 发布当前快照及相对上次成功发布的累计 delta。
+    ///
+    /// 发布基线按树保存；隐藏窗口在 hide 时清空，重新显示后的首次发布是
+    /// 完整根（`delta == None`）。读取快照本身不发布，也不推进基线。
+    fn presentation_update(&self, key: TreeSlot) -> Option<PresentationUpdate> {
+        let tree = self.tree(key)?;
+        let snapshot = self.snapshot(key)?;
+        let previous = tree.published.borrow().clone();
+        let delta = previous
+            .as_ref()
+            .and_then(|previous| PresentationDelta::between(previous, &snapshot));
+        *tree.published.borrow_mut() = Some(snapshot.clone());
+        Some(PresentationUpdate::new(snapshot, delta))
     }
 
     pub(crate) fn attach_to_owner(&mut self, resource: Resource) {
@@ -4532,6 +4555,7 @@ impl Runtime {
                         settle_before: None,
                         revision: 0,
                         snapshot: RefCell::new(None),
+                        published: RefCell::new(None),
                     },
                 );
                 state.mark_tree_changed(TreeSlot::Root);
@@ -4956,6 +4980,7 @@ impl Runtime {
                         settle_before: None,
                         revision: 0,
                         snapshot: RefCell::new(None),
+                        published: RefCell::new(None),
                     },
                 );
                 state.mark_tree_changed(TreeSlot::Window(key));
@@ -9382,6 +9407,8 @@ impl Runtime {
     }
 
     /// 指定窗口的呈现快照；窗口已关闭、属于其他 Runtime 或没有已提交树时拒绝。
+    ///
+    /// 这是给 UIA、测试与查询使用的便捷入口，不发布 delta，也不推进发布基线。
     pub fn presentation_of(&self, window: WindowCtx) -> Result<PresentationSnapshot, WindowError> {
         let state = self.state.borrow();
         if window.runtime != state.id {
@@ -9395,6 +9422,40 @@ impl Runtime {
         }
         state
             .snapshot(TreeSlot::Window(window.key))
+            .ok_or(WindowError::Stale)
+    }
+
+    /// 当前活动树的呈现发布单位：快照与相对上次成功发布的累计 delta。
+    ///
+    /// 首次发布、隐藏窗口重新显示后的首次发布，或没有可安全累计的基线时，
+    /// [`PresentationUpdate::delta`] 为 `None`，消费方按完整根重建。
+    pub fn presentation_update(&self) -> Result<PresentationUpdate, MountError> {
+        let state = self.state.borrow();
+        state
+            .active_tree_key()
+            .and_then(|key| state.presentation_update(key))
+            .ok_or(MountError::Component(
+                "presentation update requires a visible committed interface",
+            ))
+    }
+
+    /// 指定窗口的呈现发布单位；隐藏窗口拒绝发布，显示后的首次发布是完整根。
+    pub fn presentation_update_of(
+        &self,
+        window: WindowCtx,
+    ) -> Result<PresentationUpdate, WindowError> {
+        let state = self.state.borrow();
+        if window.runtime != state.id {
+            return Err(WindowError::WrongRuntime);
+        }
+        if !state.window_is_live(window.key, window.activation, window.owner) {
+            return Err(WindowError::Stale);
+        }
+        if !state.window_is_visible(window.key) {
+            return Err(WindowError::Hidden);
+        }
+        state
+            .presentation_update(TreeSlot::Window(window.key))
             .ok_or(WindowError::Stale)
     }
 
@@ -9706,7 +9767,11 @@ fn collect_snapshot(state: &State, nodes: &[MountedNode], out: &mut Vec<Snapshot
     for node in nodes {
         match node {
             MountedNode::Text(payload) => {
-                out.push(SnapshotNode::Text(state.text_value(*payload)));
+                let key = PresentationKey::from_node(state.nodes.text(*payload).node);
+                out.push(SnapshotNode::Text(SnapshotText {
+                    key,
+                    text: state.text_value(*payload),
+                }));
             }
             MountedNode::Element(id) => collect_element(state, *id, out),
             MountedNode::Component(id) => {
@@ -11128,6 +11193,129 @@ mod binding_tests {
             show < text,
             "structure patches precede value patches: {:?}",
             patches.iter().map(|patch| patch.part).collect::<Vec<_>>()
+        );
+    }
+
+    #[component]
+    fn TwoValueHost() -> MountResult<MountPlan> {
+        let left = signal(String::from("left-0"));
+        let right = signal(String::from("right-0"));
+        view! {
+            <view>
+                <text aria:label="left">{left}</text>
+                <text aria:label="right">{right}</text>
+                <button
+                    aria:label="both"
+                    on:click={move || {
+                        left.set(String::from("left-1"));
+                        right.set(String::from("right-1"));
+                    }}
+                >"both"</button>
+            </view>
+        }
+    }
+
+    #[test]
+    fn a_presentation_update_publishes_a_cumulative_delta_for_one_turn() {
+        let mut app = Runtime::new();
+        app.mount(|| view! { <TwoValueHost /> }).expect("mount");
+        let _ = app.refresh().expect("drain the mount report");
+        let first = app.presentation_update().expect("the first publication");
+        assert!(
+            first.delta().is_none(),
+            "the first publication has no baseline and is a full root"
+        );
+        let from = first.snapshot().revision();
+        assert_eq!(from, app.presentation_revision());
+
+        app.click_label("both").expect("change both values");
+        let update = app.presentation_update().expect("the changed publication");
+        let delta = update.delta().expect("a cumulative delta");
+        assert_eq!(delta.from_revision(), from);
+        assert_eq!(delta.to_revision(), update.snapshot().revision());
+        assert_ne!(delta.to_revision(), from, "the turn advanced the revision");
+        for label in ["left", "right"] {
+            let key = update.snapshot().find_label(label).expect("label").key();
+            assert!(
+                delta.changed().contains(&key),
+                "{label} is part of the cumulative delta: {:?}",
+                delta.changed()
+            );
+        }
+    }
+
+    #[component]
+    fn SharedWindowText(shared: Signal<String>) -> MountResult<MountPlan> {
+        view! {
+            <view>
+                <text aria:label="shared">{shared}</text>
+                <button
+                    aria:label="update"
+                    on:click={move || shared.set(String::from("updated"))}
+                >"Update"</button>
+            </view>
+        }
+    }
+
+    #[test]
+    fn a_hidden_window_publishes_a_full_root_after_show() {
+        let mut app = Runtime::new();
+        let shared = app
+            .setup(|| signal(String::from("initial")))
+            .expect("application setup");
+        app.declare_windows(move |catalog| {
+            catalog.window(WindowSpec::new("a").primary(), move |_| {
+                view! { <SharedWindowText shared={shared} /> }
+            })?;
+            catalog.window(WindowSpec::new("b"), move |_| {
+                view! { <SharedWindowText shared={shared} /> }
+            })?;
+            Ok(())
+        })
+        .expect("declare the windows");
+
+        app.show("a").expect("show a");
+        let b = app.show("b").expect("show b");
+        let first = app
+            .presentation_update_of(b)
+            .expect("the first b publication");
+        assert!(first.delta().is_none());
+        assert_eq!(
+            first.snapshot().revision(),
+            app.presentation_revision_of(b).expect("b revision")
+        );
+
+        app.hide(b).expect("hide b");
+        assert!(matches!(
+            app.presentation_update_of(b),
+            Err(WindowError::Hidden)
+        ));
+        let hidden_revision = app
+            .presentation_revision_of(b)
+            .expect("the hidden tree revision");
+        app.click_label("update")
+            .expect("update the shared value from the visible window");
+        assert!(
+            app.presentation_revision_of(b).expect("revision") > hidden_revision,
+            "the hidden tree flushes the shared write synchronously"
+        );
+
+        let restored = app.show("b").expect("show b again");
+        let update = app
+            .presentation_update_of(restored)
+            .expect("the publication after show");
+        assert!(
+            update.delta().is_none(),
+            "a shown window publishes a full root, not a guessed delta"
+        );
+        assert_eq!(
+            update.snapshot().revision(),
+            app.presentation_revision_of(restored).expect("revision")
+        );
+        assert_eq!(
+            update.snapshot().find_label("shared").expect("text").text(),
+            "updated",
+            "the full root already contains the flush performed while hidden"
         );
     }
 

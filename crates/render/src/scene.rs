@@ -932,7 +932,7 @@ impl<'a> Builder<'a> {
                 SnapshotNode::Element(element) => {
                     children.push(self.build_element(element, false)?)
                 }
-                SnapshotNode::Text(text) => children.push(self.build_text(text, resolved)?),
+                SnapshotNode::Text(text) => children.push(self.build_text(text.text(), resolved)?),
             }
         }
         self.tree

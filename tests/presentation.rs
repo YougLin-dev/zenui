@@ -21,7 +21,7 @@ fn add(app: &mut Runtime, title: &str) {
 fn outline(nodes: &[SnapshotNode], out: &mut Vec<(String, String)>) {
     for node in nodes {
         match node {
-            SnapshotNode::Text(text) => out.push((String::from("-"), text.clone())),
+            SnapshotNode::Text(text) => out.push((String::from("-"), text.text().to_owned())),
             SnapshotNode::Element(element) => {
                 out.push((element.tag().to_owned(), element.text()));
                 outline(element.children(), out);
