@@ -39,6 +39,10 @@ The text-scale percentage is part of `SceneEnv`, which remains `Copy + Eq`. Styl
 
 Text-layout and measurement cache keys already contain the font-size bit pattern, so a scaled layout cannot be served for another scale. A live change rebuilds open scenes, preserves focus, caret, selection and local edit values, re-clamps the stored scroll offset, and does not change the presentation revision or dispatch `on:input`. UIA bounds come from the rebuilt scene.
 
+### Environment generation
+
+A preference sample, a DPI scale change, a change in the applied scroll offset or a change in keyboard modality advances the window's `env_generation`. The generation is part of `SceneEnv` and enters `Scene::cache_key` together with the snapshot revision and the interaction-path generation, so the host can rebuild geometry and semantics from the same snapshot root. It is a host presentation counter: it never advances the committed tree revision, never appears in the snapshot or its equality, and never enters transactions or the undo history. Wheel, paging, scrollbar, UIA scroll and reveal advance it when they change the offset, before the scene that uses the new offset is built. A preference sample that changes no value does not advance it; a content-extent change that re-clamps an already stored offset advances it when the offset is corrected.
+
 ## Considered options
 
 - **WinRT `UISettings.TextScaleFactor`**: rejected for this slice. It adds WinRT activation and a float-to-percentage conversion at host startup; the registry value is the integer Windows writes for the same setting, and the host already resamples on `WM_SETTINGCHANGE`.
