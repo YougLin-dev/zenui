@@ -602,16 +602,24 @@ impl crate::runtime::State {
         self.invalidate_dependents(key);
     }
 
-    /// 字段写入代数：`Store` touch 在 `bump` 时推进。
+    /// 字段写入尝试代数：每次应用写入都推进，相等写入也算；
+    /// 与脏依赖代数分开，避免相等写入让依赖失效。
     pub(crate) fn field_write_epoch(
         &self,
         id: crate::store::TodoId,
         kind: crate::context::FieldKind,
     ) -> u64 {
-        self.write_epochs
-            .get(&DepKey::Field(id, kind))
-            .copied()
-            .unwrap_or(0)
+        self.field_writes.get(&(id, kind)).copied().unwrap_or(0)
+    }
+
+    /// 记录一次应用字段写入尝试；由 `Store` 事务在提交时调用。
+    pub(crate) fn note_field_write(
+        &mut self,
+        id: crate::store::TodoId,
+        kind: crate::context::FieldKind,
+    ) {
+        let epoch = self.field_writes.entry((id, kind)).or_insert(0);
+        *epoch = epoch.wrapping_add(1);
     }
 
     /// 绑定槽来源的写入代数；已释放或不存在的槽按 0 处理。

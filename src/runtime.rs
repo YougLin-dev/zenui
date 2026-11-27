@@ -11,7 +11,7 @@ use std::sync::{Arc, RwLock};
 use zenui_core::{Counters, PanicInfo, RowSet, catch_panic};
 use zenui_style::{Color, Length, Opacity, Property, StyleValue};
 
-use crate::context::{self, ContextFault, DepKey, Phase, with_state};
+use crate::context::{self, ContextFault, DepKey, FieldKind, Phase, with_state};
 use crate::dispatch::{DispatchError, NodeOperation};
 use crate::menu::{
     CommandError, CommandEvent, CommandHandler, CommandSource, MenuCommand, MenuCommandState,
@@ -30,7 +30,7 @@ use crate::presentation::{
 };
 use crate::session::{SessionAction, SessionCtx, SessionError, SessionPolicy};
 use crate::signal::{MemoCell, SignalCell};
-use crate::store::{TodoId, WriteError};
+use crate::store::{CachedRowSet, TodoId, TodoRow, WriteError};
 use crate::task::{TaskRecord, WakeCallback};
 use crate::text_edit::{self, Edit, Movement};
 use crate::tray::{TrayError, TraySpec};
@@ -819,10 +819,19 @@ pub(crate) struct State {
     binding_patches: BindingPatchLog,
     /// 刷新轮次；同一 binding 每轮最多求值一次，焦点结算会开启新一轮。
     refresh_round: u64,
-    /// 源写入代数；字段绑定用它辨认处理器是否写过这次编辑。
+    /// 脏依赖代数；值绑定不直接读它，相等写入不推进。
     pub(crate) write_epochs: BTreeMap<DepKey, u64>,
+    /// 字段写入尝试代数；相等写入同样推进，文本编辑器据此判断处理器
+    /// 是否处理过这次编辑。
+    pub(crate) field_writes: BTreeMap<(TodoId, FieldKind), u64>,
     pub(crate) write_error: Option<WriteError>,
-    pub(crate) core: zenui_core::Runtime,
+    /// Todo 是通用行模型的第一个实例化；行身份与业务键都由它维护。
+    pub(crate) todo_store: zenui_core::model::Store<TodoRow>,
+    /// 业务键种子；只在事务成功提交后推进，失败的事务不消耗键。
+    pub(crate) next_todo_key: u64,
+    /// 旧 `RowSet` 投影缓存，按 membership/order revision 失效。
+    pub(crate) rowset_cache: [Option<CachedRowSet>; 3],
+    pub(crate) store_counters: Counters,
     pub(crate) phase: Phase,
     pub(crate) fault: Option<ContextFault>,
     pub(crate) appearance: Appearance,
@@ -1116,8 +1125,12 @@ impl State {
             binding_patches: BindingPatchLog::default(),
             refresh_round: 0,
             write_epochs: BTreeMap::new(),
+            field_writes: BTreeMap::new(),
             write_error: None,
-            core: zenui_core::Runtime::new(),
+            todo_store: zenui_core::model::Store::new(crate::store::todo_schema()),
+            next_todo_key: 1,
+            rowset_cache: [None, None, None],
+            store_counters: Counters::default(),
             phase: Phase::Idle,
             fault: None,
             appearance: Appearance::Light,
@@ -8776,7 +8789,7 @@ impl Runtime {
     }
 
     pub fn counters(&self) -> Counters {
-        self.state.borrow().core.counters()
+        self.state.borrow().store_counters
     }
 
     /// 当前焦点窗口的呈现 revision。
@@ -9465,6 +9478,7 @@ mod lineage_tests {
     #![allow(unused_braces)]
 
     use super::*;
+    use crate::prelude::*;
     use crate::{component, memo, signal, view};
 
     fn text_of(app: &Runtime, label: &str) -> String {
@@ -9677,6 +9691,73 @@ mod lineage_tests {
         app.undo_node(input)
             .expect("an edit with unchanged committed text records nothing");
         assert_eq!(trace(&app).len(), recorded, "undo dispatched no edit");
+    }
+
+    /// Store 字段与 Signal 一样：处理器写回旧值仍表示应用处理了这次编辑。
+    #[component]
+    fn StoreCappedAtOne() -> MountResult<MountPlan> {
+        let store = Store::new();
+        let rows = memo(move || store.rows(Filter::All));
+
+        view! {
+            <view>
+                <button
+                    aria:label="seed"
+                    on:click={move || -> Result<(), WriteError> {
+                        Transaction::new().write(store.insert("a")).finish()
+                    }}
+                >"seed"</button>
+                <For each={rows} key={|id: TodoId| id}>
+                    {move |id: TodoId| view! {
+                        <text-input
+                            aria:label="store-same"
+                            value={store.title(id)}
+                            on:input={move |value: String| {
+                                let capped = value.chars().take(1).collect::<String>();
+                                let _ = Transaction::new()
+                                    .write(store.set_title(id, capped))
+                                    .finish();
+                            }}
+                        />
+                    }}
+                </For>
+            </view>
+        }
+    }
+
+    #[test]
+    fn a_store_handler_that_writes_the_old_value_settles_the_edit() {
+        let mut app = Runtime::new();
+        app.mount(|| view! { <StoreCappedAtOne /> }).expect("mount");
+        app.click_label("seed").expect("seed the row");
+        let input = app
+            .presentation()
+            .expect("snapshot")
+            .find_label("store-same")
+            .expect("the input")
+            .id();
+
+        app.set_caret_node(input, 1).expect("caret");
+        app.insert_text_node(input, "b").expect("edit");
+        assert_eq!(
+            text_of(&app, "store-same"),
+            "a",
+            "a store write of the old value still settles the edit"
+        );
+
+        let events = trace(&app);
+        assert!(
+            matches!(
+                events.last(),
+                Some(TextTrace::Settlement {
+                    revision: 1,
+                    normalized: true,
+                    ..
+                })
+            ),
+            "unexpected: {:?}",
+            events.last()
+        );
     }
 
     #[component]
@@ -11590,6 +11671,169 @@ mod binding_tests {
         assert!(
             state.owner_bands.is_empty(),
             "band ownership dies with its for"
+        );
+    }
+
+    #[component]
+    fn EqualWriteHost() -> MountResult<MountPlan> {
+        let store = Store::new();
+        let rows = memo(move || store.rows(Filter::All));
+        view! {
+            <view>
+                <button aria:label="seed" on:click={move || -> Result<(), WriteError> {
+                    Transaction::new().write(store.insert("row")).finish()
+                }}>"seed"</button>
+                <button aria:label="equal" on:click={move || -> Result<(), WriteError> {
+                    if let Some(key) = store.rows(Filter::All).as_slice().first().copied() {
+                        let id = TodoId::from_key(key);
+                        Transaction::new()
+                            .write(store.set_title(id, "row"))
+                            .write(store.set_completed(id, false))
+                            .write(store.reorder(&[id]))
+                            .finish()?;
+                    }
+                    Ok(())
+                }}>"equal"</button>
+                <button aria:label="change" on:click={move || -> Result<(), WriteError> {
+                    if let Some(key) = store.rows(Filter::All).as_slice().first().copied() {
+                        let id = TodoId::from_key(key);
+                        Transaction::new().write(store.set_title(id, "changed")).finish()?;
+                    }
+                    Ok(())
+                }}>"change"</button>
+                <For each={rows} key={|id: TodoId| id}>
+                    {move |id: TodoId| view! { <text>{store.title(id)}</text> }}
+                </For>
+            </view>
+        }
+    }
+
+    #[test]
+    fn equal_store_writes_do_not_bump_field_or_row_dependencies() {
+        use crate::context::{FieldKind, filter_slot};
+
+        let mut app = Runtime::new();
+        app.declare_windows(|catalog| {
+            catalog.window(WindowSpec::new("main").primary(), |_| {
+                view! { <EqualWriteHost /> }
+            })
+        })
+        .expect("declare the window");
+        let window = app.show("main").expect("show the window");
+        app.click_label("seed").expect("seed the row");
+        let id = app.for_items().first().expect("row item").todo;
+        assert!(app.texts().iter().any(|text| text == "row"));
+
+        let fields = [
+            DepKey::Field(id, FieldKind::Title),
+            DepKey::Field(id, FieldKind::Completed),
+        ];
+        let rows = [
+            DepKey::Rows(filter_slot(Filter::All)),
+            DepKey::Rows(filter_slot(Filter::Active)),
+            DepKey::Rows(filter_slot(Filter::Completed)),
+        ];
+        let before: Vec<u64> = {
+            let state = app.state.borrow();
+            fields
+                .iter()
+                .chain(rows.iter())
+                .map(|key| state.write_epochs.get(key).copied().unwrap_or(0))
+                .collect()
+        };
+        let revision = app.presentation_revision_of(window).expect("revision");
+        let attempts = {
+            let state = app.state.borrow();
+            [
+                state.field_write_epoch(id, FieldKind::Title),
+                state.field_write_epoch(id, FieldKind::Completed),
+            ]
+        };
+        let io_writes = app.counters().io_writes;
+
+        app.click_label("equal").expect("equal writes are allowed");
+        {
+            let state = app.state.borrow();
+            let after: Vec<u64> = fields
+                .iter()
+                .chain(rows.iter())
+                .map(|key| state.write_epochs.get(key).copied().unwrap_or(0))
+                .collect();
+            assert_eq!(after, before, "equal writes bump no field or row epoch");
+            assert!(
+                state.field_write_epoch(id, FieldKind::Title) > attempts[0],
+                "the title write attempt is still recorded"
+            );
+            assert!(
+                state.field_write_epoch(id, FieldKind::Completed) > attempts[1],
+                "the completed write attempt is still recorded"
+            );
+        }
+        assert_eq!(
+            app.counters().io_writes,
+            io_writes,
+            "equal writes are not io writes"
+        );
+        assert_eq!(
+            app.presentation_revision_of(window).expect("revision"),
+            revision,
+            "equal writes change nothing visible"
+        );
+
+        app.click_label("change").expect("real title write");
+        assert!(app.presentation_revision_of(window).expect("revision") > revision);
+        assert_eq!(
+            app.counters().io_writes,
+            io_writes + 1,
+            "a real write counts once"
+        );
+        assert!(app.texts().iter().any(|text| text == "changed"));
+    }
+
+    #[component]
+    fn WriteCountingHost() -> MountResult<MountPlan> {
+        let store = Store::new();
+        view! {
+            <view>
+                <button aria:label="two-inserts" on:click={move || -> Result<(), WriteError> {
+                    Transaction::new()
+                        .write(store.insert("a"))
+                        .write(store.insert("b"))
+                        .finish()
+                }}>"two"</button>
+                <button aria:label="empty-clear" on:click={move || -> Result<(), WriteError> {
+                    Transaction::new().write(store.clear_completed()).finish()
+                }}>"clear"</button>
+            </view>
+        }
+    }
+
+    #[test]
+    fn a_transaction_counts_each_effective_write() {
+        let mut app = Runtime::new();
+        app.mount(|| view! { <WriteCountingHost /> })
+            .expect("mount");
+
+        let before = app.counters();
+        app.click_label("two-inserts").expect("two inserts");
+        let after = app.counters();
+        assert_eq!(
+            after.io_writes - before.io_writes,
+            2,
+            "each insert is one write"
+        );
+        assert_eq!(
+            after.commits - before.commits,
+            1,
+            "one transaction commits once"
+        );
+
+        let before = app.counters();
+        app.click_label("empty-clear").expect("nothing to clear");
+        let after = app.counters();
+        assert_eq!(
+            after.io_writes, before.io_writes,
+            "an empty clear batch writes nothing"
         );
     }
 
