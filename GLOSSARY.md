@@ -76,6 +76,10 @@ _Avoid_: hover node, hit path
 每个窗口独立的呈现环境代际，随系统偏好、DPI、滚动偏移与焦点 modality 变化递增；它不是树 revision，也不进入快照。文本缩放/DPI 变化据此重建布局、整形与行带，高对比度据此重建调色板与场景，而 `tree.revision` 保持不变。
 _Avoid_: env version, ui revision
 
+**Reveal flags**:
+一次 turn 报告（`TurnReport::reveal`）中的焦点、caret/selection 与组合变化标志；由 runtime 在 turn 开始与结算时比较同一棵树的焦点节点、caret 与 anchor（selection 由二者派生）以及 preedit 得出。宿主只在任一标志为真时置位待决显露，显式滚动清除它；标志不进入快照或响应式图。
+_Avoid_: scroll request, focus event
+
 **Presentation delta**:
 一次提交相对上次成功发布的累计变化，按 `PresentationKey` 给出 changed（含祖先路径）、inserted、removed、removed subtrees 与 layout roots，以及焦点/外观/行带标志；不携带旧值或父链。renderer 用它失效增量缓存，UIA 不消费 delta。
 _Avoid_: diff, patch

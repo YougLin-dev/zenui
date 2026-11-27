@@ -724,7 +724,8 @@ struct WindowHost {
     env_generation: u64,
     /// 最近一次场景构建使用的交互路径；路径变化时推进 generation。
     interaction: InteractionPaths,
-    /// 滚动触发的重建只更新 hover，不清除 capture-based 的按压目标。
+    /// 滚动触发的本次帧（首遍与行窗口第二遍）只更新 hover，不清除
+    /// capture-based 的按压目标；在场景提交后复位。
     preserve_press_on_next_rebuild: bool,
     /// 滚动条 thumb 拖动中指针相对 thumb 顶部的逻辑偏移；捕获与它同生共死。
     scrollbar_drag: Option<f32>,
@@ -2060,7 +2061,7 @@ impl Host {
         Ok(read(&snapshot))
     }
 
-    /// 输入前确保内存场景使用当前滚动偏移与显露结果。
+    /// 输入前确保内存场景使用当前快照、环境与滚动偏移。
     ///
     /// `render_window` 在 surface `Timeout`/`Occluded` 时不会更新 `window.scene`；
     /// 指针与键盘输入必须命中最新偏移的场景，因此这里只重建，不呈现。
@@ -2069,17 +2070,26 @@ impl Host {
     /// 场景连同行窗口目标一起返回，由 [`Host::refresh_input_scene`] 在场景
     /// 构建的调用栈之外完成结构 turn（ADR：结构变化不能藏在构建里）。
     fn ensure_scene(&mut self, window: &mut WindowHost) -> Result<Option<PendingScene>, HostError> {
-        let fresh = window.scene.as_ref().is_some_and(|scene| {
-            scene.scroll_offset() == window.scroll_offset && !window.reveal_requested
-        });
-        if fresh {
-            return Ok(None);
-        }
-        // 运行时版本已经前进时缓存快照不再可信；行窗口更新也会改变版本。
+        // 运行时版本已经前进时缓存快照不再可信；行窗口更新、输入 turn 与
+        // 环境代际也会改变版本。
         let revision = self
             .runtime
             .presentation_revision_of(window.ctx)
             .unwrap_or(window.snapshot_revision);
+        // 输入前用最近一次构建的场景重命中指针；悬停变了说明这份场景已经
+        // 不能表达当前瞬态，必须重建。
+        let hover_changed = Self::rehit_hover(window);
+        let fresh = !hover_changed
+            && window.scene.as_ref().is_some_and(|scene| {
+                let key = scene.cache_key();
+                scene.scroll_offset() == window.scroll_offset
+                    && key.snapshot_revision() == revision
+                    && key.env_generation() == window.env_generation
+                    && !window.reveal_requested
+            });
+        if fresh {
+            return Ok(None);
+        }
         if window.snapshot_revision != revision || window.last_snapshot.is_none() {
             match self.runtime.presentation_of(window.ctx) {
                 Ok(snapshot) => {
@@ -2137,6 +2147,7 @@ impl Host {
                     .presentation_revision_of(window.ctx)
                     .unwrap_or(window.snapshot_revision);
                 commit_scene(window, &snapshot, scene);
+                window.preserve_press_on_next_rebuild = false;
                 window.last_snapshot = Some(snapshot);
                 Ok(())
             }
@@ -2450,6 +2461,9 @@ impl Host {
                 self.attempt_adapter = None;
             }
             commit_scene(window, snapshot, scene);
+            // 本帧的全部场景构建（首遍与行窗口第二遍）都已完成；按压保留
+            // 只覆盖这一次滚动帧，不延续到之后的无关重建。
+            window.preserve_press_on_next_rebuild = false;
             window.paint_requested = false;
             self.position_ime(window, snapshot);
             return Ok(true);
@@ -2652,13 +2666,17 @@ impl Host {
 
         // 按下与 headless 共用 Press Intent：最近可聚焦祖先获得焦点，text-input
         // 使用场景算出的字符偏移放置 caret；禁用目标不会走到这里。
-        ignore_expected_dispatch(self.runtime.dispatch_intent(Intent::press(node, caret)))?;
+        let press = self.runtime.dispatch_intent(Intent::press(node, caret));
+        let reveal = press
+            .as_ref()
+            .is_ok_and(|report| report.reveal().needs_reveal());
+        ignore_expected_dispatch(press)?;
 
         match visual {
             Visual::TextInput => {
                 // 可见切片内的点击通常不需要移动；caret 落在视口外时由同一
-                // 显露规则拉回。
-                window.reveal_requested = true;
+                // 显露规则拉回。焦点与 caret 都没变时不做显露。
+                window.reveal_requested |= reveal;
             }
             Visual::Checkbox { .. } | Visual::Button { .. } => {
                 window.pressed = Some(node);
@@ -2905,15 +2923,17 @@ impl Host {
                 .as_ref()
                 .and_then(|scene| scene.node(node))
                 .map(SceneElement::visual);
-            match visual {
-                Some(Visual::Button { .. }) => {
-                    ignore_expected_dispatch(self.runtime.activate_node(node))?
-                }
-                Some(Visual::Checkbox { checked }) => {
-                    ignore_expected_dispatch(self.runtime.change_node(node, !checked))?;
-                }
-                _ => {}
-            }
+            let report = match visual {
+                Some(Visual::Button { .. }) => self.runtime.activate_node(node),
+                Some(Visual::Checkbox { checked }) => self.runtime.change_node(node, !checked),
+                _ => Ok(TurnReport::default()),
+            };
+            // 激活处理器可能卸载当前焦点并结算到新的可见目标；runtime 在
+            // 这个 turn 里报告了焦点变化，宿主必须像其它输入一样申请显露。
+            window.reveal_requested |= report
+                .as_ref()
+                .is_ok_and(|report| report.reveal().needs_reveal());
+            ignore_expected_dispatch(report)?;
         }
 
         window.hovered = window
@@ -3266,7 +3286,7 @@ impl Host {
                     if !element.semantics().has_action(SnapshotAction::Click) {
                         continue;
                     }
-                    ignore_expected_dispatch(self.runtime.click_node(node))
+                    self.runtime.click_node(node)
                 }
                 AccessibilityAction::Toggle(_) => {
                     let Some(checked) = element.toggle_state() else {
@@ -3275,7 +3295,7 @@ impl Host {
                     if !element.semantics().has_action(SnapshotAction::Change) {
                         continue;
                     }
-                    ignore_expected_dispatch(self.runtime.change_node(node, !checked))
+                    self.runtime.change_node(node, !checked)
                 }
                 AccessibilityAction::SetValue(_, value) => {
                     let editable = element.semantics().has_action(SnapshotAction::Input)
@@ -3285,7 +3305,7 @@ impl Host {
                     if !editable {
                         continue;
                     }
-                    ignore_expected_dispatch(self.runtime.replace_text_node(node, &value))
+                    self.runtime.replace_text_node(node, &value)
                 }
                 AccessibilityAction::SetSelection(_, start, end) => {
                     let editable = element.semantics().has_action(SnapshotAction::Input)
@@ -3295,7 +3315,7 @@ impl Host {
                     if !editable {
                         continue;
                     }
-                    ignore_expected_dispatch(self.runtime.set_selection_node(node, start, end))
+                    self.runtime.set_selection_node(node, start, end)
                 }
                 AccessibilityAction::SetFocus(_) => {
                     if !element.semantics().focusable()
@@ -3303,12 +3323,17 @@ impl Host {
                     {
                         continue;
                     }
-                    ignore_expected_dispatch(self.runtime.focus_node(node))
+                    self.runtime.focus_node(node)
                 }
                 AccessibilityAction::Scroll(_) => continue,
             };
+            // 无障碍动作也是用户输入：处理器结算的焦点或 caret 与服务端点击
+            // 同样需要显露。
+            window.reveal_requested |= dispatched
+                .as_ref()
+                .is_ok_and(|report| report.reveal().needs_reveal());
             // 继续执行剩余动作；真正失败仍报告给宿主，但不丢弃已经应答的动作。
-            if let Err(error) = dispatched {
+            if let Err(error) = ignore_expected_dispatch(dispatched) {
                 failure.get_or_insert(error);
             }
         }
@@ -3511,14 +3536,18 @@ impl Host {
         let text = character.encode_utf8(&mut buffer);
         // 部分 IME 把候选确认作为 WM_CHAR 送达，而不是 GCS_RESULTSTR；
         // 组合中的字符必须走 commit，否则普通编辑会被 reducer 拒绝。
-        if is_composing(&snapshot, focused) {
-            ignore_expected_dispatch(self.runtime.compose_commit_node(focused, text))?;
+        let report = if is_composing(&snapshot, focused) {
+            self.runtime.compose_commit_node(focused, text)
         } else {
             // 可打印字符是宿主 L5 默认，但插入本身在 Event turn 内完成：
             // 一次 `on:input`、一个 `TurnReport`，不形成 Input intent。
-            ignore_expected_dispatch(self.runtime.type_text_node(focused, text))?;
-        }
-        window.reveal_requested = true;
+            self.runtime.type_text_node(focused, text)
+        };
+        let reveal = report
+            .as_ref()
+            .is_ok_and(|report| report.reveal().needs_reveal());
+        ignore_expected_dispatch(report)?;
+        window.reveal_requested |= reveal;
         window.paint_requested = true;
         Ok(())
     }
@@ -3584,7 +3613,7 @@ impl Host {
         if key == VK_TAB {
             self.cancel_compositions(window)?;
             let report = self.dispatch_key_intent(window, Key::Tab, modifiers)?;
-            window.reveal_requested = true;
+            window.reveal_requested |= report.reveal().needs_reveal();
             window.paint_requested = true;
             return Ok(report);
         }
@@ -3617,8 +3646,14 @@ impl Host {
                 || key_default_blocked(&report)
             {
                 // 组合期间翻页键归 IME；被 handler 消费的翻页键也不滚动。
+                // 这两个提前返回没有显式滚动，turn 里结算的焦点需要显露。
+                window.reveal_requested |= report.reveal().needs_reveal();
                 return Ok(report);
             }
+            // 显式滚动优先：丢弃本 turn 的显露请求与更早的 pending 显露，
+            // 翻页从用户当前偏移开始；若先置位，scroll_by_key 的输入场景刷新
+            // 会先应用显露，再在这个已改变的偏移上翻页。
+            window.reveal_requested = false;
             self.scroll_by_key(window, key)?;
             return Ok(report);
         }
@@ -3627,7 +3662,11 @@ impl Host {
             // fallback handler 与 Tab/Enter/Space 默认都在那里结算。
             let report = self.dispatch_key_intent(window, host_key(key), modifiers)?;
             if matches!(key, VK_HOME | VK_END) && !key_default_blocked(&report) {
+                // 显式滚动优先：丢弃本 turn 的显露请求与更早的 pending 显露。
+                window.reveal_requested = false;
                 self.scroll_by_key(window, key)?;
+            } else {
+                window.reveal_requested |= report.reveal().needs_reveal();
             }
             return Ok(report);
         };
@@ -3640,6 +3679,7 @@ impl Host {
                 return Ok(TurnReport::default());
             }
             let report = self.dispatch_key_intent(window, Key::Escape, modifiers)?;
+            window.reveal_requested |= report.reveal().needs_reveal();
             window.paint_requested = true;
             return Ok(report);
         }
@@ -3651,18 +3691,27 @@ impl Host {
         if let Some(action) = editor_shortcut(key, control, true, composing) {
             match action {
                 EditorAction::SelectAll => {
-                    ignore_expected_dispatch(self.runtime.select_all_node(focused))?;
-                    window.reveal_requested = true;
+                    let report = self.runtime.select_all_node(focused);
+                    window.reveal_requested |= report
+                        .as_ref()
+                        .is_ok_and(|report| report.reveal().needs_reveal());
+                    ignore_expected_dispatch(report)?;
                     window.paint_requested = true;
                 }
                 EditorAction::Undo => {
-                    ignore_expected_dispatch(self.runtime.undo_node(focused))?;
-                    window.reveal_requested = true;
+                    let report = self.runtime.undo_node(focused);
+                    window.reveal_requested |= report
+                        .as_ref()
+                        .is_ok_and(|report| report.reveal().needs_reveal());
+                    ignore_expected_dispatch(report)?;
                     window.paint_requested = true;
                 }
                 EditorAction::Redo => {
-                    ignore_expected_dispatch(self.runtime.redo_node(focused))?;
-                    window.reveal_requested = true;
+                    let report = self.runtime.redo_node(focused);
+                    window.reveal_requested |= report
+                        .as_ref()
+                        .is_ok_and(|report| report.reveal().needs_reveal());
+                    ignore_expected_dispatch(report)?;
                     window.paint_requested = true;
                 }
                 EditorAction::Copy => self.copy_selection(&snapshot, focused),
@@ -3674,7 +3723,7 @@ impl Host {
         // L3 用户 keydown → L4 控件默认全部在 runtime 内完成；宿主只保留
         // L1 快捷键、IME 与 L5 滚动/绘制。
         let report = self.dispatch_key_intent(window, host_key(key), modifiers)?;
-        window.reveal_requested = true;
+        window.reveal_requested |= report.reveal().needs_reveal();
         window.paint_requested = true;
         Ok(report)
     }
@@ -3752,8 +3801,11 @@ impl Host {
         if !self.write_selection(snapshot, focused) {
             return Ok(());
         }
-        ignore_expected_dispatch(self.runtime.backspace_node(focused))?;
-        window.reveal_requested = true;
+        let report = self.runtime.backspace_node(focused);
+        window.reveal_requested |= report
+            .as_ref()
+            .is_ok_and(|report| report.reveal().needs_reveal());
+        ignore_expected_dispatch(report)?;
         window.paint_requested = true;
         Ok(())
     }
@@ -3777,8 +3829,12 @@ impl Host {
         if filtered.is_empty() {
             return Ok(());
         }
-        ignore_expected_dispatch(self.runtime.type_text_node(focused, &filtered))?;
-        window.reveal_requested = true;
+        let report = self.runtime.type_text_node(focused, &filtered);
+        let reveal = report
+            .as_ref()
+            .is_ok_and(|report| report.reveal().needs_reveal());
+        ignore_expected_dispatch(report)?;
+        window.reveal_requested |= reveal;
         window.paint_requested = true;
         Ok(())
     }
@@ -4195,6 +4251,9 @@ impl Host {
         if snapshot_changed {
             window.wheel.reset();
         }
+        // 构建前用上一份场景重命中最后指针位置：场景变化后，悬停路径必须
+        // 从当前可命中的节点重新开始，而不是沿用旧目标。
+        Self::rehit_hover(window);
         refresh_interaction_paths(snapshot, window);
         let requested = window.scroll_offset;
         let preserve_press = window.preserve_press_on_next_rebuild;
@@ -4210,6 +4269,10 @@ impl Host {
         // 新场景可能已经移走或卸载了指针下的节点；失效目标不能继续高亮。
         // 滚动触发的重建保留 capture-based 的按压目标。
         if self.revalidate_pointer(window, &scene, !preserve_press) {
+            #[cfg(test)]
+            {
+                self.counters.scene_builds += 1;
+            }
             refresh_interaction_paths(snapshot, window);
             scene = Scene::build_cached(
                 snapshot,
@@ -4222,7 +4285,6 @@ impl Host {
             let requested = window.scroll_offset;
             adopt_scroll_offset(window, &scene, requested);
         }
-        window.preserve_press_on_next_rebuild = false;
         // 组合期间不绘制 caret，草稿由 preedit 下划线标识；闪烁只在非组合状态生效。
         let composing = focused_composition(snapshot);
         scene.set_caret_visible(window.caret_visible && !composing);
@@ -4270,10 +4332,35 @@ impl Host {
         Ok(scene)
     }
 
+    /// 用已构建的场景重新命中最后的指针位置；只刷新 hover。
+    ///
+    /// 场景构建前与输入派发前调用。按压目标是 capture-based 的，不在这里
+    /// 重新评估；目标失效由构建后的 [`Host::revalidate_pointer`] 清除。
+    fn rehit_hover(window: &mut WindowHost) -> bool {
+        let Some(point) = window.pointer else {
+            return false;
+        };
+        let Some(scene) = window.scene.as_ref() else {
+            return false;
+        };
+        let hit = (!scene.scrollbar().is_some_and(|bar| bar.hit(point)))
+            .then(|| scene.hit_test(point))
+            .flatten();
+        let enabled =
+            hit.filter(|node| scene.node(*node).is_some_and(|element| !element.disabled()));
+        if enabled == window.hovered {
+            return false;
+        }
+        window.hovered = enabled;
+        true
+    }
+
     /// 用新场景重新命中最后的指针位置；返回是否需要按新瞬态重建。
     ///
-    /// `clear_press` 为 false 时只更新 hover，保留 capture-based 的按压目标，
-    /// 用于滚动触发的重建：滚动不重新评估按压，松开时仍按命中结果决定激活。
+    /// `clear_press` 为 false 时保留 capture-based 的按压目标，用于滚动触发
+    /// 的重建：滚动不按新的 hover 重新评估按压，松开时仍按命中结果决定激活。
+    /// 但目标在最新场景中已经不存在、被禁用或已卸载时，按压必须立即清除，
+    /// 与是否由滚动触发无关。
     fn revalidate_pointer(
         &mut self,
         window: &mut WindowHost,
@@ -4289,10 +4376,11 @@ impl Host {
             .flatten();
         let enabled = hit.filter(|node| scene.node(*node).is_some_and(|e| !e.disabled()));
         let hover_changed = enabled != window.hovered;
-        let press_cleared = clear_press
-            && window.pressed.is_some_and(|pressed| {
-                hit != Some(pressed) || scene.node(pressed).is_none_or(|element| element.disabled())
-            });
+        let press_stale = window
+            .pressed
+            .is_some_and(|pressed| scene.node(pressed).is_none_or(|element| element.disabled()));
+        let press_cleared = press_stale
+            || (clear_press && window.pressed.is_some_and(|pressed| hit != Some(pressed)));
         if !hover_changed && !press_cleared {
             return false;
         }
@@ -8947,6 +9035,45 @@ mod tests {
     }
 
     #[test]
+    fn an_accessibility_invoke_that_settles_focus_requests_reveal() {
+        let (mut host, _probe) = open_uia_probe();
+        host.runtime
+            .focus("Ephemeral")
+            .expect("focus the ephemeral button");
+        host.render().expect("focused frame");
+        with_main(&mut host, |_host, window| {
+            window.reveal_requested = false;
+            Ok(())
+        });
+        let node = host
+            .accessibility_tree(MAIN)
+            .expect("published tree")
+            .find_name("Hide")
+            .and_then(|node| node.node_id())
+            .expect("the hide node");
+        assert!(
+            host.windows[MAIN]
+                .accessibility
+                .enqueue(AccessibilityAction::Invoke(node))
+        );
+        with_main(&mut host, |host, window| {
+            host.run_accessibility_actions(window)
+        });
+        assert!(
+            host.runtime
+                .presentation()
+                .expect("snapshot")
+                .find_label("Ephemeral")
+                .is_none(),
+            "the invoke unmounted the focused control"
+        );
+        assert!(
+            host.windows[MAIN].reveal_requested,
+            "the settled focus from an accessibility invoke requests reveal"
+        );
+    }
+
+    #[test]
     fn the_accessibility_action_queue_rejects_overflow() {
         let (host, _probe) = open_uia_probe();
         let node = host
@@ -10662,6 +10789,737 @@ mod tests {
             revision,
             "scrolling does not touch the snapshot revision"
         );
+    }
+
+    fn tall_host(tasks: usize) -> Host {
+        let mut host = open_host();
+        for index in 0..tasks {
+            host.runtime
+                .input("What needs to be done?", &format!("Task {index}"))
+                .expect("fill the draft");
+            host.runtime.submit("Add task").expect("add a row");
+        }
+        host.render().expect("render the tall window");
+        host
+    }
+
+    /// 按下指定标签的行复选框，返回它的 NodeId；调用后 press 目标已建立。
+    fn press_label(host: &mut Host, label: &str) -> NodeId {
+        let scene = host.scene(MAIN).expect("scene");
+        let id = host
+            .runtime
+            .presentation()
+            .expect("snapshot")
+            .find_label(label)
+            .expect("the labelled checkbox")
+            .id();
+        let rect = scene.node(id).expect("checkbox geometry").rect();
+        let point = Point::new(rect.x + rect.width / 2.0, rect.y + rect.height / 2.0);
+        send_msg(
+            host,
+            MSG {
+                message: WM_LBUTTONDOWN,
+                lParam: pointer_lparam(point, scene.viewport().scale()),
+                ..Default::default()
+            },
+        );
+        id
+    }
+
+    #[test]
+    fn input_scene_follows_the_committed_revision_without_a_render() {
+        let mut host = open_host();
+        host.render().expect("the first frame");
+        let revision = host
+            .runtime
+            .presentation_revision_of(host.windows[MAIN].ctx)
+            .expect("revision");
+        host.runtime
+            .input("What needs to be done?", "changed")
+            .expect("commit a draft change");
+        let committed = host
+            .runtime
+            .presentation_revision_of(host.windows[MAIN].ctx)
+            .expect("revision");
+        assert!(
+            committed > revision,
+            "the draft change commits a new revision"
+        );
+        assert!(
+            host.scene(MAIN)
+                .expect("scene")
+                .cache_key()
+                .snapshot_revision()
+                < committed,
+            "the rendered scene predates the commit"
+        );
+
+        host.with_window(MAIN, |host, window| host.refresh_input_scene(window))
+            .expect("refresh the input scene");
+        assert_eq!(
+            host.scene(MAIN)
+                .expect("scene")
+                .cache_key()
+                .snapshot_revision(),
+            committed,
+            "input uses the committed snapshot, not the rendered one"
+        );
+    }
+
+    #[test]
+    fn input_scene_follows_the_environment_generation_without_a_render() {
+        let mut host = open_host();
+        host.render().expect("the first frame");
+        let node = host
+            .runtime
+            .presentation()
+            .expect("snapshot")
+            .find_label("What needs to be done?")
+            .expect("draft")
+            .id();
+        host.set_system_preferences(SystemPreferences::new(false, 225));
+        let generation = host.windows.get(MAIN).expect("window").env_generation;
+        assert_ne!(
+            host.scene(MAIN)
+                .expect("scene")
+                .cache_key()
+                .env_generation(),
+            generation,
+            "the rendered scene predates the preference change"
+        );
+
+        host.with_window(MAIN, |host, window| host.refresh_input_scene(window))
+            .expect("refresh the input scene");
+        let scene = host.scene(MAIN).expect("scaled scene");
+        assert_eq!(scene.cache_key().env_generation(), generation);
+        assert!(
+            (scene
+                .node(node)
+                .expect("draft geometry")
+                .resolved_style()
+                .font_size()
+                - 31.5)
+                .abs()
+                < 0.01,
+            "input hit testing uses the scaled scene"
+        );
+    }
+
+    #[test]
+    fn a_scroll_that_unmounts_the_pressed_row_clears_press() {
+        let mut host = tall_host(100);
+        host.windows.get_mut(MAIN).expect("window").wheel = wheel(WheelLines::Lines(3));
+        let pressed = press_label(&mut host, "Complete Task 5");
+        assert_eq!(host.windows[MAIN].pressed, Some(pressed));
+        send_msg(
+            &mut host,
+            MSG {
+                message: WM_MOUSEWHEEL,
+                wParam: WPARAM(((-2400i16 as u16) as u32 as usize) << 16),
+                ..Default::default()
+            },
+        );
+        assert!(
+            host.runtime
+                .presentation()
+                .expect("snapshot")
+                .node(pressed)
+                .is_none(),
+            "the pressed row left the mounted window"
+        );
+        assert_eq!(
+            host.windows[MAIN].pressed, None,
+            "a press target gone from the scene is cleared even by a scroll rebuild"
+        );
+    }
+
+    #[test]
+    fn a_scroll_that_keeps_the_pressed_row_preserves_press() {
+        let mut host = tall_host(100);
+        host.windows.get_mut(MAIN).expect("window").wheel = wheel(WheelLines::Lines(3));
+        let pressed = press_label(&mut host, "Complete Task 5");
+        send_msg(
+            &mut host,
+            MSG {
+                message: WM_MOUSEWHEEL,
+                wParam: WPARAM(((-8i16 as u16) as u32 as usize) << 16),
+                ..Default::default()
+            },
+        );
+        assert!(
+            host.runtime
+                .presentation()
+                .expect("snapshot")
+                .node(pressed)
+                .is_some(),
+            "the pressed row is still mounted"
+        );
+        assert_eq!(
+            host.windows[MAIN].pressed,
+            Some(pressed),
+            "capture-based press survives scrolling"
+        );
+    }
+
+    #[test]
+    fn a_row_window_turn_keeps_a_press_that_is_still_mounted() {
+        let mut host = tall_host(100);
+        host.windows.get_mut(MAIN).expect("window").wheel = wheel(WheelLines::Lines(3));
+        let pressed = press_label(&mut host, "Complete Task 5");
+        assert_eq!(host.windows[MAIN].pressed, Some(pressed));
+        let first_row = host
+            .runtime
+            .presentation()
+            .expect("snapshot")
+            .find_label("Complete Write tests")
+            .expect("the first seeded row")
+            .id();
+        let (band_top, row_height) = {
+            let scene = host.scene(MAIN).expect("scene");
+            let band = scene.row_bands().first().expect("the todo list band");
+            (band.top(), band.row_height())
+        };
+        // 前进至少一行：行窗口首行离开 0，结构 turn 必然重建第二遍场景。
+        let notches = (((band_top + row_height) / 72.0).ceil() as i32).max(1);
+        send_msg(
+            &mut host,
+            MSG {
+                message: WM_MOUSEWHEEL,
+                wParam: WPARAM((((-120 * notches) as i16 as u16) as u32 as usize) << 16),
+                ..Default::default()
+            },
+        );
+        assert!(
+            host.scene(MAIN)
+                .expect("scene")
+                .row_bands()
+                .first()
+                .expect("the todo list band")
+                .first_row()
+                > 0,
+            "the scroll advanced the mounted row window"
+        );
+        let snapshot = host.runtime.presentation().expect("snapshot");
+        assert!(
+            snapshot.node(first_row).is_none(),
+            "the row above the new window unmounted"
+        );
+        assert!(
+            snapshot.node(pressed).is_some(),
+            "the pressed row is still inside the new window"
+        );
+        assert_eq!(
+            host.windows[MAIN].pressed,
+            Some(pressed),
+            "the second build of a scroll frame keeps a still-mounted press"
+        );
+    }
+
+    #[test]
+    fn an_explicit_scroll_keeps_a_press_that_is_still_mounted() {
+        let mut host = tall_host(100);
+        let pressed = press_label(&mut host, "Complete Task 5");
+        assert_eq!(host.windows[MAIN].pressed, Some(pressed));
+        let target = {
+            let scene = host.scene(MAIN).expect("scene");
+            let band = scene.row_bands().first().expect("the todo list band");
+            (band.top() + 2.0 * band.row_height()).ceil() as i32
+        };
+        with_main(&mut host, |host, window| {
+            host.explicit_scroll(window, target);
+            Ok(())
+        });
+        host.render().expect("explicit-scroll frame");
+        assert!(
+            host.scene(MAIN)
+                .expect("scene")
+                .row_bands()
+                .first()
+                .expect("the todo list band")
+                .first_row()
+                > 0,
+            "the explicit scroll advanced the mounted row window"
+        );
+        assert!(
+            host.runtime
+                .presentation()
+                .expect("snapshot")
+                .node(pressed)
+                .is_some(),
+            "the pressed row is still inside the new window"
+        );
+        assert_eq!(
+            host.windows[MAIN].pressed,
+            Some(pressed),
+            "explicit scrolling keeps a press whose target is still mounted"
+        );
+    }
+
+    #[test]
+    fn a_preserved_press_clears_when_its_target_leaves_the_scene() {
+        let mut host = tall_host(40);
+        let pressed = press_label(&mut host, "Complete Task 5");
+        assert_eq!(host.windows[MAIN].pressed, Some(pressed));
+        let mut other = Runtime::new();
+        other
+            .mount(|| view! { <view /> })
+            .expect("mount an unrelated tree");
+        let foreign = Scene::build(
+            &other.presentation().expect("snapshot"),
+            Viewport::new(400.0, 300.0, 1.0).expect("viewport"),
+        )
+        .expect("foreign scene");
+        host.with_window(MAIN, |host, window| {
+            assert!(
+                host.revalidate_pointer(window, &foreign, false),
+                "the missing target triggers a rebuild"
+            );
+            Ok(())
+        })
+        .expect("revalidate the pointer");
+        assert_eq!(
+            host.windows[MAIN].pressed, None,
+            "a preserved press whose target left the scene is cleared"
+        );
+    }
+
+    #[test]
+    fn capture_loss_clears_press() {
+        let mut host = open_host();
+        host.render().expect("the first frame");
+        let pressed = press_label(&mut host, "Complete Write tests");
+        assert_eq!(host.windows[MAIN].pressed, Some(pressed));
+        send_msg(
+            &mut host,
+            MSG {
+                message: WM_CAPTURECHANGED,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            host.windows[MAIN].pressed, None,
+            "capture loss clears the press target"
+        );
+    }
+
+    #[test]
+    fn hiding_the_window_clears_press() {
+        let mut host = open_host();
+        host.render().expect("the first frame");
+        let pressed = press_label(&mut host, "Complete Write tests");
+        assert_eq!(host.windows[MAIN].pressed, Some(pressed));
+        host.hide(MAIN).expect("hide the window");
+        assert_eq!(
+            host.windows[MAIN].pressed, None,
+            "hiding the window clears the press target"
+        );
+    }
+
+    #[test]
+    fn a_stale_hover_is_rehit_before_the_scene_build() {
+        let mut host = open_host();
+        host.render().expect("the first frame");
+        let snapshot = host.runtime.presentation().expect("snapshot");
+        let draft = snapshot
+            .find_label("What needs to be done?")
+            .expect("draft")
+            .id();
+        let target = snapshot
+            .find_label("Toggle theme")
+            .expect("theme button")
+            .id();
+        let scene = host.scene(MAIN).expect("scene");
+        let rect = scene.node(target).expect("button geometry").rect();
+        let point = Point::new(rect.x + rect.width / 2.0, rect.y + rect.height / 2.0);
+        let hit = scene.hit_test(point).expect("the point hits an element");
+        assert_eq!(hit, target, "the point hits the theme button");
+        assert_ne!(hit, draft, "the stale hover names another element");
+        let window = host.windows.get_mut(MAIN).expect("window");
+        window.pointer = Some(point);
+        window.hovered = Some(draft);
+        window.paint_requested = true;
+
+        let before = host.counters.scene_builds;
+        host.render().expect("render");
+        assert_eq!(
+            host.counters.scene_builds - before,
+            1,
+            "the pre-build re-hit corrects hover without a second build"
+        );
+        assert_eq!(host.windows[MAIN].hovered, Some(hit));
+        assert!(
+            host.scene(MAIN)
+                .expect("scene")
+                .node(hit)
+                .expect("hit element")
+                .hovered(),
+            "the built scene styles the real pointer target"
+        );
+    }
+
+    #[test]
+    fn a_key_without_a_reveal_target_keeps_the_scroll_offset() {
+        let mut host = tall_host(40);
+        press_label(&mut host, "What needs to be done?");
+        with_main(&mut host, |host, window| {
+            host.char_typed(window, WPARAM('a' as usize), LPARAM(0))
+        });
+        // 键入本身请求过显露；先结算掉，再滚到真正离屏的位置。
+        with_main(&mut host, |_host, window| {
+            window.reveal_requested = false;
+            Ok(())
+        });
+        host.windows.get_mut(MAIN).expect("window").scroll_offset = i32::MAX;
+        host.render().expect("bottom frame");
+        let bottom = host.scene(MAIN).expect("scene").scroll_offset();
+        assert!(bottom > 0, "the draft is offscreen");
+
+        send_msg(
+            &mut host,
+            MSG {
+                message: WM_KEYDOWN,
+                wParam: WPARAM(VK_SHIFT.0 as usize),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            host.scene(MAIN).expect("scene").scroll_offset(),
+            bottom,
+            "a key that moves no focus or caret does not reveal"
+        );
+
+        send_msg(
+            &mut host,
+            MSG {
+                message: WM_KEYDOWN,
+                wParam: WPARAM(VK_LEFT.0 as usize),
+                ..Default::default()
+            },
+        );
+        assert!(
+            host.scene(MAIN).expect("scene").scroll_offset() < bottom,
+            "a caret move still reveals the focused input"
+        );
+    }
+
+    #[test]
+    fn an_undo_without_history_keeps_the_scroll_offset() {
+        let mut host = tall_host(40);
+        press_label(&mut host, "What needs to be done?");
+        // 按压本身申请过显露；先结算掉，再滚到真正离屏的位置。
+        with_main(&mut host, |_host, window| {
+            window.reveal_requested = false;
+            Ok(())
+        });
+        host.windows.get_mut(MAIN).expect("window").scroll_offset = i32::MAX;
+        host.render().expect("bottom frame");
+        let bottom = host.scene(MAIN).expect("scene").scroll_offset();
+        assert!(bottom > 0, "the draft is offscreen");
+
+        with_main(&mut host, |host, window| {
+            host.key_down_with(window, VK_Z, false, true)
+        });
+        assert!(
+            !host.windows[MAIN].reveal_requested,
+            "an editor shortcut without a change does not request reveal"
+        );
+        host.render().expect("settled frame");
+        assert_eq!(
+            host.scene(MAIN).expect("scene").scroll_offset(),
+            bottom,
+            "the empty-history undo keeps the user's scroll position"
+        );
+    }
+
+    #[test]
+    fn explicit_scroll_clears_a_pending_reveal() {
+        let mut host = tall_host(40);
+        host.windows.get_mut(MAIN).expect("window").reveal_requested = true;
+        host.with_window(MAIN, |host, window| {
+            host.explicit_scroll(window, 40);
+            Ok(())
+        })
+        .expect("explicit scroll");
+        assert!(
+            !host.windows[MAIN].reveal_requested,
+            "explicit scrolling clears the pending reveal"
+        );
+        assert_eq!(host.windows[MAIN].scroll_offset, 40);
+    }
+
+    #[test]
+    fn a_reveal_settles_without_repeating() {
+        let mut host = tall_host(60);
+        host.windows.get_mut(MAIN).expect("window").scroll_offset = i32::MAX;
+        host.render().expect("bottom frame");
+        let bottom = host.scene(MAIN).expect("scene").scroll_offset();
+        assert!(bottom > 0, "the tall content scrolls");
+
+        let reveal_builds = host.counters.scene_builds;
+        send_msg(
+            &mut host,
+            MSG {
+                message: WM_KEYDOWN,
+                wParam: WPARAM(VK_TAB.0 as usize),
+                ..Default::default()
+            },
+        );
+        assert!(
+            host.counters.scene_builds - reveal_builds <= 4,
+            "a reveal frame is bounded: pass one, at most two reveal passes and one row-window build"
+        );
+        let revealed = host.scene(MAIN).expect("scene").scroll_offset();
+        assert!(revealed < bottom, "Tab reveals the first control");
+        assert!(
+            !host.windows[MAIN].reveal_requested,
+            "the reveal request is consumed"
+        );
+
+        let builds = host.counters.scene_builds;
+        host.render().expect("settled frame");
+        assert_eq!(
+            host.scene(MAIN).expect("scene").scroll_offset(),
+            revealed,
+            "the settled frame does not move the offset again"
+        );
+        assert!(
+            host.counters.scene_builds - builds <= 2,
+            "a settled frame is bounded"
+        );
+    }
+
+    /// 点击后卸载自身所在分支的按钮：焦点必须在 activation 内结算。
+    fn focus_settling_host() -> Host {
+        let mut runtime = Runtime::new();
+        runtime
+            .declare_windows(|catalog| {
+                catalog.window(WindowSpec::new(MAIN).primary().sized(320, 240), |_| {
+                    let shown = signal(true);
+                    let draft = signal(String::from("ab"));
+                    view! {
+                        <view>
+                            <Show
+                                when={memo(move || shown.get())}
+                                fallback={|| view! { <text>"gone"</text> }}
+                            >
+                                <view>
+                                    <text-input aria:label="draft" value={draft} />
+                                    <button
+                                        aria:label="remove"
+                                        on:click={move || shown.set(false)}
+                                    >
+                                        "Remove"
+                                    </button>
+                                </view>
+                            </Show>
+                        </view>
+                    }
+                })?;
+                Ok(())
+            })
+            .expect("declare the focus-settling window");
+        Host::open(runtime, HostConfig::hidden()).expect("open the focus-settling host")
+    }
+
+    #[test]
+    fn a_pointer_activation_reports_the_focus_it_settles() {
+        let mut host = focus_settling_host();
+        host.render().expect("first frame");
+        let (remove, point, scale) = {
+            let snapshot = host.runtime.presentation().expect("snapshot");
+            let scene = host.scene(MAIN).expect("scene");
+            let remove = snapshot.find_label("remove").expect("remove button").id();
+            let rect = scene.node(remove).expect("button geometry").rect();
+            let point = Point::new(rect.x + rect.width / 2.0, rect.y + rect.height / 2.0);
+            (remove, point, scene.viewport().scale())
+        };
+        let lparam = pointer_lparam(point, scale);
+        with_main(&mut host, |host, window| {
+            host.pointer_pressed(window, lparam)
+        });
+        host.render().expect("pressed frame");
+        with_main(&mut host, |_host, window| {
+            window.reveal_requested = false;
+            Ok(())
+        });
+        assert_eq!(
+            host.runtime.presentation().expect("snapshot").focus(),
+            Some(remove),
+            "the press focused the button"
+        );
+
+        with_main(&mut host, |host, window| {
+            host.pointer_released(window, lparam)
+        });
+        assert!(
+            host.runtime
+                .presentation()
+                .expect("snapshot")
+                .node(remove)
+                .is_none(),
+            "the click handler unmounted the focused button"
+        );
+        assert!(
+            host.windows[MAIN].reveal_requested,
+            "the activation's settled focus requests reveal"
+        );
+    }
+
+    /// 聚焦输入在 PageDown 时被 handler 卸载且不消费按键：焦点结算到顶部输入。
+    fn paging_settling_host() -> Host {
+        let mut runtime = Runtime::new();
+        runtime
+            .declare_windows(|catalog| {
+                catalog.window(WindowSpec::new(MAIN).primary().sized(320, 240), |_| {
+                    let shown = signal(true);
+                    let top = signal(String::from("top"));
+                    let draft = signal(String::from("ab"));
+                    view! {
+                        <view>
+                            <text-input aria:label="top" value={top} />
+                            <view style:height={once(px(1600.0))} />
+                            <Show
+                                when={memo(move || shown.get())}
+                                fallback={|| view! { <text>"gone"</text> }}
+                            >
+                                <text-input
+                                    aria:label="draft"
+                                    value={draft}
+                                    on:keydown={move |_event: &mut KeyEvent| {
+                                        shown.set(false);
+                                    }}
+                                />
+                            </Show>
+                        </view>
+                    }
+                })?;
+                Ok(())
+            })
+            .expect("declare the paging window");
+        Host::open(runtime, HostConfig::hidden()).expect("open the paging host")
+    }
+
+    #[test]
+    fn paging_from_a_settled_focus_pages_from_the_user_offset() {
+        let mut host = paging_settling_host();
+        host.runtime.focus("draft").expect("focus the draft");
+        host.windows.get_mut(MAIN).expect("window").scroll_offset = i32::MAX;
+        host.render().expect("bottom frame");
+        let (before, viewport_height) = {
+            let scene = host.scene(MAIN).expect("scene");
+            (scene.scroll_offset(), scene.viewport().height())
+        };
+        assert!(before > 0, "the content scrolls");
+        let page = ((viewport_height - 24.0).floor() as i32).max(1);
+        assert!(before > page, "a page step fits above the bottom");
+        with_main(&mut host, |_host, window| {
+            window.reveal_requested = false;
+            Ok(())
+        });
+
+        with_main(&mut host, |host, window| {
+            host.key_down_with(window, VK_PRIOR, false, false)
+        });
+        let snapshot = host.runtime.presentation().expect("snapshot");
+        assert!(
+            snapshot.find_label("draft").is_none(),
+            "the handler unmounted the focused input"
+        );
+        assert!(
+            snapshot
+                .find_label("top")
+                .is_some_and(|top| snapshot.focus() == Some(top.id())),
+            "focus settled on the top input"
+        );
+        // 卸载草稿缩小了内容：刷新后的偏移先重新夹取，再从该用户偏移翻页。
+        let refreshed = host
+            .scene(MAIN)
+            .expect("scene after the unmount")
+            .max_scroll_offset();
+        let expected = before.min(refreshed) - page;
+        assert!(expected > 0, "the page step stays above the top");
+        assert_eq!(
+            host.windows[MAIN].scroll_offset, expected,
+            "explicit paging wins over the turn's reveal and starts from the user offset"
+        );
+        host.render().expect("paged frame");
+        assert_eq!(
+            host.scene(MAIN).expect("scene").scroll_offset(),
+            expected,
+            "the paged frame keeps the page step, not the reveal"
+        );
+    }
+
+    /// 聚焦输入的 keydown handler 卸载自身分支：Escape 与翻页键都会结算焦点。
+    fn key_settling_host() -> Host {
+        let mut runtime = Runtime::new();
+        runtime
+            .declare_windows(|catalog| {
+                catalog.window(WindowSpec::new(MAIN).primary().sized(320, 240), |_| {
+                    let shown = signal(true);
+                    let draft = signal(String::from("ab"));
+                    view! {
+                        <view>
+                            <Show
+                                when={memo(move || shown.get())}
+                                fallback={|| view! { <text>"gone"</text> }}
+                            >
+                                <text-input
+                                    aria:label="draft"
+                                    value={draft}
+                                    on:keydown={move |event: &mut KeyEvent| {
+                                        if matches!(event.key(), Key::Escape | Key::PageDown) {
+                                            shown.set(false);
+                                            event.consume();
+                                        }
+                                    }}
+                                />
+                            </Show>
+                            <button aria:label="tail">"Tail"</button>
+                        </view>
+                    }
+                })?;
+                Ok(())
+            })
+            .expect("declare the key-settling window");
+        Host::open(runtime, HostConfig::hidden()).expect("open the key-settling host")
+    }
+
+    #[test]
+    fn a_key_turn_that_settles_focus_requests_reveal() {
+        for key in [VK_ESCAPE, VK_NEXT] {
+            let mut host = key_settling_host();
+            host.runtime.focus("draft").expect("focus the draft");
+            host.render().expect("focused frame");
+            let tail = host
+                .runtime
+                .presentation()
+                .expect("snapshot")
+                .find_label("tail")
+                .expect("tail button")
+                .id();
+            with_main(&mut host, |_host, window| {
+                window.reveal_requested = false;
+                Ok(())
+            });
+            with_main(&mut host, |host, window| {
+                host.key_down_with(window, key, false, false)
+            });
+            let snapshot = host.runtime.presentation().expect("snapshot");
+            assert!(
+                snapshot.find_label("draft").is_none(),
+                "the handler unmounted the focused input"
+            );
+            assert_eq!(
+                snapshot.focus(),
+                Some(tail),
+                "focus settles on the surviving button"
+            );
+            assert!(
+                host.windows[MAIN].reveal_requested,
+                "the settled focus requests reveal"
+            );
+        }
     }
 
     /// 测试期记录器：`&'static` 是 Copy，事件闭包重复构造时不会把 view 的

@@ -243,6 +243,80 @@ impl Intent {
     }
 }
 
+/// 一次 turn 中可能改变显露目标的三类位置变化。
+///
+/// 宿主在 turn 结束后据此置位待决显露；显式滚动仍会清除该请求。标志描述的是
+/// 变化本身，不表示目标当前是否在视口内。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RevealFlags {
+    focus_changed: bool,
+    caret_changed: bool,
+    composition_changed: bool,
+}
+
+impl RevealFlags {
+    /// 焦点节点发生了变化。
+    pub const fn focus_changed(self) -> bool {
+        self.focus_changed
+    }
+
+    /// 聚焦输入的 caret 或 selection 发生了变化。
+    pub const fn caret_changed(self) -> bool {
+        self.caret_changed
+    }
+
+    /// 组合的 preedit 发生了变化。
+    pub const fn composition_changed(self) -> bool {
+        self.composition_changed
+    }
+
+    /// 任一位置变化需要宿主执行显露。
+    pub const fn needs_reveal(self) -> bool {
+        self.focus_changed || self.caret_changed || self.composition_changed
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.focus_changed |= other.focus_changed;
+        self.caret_changed |= other.caret_changed;
+        self.composition_changed |= other.composition_changed;
+    }
+}
+
+/// 一棵树中与显露有关的焦点、caret/selection 与 preedit 指纹。
+///
+/// turn 开始与结束时各取一次；两次之间的差异就是该 turn 的 [`RevealFlags`]。
+#[derive(Clone, PartialEq, Eq)]
+struct RevealProbe {
+    focused: Option<NodeId>,
+    caret: usize,
+    anchor: usize,
+    preedit: Option<String>,
+}
+
+impl RevealProbe {
+    fn diff(before: &Self, after: &Self) -> RevealFlags {
+        let focus_changed = before.focused != after.focused;
+        // 焦点换了输入时 caret 数值没有可比性，只报告焦点变化。选择区间由
+        // caret/anchor 派生，不单独比较存储编码：折叠选择的 `None` 与
+        // `Some((c, c))` 表示同一位置。
+        let caret_changed =
+            !focus_changed && (before.caret != after.caret || before.anchor != after.anchor);
+        RevealFlags {
+            focus_changed,
+            caret_changed,
+            composition_changed: before.preedit != after.preedit,
+        }
+    }
+}
+
+/// turn 结束时把初始指纹与当前树的差异写进报告。
+fn finish_reveal(report: &mut TurnReport, tree: Option<TreeSlot>, before: Option<&RevealProbe>) {
+    if let (Some(tree), Some(before)) = (tree, before) {
+        let after = with_state(|state| state.reveal_probe(tree));
+        report.set_reveal(RevealProbe::diff(before, &after));
+    }
+}
+
 /// 一次 turn 的 flow 结果。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TurnOutcome {
@@ -283,6 +357,7 @@ impl std::error::Error for TurnError {}
 pub struct TurnReport {
     outcome: TurnOutcome,
     errors: Vec<TurnError>,
+    reveal: RevealFlags,
     changed: bool,
 }
 
@@ -299,8 +374,17 @@ impl TurnReport {
         self.errors.is_empty()
     }
 
+    /// 本 turn 中焦点、caret/selection 与组合的变化；宿主据此申请显露。
+    pub const fn reveal(&self) -> RevealFlags {
+        self.reveal
+    }
+
     pub const fn changed(&self) -> bool {
         self.changed
+    }
+
+    fn set_reveal(&mut self, reveal: RevealFlags) {
+        self.reveal = reveal;
     }
 
     fn push_error(&mut self, error: TurnError) {
@@ -318,10 +402,11 @@ impl TurnReport {
         self.changed = true;
     }
 
-    /// 合并一个嵌套默认动作的报告：错误、flow 与 changed 都要回到外层 turn。
+    /// 合并一个嵌套默认动作的报告：错误、flow、显露标志与 changed 都要回到外层 turn。
     fn absorb(&mut self, other: Self) {
         self.errors.extend(other.errors);
         self.changed |= other.changed;
+        self.reveal.merge(other.reveal);
         self.outcome.consumed |= other.outcome.consumed;
         self.outcome.prevent_default |= other.outcome.prevent_default;
     }
@@ -2072,6 +2157,32 @@ impl State {
     /// 当前焦点目标；焦点属于树，而不是整个应用。
     fn focused_in(&self, key: TreeSlot) -> Option<usize> {
         self.tree(key).and_then(|tree| tree.focused)
+    }
+
+    /// 树在显露相关状态上的指纹：焦点节点与聚焦输入的 caret/selection/preedit。
+    fn reveal_probe(&self, key: TreeSlot) -> RevealProbe {
+        let focused = self.focused_in(key);
+        let node = focused.map(|element| self.elements[element].id);
+        let Some(editor) = focused.and_then(|element| match self.element_local(element) {
+            LocalState::TextInput(editor) => Some(editor),
+            LocalState::None | LocalState::Checkbox { .. } => None,
+        }) else {
+            return RevealProbe {
+                focused: node,
+                caret: 0,
+                anchor: 0,
+                preedit: None,
+            };
+        };
+        RevealProbe {
+            focused: node,
+            caret: editor.caret,
+            anchor: editor.anchor,
+            preedit: editor
+                .composition
+                .as_ref()
+                .map(|composition| composition.preedit.clone()),
+        }
     }
 
     fn set_focused_in(&mut self, key: TreeSlot, focused: Option<usize>) {
@@ -7618,6 +7729,8 @@ impl Runtime {
         let state = self.state.clone();
         context::install(&state, || {
             let element = with_state(|state| state.element_for_node(node))?;
+            let tree = with_state(|state| state.tree_for_element(element));
+            let reveal_before = tree.map(|tree| with_state(|state| state.reveal_probe(tree)));
             let (event_id, event) =
                 self.take_node_event(node, element, EventKind::Click, NodeOperation::Click)?;
             let outcome = invoke_click_event(event_id, event);
@@ -7631,6 +7744,7 @@ impl Runtime {
                 Err(panic) => report.push_error(TurnError::HandlerPanicked(panic)),
             }
             self.finish_command().map_err(DispatchError::Command)?;
+            finish_reveal(&mut report, tree, reveal_before.as_ref());
             Ok(report)
         })
     }
@@ -7638,6 +7752,8 @@ impl Runtime {
     /// 路由后的激活：先运行最近 click handler，再执行 `type=submit` 表单默认。
     fn activate_element(&mut self, element: usize) -> Result<TurnReport, DispatchError> {
         let node = with_state(|state| state.elements[element].id);
+        let tree = with_state(|state| state.tree_for_element(element));
+        let before = tree.map(|tree| with_state(|state| state.reveal_probe(tree)));
         let has_click = with_state(|state| state.has_click_handler(element));
         let mut report = if has_click {
             self.click_node(node)?
@@ -7649,6 +7765,7 @@ impl Runtime {
         {
             self.apply_click_default(element, &mut report)?;
         }
+        finish_reveal(&mut report, tree, before.as_ref());
         Ok(report)
     }
 
@@ -7741,6 +7858,7 @@ impl Runtime {
                 focusable.map(|element| with_state(|state| state.elements[element].id));
             let tree = with_state(|state| state.tree_for_element(element))
                 .ok_or(DispatchError::StaleNode(node))?;
+            let before = with_state(|state| state.reveal_probe(tree));
             let mut report = TurnReport::default();
             if with_state(|state| state.focused_in(tree)) != focusable {
                 self.move_focus(tree, focusable)
@@ -7783,6 +7901,7 @@ impl Runtime {
                 }
             }
             self.finish_command().map_err(DispatchError::Command)?;
+            finish_reveal(&mut report, Some(tree), Some(&before));
             Ok(report)
         })
     }
@@ -7795,29 +7914,45 @@ impl Runtime {
         modifiers: Modifiers,
     ) -> Result<TurnReport, DispatchError> {
         let state = self.state.clone();
-        context::install(&state, || match target {
-            EventTarget::Node(node) => {
-                let element = with_state(|state| state.element_for_node(node))?;
-                if with_state(|state| state.element_local(element).is_composing()) {
-                    return self.keydown_node(node, key);
+        context::install(&state, || {
+            let tree = match target {
+                EventTarget::Node(node) => with_state(|state| {
+                    state
+                        .element_for_node(node)
+                        .ok()
+                        .and_then(|element| state.tree_for_element(element))
+                }),
+                EventTarget::Window(window) => Some(TreeSlot::Window(window.key)),
+                EventTarget::App => None,
+            };
+            let before = tree.map(|tree| with_state(|state| state.reveal_probe(tree)));
+            let mut report = match target {
+                EventTarget::Node(node) => {
+                    let element = with_state(|state| state.element_for_node(node))?;
+                    if with_state(|state| state.element_local(element).is_composing()) {
+                        self.keydown_node(node, key)?
+                    } else {
+                        let window = with_state(|state| {
+                            state.tree_for_element(element).and_then(|tree| match tree {
+                                TreeSlot::Window(key) => state.window_ctx(key),
+                                TreeSlot::Root => None,
+                            })
+                        });
+                        self.route_keydown(Some(element), window, key, modifiers)?
+                    }
                 }
-                let window = with_state(|state| {
-                    state.tree_for_element(element).and_then(|tree| match tree {
-                        TreeSlot::Window(key) => state.window_ctx(key),
-                        TreeSlot::Root => None,
-                    })
-                });
-                self.route_keydown(Some(element), window, key, modifiers)
-            }
-            EventTarget::Window(window) => {
-                if !with_state(|state| state.intent_window_usable(window)) {
-                    return Err(DispatchError::TargetClosed);
+                EventTarget::Window(window) => {
+                    if !with_state(|state| state.intent_window_usable(window)) {
+                        return Err(DispatchError::TargetClosed);
+                    }
+                    let focused =
+                        with_state(|state| state.presented_focus_in(TreeSlot::Window(window.key)));
+                    self.route_keydown(focused, Some(window), key, modifiers)?
                 }
-                let focused =
-                    with_state(|state| state.presented_focus_in(TreeSlot::Window(window.key)));
-                self.route_keydown(focused, Some(window), key, modifiers)
-            }
-            EventTarget::App => Ok(TurnReport::default()),
+                EventTarget::App => TurnReport::default(),
+            };
+            finish_reveal(&mut report, tree, before.as_ref());
+            Ok(report)
         })
     }
 
@@ -8252,7 +8387,11 @@ impl Runtime {
     }
 
     /// 设置折叠 caret；偏移按字符夹取到当前值，不派发事件。
-    pub fn set_caret_node(&mut self, node: NodeId, offset: usize) -> Result<(), DispatchError> {
+    pub fn set_caret_node(
+        &mut self,
+        node: NodeId,
+        offset: usize,
+    ) -> Result<TurnReport, DispatchError> {
         self.place_selection(node, NodeOperation::SetCaret, Movement::Caret(offset))
     }
 
@@ -8262,7 +8401,7 @@ impl Runtime {
         node: NodeId,
         start: usize,
         end: usize,
-    ) -> Result<(), DispatchError> {
+    ) -> Result<TurnReport, DispatchError> {
         self.place_selection(
             node,
             NodeOperation::SetSelection,
@@ -8271,7 +8410,7 @@ impl Runtime {
     }
 
     /// 选中全部文本；caret 停在末尾，不派发事件。
-    pub fn select_all_node(&mut self, node: NodeId) -> Result<(), DispatchError> {
+    pub fn select_all_node(&mut self, node: NodeId) -> Result<TurnReport, DispatchError> {
         self.place_selection(node, NodeOperation::SelectAll, Movement::SelectAll)
     }
 
@@ -8280,10 +8419,12 @@ impl Runtime {
         node: NodeId,
         operation: NodeOperation,
         movement: Movement,
-    ) -> Result<(), DispatchError> {
+    ) -> Result<TurnReport, DispatchError> {
         let mut state = self.state.borrow_mut();
         let element = state.element_for_node(node)?;
         state.require_editable_text_input(node, element, operation)?;
+        let key = state.tree_for_element(element);
+        let reveal_before = key.map(|key| state.reveal_probe(key));
         let length = text_length(state.element_local(element));
         let (anchor, focus) = match movement {
             Movement::Caret(offset) => {
@@ -8297,13 +8438,17 @@ impl Runtime {
         if let LocalState::TextInput(editor) = state.element_local_mut(element) {
             editor.history.break_run();
         }
-        let key = state.tree_for_element(element);
         state.mark_element_changed(element);
         // 直接 selection 原语不经过 refresh；提交 revision 让宿主看到编辑状态变化。
         if let Some(key) = key {
             state.commit_tree_revision(key);
         }
-        Ok(())
+        let mut report = TurnReport::default();
+        if let (Some(key), Some(before)) = (key, reveal_before) {
+            let after = state.reveal_probe(key);
+            report.set_reveal(RevealProbe::diff(&before, &after));
+        }
+        Ok(report)
     }
 
     fn apply_text_edit(
@@ -8314,6 +8459,8 @@ impl Runtime {
         edit: Edit<'_>,
     ) -> Result<TurnReport, DispatchError> {
         with_state(|state| state.require_editable_text_input(node, element, operation))?;
+        let tree = with_state(|state| state.tree_for_element(element));
+        let reveal_before = tree.map(|tree| with_state(|state| state.reveal_probe(tree)));
         let (before, caret, selection) = with_state(|state| {
             let LocalState::TextInput(editor) = state.element_local(element) else {
                 unreachable!("require_editable_text_input validated the input");
@@ -8338,7 +8485,9 @@ impl Runtime {
             Edit::Replace(_) | Edit::Backspace | Edit::DeleteForward => EditKind::Boundary,
         };
         let Some(outcome) = text_edit::apply(&before.value, caret, selection, edit) else {
-            return Ok(TurnReport::default());
+            let mut report = TurnReport::default();
+            finish_reveal(&mut report, tree, reveal_before.as_ref());
+            return Ok(report);
         };
         let text_edit::EditOutcome {
             value: new_value,
@@ -8365,6 +8514,7 @@ impl Runtime {
         if panicked {
             with_state(|state| abort_text_dispatch(state, element));
             let _ = self.finish_command();
+            finish_reveal(&mut report, tree, reveal_before.as_ref());
             return Ok(report);
         }
         if let Err(error) = self.finish_command() {
@@ -8374,6 +8524,7 @@ impl Runtime {
         with_state(|state| clamp_local_edit(state, element));
         self.record_text_edit(element, before, kind);
         report.mark_changed();
+        finish_reveal(&mut report, tree, reveal_before.as_ref());
         Ok(report)
     }
 
@@ -8401,7 +8552,7 @@ impl Runtime {
     /// 连续单字符插入可能已合并为一个撤销步。撤销通过一次 `on:input` 写回该步
     /// 开始前的值，应用模型仍是值的权威。精确恢复 caret/anchor/selection 只对
     /// 原样提交值的处理器成立。
-    pub fn undo_node(&mut self, node: NodeId) -> Result<(), DispatchError> {
+    pub fn undo_node(&mut self, node: NodeId) -> Result<TurnReport, DispatchError> {
         self.apply_history(node, NodeOperation::Undo, HistoryDirection::Undo)
     }
 
@@ -8409,7 +8560,7 @@ impl Runtime {
     ///
     /// 重做同样通过一次 `on:input` 写回，恢复的是该步提交后的状态；合并 run
     /// 的重做仍是一步。
-    pub fn redo_node(&mut self, node: NodeId) -> Result<(), DispatchError> {
+    pub fn redo_node(&mut self, node: NodeId) -> Result<TurnReport, DispatchError> {
         self.apply_history(node, NodeOperation::Redo, HistoryDirection::Redo)
     }
 
@@ -8418,11 +8569,13 @@ impl Runtime {
         node: NodeId,
         operation: NodeOperation,
         direction: HistoryDirection,
-    ) -> Result<(), DispatchError> {
+    ) -> Result<TurnReport, DispatchError> {
         let state = self.state.clone();
         context::install(&state, || {
             let element = with_state(|state| state.element_for_node(node))?;
             with_state(|state| state.require_editable_text_input(node, element, operation))?;
+            let tree = with_state(|state| state.tree_for_element(element));
+            let reveal_before = tree.map(|tree| with_state(|state| state.reveal_probe(tree)));
             // 撤销/重做后继续输入必须开启新的 run，不能并入更早的条目。
             with_state(|state| {
                 let LocalState::TextInput(editor) = state.element_local_mut(element) else {
@@ -8441,7 +8594,9 @@ impl Runtime {
                 .cloned()
             });
             let Some(entry) = entry else {
-                return Ok(());
+                let mut report = TurnReport::default();
+                finish_reveal(&mut report, tree, reveal_before.as_ref());
+                return Ok(report);
             };
             let target = match direction {
                 HistoryDirection::Undo => entry.before.clone(),
@@ -8507,7 +8662,10 @@ impl Runtime {
                     }
                 }
             });
-            Ok(())
+            let mut report = TurnReport::default();
+            report.mark_changed();
+            finish_reveal(&mut report, tree, reveal_before.as_ref());
+            Ok(report)
         })
     }
 
@@ -8652,6 +8810,8 @@ impl Runtime {
                 )?;
                 state.require_composing_text_input(node, element, NodeOperation::CompositionCommit)
             })?;
+            let tree = with_state(|state| state.tree_for_element(element));
+            let probe_before = tree.map(|tree| with_state(|state| state.reveal_probe(tree)));
             self.enter_event_phase();
             let (before, mut report) = match self.commit_composition(node, element, text) {
                 Ok(done) => done,
@@ -8674,6 +8834,7 @@ impl Runtime {
                 self.record_text_edit(element, before, EditKind::Boundary);
             }
             report.mark_changed();
+            finish_reveal(&mut report, tree, probe_before.as_ref());
             Ok(report)
         })
     }
@@ -8845,6 +9006,8 @@ impl Runtime {
         let state = self.state.clone();
         context::install(&state, || {
             let element = with_state(|state| state.element_for_node(node))?;
+            let tree = with_state(|state| state.tree_for_element(element));
+            let reveal_before = tree.map(|tree| with_state(|state| state.reveal_probe(tree)));
             let before = with_state(|state| match state.element_local(element) {
                 LocalState::Checkbox { checked } => Some(*checked),
                 _ => None,
@@ -8886,6 +9049,7 @@ impl Runtime {
             if after.is_some_and(|after| after != before) {
                 report.mark_changed();
             }
+            finish_reveal(&mut report, tree, reveal_before.as_ref());
             Ok(report)
         })
     }
@@ -8904,6 +9068,8 @@ impl Runtime {
         let state = self.state.clone();
         context::install(&state, || {
             let element = with_state(|state| state.element_for_node(node))?;
+            let tree = with_state(|state| state.tree_for_element(element));
+            let reveal_before = tree.map(|tree| with_state(|state| state.reveal_probe(tree)));
             let (event_id, event) =
                 self.take_node_event(node, element, EventKind::Submit, NodeOperation::Submit)?;
             let mut submit_event = SubmitEvent::default();
@@ -8917,6 +9083,7 @@ impl Runtime {
             self.finish_command().map_err(DispatchError::Command)?;
             report.set_outcome(submit_event.is_consumed(), submit_event.is_prevented());
             report.mark_changed();
+            finish_reveal(&mut report, tree, reveal_before.as_ref());
             Ok(report)
         })
     }
@@ -8939,6 +9106,8 @@ impl Runtime {
         let state = self.state.clone();
         context::install(&state, || {
             let element = with_state(|state| state.element_for_node(node))?;
+            let tree = with_state(|state| state.tree_for_element(element));
+            let reveal_before = tree.map(|tree| with_state(|state| state.reveal_probe(tree)));
             if with_state(|state| state.element_local(element).is_composing()) {
                 let mut report = TurnReport::default();
                 if key == Key::Escape {
@@ -8957,6 +9126,7 @@ impl Runtime {
                 report.set_outcome(true, false);
                 with_state(|state| state.phase = Phase::Idle);
                 self.finish_command().map_err(DispatchError::Command)?;
+                finish_reveal(&mut report, tree, reveal_before.as_ref());
                 return Ok(report);
             }
             let (event_id, event) =
@@ -8984,6 +9154,7 @@ impl Runtime {
             );
             with_state(|state| state.phase = Phase::Idle);
             self.finish_command().map_err(DispatchError::Command)?;
+            finish_reveal(&mut report, tree, reveal_before.as_ref());
             Ok(report)
         })
     }
@@ -8994,12 +9165,12 @@ impl Runtime {
             FindTarget::Label(label.to_owned()),
             "focus target not found",
             "focus target is not focusable",
-            Self::focus_node,
+            move |runtime, node| runtime.focus_node(node).map(|_| ()),
         )
     }
 
     /// 按 Node ID 移动焦点；不可聚焦的目标返回 `WrongKind`，焦点保持不变。
-    pub fn focus_node(&mut self, node: NodeId) -> Result<(), DispatchError> {
+    pub fn focus_node(&mut self, node: NodeId) -> Result<TurnReport, DispatchError> {
         let state = self.state.clone();
         context::install(&state, || {
             let element = with_state(|state| state.element_for_node(node))?;
@@ -9011,8 +9182,17 @@ impl Runtime {
                     operation: NodeOperation::Focus,
                 });
             }
+            let before = with_state(|state| state.reveal_probe(tree));
             self.move_focus(tree, Some(element))
-                .map_err(DispatchError::Command)
+                .map_err(DispatchError::Command)?;
+            let mut report = TurnReport::default();
+            finish_reveal(&mut report, Some(tree), Some(&before));
+            // 目标已经是焦点时 move_focus 不派发 handler、不推进 revision；
+            // 只有焦点真的换了才报告 changed。
+            if report.reveal().focus_changed() {
+                report.mark_changed();
+            }
+            Ok(report)
         })
     }
 

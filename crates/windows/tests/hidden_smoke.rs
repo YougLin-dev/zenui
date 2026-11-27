@@ -2289,12 +2289,14 @@ fn paging_keys_leave_a_focused_editor_in_place() {
         "PageDown keeps the same editor focused"
     );
 
-    post_key(&host, VK_HOME);
-    host.pump().expect("Home while editing");
+    // 第一遍 Home 已经把 caret 放在文本开头；这里用 End 让 cursor 真正移动，
+    // 编辑器消费的按键只有在焦点/caret 变化时才请求显露。
+    post_key(&host, VK_END);
+    host.pump().expect("End while editing after paging");
     let revealed = host.scene(MAIN).expect("scene").scroll_offset();
     assert!(
         revealed < page,
-        "Home edits the caret and reveals the focused input instead of paging"
+        "End edits the caret and reveals the focused input instead of paging"
     );
     assert_eq!(
         focused_id(&host),
