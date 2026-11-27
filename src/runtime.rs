@@ -846,7 +846,7 @@ static NEXT_RUNTIME: AtomicU32 = AtomicU32::new(1);
 
 /// 一棵已提交树的身份：headless 根，或目录中的窗口键。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum TreeSlot {
+pub(crate) enum TreeSlot {
     Root,
     Window(&'static str),
 }
@@ -1269,6 +1269,41 @@ impl State {
             }
         }
         live
+    }
+
+    /// 测试/差分 oracle：全部已挂载树。
+    #[cfg(test)]
+    pub(crate) fn oracle_trees(&self) -> Vec<TreeKey> {
+        self.arena_trees.values().copied().collect()
+    }
+
+    /// 测试/差分 oracle：读取一棵树的绑定表。
+    #[cfg(test)]
+    pub(crate) fn oracle_binding_table(&self, tree: TreeKey) -> Option<&BindingTable> {
+        self.nodes.binding_table(tree)
+    }
+
+    /// 测试/差分 oracle：在测试里篡改绑定槽以验证 oracle 的检测能力。
+    #[cfg(test)]
+    pub(crate) fn oracle_binding_table_mut(&mut self, tree: TreeKey) -> Option<&mut BindingTable> {
+        Some(self.nodes.binding_table_mut(tree))
+    }
+
+    /// 测试/差分 oracle：每棵已挂载树的可见性与已提交快照（包括隐藏窗口）。
+    ///
+    /// 隐藏窗口拒绝公开的 `presentation_of`，但它的树仍在结算后被推进；
+    /// oracle 必须比较这些树，才能覆盖“隐藏期间共享写入仍同步刷新”的路径。
+    #[cfg(test)]
+    pub(crate) fn oracle_tree_snapshots(&self) -> Vec<(TreeSlot, bool, PresentationSnapshot)> {
+        let mut slots: Vec<TreeSlot> = self.trees.keys().copied().collect();
+        slots.sort();
+        slots
+            .into_iter()
+            .filter_map(|slot| {
+                let snapshot = self.snapshot(slot)?;
+                Some((slot, self.tree_is_visible(slot), snapshot))
+            })
+            .collect()
     }
 
     /// flush step 0：本帧需要 quarantine 的行。
@@ -3036,6 +3071,17 @@ impl State {
 
     fn element_is_mounted(&self, element: usize) -> bool {
         self.tree_for_element(element).is_some()
+    }
+
+    /// 元素索引是否仍代表同一个已挂载的 NodeId。
+    ///
+    /// 结算可能卸载触发事件的元素并在同一轮刷新中复用它的槽位；只检查
+    /// “仍挂载”会把旧元素的本地状态读到新占用者身上。
+    fn element_is_current(&self, element: usize, node: NodeId) -> bool {
+        self.elements
+            .get(element)
+            .is_some_and(|held| held.id == node)
+            && self.element_is_mounted(element)
     }
 
     /// 旧焦点不在新的可聚焦集合时，下一次结算才产生接任目标。
@@ -8444,14 +8490,24 @@ impl Runtime {
             Movement::Selection(anchor, focus) => (anchor.min(length), focus.min(length)),
             Movement::SelectAll => (0, length),
         };
+        let selection = Some((anchor.min(focus), anchor.max(focus)));
+        let changed = {
+            let LocalState::TextInput(editor) = state.element_local(element) else {
+                unreachable!("require_editable_text_input validated the input");
+            };
+            editor.caret != focus || editor.anchor != anchor || editor.selection != selection
+        };
         set_local_selection(state.element_local_mut(element), anchor, focus);
         if let LocalState::TextInput(editor) = state.element_local_mut(element) {
             editor.history.break_run();
         }
-        state.mark_element_changed(element);
-        // 直接 selection 原语不经过 refresh；提交 revision 让宿主看到编辑状态变化。
-        if let Some(key) = key {
-            state.commit_tree_revision(key);
+        // 直接 selection 原语不经过 refresh；只有编辑状态真的变化时才提交
+        // revision，原位重复的选择通知不是有效变化。
+        if changed {
+            state.mark_element_changed(element);
+            if let Some(key) = key {
+                state.commit_tree_revision(key);
+            }
         }
         let mut report = TurnReport::default();
         if let (Some(key), Some(before)) = (key, reveal_before) {
@@ -8522,17 +8578,22 @@ impl Runtime {
         let panicked = record_handler_outcome(outcome, &mut report);
         with_state(|state| state.phase = Phase::Idle);
         if panicked {
-            with_state(|state| abort_text_dispatch(state, element));
+            with_state(|state| abort_text_dispatch_if_current(state, node, element));
             let _ = self.finish_command();
             finish_reveal(&mut report, tree, reveal_before.as_ref());
             return Ok(report);
         }
         if let Err(error) = self.finish_command() {
-            with_state(|state| abort_text_dispatch(state, element));
+            with_state(|state| abort_text_dispatch_if_current(state, node, element));
             return Err(DispatchError::Command(error));
         }
-        with_state(|state| clamp_local_edit(state, element));
-        self.record_text_edit(element, before, kind);
+        // 结算可能卸载这个输入；只有同一个 NodeId 仍是占用者时才夹取偏移。
+        with_state(|state| {
+            if state.element_is_current(element, node) {
+                clamp_local_edit(state, element);
+            }
+        });
+        self.record_text_edit(node, element, before, kind);
         report.mark_changed();
         finish_reveal(&mut report, tree, reveal_before.as_ref());
         Ok(report)
@@ -8542,9 +8603,15 @@ impl Runtime {
     ///
     /// 只记录仍然挂载的元素；同一命令内结算的归一化值已经写回编辑器，
     /// 因此条目以提交后的文本为准；提交前后值相同的编辑不产生条目。
-    fn record_text_edit(&mut self, element: usize, before: TextSnapshot, kind: EditKind) {
+    fn record_text_edit(
+        &mut self,
+        node: NodeId,
+        element: usize,
+        before: TextSnapshot,
+        kind: EditKind,
+    ) {
         with_state(|state| {
-            if !state.element_is_mounted(element) {
+            if !state.element_is_current(element, node) {
                 return;
             }
             let Some(after) = text_snapshot(state.element_local(element)) else {
@@ -8639,12 +8706,12 @@ impl Runtime {
             .err();
             with_state(|state| state.phase = Phase::Idle);
             if panic.is_some() {
-                with_state(|state| abort_text_dispatch(state, element));
+                with_state(|state| abort_text_dispatch_if_current(state, node, element));
             }
             if panic.is_none()
                 && let Err(error) = self.finish_command()
             {
-                with_state(|state| abort_text_dispatch(state, element));
+                with_state(|state| abort_text_dispatch_if_current(state, node, element));
                 return Err(DispatchError::Command(error));
             }
             if let Some(panic) = panic {
@@ -8652,10 +8719,10 @@ impl Runtime {
                 return Err(DispatchError::Panic(panic));
             }
             with_state(|state| {
-                clamp_local_edit(state, element);
-                if !state.element_is_mounted(element) {
+                if !state.element_is_current(element, node) {
                     return;
                 }
+                clamp_local_edit(state, element);
                 let LocalState::TextInput(editor) = state.element_local_mut(element) else {
                     return;
                 };
@@ -8826,7 +8893,7 @@ impl Runtime {
             let (before, mut report) = match self.commit_composition(node, element, text) {
                 Ok(done) => done,
                 Err(DispatchError::Panic(panic)) => {
-                    with_state(|state| abort_text_dispatch(state, element));
+                    with_state(|state| abort_text_dispatch_if_current(state, node, element));
                     let _ = self.finish_command();
                     return Err(DispatchError::Panic(panic));
                 }
@@ -8836,12 +8903,16 @@ impl Runtime {
                 }
             };
             if let Err(error) = self.leave_event_phase() {
-                with_state(|state| abort_text_dispatch(state, element));
+                with_state(|state| abort_text_dispatch_if_current(state, node, element));
                 return Err(DispatchError::Command(error));
             }
-            with_state(|state| clamp_local_edit(state, element));
+            with_state(|state| {
+                if state.element_is_current(element, node) {
+                    clamp_local_edit(state, element);
+                }
+            });
             if let Some(before) = before {
-                self.record_text_edit(element, before, EditKind::Boundary);
+                self.record_text_edit(node, element, before, EditKind::Boundary);
             }
             report.mark_changed();
             finish_reveal(&mut report, tree, probe_before.as_ref());
@@ -9052,11 +9123,18 @@ impl Runtime {
                 with_state(|state| state.update_local(element, LocalUpdate::Change(value)));
             }
             self.finish_command().map_err(DispatchError::Command)?;
-            let after = with_state(|state| match state.element_local(element) {
-                LocalState::Checkbox { checked } => Some(*checked),
-                _ => None,
+            // 结算可能把行移出当前过滤或卸载整棵子树；只有同一个 NodeId 仍
+            // 挂载时才读取本地状态，否则槽位可能已被复用。
+            let after = with_state(|state| {
+                if !state.element_is_current(element, node) {
+                    return None;
+                }
+                match state.element_local(element) {
+                    LocalState::Checkbox { checked } => Some(*checked),
+                    _ => None,
+                }
             });
-            if after.is_some_and(|after| after != before) {
+            if after != Some(before) {
                 report.mark_changed();
             }
             finish_reveal(&mut report, tree, reveal_before.as_ref());
@@ -9857,6 +9935,13 @@ fn text_length(local: &LocalState) -> usize {
 fn abort_text_dispatch(state: &mut State, element: usize) {
     if let LocalState::TextInput(editor) = state.element_local_mut(element) {
         editor.lineage.abort_dispatch();
+    }
+}
+
+/// 撤销派发只作用于同一个仍挂载的输入；失败的刷新可能已卸载它并复用槽位。
+fn abort_text_dispatch_if_current(state: &mut State, node: NodeId, element: usize) {
+    if state.element_is_current(element, node) {
+        abort_text_dispatch(state, element);
     }
 }
 

@@ -1031,6 +1031,9 @@ fn the_presentation_revision_tracks_snapshot_visible_changes_only() {
     revision = revision_bumped(&mut app, revision, |app| {
         app.focus("Edit Task 0").expect("focus");
     });
+    revision = revision_bumped(&mut app, revision, |app| {
+        app.input("Edit Task 0", "abcd").expect("seed the editor");
+    });
     let node = app
         .presentation()
         .expect("snapshot")
@@ -1063,5 +1066,41 @@ fn the_presentation_revision_tracks_snapshot_visible_changes_only() {
     });
     let _ = revision_bumped(&mut app, revision, |app| {
         app.set_appearance(Appearance::Dark).expect("theme");
+    });
+}
+
+#[test]
+fn an_identical_selection_is_not_an_effective_change() {
+    let mut app = runtime();
+    add(&mut app, "Task 0");
+    app.input("Edit Task 0", "abcd")
+        .expect("seed the editor with four characters");
+    let node = app
+        .presentation()
+        .expect("snapshot")
+        .find_label("Edit Task 0")
+        .expect("input")
+        .id();
+    app.set_selection_node(node, 1, 3).expect("selection");
+    app.set_caret_node(node, 3)
+        .expect("collapse at the same focus");
+
+    let revision = app.presentation_revision();
+    app.set_caret_node(node, 3).expect("identical caret");
+    assert_eq!(
+        app.presentation_revision(),
+        revision,
+        "an identical caret is not a state change"
+    );
+    app.set_selection_node(node, 3, 3)
+        .expect("identical collapsed selection");
+    assert_eq!(
+        app.presentation_revision(),
+        revision,
+        "an identical selection is not a state change"
+    );
+
+    let _ = revision_bumped(&mut app, revision, |app| {
+        app.set_selection_node(node, 0, 2).expect("real selection");
     });
 }

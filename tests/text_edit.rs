@@ -85,6 +85,74 @@ fn edit(app: &Runtime, label: &str) -> (usize, Option<(usize, usize)>, Option<St
     )
 }
 
+/// 输入在处理器里关闭自己：结算卸载原输入并挂载 fallback 输入。
+#[component]
+fn SelfClosingEditor() -> MountResult<MountPlan> {
+    let editing = signal(true);
+    let draft = signal(String::from("old"));
+    let other = signal(String::new());
+
+    view! {
+        <view>
+            <Show
+                when={editing}
+                fallback={move || view! {
+                    <text-input
+                        aria:label="other"
+                        value={other}
+                        on:input={move |value: String| other.set(value)}
+                    />
+                }}
+            >
+                <text-input
+                    aria:label="draft"
+                    value={draft}
+                    on:input={move |value: String| {
+                        draft.set(value);
+                        editing.set(false);
+                    }}
+                />
+            </Show>
+            <text aria:label="state">{memo(move || if editing.get() {
+                String::from("editing")
+            } else {
+                String::from("closed")
+            })}</text>
+        </view>
+    }
+}
+
+#[test]
+fn an_input_unmounted_by_its_own_handler_keeps_the_next_editor_clean() {
+    let mut app = Runtime::new();
+    app.mount(|| view! { <SelfClosingEditor /> })
+        .expect("mount the self-closing editor");
+    let draft = node(&app, "draft");
+
+    let report = app
+        .replace_text_node(draft, "typed")
+        .expect("the closing edit still settles");
+    assert!(report.is_ok());
+    assert!(report.changed());
+    assert!(
+        app.presentation()
+            .expect("snapshot")
+            .find_label("draft")
+            .is_none(),
+        "the gated input is unmounted by its own handler"
+    );
+
+    let other = node(&app, "other");
+    let before = app.presentation().expect("snapshot");
+    app.undo_node(other)
+        .expect("undo on the replacement input is silent");
+    assert_eq!(
+        app.presentation().expect("snapshot"),
+        before,
+        "the retired editor's history entry did not follow the slot"
+    );
+}
+
 #[test]
 fn insert_replaces_the_selection_and_moves_the_caret() {
     let (mut app, inputs, editor) = editor();

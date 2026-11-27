@@ -12,6 +12,8 @@ pub mod dispatch;
 pub mod file_dialog;
 pub mod menu;
 mod node;
+#[cfg(test)]
+mod oracle;
 pub mod presentation;
 pub mod runtime;
 pub mod session;
