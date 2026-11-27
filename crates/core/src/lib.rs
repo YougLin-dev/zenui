@@ -8,6 +8,7 @@ pub mod graph;
 pub mod handle;
 mod layout;
 pub mod metrics;
+pub mod model;
 pub mod owner;
 mod panic;
 mod query;

@@ -285,6 +285,69 @@ fn shared_rowsets_come_from_the_target_query_cache() {
 }
 
 #[test]
+fn row_visits_counts_the_rows_a_filter_rebuild_scanned() {
+    #[component]
+    fn ScanHost() -> MountResult<MountPlan> {
+        let store = Store::new();
+        let active = memo(move || store.rows(Filter::Active));
+        let label = memo(move || format!("active={}", active.get().len()));
+
+        view! {
+            <view>
+                <button aria:label="seed" on:click={move || -> Result<(), WriteError> {
+                    Transaction::new()
+                        .write(store.insert("a"))
+                        .write(store.insert("b"))
+                        .finish()
+                }}>"Seed"</button>
+                <text>{label}</text>
+                <For each={active} key={|id: TodoId| id}>
+                    {move |id: TodoId| view! {
+                        <button
+                            aria:label="done"
+                            on:click={move || -> Result<(), WriteError> {
+                                Transaction::new()
+                                    .write(store.set_completed(id, true))
+                                    .finish()
+                            }}
+                        >"Done"</button>
+                    }}
+                </For>
+            </view>
+        }
+    }
+
+    let mut app = mount(|| view! { <ScanHost /> });
+    assert!(app.texts().iter().any(|text| text == "active=0"));
+
+    let before = app.counters().row_visits;
+    app.click_label("seed").expect("seed two rows");
+    assert_eq!(
+        app.counters().row_visits - before,
+        2,
+        "a rebuild scans every live row, not just the matching ones"
+    );
+    assert!(app.texts().iter().any(|text| text == "active=2"));
+
+    let before = app.counters().row_visits;
+    app.click_label("done").expect("complete the first row");
+    assert_eq!(
+        app.counters().row_visits - before,
+        2,
+        "the remaining active row still pays for the whole scan"
+    );
+
+    let before = app.counters().row_visits;
+    app.click_label("done").expect("complete the second row");
+    assert_eq!(
+        app.counters().row_visits,
+        before,
+        "an empty filter is short-circuited without scanning"
+    );
+    assert!(app.texts().iter().any(|text| text == "active=0"));
+}
+
+#[test]
 fn typed_key_events_reach_the_target_handler() {
     #[component]
     fn Editor() -> MountResult<MountPlan> {

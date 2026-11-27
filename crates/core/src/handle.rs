@@ -79,7 +79,6 @@ impl Generation {
         Self(u32::MAX)
     }
 
-    #[cfg(test)]
     pub(crate) const fn from_raw(raw: u32) -> Self {
         Self(raw)
     }
@@ -97,7 +96,8 @@ impl Generation {
 pub struct RowKey(u64);
 
 impl RowKey {
-    pub(crate) const fn from_raw(raw: u64) -> Self {
+    /// 由应用维护的业务键种子构造键；行身份是 [`crate::model::RowId`]。
+    pub const fn from_raw(raw: u64) -> Self {
         Self(raw)
     }
 
