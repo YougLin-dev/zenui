@@ -841,6 +841,8 @@ pub enum WindowError {
     Hidden,
     /// 该 activation 已关闭或被更新的一代取代。
     Stale,
+    /// 一个行窗口批次里同一个行带出现了不止一次。
+    DuplicateRowBand,
     WrongRuntime,
     /// 目录中没有这个窗口键。
     UnknownWindow(&'static str),
@@ -865,6 +867,9 @@ impl fmt::Display for WindowError {
             Self::State(message) => f.write_str(message),
             Self::Hidden => f.write_str("the window is hidden"),
             Self::Stale => f.write_str("the window activation is no longer live"),
+            Self::DuplicateRowBand => {
+                f.write_str("a row-window batch names the same band more than once")
+            }
             Self::WrongRuntime => {
                 f.write_str("a WindowCtx from another ZenUI Runtime cannot access this one")
             }

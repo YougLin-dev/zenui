@@ -107,7 +107,8 @@ fn a_windowed_for_mounts_only_the_requested_rows_and_remounts_fresh() {
 
     assert!(
         app.set_row_window(window, band.key(), 40, 10)
-            .expect("apply the window"),
+            .expect("apply the window")
+            .changed(),
         "the requested window differs"
     );
     let snapshot = app.presentation_of(window).expect("snapshot");
@@ -127,6 +128,7 @@ fn a_windowed_for_mounts_only_the_requested_rows_and_remounts_fresh() {
     assert!(
         app.set_row_window(window, band.key(), 0, 10)
             .expect("return to the top")
+            .changed()
     );
     let snapshot = app.presentation_of(window).expect("snapshot");
     assert_eq!(snapshot.row_bands()[0].first_row(), 0);
@@ -152,6 +154,7 @@ fn focus_keeps_a_row_one_outside_the_window_but_drops_it_further() {
     assert!(
         app.set_row_window(window, band.key(), 1, 10)
             .expect("scroll one row down")
+            .changed()
     );
     let snapshot = app.presentation_of(window).expect("snapshot");
     assert_eq!(
@@ -169,6 +172,7 @@ fn focus_keeps_a_row_one_outside_the_window_but_drops_it_further() {
     assert!(
         app.set_row_window(window, band.key(), 5, 10)
             .expect("scroll far down")
+            .changed()
     );
     let snapshot = app.presentation_of(window).expect("snapshot");
     assert_eq!(snapshot.row_bands()[0].first_row(), 5);

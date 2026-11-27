@@ -777,11 +777,41 @@ struct MountedTree {
     revision: u64,
 }
 
-/// 宿主为一行带请求的挂载窗口；`count` 为零表示该行带当前不需要行。
+/// 一个窗口化 `For` 的挂载窗口：从 `first` 行开始挂载 `count` 行。
+///
+/// 请求按行带身份保存；运行时把区间夹到当前行数，并允许聚焦行在窗口外
+/// 一行以内时把窗口扩大一行。`count` 为零表示该行带当前不挂载任何行。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct RowWindow {
+pub struct RowWindow {
     first: usize,
     count: usize,
+}
+
+impl RowWindow {
+    /// 从 `first` 行开始挂载 `count` 行。
+    pub const fn new(first: usize, count: usize) -> Self {
+        Self { first, count }
+    }
+
+    /// 请求的起始行。
+    pub const fn first(self) -> usize {
+        self.first
+    }
+
+    /// 请求挂载的行数。
+    pub const fn count(self) -> usize {
+        self.count
+    }
+}
+
+/// 一次批量行窗口结构 turn 的请求与提交记录。
+#[derive(Default)]
+struct RowWindowBatch {
+    /// 本批改变了请求的行带。
+    bands: BTreeSet<u64>,
+    /// 已经被对应 `For` 消费并提交的行带；失败时这些行带需要一次修复
+    /// 刷新才能把已提交的行搬回旧窗口。
+    applied: BTreeSet<u64>,
 }
 
 /// 没有宿主窗口时的默认挂载行数；ADR-0011 要求它远大于常见视口行数。
@@ -978,11 +1008,9 @@ pub(crate) struct State {
     refresh_focus: Option<usize>,
     /// 本帧窗口化 For 卸载了焦点所在行；刷新后清除焦点而不是结算到邻居。
     window_focus_dropped: Option<usize>,
-    /// 正在进行的 `set_row_window` tick 请求的行带；只有 tick 内的刷新
-    /// 需要报告请求窗口是否已经提交。
-    row_window_tick: Option<u64>,
-    /// tick 请求的行窗口是否已在本次刷新提交；tick 结束后清零。
-    row_window_commit: bool,
+    /// 正在进行的批量行窗口结构 turn；只有该 turn 内的刷新会记录哪些
+    /// 行带已经消费并提交了请求。
+    row_window_batch: Option<RowWindowBatch>,
     pub(crate) tasks: BTreeMap<u32, TaskRecord>,
     pub(crate) next_task: u32,
     /// 已排队、等待宿主弹出的文件选择请求；任务本身在 `tasks` 中。
@@ -1335,8 +1363,7 @@ impl State {
             next_row_band: 1,
             refresh_focus: None,
             window_focus_dropped: None,
-            row_window_tick: None,
-            row_window_commit: false,
+            row_window_batch: None,
             tasks: BTreeMap::new(),
             next_task: 1,
             pending_file_dialogs: Vec::new(),
@@ -1993,6 +2020,21 @@ impl State {
     fn tree_has_band(&self, key: TreeSlot, band: u64) -> bool {
         self.tree(key)
             .is_some_and(|tree| contains_band(self, &tree.nodes, band))
+    }
+
+    /// 一棵树里全部可寻址窗口的行带键；一次遍历服务整批校验。
+    fn tree_band_keys(&self, key: TreeSlot) -> BTreeSet<u64> {
+        let mut bands = BTreeSet::new();
+        if let Some(tree) = self.tree(key) {
+            collect_band_keys(self, &tree.nodes, &mut bands);
+        }
+        bands
+    }
+
+    /// 行带所属的 `For` payload；行带已随 owner 释放时返回 `None`。
+    fn for_payload_for_band(&self, key: TreeSlot, band: u64) -> Option<u32> {
+        self.tree(key)
+            .and_then(|tree| find_for_payload(self, &tree.nodes, band))
     }
 
     fn element_is_visible(&self, element: usize) -> bool {
@@ -3802,6 +3844,9 @@ struct ForData {
     band: u64,
     total_rows: usize,
     first_row: usize,
+    /// 最近一次提交的有效行窗口跨度；静态行集的已删除行不在 `order`
+    /// 里，因此不能用 `order.len()` 还原宿主请求的窗口。
+    window_count: usize,
     /// 窗口化 For 的上下 spacer 元素槽位；保持内容总高度不变。
     spacers: Option<(usize, usize)>,
     /// 最近一次提交的完整投影；完整行顺序的唯一来源。
@@ -5704,20 +5749,29 @@ impl Runtime {
             && state.window_is_visible(window.key)
     }
 
-    /// 声明一个窗口化 `For` 的挂载窗口。
+    /// 批量声明窗口化 `For` 的挂载窗口，一个原子结构 turn。
     ///
-    /// `band` 来自快照的 [`SnapshotRowBand::key`]；`first`/`count` 是宿主从行带
-    /// 几何和滚动偏移换算出的行区间。运行时在这里挂载进入窗口的行、卸载离开
-    /// 窗口的行并更新上下 spacer；聚焦行在窗口外一行以内时窗口自动扩大一行，
-    /// 更远时该行被卸载且焦点清除。返回是否真的有变化；未变化的请求不刷新
-    /// 也不改变呈现版本。窗口、行带已失效时返回 [`WindowError::Stale`]。
-    pub fn set_row_window(
+    /// `bands` 的每个键来自快照的 [`SnapshotRowBand::key`]，窗口目标由宿主从
+    /// 行带几何和滚动偏移换算。批量先整体校验：任一行带不属于该窗口的已
+    /// 提交树、不是声明了 `row-height` 的行带（[`WindowError::Stale`]），或
+    /// 同一个行带出现两次（[`WindowError::DuplicateRowBand`]）时，整批请求
+    /// 都不应用。
+    ///
+    /// 返回报告的 [`TurnReport::changed`] 为真当且仅当本 turn 推进了窗口树
+    /// 的呈现版本：有行挂载/卸载、spacer 高度变化、焦点被清除或值绑定变化。
+    /// 空批次和与当前请求完全相同的批次不刷新，返回 `changed == false`。
+    ///
+    /// 结构 turn 里任一行工厂失败时，本批改变过的请求全部回滚到调用前的
+    /// 窗口；已经提交过窗口的行带逐个再刷新一次，把行搬回旧窗口。旧行本身
+    /// 也挂不回去（同一个工厂故障持续）时，该行带的请求改为描述实际提交的
+    /// 窗口，下一次普通刷新不会把行搬到宿主没有请求过的地方。错误以
+    /// [`WindowError::Mount`] 返回，树保持最后一次可提交的结构，宿主可以
+    /// 重试同一个批次。
+    pub fn set_row_windows(
         &mut self,
         window: WindowCtx,
-        band: u64,
-        first: usize,
-        count: usize,
-    ) -> Result<bool, WindowError> {
+        bands: &[(u64, RowWindow)],
+    ) -> Result<TurnReport, WindowError> {
         let state = self.state.clone();
         if window.runtime != state.borrow().id {
             return Err(WindowError::WrongRuntime);
@@ -5727,67 +5781,155 @@ impl Runtime {
                 return Err(WindowError::Stale);
             }
             let key = TreeSlot::Window(window.key);
-            if !with_state(|state| state.tree_has_band(key, band)) {
-                return Err(WindowError::Stale);
-            }
-            // 请求本身不改 revision；只有刷新真的改变了呈现（行挂载/卸载、
-            // spacer 高度、值绑定）才由刷新路径标记 dirty。
-            let mut previous = None;
-            let changed = with_state(|state| {
-                let request = RowWindow { first, count };
-                if state.row_windows.get(&band) == Some(&request) {
-                    return false;
+            // 1) 预校验全部行带：任何一条失败都不应用任何请求。活行带集合
+            // 每次 turn 只遍历树一次，批量大小不影响校验成本。
+            let live = with_state(|state| state.tree_band_keys(key));
+            let mut seen = BTreeSet::new();
+            for (band, _) in bands {
+                if !seen.insert(*band) {
+                    return Err(WindowError::DuplicateRowBand);
                 }
-                previous = Some(state.row_windows.insert(band, request));
-                true
-            });
-            if changed {
-                // 滚动 tick 是一个独立求值轮次；补丁日志按 (tree, node, part)
-                // 去重，释放的行由 retire_node 从日志移除，反复滚动不会累积。
-                // tick 状态只在这段调用内存活：refresh_for 据此报告请求窗口
-                // 是否已提交，调用结束即清零，不会随卸载的 For 累积。
+                if !live.contains(band) {
+                    return Err(WindowError::Stale);
+                }
+            }
+            // 2) 只记录与当前请求不同的行带；请求本身不改 revision，只有
+            // 刷新真的改变了呈现（行挂载/卸载、spacer 高度、值绑定）才由
+            // 刷新路径标记 dirty。
+            let mut changed_bands = BTreeSet::new();
+            let mut previous = Vec::new();
+            for (band, request) in bands {
+                let current = with_state(|state| state.row_windows.get(band).copied());
+                if current == Some(*request) {
+                    continue;
+                }
+                changed_bands.insert(*band);
+                previous.push((*band, current));
                 with_state(|state| {
-                    state.bump_refresh_round();
-                    state.row_window_tick = Some(band);
-                    state.row_window_commit = false;
+                    state.row_windows.insert(*band, *request);
                 });
-                let result = self.refresh_tree_once(key).map_err(WindowError::Mount);
-                let committed = with_state(|state| {
-                    let committed = state.row_window_commit;
-                    state.row_window_tick = None;
-                    state.row_window_commit = false;
-                    committed
+            }
+            if changed_bands.is_empty() {
+                return Ok(TurnReport::default());
+            }
+            // 3) 一个求值轮次消费整批请求。批标记只在这段调用内存活：
+            // refresh_for 据此记录哪些行带已经提交，调用结束即清零。
+            with_state(|state| {
+                state.bump_refresh_round();
+                state.row_window_batch = Some(RowWindowBatch {
+                    bands: changed_bands,
+                    applied: BTreeSet::new(),
                 });
-                if let Err(error) = result {
-                    // 拟议窗口在失败前已提交（行工厂之后的行内结构错误、或
-                    // 后续兄弟节点失败）时，请求必须保留：回滚会让请求映射
-                    // 与已提交的 first_row/spacer 分叉，下一次普通刷新会把
-                    // 宿主没有请求过的窗口悄悄套上去。
-                    if !committed {
-                        // 窗口本身没有落地才回滚请求，宿主可以用同一个窗口
-                        // 重试，而不是被“请求已存在”的快速路径吞掉。行带
-                        // 若随 owner 卸载，请求已经一并丢弃，不再恢复。
-                        with_state(|state| {
+            });
+            let result = self.refresh_tree_once(key);
+            let batch = with_state(|state| state.row_window_batch.take());
+            let batch = batch.unwrap_or_default();
+            match result {
+                Ok(changed) => Ok(TurnReport {
+                    changed,
+                    ..TurnReport::default()
+                }),
+                Err(error) => {
+                    // 原子回滚：恢复本批改变过的全部请求。行带已随 owner
+                    // 释放时请求一并丢弃（它的 For 已不在树里），不能把
+                    // 请求复活成没有归属的映射。
+                    with_state(|state| {
+                        for (band, previous) in previous {
                             if !state.tree_has_band(key, band) {
                                 state.row_windows.remove(&band);
-                                return;
+                                continue;
                             }
                             match previous {
-                                Some(Some(request)) => {
+                                Some(request) => {
                                     state.row_windows.insert(band, request);
                                 }
-                                Some(None) => {
+                                None => {
                                     state.row_windows.remove(&band);
                                 }
-                                None => {}
                             }
+                        }
+                    });
+                    if !batch.applied.is_empty() {
+                        // 失败前已有行带提交了新窗口：逐个把已提交的行带
+                        // 刷回恢复后的旧请求。只刷新这些 For，不重跑整棵树，
+                        // 避免再次撞上失败行或无关兄弟节点的错误。修复仍是
+                        // 结构阶段：新行必须挂到本窗口的树，而不是根树。
+                        let (previous_phase, previous_tree) = with_state(|state| {
+                            let previous = (state.phase, state.building_tree);
+                            state.refresh_focus = None;
+                            state.phase = Phase::Binding;
+                            state.building_tree = Some(key);
+                            previous
+                        });
+                        for band in batch.applied {
+                            // 每个行带一个新求值轮次：另一个行带的修复刷新
+                            // 可能已经通过嵌套结构消费过这个 For，并把它的
+                            // `structure_round` 记成当前轮；不换轮次会让本轮
+                            // 自己的修复被跳过，请求与已提交窗口就此分叉。
+                            with_state(State::bump_refresh_round);
+                            let Some(payload) =
+                                with_state(|state| state.for_payload_for_band(key, band))
+                            else {
+                                continue;
+                            };
+                            // 修复会求值用户结构（Show/嵌套 For 的触发）；
+                            // 与完整刷新一样包在 panic 边界里，毒化 memo 等
+                            // 用户代码不能穿过公开入口。修复失败按“旧结构
+                            // 不可表示”处理。
+                            let repaired = catch_panic(std::panic::AssertUnwindSafe(|| {
+                                self.refresh_for(payload)
+                            }));
+                            if matches!(repaired, Ok(Ok(()))) {
+                                continue;
+                            }
+                            // 旧行也挂不回去时，旧结构已经不可表示。让请求
+                            // 映射描述实际提交的窗口，避免下一次普通刷新把
+                            // 行悄悄搬到宿主没请求过的地方；原始错误仍然
+                            // 返回给调用方。窗口跨度取最近提交的有效 count，
+                            // 不能取 `order.len()`：静态行集里已删除的行不
+                            // 挂载，但仍在窗口跨度内。
+                            let committed = with_state(|state| {
+                                let payload = state.for_payload_for_band(key, band)?;
+                                let for_node = state.nodes.for_node(payload);
+                                Some((for_node.first_row, for_node.window_count))
+                            });
+                            if let Some((first, count)) = committed {
+                                with_state(|state| {
+                                    state.row_windows.insert(band, RowWindow::new(first, count));
+                                });
+                            }
+                        }
+                        // 修复重挂的行没有已提交的绑定值；补一次值阶段，
+                        // 动态文本与属性不会在失败帧后呈现为空。
+                        let _ = self.refresh_values_once(key);
+                        with_state(|state| {
+                            state.commit_tree_revision(key);
+                            state.phase = previous_phase;
+                            state.building_tree = previous_tree;
+                            // 修复是失败 turn 的恢复步骤；它产生的读失败与
+                            // 焦点丢弃不留给下一次普通刷新重复报告。
+                            state.fault = None;
+                            state.window_focus_dropped = None;
                         });
                     }
-                    return Err(error);
+                    Err(WindowError::Mount(error))
                 }
             }
-            Ok(changed)
         })
+    }
+
+    /// [`Runtime::set_row_windows`] 的单带便捷形式；语义相同。
+    ///
+    /// `band` 来自快照的 [`SnapshotRowBand::key`]，`first`/`count` 是从行带
+    /// 几何和滚动偏移换算出的目标区间。
+    pub fn set_row_window(
+        &mut self,
+        window: WindowCtx,
+        band: u64,
+        first: usize,
+        count: usize,
+    ) -> Result<TurnReport, WindowError> {
+        self.set_row_windows(window, &[(band, RowWindow::new(first, count))])
     }
 
     /// 刷新全部已提交树，并返回自上次报告以来的有效呈现变化。
@@ -5986,6 +6128,46 @@ impl Runtime {
                 return Err(State::context_error(fault));
             }
             Ok(changed)
+        })
+    }
+
+    /// 只求值一棵树的值绑定，不重跑结构触发。
+    ///
+    /// 失败批量 turn 的修复刷新重挂了旧行；新行的绑定槽没有已提交值，
+    /// 必须补一次值阶段，否则动态文本/属性会呈现为空，直到下一次完整
+    /// 刷新。结构已经稳定，这里只走值阶段，并沿用与完整刷新相同的
+    /// panic 边界与树保护。
+    fn refresh_values_once(&mut self, key: TreeSlot) -> Result<(), MountError> {
+        let state = self.state.clone();
+        context::install(&state, || {
+            let (taken, previous_phase, previous_tree) = with_state(|state| {
+                let previous_phase = state.phase;
+                let previous_tree = state.building_tree;
+                state.phase = Phase::Binding;
+                state.building_tree = Some(key);
+                state.refresh_focus = None;
+                (state.take_tree(key), previous_phase, previous_tree)
+            });
+            let Some(tree) = taken else {
+                with_state(|state| {
+                    state.phase = previous_phase;
+                    state.building_tree = previous_tree;
+                });
+                return Ok(());
+            };
+            let mut guard = TreeRefreshGuard::new(key, tree, previous_phase, previous_tree);
+            let result = catch_panic(std::panic::AssertUnwindSafe(|| {
+                self.refresh_value_nodes(guard.nodes())
+            }));
+            guard.restore();
+            with_state(|state| {
+                state.phase = previous_phase;
+                state.refresh_focus = None;
+            });
+            match result {
+                Ok(result) => result,
+                Err(panic) => Err(MountError::Panic(panic)),
+            }
         })
     }
 
@@ -6424,6 +6606,7 @@ impl Runtime {
                         band,
                         total_rows: 0,
                         first_row: 0,
+                        window_count: 0,
                         spacers: None,
                         committed_rows: None,
                         items: BTreeMap::new(),
@@ -7330,14 +7513,16 @@ impl Runtime {
         }
         for_node.total_rows = total;
         for_node.first_row = first;
+        for_node.window_count = count;
         if for_node.row_height.is_some() {
-            // tick 请求的窗口已经消费并提交；失败的 tick 不能把它回滚成
-            // “宿主从未请求过”的状态，否则请求映射与已提交行窗口会长期
-            // 分叉。只有 tick 内的刷新才记录，普通刷新不留下任何标记。
+            // 本批请求的窗口已经消费并提交；失败的 turn 据此决定是否需要
+            // 修复刷新。只有批量 turn 内的刷新才记录，普通刷新不留下标记。
             let band = for_node.band;
             with_state(|state| {
-                if state.row_window_tick == Some(band) {
-                    state.row_window_commit = true;
+                if let Some(batch) = &mut state.row_window_batch
+                    && batch.bands.contains(&band)
+                {
+                    batch.applied.insert(band);
                 }
             });
         }
@@ -9261,6 +9446,82 @@ fn contains_element(state: &State, nodes: &[MountedNode], wanted: usize) -> bool
     })
 }
 
+fn collect_band_keys(state: &State, nodes: &[MountedNode], out: &mut BTreeSet<u64>) {
+    for node in nodes {
+        match node {
+            MountedNode::Text(_) => {}
+            MountedNode::Element(id) => {
+                collect_band_keys(state, &state.elements[*id].children, out);
+            }
+            MountedNode::Component(id) => {
+                collect_band_keys(state, &state.components[*id].children, out);
+            }
+            MountedNode::Show(payload) => {
+                let show = state.nodes.show(*payload);
+                if let Some(branch) = &show.active {
+                    collect_band_keys(state, &branch.children, out);
+                }
+            }
+            MountedNode::For(payload) => {
+                let for_node = state.nodes.for_node(*payload);
+                // 只有声明了 `row-height` 的 For 才发布行带；其他 For 的键
+                // 不是宿主可以寻址的窗口。
+                if for_node.row_height.is_some() {
+                    out.insert(for_node.band);
+                }
+                for key in &for_node.order {
+                    if let Some(item) = for_node.items.get(key) {
+                        collect_band_keys(state, &item.children, out);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn find_for_payload(state: &State, nodes: &[MountedNode], band: u64) -> Option<u32> {
+    for node in nodes {
+        match node {
+            MountedNode::Text(_) => {}
+            MountedNode::Element(id) => {
+                if let Some(payload) = find_for_payload(state, &state.elements[*id].children, band)
+                {
+                    return Some(payload);
+                }
+            }
+            MountedNode::Component(id) => {
+                if let Some(payload) =
+                    find_for_payload(state, &state.components[*id].children, band)
+                {
+                    return Some(payload);
+                }
+            }
+            MountedNode::Show(payload) => {
+                let show = state.nodes.show(*payload);
+                if let Some(branch) = &show.active
+                    && let Some(payload) = find_for_payload(state, &branch.children, band)
+                {
+                    return Some(payload);
+                }
+            }
+            MountedNode::For(payload) => {
+                let for_node = state.nodes.for_node(*payload);
+                if for_node.band == band && for_node.row_height.is_some() {
+                    return Some(*payload);
+                }
+                for key in &for_node.order {
+                    if let Some(item) = for_node.items.get(key)
+                        && let Some(payload) = find_for_payload(state, &item.children, band)
+                    {
+                        return Some(payload);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 fn contains_band(state: &State, nodes: &[MountedNode], band: u64) -> bool {
     nodes.iter().any(|node| match node {
         MountedNode::Text(_) => false,
@@ -9274,7 +9535,9 @@ fn contains_band(state: &State, nodes: &[MountedNode], band: u64) -> bool {
         }
         MountedNode::For(payload) => {
             let for_node = state.nodes.for_node(*payload);
-            for_node.band == band
+            // 只有声明了 `row-height` 的 For 才发布行带；其他 For 的键
+            // 不是宿主可以寻址的窗口。
+            (for_node.band == band && for_node.row_height.is_some())
                 || for_node.order.iter().any(|key| {
                     for_node
                         .items
@@ -10439,10 +10702,12 @@ mod recycling_tests {
             assert!(
                 app.set_row_window(window, band, 40, 10)
                     .expect("shrink the row window")
+                    .changed()
             );
             assert!(
                 app.set_row_window(window, band, 0, 32)
                     .expect("restore the row window")
+                    .changed()
             );
         }
         let steady = store_lengths(&app);
@@ -10455,10 +10720,12 @@ mod recycling_tests {
             assert!(
                 app.set_row_window(window, band, 40, 10)
                     .expect("shrink the row window")
+                    .changed()
             );
             assert!(
                 app.set_row_window(window, band, 0, 32)
                     .expect("restore the row window")
+                    .changed()
             );
         }
         assert_eq!(
@@ -11673,7 +11940,8 @@ mod binding_tests {
         app.click_label("disarm").expect("disarm the row fault");
         assert!(
             app.set_row_window(window, band, 32, 8)
-                .expect("the retry applies"),
+                .expect("the retry applies")
+                .changed(),
             "the window change is applied once the rows mount"
         );
         assert_eq!(
@@ -11710,7 +11978,7 @@ mod binding_tests {
     }
 
     #[test]
-    fn a_failed_tick_after_the_window_commit_keeps_the_request() {
+    fn a_failed_batch_restores_the_committed_windows() {
         let mut app = Runtime::new();
         app.declare_windows(|catalog| {
             catalog.window(WindowSpec::new("main").primary(), |_| {
@@ -11724,10 +11992,12 @@ mod binding_tests {
         assert!(
             app.set_row_window(window, band, 2, 8)
                 .expect("the first window applies")
+                .changed()
         );
         assert_eq!(row_band_first(&app, window), 2);
 
-        // 后续兄弟节点失败，但请求的窗口在失败前已经提交。
+        // 后续兄弟节点失败：整个批量结构 turn 失败，已经提交的新窗口也要
+        // 搬回旧窗口，请求映射与已提交的 first_row/spacer 不能分叉。
         let failure = app.click_label("break").expect_err("the show branch fails");
         assert!(
             matches!(failure, MountError::Component("branch boom")),
@@ -11736,51 +12006,7 @@ mod binding_tests {
         let revision = app.presentation_revision_of(window).expect("revision");
         let failure = app
             .set_row_window(window, band, 4, 8)
-            .expect_err("the later sibling fails the tick");
-        assert!(
-            matches!(
-                failure,
-                WindowError::Mount(MountError::Component("branch boom"))
-            ),
-            "unexpected failure: {failure:?}"
-        );
-        assert_eq!(
-            row_band_first(&app, window),
-            4,
-            "the committed window stands after the failed tick"
-        );
-        {
-            let state = app.state.borrow();
-            assert!(
-                state.row_window_tick.is_none() && !state.row_window_commit,
-                "the failed tick leaves no request marker behind"
-            );
-        }
-        assert_ne!(
-            app.presentation_revision_of(window).expect("revision"),
-            revision,
-            "the committed window advances the revision"
-        );
-        assert!(
-            !app.set_row_window(window, band, 4, 8)
-                .expect("the committed request is already applied"),
-            "a request whose window committed is not rolled back"
-        );
-
-        // 普通刷新失败也不能把窗口悄悄挪回默认值：请求映射必须描述
-        // 已提交的行窗口。
-        let _ = app.refresh().expect_err("the branch still fails");
-        assert_eq!(
-            row_band_first(&app, window),
-            4,
-            "a failing refresh keeps the committed window"
-        );
-
-        // 宿主显式请求旧窗口时，请求照常应用并记录下来，不会被
-        // “请求已存在”的快速路径吞掉。
-        let failure = app
-            .set_row_window(window, band, 2, 8)
-            .expect_err("the branch still fails the tick");
+            .expect_err("the later sibling fails the turn");
         assert!(
             matches!(
                 failure,
@@ -11791,12 +12017,52 @@ mod binding_tests {
         assert_eq!(
             row_band_first(&app, window),
             2,
-            "the explicit request applies despite the sibling failure"
+            "the failed batch restores the committed window"
+        );
+        {
+            let state = app.state.borrow();
+            assert!(
+                state.row_window_batch.is_none(),
+                "the failed turn leaves no batch marker behind"
+            );
+        }
+        assert_ne!(
+            app.presentation_revision_of(window).expect("revision"),
+            revision,
+            "the failed batch reports the restored window as a change"
         );
         assert!(
             !app.set_row_window(window, band, 2, 8)
-                .expect("the restored request is recorded"),
-            "the applied request is stored"
+                .expect("the restored request is recorded")
+                .changed(),
+            "the restored request matches the committed window"
+        );
+
+        // 普通刷新失败也不能把窗口悄悄挪回默认值：请求映射必须描述
+        // 已提交的行窗口。
+        let _ = app.refresh().expect_err("the branch still fails");
+        assert_eq!(
+            row_band_first(&app, window),
+            2,
+            "a failing refresh keeps the committed window"
+        );
+
+        // 被回滚的请求不会因为“请求已存在”被吞掉：重试仍然先经过
+        // 结构 turn，并再次失败。
+        let failure = app
+            .set_row_window(window, band, 4, 8)
+            .expect_err("the retry still fails the turn");
+        assert!(
+            matches!(
+                failure,
+                WindowError::Mount(MountError::Component("branch boom"))
+            ),
+            "unexpected failure: {failure:?}"
+        );
+        assert_eq!(
+            row_band_first(&app, window),
+            2,
+            "the retried batch restores the committed window again"
         );
     }
 
@@ -11992,16 +12258,16 @@ mod binding_tests {
         }
     }
 
-    fn assert_no_row_window_tick_state(app: &Runtime) {
+    fn assert_no_row_window_batch_state(app: &Runtime) {
         let state = app.state.borrow();
         assert!(
-            state.row_window_tick.is_none() && !state.row_window_commit,
-            "no row-window tick state survives its tick"
+            state.row_window_batch.is_none(),
+            "no row-window batch state survives its turn"
         );
     }
 
     #[test]
-    fn row_window_tick_state_does_not_survive_or_accumulate() {
+    fn row_window_batch_state_does_not_survive_or_accumulate() {
         let mut app = Runtime::new();
         app.declare_windows(|catalog| {
             catalog.window(WindowSpec::new("main").primary(), |_| {
@@ -12011,28 +12277,29 @@ mod binding_tests {
         .expect("declare the window");
         let window = app.show("main").expect("show the window");
         app.click_label("seed").expect("seed the rows");
-        // 普通刷新（没有宿主 tick）不留下任何 tick 状态。
+        // 普通刷新（没有宿主批量 turn）不留下任何批状态。
         app.click_label("toggle").expect("open the windowed for");
-        assert_no_row_window_tick_state(&app);
+        assert_no_row_window_batch_state(&app);
         let band = app.presentation_of(window).expect("snapshot").row_bands()[0].key();
 
-        // 成功的 tick 结束后同样清零，而不是把请求标记留给下一轮。
+        // 成功的批量 turn 结束后同样清零，而不是把批标记留给下一轮。
         assert!(
             app.set_row_window(window, band, 2, 4)
-                .expect("the tick applies")
+                .expect("the batch applies")
+                .changed()
         );
-        assert_no_row_window_tick_state(&app);
+        assert_no_row_window_batch_state(&app);
         assert_eq!(
             app.presentation_of(window).expect("snapshot").row_bands()[0].first_row(),
             2,
-            "the successful tick applies its window"
+            "the successful batch applies its window"
         );
 
-        // 卸载/重挂多轮也不会累积 tick 状态；行带请求随 owner 释放。
+        // 卸载/重挂多轮也不会累积批状态；行带请求随 owner 释放。
         for _ in 0..4 {
             app.click_label("toggle").expect("close the windowed for");
             app.click_label("toggle").expect("reopen the windowed for");
-            assert_no_row_window_tick_state(&app);
+            assert_no_row_window_batch_state(&app);
         }
         {
             let state = app.state.borrow();
@@ -12043,7 +12310,7 @@ mod binding_tests {
             );
         }
         app.click_label("toggle").expect("close the windowed for");
-        assert_no_row_window_tick_state(&app);
+        assert_no_row_window_batch_state(&app);
         let state = app.state.borrow();
         assert!(
             state.row_windows.is_empty(),
@@ -12052,6 +12319,742 @@ mod binding_tests {
         assert!(
             state.owner_bands.is_empty(),
             "band ownership dies with its for"
+        );
+    }
+
+    /// 两个兄弟窗口化 `For`：A 正常，B 在 armed 时让新行工厂失败。
+    #[component]
+    fn TwoBandRows() -> MountResult<MountPlan> {
+        let store = Store::new();
+        let rows = memo(move || store.rows(Filter::All));
+        let armed = signal(false);
+        // 动态文本绑定：失败回滚重挂的行必须重新求值。
+        let mark = signal(String::from("m"));
+        view! {
+            <view>
+                <button aria:label="seed" on:click={move || -> Result<(), WriteError> {
+                    let mut transaction = Transaction::new();
+                    for index in 0..40 {
+                        transaction = transaction.write(store.insert(format!("r{index}")));
+                    }
+                    transaction.finish()
+                }}>"seed"</button>
+                <button aria:label="arm" on:click={move || armed.set(true)}>"arm"</button>
+                <button aria:label="disarm" on:click={move || armed.set(false)}>"disarm"</button>
+                <For each={rows} store={store} key={|row: &TodoRow| row.id} row-height={px(20.0)}>
+                    {move |row: RowView<TodoRow>| view! {
+                        <button aria:label={once(format!("a {}", row.key().raw()))}>
+                            <text>{mark}</text>
+                        </button>
+                    }}
+                </For>
+                <For each={rows} store={store} key={|row: &TodoRow| row.id} row-height={px(20.0)}>
+                    {move |row: RowView<TodoRow>| {
+                        if armed.get() {
+                            return Err(MountError::Component("b boom"));
+                        }
+                        view! {
+                            <button aria:label={once(format!("b {}", row.key().raw()))}>"b"</button>
+                        }
+                    }}
+                </For>
+            </view>
+        }
+    }
+
+    fn count_labels(app: &Runtime, window: WindowCtx, prefix: &str) -> usize {
+        app.presentation_of(window)
+            .expect("snapshot")
+            .elements()
+            .filter_map(SnapshotElement::label)
+            .filter(|label| label.starts_with(prefix))
+            .count()
+    }
+
+    fn two_band_fixture() -> (Runtime, WindowCtx, [u64; 2]) {
+        let mut app = Runtime::new();
+        app.declare_windows(|catalog| {
+            catalog.window(WindowSpec::new("main").primary(), |_| {
+                view! { <TwoBandRows /> }
+            })
+        })
+        .expect("declare the window");
+        let window = app.show("main").expect("show the window");
+        app.click_label("seed").expect("seed the rows");
+        let snapshot = app.presentation_of(window).expect("snapshot");
+        assert_eq!(snapshot.row_bands().len(), 2, "two windowed fors");
+        let bands = [snapshot.row_bands()[0].key(), snapshot.row_bands()[1].key()];
+        (app, window, bands)
+    }
+
+    #[test]
+    fn a_batch_applies_every_band_and_unchanged_batches_reuse_the_scene() {
+        let (mut app, window, bands) = two_band_fixture();
+        let revision = app.presentation_revision_of(window).expect("revision");
+        let report = app
+            .set_row_windows(
+                window,
+                &[
+                    (bands[0], RowWindow::new(40, 10)),
+                    (bands[1], RowWindow::new(20, 5)),
+                ],
+            )
+            .expect("both bands apply");
+        assert!(report.changed(), "a changed batch reports a new scene");
+        let snapshot = app.presentation_of(window).expect("snapshot");
+        assert_eq!(snapshot.row_bands()[0].first_row(), 40);
+        assert_eq!(snapshot.row_bands()[1].first_row(), 20);
+        assert_eq!(
+            count_labels(&app, window, "b "),
+            5,
+            "the second band mounts exactly its own window"
+        );
+        assert_eq!(
+            count_labels(&app, window, "a "),
+            0,
+            "the first band unmounts rows outside its empty window"
+        );
+        assert_ne!(
+            app.presentation_revision_of(window).expect("revision"),
+            revision,
+            "a changed batch advances the revision"
+        );
+
+        let revision = app.presentation_revision_of(window).expect("revision");
+        let report = app
+            .set_row_windows(
+                window,
+                &[
+                    (bands[0], RowWindow::new(40, 10)),
+                    (bands[1], RowWindow::new(20, 5)),
+                ],
+            )
+            .expect("the identical batch is a no-op");
+        assert!(
+            !report.changed(),
+            "an identical batch reuses the committed scene"
+        );
+        assert_eq!(
+            app.presentation_revision_of(window).expect("revision"),
+            revision,
+            "an identical batch does not advance the revision"
+        );
+    }
+
+    #[test]
+    fn an_empty_batch_is_a_no_op() {
+        let (mut app, window, _bands) = two_band_fixture();
+        let revision = app.presentation_revision_of(window).expect("revision");
+        let report = app
+            .set_row_windows(window, &[])
+            .expect("an empty batch succeeds");
+        assert!(!report.changed());
+        assert_eq!(
+            app.presentation_revision_of(window).expect("revision"),
+            revision
+        );
+    }
+
+    #[test]
+    fn a_batch_with_one_stale_band_applies_none_of_its_bands() {
+        let (mut app, window, bands) = two_band_fixture();
+        let revision = app.presentation_revision_of(window).expect("revision");
+        let failure = app
+            .set_row_windows(
+                window,
+                &[
+                    (bands[0], RowWindow::new(40, 10)),
+                    (bands[1].wrapping_add(1), RowWindow::new(20, 5)),
+                ],
+            )
+            .expect_err("the stale band rejects the batch");
+        assert!(
+            matches!(failure, WindowError::Stale),
+            "unexpected failure: {failure:?}"
+        );
+        let snapshot = app.presentation_of(window).expect("snapshot");
+        assert_eq!(snapshot.row_bands()[0].first_row(), 0);
+        assert_eq!(snapshot.row_bands()[1].first_row(), 0);
+        assert_eq!(
+            app.presentation_revision_of(window).expect("revision"),
+            revision,
+            "a rejected batch does not refresh"
+        );
+        assert!(
+            app.state.borrow().row_windows.is_empty(),
+            "a rejected batch installs no requests"
+        );
+    }
+
+    #[test]
+    fn a_batch_with_a_foreign_band_applies_none_of_its_bands() {
+        let mut app = Runtime::new();
+        app.declare_windows(|catalog| {
+            catalog.window(WindowSpec::new("main").primary(), |_| {
+                view! { <TwoBandRows /> }
+            })?;
+            catalog.window(WindowSpec::new("other"), |_| {
+                view! { <TwoBandRows /> }
+            })?;
+            Ok(())
+        })
+        .expect("declare the windows");
+        let main = app.show("main").expect("show main");
+        let other = app.show("other").expect("show other");
+        app.show("main").expect("focus main again");
+        let main_band = app.presentation_of(main).expect("snapshot").row_bands()[0].key();
+        let other_band = app.presentation_of(other).expect("snapshot").row_bands()[0].key();
+        let failure = app
+            .set_row_windows(
+                main,
+                &[
+                    (main_band, RowWindow::new(20, 5)),
+                    (other_band, RowWindow::new(20, 5)),
+                ],
+            )
+            .expect_err("a band from another window rejects the batch");
+        assert!(
+            matches!(failure, WindowError::Stale),
+            "unexpected failure: {failure:?}"
+        );
+        assert!(
+            app.state.borrow().row_windows.is_empty(),
+            "the foreign band applies nothing"
+        );
+        assert_eq!(
+            app.presentation_of(main).expect("snapshot").row_bands()[0].first_row(),
+            0
+        );
+    }
+
+    /// 两个行带的工厂共享同一个失败条件：回滚时旧行也挂不回去。
+    #[component]
+    fn SharedFaultBands() -> MountResult<MountPlan> {
+        let store = Store::new();
+        let rows = memo(move || store.rows(Filter::All));
+        let armed = signal(false);
+        // 动态文本绑定：修复重挂的行必须重新求值，否则呈现为空。
+        let mark = signal(String::from("m"));
+        view! {
+            <view>
+                <button aria:label="seed" on:click={move || -> Result<(), WriteError> {
+                    let mut transaction = Transaction::new();
+                    for index in 0..40 {
+                        transaction = transaction.write(store.insert(format!("r{index}")));
+                    }
+                    transaction.finish()
+                }}>"seed"</button>
+                <button aria:label="arm" on:click={move || armed.set(true)}>"arm"</button>
+                <button aria:label="disarm" on:click={move || armed.set(false)}>"disarm"</button>
+                <For each={rows} store={store} key={|row: &TodoRow| row.id} row-height={px(20.0)}>
+                    {move |row: RowView<TodoRow>| {
+                        if armed.get() {
+                            return Err(MountError::Component("a boom"));
+                        }
+                        view! {
+                            <button aria:label={once(format!("a {}", row.key().raw()))}>
+                                <text>{mark}</text>
+                            </button>
+                        }
+                    }}
+                </For>
+                <For each={rows} store={store} key={|row: &TodoRow| row.id} row-height={px(20.0)}>
+                    {move |row: RowView<TodoRow>| {
+                        if armed.get() {
+                            return Err(MountError::Component("b boom"));
+                        }
+                        view! {
+                            <button aria:label={once(format!("b {}", row.key().raw()))}>"b"</button>
+                        }
+                    }}
+                </For>
+            </view>
+        }
+    }
+
+    #[test]
+    fn a_failed_rollback_keeps_requests_describing_the_committed_windows() {
+        let mut app = Runtime::new();
+        app.declare_windows(|catalog| {
+            catalog.window(WindowSpec::new("main").primary(), |_| {
+                view! { <SharedFaultBands /> }
+            })
+        })
+        .expect("declare the window");
+        let window = app.show("main").expect("show the window");
+        app.click_label("seed").expect("seed the rows");
+        let snapshot = app.presentation_of(window).expect("snapshot");
+        let bands = [snapshot.row_bands()[0].key(), snapshot.row_bands()[1].key()];
+        app.click_label("arm").expect("arm the shared fault");
+        let failure = app
+            .set_row_windows(
+                window,
+                &[
+                    // 第一个行带的目标区间已经挂载，不需要运行工厂即可提交。
+                    (bands[0], RowWindow::new(5, 10)),
+                    // 第二个行带必须新挂载行，共享故障让它失败。
+                    (bands[1], RowWindow::new(35, 5)),
+                ],
+            )
+            .expect_err("the second band's factory fails");
+        assert!(
+            matches!(
+                &failure,
+                WindowError::Mount(MountError::FactoryFailed(error))
+                    if **error == MountError::Component("b boom")
+            ),
+            "unexpected failure: {failure:?}"
+        );
+        let snapshot = app.presentation_of(window).expect("snapshot");
+        assert_eq!(
+            snapshot.row_bands()[0].first_row(),
+            5,
+            "the first band keeps its committed window when its old rows cannot remount"
+        );
+        assert_eq!(
+            app.texts()
+                .iter()
+                .filter(|text| text.as_str() == "m")
+                .count(),
+            10,
+            "the repaired rows evaluate their value bindings instead of rendering empty"
+        );
+        assert_eq!(
+            app.state.borrow().row_windows.get(&bands[0]).copied(),
+            Some(RowWindow::new(5, 10)),
+            "the request map describes the window that is actually committed"
+        );
+        assert_eq!(
+            app.state.borrow().row_windows.get(&bands[1]).copied(),
+            None,
+            "the failed band keeps its old default window"
+        );
+
+        // 失败的修复不能留下一个会在下一次普通刷新时偷偷移动的窗口。
+        app.click_label("disarm").expect("disarm the shared fault");
+        app.refresh().expect("the ordinary refresh succeeds");
+        assert_eq!(
+            app.presentation_of(window).expect("snapshot").row_bands()[0].first_row(),
+            5,
+            "the committed window stays where the failed batch left it"
+        );
+        assert_eq!(
+            count_labels(&app, window, "a "),
+            10,
+            "the committed window still mounts exactly its rows"
+        );
+    }
+
+    /// 外层、嵌套内层与兄弟三个行带共享同一个失败条件；外层与内层的目标
+    /// 区间都已挂载（提交不需要工厂），兄弟行带需要新行并失败。
+    #[component]
+    fn NestedFaultBands() -> MountResult<MountPlan> {
+        let store = Store::new();
+        let rows = memo(move || store.rows(Filter::All));
+        let armed = signal(false);
+        view! {
+            <view>
+                <button aria:label="seed" on:click={move || -> Result<(), WriteError> {
+                    let mut transaction = Transaction::new();
+                    for index in 0..40 {
+                        transaction = transaction.write(store.insert(format!("r{index}")));
+                    }
+                    transaction.finish()
+                }}>"seed"</button>
+                <button aria:label="arm" on:click={move || armed.set(true)}>"arm"</button>
+                <For each={rows} store={store} key={|row: &TodoRow| row.id} row-height={px(40.0)}>
+                    {move |group: RowView<TodoRow>| view! {
+                        <view>
+                            <text>{once(format!("g{}", group.key().raw()))}</text>
+                            <For each={rows} store={store} key={|row: &TodoRow| row.id} row-height={px(20.0)}>
+                                {move |item: RowView<TodoRow>| {
+                                    if armed.get() {
+                                        return Err(MountError::Component("item boom"));
+                                    }
+                                    view! {
+                                        <text>{once(format!("i{}", item.key().raw()))}</text>
+                                    }
+                                }}
+                            </For>
+                        </view>
+                    }}
+                </For>
+                <For each={rows} store={store} key={|row: &TodoRow| row.id} row-height={px(20.0)}>
+                    {move |_item: RowView<TodoRow>| {
+                        if armed.get() {
+                            return Err(MountError::Component("c boom"));
+                        }
+                        view! { <text>"c"</text> }
+                    }}
+                </For>
+            </view>
+        }
+    }
+
+    #[test]
+    fn a_nested_applied_band_is_repaired_in_its_own_refresh_round() {
+        let mut app = Runtime::new();
+        app.declare_windows(|catalog| {
+            catalog.window(WindowSpec::new("main").primary(), |_| {
+                view! { <NestedFaultBands /> }
+            })
+        })
+        .expect("declare the window");
+        let window = app.show("main").expect("show the window");
+        app.click_label("seed").expect("seed the rows");
+        let snapshot = app.presentation_of(window).expect("snapshot");
+        // O band，随后每个已挂载外层行一个 B band，最后是兄弟 C band。
+        let outer = snapshot.row_bands()[0].key();
+        let nested = snapshot.row_bands()[1 + 5].key();
+        let sibling = snapshot.row_bands().last().expect("the sibling band").key();
+        // 内层 band 的 id 总是大于外层；确认选择的是一个嵌套行带。
+        assert!(
+            nested > outer,
+            "the chosen band is nested in the outer rows"
+        );
+        app.click_label("arm").expect("arm the shared fault");
+        let failure = app
+            .set_row_windows(
+                window,
+                &[
+                    (outer, RowWindow::new(5, 10)),
+                    (nested, RowWindow::new(5, 10)),
+                    (sibling, RowWindow::new(35, 5)),
+                ],
+            )
+            .expect_err("the sibling needs new rows from a failing factory");
+        assert!(
+            matches!(&failure, WindowError::Mount(MountError::FactoryFailed(_))),
+            "unexpected failure: {failure:?}"
+        );
+        let requests = app.state.borrow().row_windows.clone();
+        assert_eq!(
+            requests.get(&nested).copied(),
+            Some(RowWindow::new(5, 10)),
+            "the nested band's request describes its committed window"
+        );
+        assert_eq!(
+            requests.get(&outer).copied(),
+            Some(RowWindow::new(5, 10)),
+            "the outer band's request describes its committed window"
+        );
+        assert_eq!(
+            requests.get(&sibling).copied(),
+            None,
+            "the failed sibling keeps its old window"
+        );
+        let snapshot = app.presentation_of(window).expect("snapshot");
+        let nested_band = snapshot
+            .row_bands()
+            .iter()
+            .find(|band| band.key() == nested)
+            .expect("the nested band stays mounted");
+        assert_eq!(nested_band.first_row(), 5);
+
+        // 请求与已提交窗口一致后，普通刷新不会搬动任何行带。
+        app.refresh().expect("the ordinary refresh succeeds");
+        let snapshot = app.presentation_of(window).expect("snapshot");
+        assert_eq!(
+            snapshot.row_bands()[0].first_row(),
+            5,
+            "the outer window stays where the failed batch left it"
+        );
+        assert_eq!(
+            app.state.borrow().row_windows.get(&nested).copied(),
+            Some(RowWindow::new(5, 10)),
+            "the nested request is stable across an ordinary refresh"
+        );
+    }
+
+    #[test]
+    fn a_batch_with_a_duplicate_band_is_rejected() {
+        let (mut app, window, bands) = two_band_fixture();
+        let failure = app
+            .set_row_windows(
+                window,
+                &[
+                    (bands[0], RowWindow::new(4, 2)),
+                    (bands[0], RowWindow::new(8, 2)),
+                ],
+            )
+            .expect_err("a duplicate band is ambiguous");
+        assert!(
+            matches!(failure, WindowError::DuplicateRowBand),
+            "unexpected failure: {failure:?}"
+        );
+        assert!(
+            app.state.borrow().row_windows.is_empty(),
+            "a duplicate band installs no requests"
+        );
+    }
+
+    #[test]
+    fn one_failed_band_rolls_back_every_band_in_the_batch() {
+        let (mut app, window, bands) = two_band_fixture();
+        app.click_label("arm").expect("arm the second factory");
+        let failure = app
+            .set_row_windows(
+                window,
+                &[
+                    (bands[0], RowWindow::new(40, 10)),
+                    (bands[1], RowWindow::new(35, 5)),
+                ],
+            )
+            .expect_err("the second band's factory fails");
+        assert!(
+            matches!(
+                &failure,
+                WindowError::Mount(MountError::FactoryFailed(error))
+                    if **error == MountError::Component("b boom")
+            ),
+            "unexpected failure: {failure:?}"
+        );
+        let snapshot = app.presentation_of(window).expect("snapshot");
+        assert_eq!(
+            snapshot.row_bands()[0].first_row(),
+            0,
+            "the committed first band is rolled back with the failed batch"
+        );
+        assert_eq!(
+            count_labels(&app, window, "a "),
+            32,
+            "the first band's old rows are restored"
+        );
+        assert_eq!(
+            app.texts()
+                .iter()
+                .filter(|text| text.as_str() == "m")
+                .count(),
+            32,
+            "the restored rows evaluate their value bindings"
+        );
+        assert_eq!(snapshot.row_bands()[1].first_row(), 0);
+        assert!(
+            app.state.borrow().row_windows.is_empty(),
+            "the rollback leaves no requests behind"
+        );
+        assert!(
+            app.state.borrow().row_window_batch.is_none(),
+            "the failed batch leaves no marker behind"
+        );
+
+        app.click_label("disarm")
+            .expect("disarm the second factory");
+        let report = app
+            .set_row_windows(
+                window,
+                &[
+                    (bands[0], RowWindow::new(40, 10)),
+                    (bands[1], RowWindow::new(35, 5)),
+                ],
+            )
+            .expect("the retried batch applies");
+        assert!(report.changed());
+        let snapshot = app.presentation_of(window).expect("snapshot");
+        assert_eq!(snapshot.row_bands()[0].first_row(), 40);
+        assert_eq!(snapshot.row_bands()[1].first_row(), 35);
+        assert_eq!(
+            count_labels(&app, window, "b "),
+            5,
+            "the retried batch mounts the second band's new rows"
+        );
+    }
+
+    /// 一个外层窗口化行，每行里面再挂一个窗口化 `For`。
+    ///
+    /// Todo facade 的 `Store::new()` 是同一个共享模型的句柄，因此内外两层
+    /// 读同一份行集；行工厂只在内层挂文本，不会递归。
+    #[component]
+    fn NestedBandsHost() -> MountResult<MountPlan> {
+        let store = Store::new();
+        let rows = memo(move || store.rows(Filter::All));
+        view! {
+            <view>
+                <button aria:label="seed" on:click={move || -> Result<(), WriteError> {
+                    let mut transaction = Transaction::new();
+                    for index in 0..26 {
+                        transaction = transaction.write(store.insert(format!("r{index}")));
+                    }
+                    transaction.finish()
+                }}>"seed"</button>
+                <For each={rows} store={store} key={|row: &TodoRow| row.id} row-height={px(40.0)}>
+                    {move |group: RowView<TodoRow>| view! {
+                        <view>
+                            <text>{once(format!("g{}", group.key().raw()))}</text>
+                            <For each={rows} store={store} key={|row: &TodoRow| row.id} row-height={px(20.0)}>
+                                {move |item: RowView<TodoRow>| view! {
+                                    <text>{once(format!("i{}", item.key().raw()))}</text>
+                                }}
+                            </For>
+                        </view>
+                    }}
+                </For>
+            </view>
+        }
+    }
+
+    #[test]
+    fn a_batch_applies_nested_bands_without_rejecting_unmounted_inner_bands() {
+        let mut app = Runtime::new();
+        app.declare_windows(|catalog| {
+            catalog.window(WindowSpec::new("main").primary(), |_| {
+                view! { <NestedBandsHost /> }
+            })
+        })
+        .expect("declare the window");
+        let window = app.show("main").expect("show the window");
+        app.click_label("seed").expect("seed both levels");
+        let snapshot = app.presentation_of(window).expect("snapshot");
+        // 第一项是外层行带；其余按已挂载外层行的顺序排列内层行带。
+        let total = snapshot.row_bands()[0].total_rows();
+        assert_eq!(
+            snapshot.row_bands().len(),
+            1 + total,
+            "one outer band and one inner band per mounted outer row"
+        );
+        let outer = snapshot.row_bands()[0].key();
+        let leaving_inner = snapshot.row_bands()[1].key();
+        let staying_inner = snapshot.row_bands()[3].key();
+
+        let report = app
+            .set_row_windows(
+                window,
+                &[
+                    (outer, RowWindow::new(2, 4)),
+                    // 外层窗口卸载第 0 行后，这个内层行带随行一起释放；它的
+                    // 请求可以留在同一批里，不能因此拒绝整批。
+                    (leaving_inner, RowWindow::new(0, 2)),
+                    (staying_inner, RowWindow::new(5, 2)),
+                ],
+            )
+            .expect("nested bands apply atomically");
+        assert!(report.changed());
+        let snapshot = app.presentation_of(window).expect("snapshot");
+        assert_eq!(snapshot.row_bands()[0].first_row(), 2);
+        assert_eq!(
+            snapshot.row_bands().len(),
+            1 + 4,
+            "only the surviving outer rows keep their inner bands"
+        );
+        let inner = snapshot
+            .row_bands()
+            .iter()
+            .find(|band| band.key() == staying_inner)
+            .expect("the surviving inner band stays mounted");
+        assert_eq!(inner.first_row(), 5);
+    }
+
+    #[test]
+    fn a_failed_batch_clears_focus_on_rows_it_remounted() {
+        let (mut app, window, bands) = two_band_fixture();
+        let snapshot = app.presentation_of(window).expect("snapshot");
+        let label = snapshot
+            .elements()
+            .find_map(|element| {
+                element
+                    .label()
+                    .filter(|label| label.starts_with("a "))
+                    .map(str::to_owned)
+            })
+            .expect("the first band has a focusable row");
+        app.focus(&label).expect("focus a row");
+        let focused = app
+            .presentation_of(window)
+            .expect("snapshot")
+            .focus()
+            .expect("the row holds focus");
+        app.click_label("arm").expect("arm the second factory");
+        app.set_row_windows(
+            window,
+            &[
+                (bands[0], RowWindow::new(40, 10)),
+                (bands[1], RowWindow::new(35, 5)),
+            ],
+        )
+        .expect_err("the second band's factory fails");
+        // 已提交的行带被回滚刷新重挂：旧行身份不存在，焦点按行窗口卸载
+        // 策略清除，而不是结算到相邻行或复活一个 Stale 节点。
+        assert_eq!(
+            app.presentation_of(window).expect("snapshot").focus(),
+            None,
+            "a failed batch never leaves focus on a remounted row"
+        );
+        assert_eq!(app.node_status(focused), NodeStatus::Stale);
+        assert!(app.focused().is_none());
+        app.focus(&label)
+            .expect("the restored row is focusable again");
+    }
+
+    #[test]
+    fn a_batch_clears_focus_that_leaves_its_window_instead_of_settling() {
+        let (mut app, window, bands) = two_band_fixture();
+        let snapshot = app.presentation_of(window).expect("snapshot");
+        let focused_label = snapshot
+            .elements()
+            .find_map(|element| {
+                element
+                    .label()
+                    .filter(|label| label.starts_with("a "))
+                    .map(str::to_owned)
+            })
+            .expect("the first band has a focusable row");
+        app.focus(&focused_label).expect("focus a row");
+        assert!(app.focused().is_some());
+        app.set_row_windows(
+            window,
+            &[
+                (bands[0], RowWindow::new(40, 10)),
+                (bands[1], RowWindow::new(20, 5)),
+            ],
+        )
+        .expect("the batch applies");
+        let snapshot = app.presentation_of(window).expect("snapshot");
+        assert_eq!(
+            snapshot.focus(),
+            None,
+            "a focused row that leaves the window is cleared, not reassigned"
+        );
+        assert!(app.focused().is_none());
+    }
+
+    #[component]
+    fn PlainForHost() -> MountResult<MountPlan> {
+        let store = Store::new();
+        let rows = memo(move || store.rows(Filter::All));
+        view! {
+            <view>
+                <For each={rows} store={store} key={|row: &TodoRow| row.id}>
+                    {move |_row: RowView<TodoRow>| view! { <text>"row"</text> }}
+                </For>
+            </view>
+        }
+    }
+
+    #[test]
+    fn a_band_without_a_row_height_is_not_a_window() {
+        let mut app = Runtime::new();
+        app.declare_windows(|catalog| {
+            catalog.window(WindowSpec::new("main").primary(), |_| {
+                view! { <PlainForHost /> }
+            })
+        })
+        .expect("declare the window");
+        let window = app.show("main").expect("show the window");
+        let band = {
+            let state = app.state.borrow();
+            *state
+                .owner_bands
+                .values()
+                .flatten()
+                .next()
+                .expect("the plain for owns its band")
+        };
+        let failure = app
+            .set_row_windows(window, &[(band, RowWindow::new(0, 4))])
+            .expect_err("a non-windowed band is not addressable");
+        assert!(
+            matches!(failure, WindowError::Stale),
+            "unexpected failure: {failure:?}"
         );
     }
 

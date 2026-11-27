@@ -40,8 +40,8 @@ pub use presentation::{
     TextEditState,
 };
 pub use runtime::{
-    EventSource, EventTarget, FocusInfo, Intent, IntentPayload, Modifiers, RefreshReport, Runtime,
-    TurnError, TurnOutcome, TurnReport,
+    EventSource, EventTarget, FocusInfo, Intent, IntentPayload, Modifiers, RefreshReport,
+    RowWindow, Runtime, TurnError, TurnOutcome, TurnReport,
 };
 pub use session::{SessionCtx, SessionError, SessionPolicy};
 pub use signal::{Memo, MemoCompute, Once, ReactiveValue, Signal, memo, once, signal};
@@ -84,14 +84,14 @@ pub mod prelude {
         MenuCommandState, MenuItem, MenuShortcut, MenuSpec, MenuStateError, Modifiers, MountError,
         MountPlan, MountResult, NodeId, NodeOperation, NodeStatus, Once, Opacity, PanicInfo,
         PresentationKey, PresentationSnapshot, Property, ReactiveValue, Read, ReadFault, ReadValue,
-        RefreshReport, Row, RowId, RowKey, RowSet, RowStore, RowView, Runtime, SessionCtx,
-        SessionError, SessionPolicy, ShortcutError, ShortcutKey, Signal, SnapshotAction,
-        SnapshotActions, SnapshotAttr, SnapshotElement, SnapshotNode, SnapshotRowBand,
-        SnapshotSemantics, SnapshotValue, Store, StyleDeclaration, StyleOrigin, StyleValue,
-        Submenu, SubmitEvent, Task, TaskError, TaskScope, TaskStatus, TaskToken, TextEditState,
-        TodoId, TodoRow, Transaction, TrayError, TraySpec, TurnError, TurnOutcome, TurnReport,
-        WindowCatalog, WindowCtx, WindowError, WindowInfo, WindowRole, WindowSpec, WriteError,
-        WriteOp, component, em, memo, once, px, signal, view,
+        RefreshReport, Row, RowId, RowKey, RowSet, RowStore, RowView, RowWindow, Runtime,
+        SessionCtx, SessionError, SessionPolicy, ShortcutError, ShortcutKey, Signal,
+        SnapshotAction, SnapshotActions, SnapshotAttr, SnapshotElement, SnapshotNode,
+        SnapshotRowBand, SnapshotSemantics, SnapshotValue, Store, StyleDeclaration, StyleOrigin,
+        StyleValue, Submenu, SubmitEvent, Task, TaskError, TaskScope, TaskStatus, TaskToken,
+        TextEditState, TodoId, TodoRow, Transaction, TrayError, TraySpec, TurnError, TurnOutcome,
+        TurnReport, WindowCatalog, WindowCtx, WindowError, WindowInfo, WindowRole, WindowSpec,
+        WriteError, WriteOp, component, em, memo, once, px, signal, view,
     };
     pub use zenui_core::Filter;
 }

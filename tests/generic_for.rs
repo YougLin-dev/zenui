@@ -269,6 +269,46 @@ fn WindowedStaticList(store: RowStore<Note>, set: RowSet) -> MountResult<MountPl
     }
 }
 
+/// 两个窗口化静态列表，各自按行键拒绝新挂载；用于批量回滚失败后的窗口对账。
+#[component]
+fn FaultedStaticBands(
+    store: RowStore<Note>,
+    set: RowSet,
+    first_fails: Rc<RefCell<Vec<u32>>>,
+    second_fails: Rc<RefCell<Vec<u32>>>,
+) -> MountResult<MountPlan> {
+    let other = set.clone();
+    let second_fails = Rc::clone(&second_fails);
+    view! {
+        <view class="gap-0">
+            <For each={set} store={store} key={|note: &Note| note.key} row-height={px(20.0)}>
+                {move |row: RowView<Note>| {
+                    if first_fails.borrow().contains(&row.key()) {
+                        return Err(MountError::Component("first boom"));
+                    }
+                    view! {
+                        <view style:height={once(px(20.0))}>
+                            <text>{once(format!("row {}", row.key()))}</text>
+                        </view>
+                    }
+                }}
+            </For>
+            <For each={other} store={store} key={|note: &Note| note.key} row-height={px(20.0)}>
+                {move |row: RowView<Note>| {
+                    if second_fails.borrow().contains(&row.key()) {
+                        return Err(MountError::Component("second boom"));
+                    }
+                    view! {
+                        <view style:height={once(px(20.0))}>
+                            <text>{once(format!("other {}", row.key()))}</text>
+                        </view>
+                    }
+                }}
+            </For>
+        </view>
+    }
+}
+
 /// Todo 列表保持既有形态：`Store` 属性 + `Memo<RowSet>` 读源，行工厂收 RowView。
 #[component]
 fn TodoList(keys: Rc<RefCell<Vec<TodoId>>>) -> MountResult<MountPlan> {
@@ -711,10 +751,12 @@ fn a_windowed_static_rowset_crosses_a_deleted_row_without_failing() {
     assert!(
         app.set_row_window(window, band_key, 40, 10)
             .expect("scroll past the deleted row")
+            .changed()
     );
     assert!(
         app.set_row_window(window, band_key, 0, 10)
-            .expect("a range crossing the deleted row still applies"),
+            .expect("a range crossing the deleted row still applies")
+            .changed(),
         "the requested window differs"
     );
     assert_eq!(
@@ -728,6 +770,100 @@ fn a_windowed_static_rowset_crosses_a_deleted_row_without_failing() {
             ids[0], ids[1], ids[2], ids[3], ids[4], ids[6], ids[7], ids[8], ids[9]
         ],
         "the window mounts the live rows and skips the deleted slot"
+    );
+}
+
+#[test]
+fn a_failed_repair_reconciles_the_window_span_not_the_mounted_count() {
+    let store = note_store();
+    let ids: Vec<RowId> = (0..8)
+        .map(|index| insert(&store, note(index, &format!("n{index}"))))
+        .collect();
+    let set = store.rowset(ids.iter().copied());
+    store
+        .remove(ids[2])
+        .expect("delete a row inside the window span");
+
+    let first_fails = Rc::new(RefCell::new(Vec::new()));
+    let second_fails = Rc::new(RefCell::new(Vec::new()));
+
+    let mut app = Runtime::new();
+    app.declare_windows({
+        let store = store.clone();
+        let set = set.clone();
+        let first_fails = Rc::clone(&first_fails);
+        let second_fails = Rc::clone(&second_fails);
+        move |catalog| {
+            catalog.window(WindowSpec::new("main").primary(), move |_| {
+                let store = store.clone();
+                let set = set.clone();
+                let first_fails = Rc::clone(&first_fails);
+                let second_fails = Rc::clone(&second_fails);
+                view! {
+                    <FaultedStaticBands
+                        store={store}
+                        set={set}
+                        first_fails={first_fails}
+                        second_fails={second_fails}
+                    />
+                }
+            })
+        }
+    })
+    .expect("declare the window");
+    let window = app.show("main").expect("show the window");
+    let snapshot = app.presentation_of(window).expect("snapshot");
+    assert_eq!(snapshot.row_bands().len(), 2);
+    let (head, tail) = (snapshot.row_bands()[0].key(), snapshot.row_bands()[1].key());
+
+    let moved = app
+        .set_row_windows(
+            window,
+            &[(head, RowWindow::new(3, 5)), (tail, RowWindow::new(3, 5))],
+        )
+        .expect("both empty batches apply");
+    assert!(moved.changed());
+
+    // 首个行带的提交窗口 (0,7) 不需要 ids[7]，失败的是修复回旧窗口；
+    // 第二个行带在同一批里挂 ids[0] 时失败。
+    first_fails.borrow_mut().push(7);
+    second_fails.borrow_mut().push(0);
+    app.set_row_windows(
+        window,
+        &[(head, RowWindow::new(0, 7)), (tail, RowWindow::new(0, 7))],
+    )
+    .expect_err("the second band cannot mount the new window");
+
+    let texts = app.texts();
+    assert!(
+        !texts.iter().any(|text| text == "row 7"),
+        "committed window excludes ids[7]"
+    );
+    assert!(
+        texts.iter().any(|text| text == "row 6"),
+        "the committed span still holds the live row after the deleted slot"
+    );
+    assert!(
+        texts.iter().any(|text| text == "other 7"),
+        "the failed band keeps its committed rows"
+    );
+
+    // 修复失败后请求映射描述实际提交的窗口跨度 (0,7)。若按已挂行数
+    // (6) 改写，接下来的普通刷新会把窗口收窄到 (0,6)，丢掉 span 末尾
+    // 仍存活的 ids[6]。
+    first_fails.borrow_mut().clear();
+    second_fails.borrow_mut().clear();
+    app.refresh()
+        .expect("the reconciled windows keep refreshing");
+    let texts = app.texts();
+    assert!(
+        texts.iter().any(|text| text == "row 6"),
+        "the reconciled span keeps the live trailing row"
+    );
+    assert!(!texts.iter().any(|text| text == "row 7"));
+    assert_eq!(
+        app.presentation_of(window).expect("snapshot").row_bands()[0].first_row(),
+        0
     );
 }
 

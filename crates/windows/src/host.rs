@@ -793,6 +793,9 @@ struct RenderCounters {
     presents: usize,
 }
 
+/// 可恢复诊断的保留上限；最旧的先丢弃。
+const DIAGNOSTIC_LIMIT: usize = 32;
+
 /// Win32 宿主：一个 Runtime、一个消息循环，每个存活窗口一个 HWND/Surface/Scene。
 pub struct Host {
     runtime: Runtime,
@@ -856,6 +859,8 @@ pub struct Host {
     injected_rebuild_failures: usize,
     /// 窗口过程不能返回错误；消息循环在派发后取走并返回。
     deferred_error: Option<HostError>,
+    /// 可恢复的宿主诊断（行工厂拒绝新窗口等）；致命错误仍走 `deferred_error`。
+    diagnostics: Vec<String>,
     /// 关闭协议改变了焦点/启用状态，消息循环在下次同步后重定向前台。
     focus_after_sync: bool,
     /// 测试或嵌入方注入的文件选择器；`None` 时使用原生对话框或 Unsupported。
@@ -1035,6 +1040,7 @@ impl Host {
             #[cfg(test)]
             injected_rebuild_failures: 0,
             deferred_error: None,
+            diagnostics: Vec::new(),
             focus_after_sync: false,
             file_dialog_presenter: None,
             file_dialog_active: false,
@@ -1468,6 +1474,16 @@ impl Host {
         unsafe { pump_loop(host) }
     }
 
+    /// 取走自上次调用以来的可恢复诊断；致命错误仍通过 [`Host::run`] /
+    /// [`Host::pump`] 返回。
+    ///
+    /// 行工厂拒绝新的行窗口、行带失效等刷新失败记录在这里：宿主保留
+    /// 已提交场景并继续运行（运行时已经把请求回滚到旧窗口）。最多保留
+    /// 32 条，最旧的先丢弃。
+    pub fn take_diagnostics(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.diagnostics)
+    }
+
     /// 处理一条已经派发到窗口过程的消息。
     ///
     /// 输入处理放在窗口过程而不是消息循环里，因为系统的模态拖动/缩放循环会
@@ -1756,7 +1772,7 @@ impl Host {
         ) {
             // 输入必须命中当前滚动偏移的场景；surface 被遮挡时渲染可能没有
             // 更新 `window.scene`，这里先补一次只重建、不呈现的同步。
-            self.ensure_scene(window)?;
+            self.refresh_input_scene(window)?;
         }
         if message == WM_LBUTTONDOWN {
             self.pointer_pressed(window, lparam)
@@ -2035,13 +2051,17 @@ impl Host {
     /// 输入前确保内存场景使用当前滚动偏移与显露结果。
     ///
     /// `render_window` 在 surface `Timeout`/`Occluded` 时不会更新 `window.scene`；
-    /// 指针与键盘输入必须命中最新偏移的场景，因此这里只重建并保存，不呈现。
-    fn ensure_scene(&mut self, window: &mut WindowHost) -> Result<(), HostError> {
+    /// 指针与键盘输入必须命中最新偏移的场景，因此这里只重建，不呈现。
+    ///
+    /// 这是纯构建：不运行行 factory，也不调用 `set_row_windows`。第一遍
+    /// 场景连同行窗口目标一起返回，由 [`Host::refresh_input_scene`] 在场景
+    /// 构建的调用栈之外完成结构 turn（ADR：结构变化不能藏在构建里）。
+    fn ensure_scene(&mut self, window: &mut WindowHost) -> Result<Option<PendingScene>, HostError> {
         let fresh = window.scene.as_ref().is_some_and(|scene| {
             scene.scroll_offset() == window.scroll_offset && !window.reveal_requested
         });
         if fresh {
-            return Ok(());
+            return Ok(None);
         }
         // 运行时版本已经前进时缓存快照不再可信；行窗口更新也会改变版本。
         let revision = self
@@ -2054,13 +2074,13 @@ impl Host {
                     window.last_snapshot = Some(snapshot);
                     window.snapshot_revision = revision;
                 }
-                Err(WindowError::Hidden) => return Ok(()),
+                Err(WindowError::Hidden) => return Ok(None),
                 Err(error) => return Err(HostError::Snapshot(error)),
             }
         }
         // 快照先取出再放回：输入前同步场景不复制 snapshot。
-        let Some(mut snapshot) = window.last_snapshot.take() else {
-            return Ok(());
+        let Some(snapshot) = window.last_snapshot.take() else {
+            return Ok(None);
         };
         let result = (|| {
             let (width, height) = client_size(window.hwnd())?;
@@ -2068,87 +2088,205 @@ impl Host {
                 window.accessibility.clear();
                 return Ok(None);
             }
-            let mut scene =
-                self.build_scene_with_reveal(window, &snapshot, width, height, false)?;
-            if self.sync_row_windows(window, &mut snapshot, &scene)? {
-                scene = self.build_scene_with_reveal(window, &snapshot, width, height, false)?;
-            }
-            Ok(Some(scene))
+            let scene = self.build_scene_with_reveal(window, &snapshot, width, height, false)?;
+            let row_windows = pending_row_windows(&scene);
+            Ok(Some(PendingScene { scene, row_windows }))
         })();
         window.last_snapshot = Some(snapshot);
         window.snapshot_revision = self
             .runtime
             .presentation_revision_of(window.ctx)
             .unwrap_or(window.snapshot_revision);
-        if let Some(scene) = result? {
-            match window.last_snapshot.take() {
-                Some(snapshot) => {
-                    commit_scene(window, &snapshot, scene);
-                    window.last_snapshot = Some(snapshot);
-                }
-                None => {
-                    window.accessibility.clear();
-                    window.scene = Some(scene);
-                }
-            }
-        }
-        Ok(())
+        result
     }
 
-    /// 同步该窗口里每个窗口化 `For` 的挂载窗口；返回快照是否被替换。
+    /// 输入前把场景推进到最终状态：纯构建之后，在构建调用栈之外应用行窗口。
+    fn refresh_input_scene(&mut self, window: &mut WindowHost) -> Result<(), HostError> {
+        let Some(pending) = self.ensure_scene(window)? else {
+            return Ok(());
+        };
+        self.settle_input_scene(window, pending)
+    }
+
+    /// 结算 [`Host::ensure_scene`] 返回的第一遍场景：应用行窗口并提交最终场景。
+    fn settle_input_scene(
+        &mut self,
+        window: &mut WindowHost,
+        pending: PendingScene,
+    ) -> Result<(), HostError> {
+        let Some(mut snapshot) = window.last_snapshot.take() else {
+            return Ok(());
+        };
+        let result = self.apply_row_windows(window, &mut snapshot, pending);
+        match result {
+            Ok(scene) => {
+                window.snapshot_revision = self
+                    .runtime
+                    .presentation_revision_of(window.ctx)
+                    .unwrap_or(window.snapshot_revision);
+                commit_scene(window, &snapshot, scene);
+                window.last_snapshot = Some(snapshot);
+                Ok(())
+            }
+            Err(error) => {
+                // 失败的批量 turn 可能已经推进过 revision（提交后再回滚）：
+                // 不把缓存标记成最新，下一次绘制会重新读取快照。
+                window.last_snapshot = Some(snapshot);
+                Err(error)
+            }
+        }
+    }
+
+    /// 在第一遍场景之后应用批量行窗口，返回最终要呈现的场景。
     ///
-    /// 行区间只由行带几何、已应用的滚动偏移和视口高度决定；运行时是唯一
-    /// 挂载或卸载行的一方。聚焦行超过一行 grace 时，宿主先结束焦点并取消
-    /// 组合，再应用新窗口，避免 IME 候选窗跟随一个即将卸载的编辑器。
-    fn sync_row_windows(
+    /// 行带目标与运行时当前请求相同（或没有窗口化 `For`）时直接复用第一遍
+    /// 场景，不刷新、不建第二遍。任一 band 变化时用运行时的新快照重建第二遍；
+    /// 批次被拒绝时保留第一遍场景并把错误报告给调用方。
+    ///
+    /// 聚焦行超过一行 grace 要离开窗口时，先用仍存活的旧结构完成 blur 并
+    /// 取消组合（ADR-0011），已卸载节点不再派发事件。blur 处理器是用户代码，
+    /// 可能已经改写树或行带几何；第一遍批次因此失效时用新快照重建并只重试
+    /// 一次，而不是把一次正常滚动变成宿主错误。
+    fn apply_row_windows(
         &mut self,
         window: &mut WindowHost,
         snapshot: &mut PresentationSnapshot,
-        scene: &Scene,
-    ) -> Result<bool, HostError> {
-        if scene.row_bands().is_empty() {
-            return Ok(false);
+        pending: PendingScene,
+    ) -> Result<Scene, HostError> {
+        let PendingScene {
+            mut scene,
+            row_windows,
+        } = pending;
+        if row_windows.is_empty() {
+            return Ok(scene);
         }
-        let offset = scene.scroll_offset() as f32;
-        let height = scene.viewport().height();
-        let mut replaced = false;
-        let mut focus_cleared = false;
-        for band in scene.row_bands() {
-            let Some((first, count)) = row_window_for(*band, offset, height) else {
-                continue;
-            };
-            if !focus_cleared
-                && let Some(focused) = snapshot.focus()
-                && let Some(element) = scene.node(focused)
-                && let Some(row) = row_containing(*band, element.rect().y + offset)
-                && (row + 1 < first || row > first + count)
-            {
-                self.runtime
-                    .blur_in(window.ctx)
-                    .map_err(HostError::WindowState)?;
-                self.cancel_compositions(window)?;
-                focus_cleared = true;
-                replaced = true;
+        let focus_leaves = {
+            let offset = scene.scroll_offset() as f32;
+            snapshot.focus().is_some_and(|focused| {
+                let Some(element) = scene.node(focused) else {
+                    return false;
+                };
+                let content_y = element.rect().y + offset;
+                row_windows.bands.iter().any(|(key, request)| {
+                    let Some(band) = scene.row_bands().iter().find(|band| band.key() == *key)
+                    else {
+                        return false;
+                    };
+                    row_containing(*band, content_y).is_some_and(|row| {
+                        row + 1 < request.first() || row > request.first() + request.count()
+                    })
+                })
+            })
+        };
+        let mut blurred = false;
+        if focus_leaves {
+            if let Err(error) = self.runtime.blur_in(window.ctx) {
+                // 窗口在消息派发中被关闭：没有可 blur 的树，条目马上移除。
+                if matches!(error, WindowError::Stale) && !self.runtime.window_alive(window.ctx) {
+                    return Ok(scene);
+                }
+                return Err(HostError::WindowState(error));
             }
-            match self
-                .runtime
-                .set_row_window(window.ctx, band.key(), first, count)
-            {
-                Ok(true) => replaced = true,
-                Ok(false) => {}
-                // 外层窗口的变化可能卸载了包含这个嵌套行带的行；该行带已经
-                // 不在新快照里，跳过即可（ADR-0011 的嵌套情况）。
-                Err(WindowError::Stale) => {}
-                Err(error) => return Err(HostError::WindowState(error)),
+            self.cancel_compositions(window)?;
+            blurred = true;
+        }
+        let mut refreshed = false;
+        let report = match self.runtime.set_row_windows(window.ctx, &row_windows.bands) {
+            Ok(report) => report,
+            // activation 已经结束：`settle_requests` 关闭窗口树之后，原生
+            // 条目要到下一次 `sync_windows` 才移除。这一帧保留场景，不再
+            // 为死窗口跑结构 turn，直到宿主销毁 HWND。
+            Err(WindowError::Stale) if !self.runtime.window_alive(window.ctx) => return Ok(scene),
+            // blur 改变了树：第一遍场景与批次都可能失效，焦点已经清除，
+            // 不再 blur；用新快照重建第一遍并重试一次。
+            Err(WindowError::Stale) if blurred => {
+                *snapshot = self
+                    .runtime
+                    .presentation_of(window.ctx)
+                    .map_err(HostError::Snapshot)?;
+                let (width, height) = client_size(window.hwnd())?;
+                if width == 0 || height == 0 {
+                    return Ok(scene);
+                }
+                scene = self.build_scene_with_reveal(window, snapshot, width, height, false)?;
+                refreshed = true;
+                let retry = pending_row_windows(&scene);
+                if retry.is_empty() {
+                    return Ok(scene);
+                }
+                match self.runtime.set_row_windows(window.ctx, &retry.bands) {
+                    Ok(report) => report,
+                    Err(error @ (WindowError::WrongRuntime | WindowError::DuplicateRowBand)) => {
+                        return Err(HostError::WindowState(error));
+                    }
+                    // 运行时已经回滚请求；宿主保留旧窗口并继续运行。
+                    Err(error) => {
+                        return self.recover_row_window_failure(window, snapshot, scene, error);
+                    }
+                }
             }
+            // 运行时已经回滚请求；行工厂拒绝新窗口不是致命会话错误。
+            Err(error @ (WindowError::WrongRuntime | WindowError::DuplicateRowBand)) => {
+                return Err(HostError::WindowState(error));
+            }
+            Err(error) => {
+                return self.recover_row_window_failure(window, snapshot, scene, error);
+            }
+        };
+        if !report.changed() && (!blurred || refreshed) {
+            // 未变化的批次复用第一遍；重试路径的第一遍已经来自 blur 后的
+            // 新快照，不需要再为焦点清除建一遍。
+            return Ok(scene);
         }
-        if replaced {
-            *snapshot = self
-                .runtime
-                .presentation_of(window.ctx)
-                .map_err(HostError::Snapshot)?;
+        // 结构 turn 已经提交新窗口；快照与第二遍场景都来自新版本。
+        *snapshot = self
+            .runtime
+            .presentation_of(window.ctx)
+            .map_err(HostError::Snapshot)?;
+        let (width, height) = client_size(window.hwnd())?;
+        if width == 0 || height == 0 {
+            // 零尺寸没有可呈现的几何；保留第一遍场景直到尺寸恢复。
+            return Ok(scene);
         }
-        Ok(replaced)
+        self.build_scene_with_reveal(window, snapshot, width, height, false)
+    }
+
+    /// 行窗口批次可恢复地失败：保留已提交场景并记录诊断。
+    ///
+    /// 运行时已经把请求回滚到旧窗口；宿主不把用户 factory 的失败升级成
+    /// 会话错误。blur 或处理器写入可能已经改变树，第一遍场景用的快照过期
+    /// 时用新快照重建第一遍，保证场景、快照与可访问性树来自同一版本。
+    fn recover_row_window_failure(
+        &mut self,
+        window: &mut WindowHost,
+        snapshot: &mut PresentationSnapshot,
+        scene: Scene,
+        error: WindowError,
+    ) -> Result<Scene, HostError> {
+        self.note_diagnostic(format!(
+            "row window sync failed for {}: {error}",
+            window.ctx.key()
+        ));
+        let fresh = self
+            .runtime
+            .presentation_of(window.ctx)
+            .map_err(HostError::Snapshot)?;
+        if fresh == *snapshot {
+            return Ok(scene);
+        }
+        *snapshot = fresh;
+        let (width, height) = client_size(window.hwnd())?;
+        if width == 0 || height == 0 {
+            return Ok(scene);
+        }
+        self.build_scene_with_reveal(window, snapshot, width, height, false)
+    }
+
+    fn note_diagnostic(&mut self, message: String) {
+        if self.diagnostics.len() >= DIAGNOSTIC_LIMIT {
+            self.diagnostics.remove(0);
+        }
+        self.diagnostics.push(message);
     }
 
     /// 把一个窗口的新快照渲染到它自己的 surface；共享 renderer 按目标尺寸切换。
@@ -2224,12 +2362,14 @@ impl Host {
             window.accessibility.clear();
             return Ok(false);
         }
-        let mut scene =
+        let scene =
             self.build_scene_with_reveal(window, snapshot, width, height, snapshot_changed)?;
-        if self.sync_row_windows(window, snapshot, &scene)? {
-            // 行带顶端锚定在内容起点，第二遍场景与第一遍的偏移一致且精确。
-            scene = self.build_scene_with_reveal(window, snapshot, width, height, false)?;
-        }
+        // 行带几何来自第一遍；行窗口结构 turn 在场景构建之外应用，只有真的
+        // 变化时才用运行时的新快照建第二遍。行带顶端锚定在内容起点，两遍
+        // 场景的偏移一致且精确。
+        let row_windows = pending_row_windows(&scene);
+        let scene =
+            self.apply_row_windows(window, snapshot, PendingScene { scene, row_windows })?;
         let target = target_config(self.format, width, height)?;
         if self.renderer_target != target {
             self.renderer.resize(target);
@@ -2681,7 +2821,7 @@ impl Host {
         window: &mut WindowHost,
         key: VIRTUAL_KEY,
     ) -> Result<(), HostError> {
-        self.ensure_scene(window)?;
+        self.refresh_input_scene(window)?;
         let Some(scene) = window.scene.as_ref() else {
             return Ok(());
         };
@@ -5390,6 +5530,44 @@ fn row_containing(band: SceneRowBand, content_y: f32) -> Option<usize> {
     }
     let row = (content_y - band.top()) / row_height;
     (row >= 0.0 && row < band.total_rows() as f32).then_some(row.floor() as usize)
+}
+
+/// 第一遍场景之后、在场景构建调用栈之外应用的行窗口集合。
+///
+/// pending 是**按 band 的集合**而不是单个 `Option<RowWindow>`：同一屏可以
+/// 有多个窗口化 `For`，其中还可以有嵌套行带。
+struct PendingRowWindows {
+    bands: Vec<(u64, RowWindow)>,
+}
+
+impl PendingRowWindows {
+    fn is_empty(&self) -> bool {
+        self.bands.is_empty()
+    }
+}
+
+/// 第一遍场景与需要随后结算的行窗口目标。
+struct PendingScene {
+    scene: Scene,
+    row_windows: PendingRowWindows,
+}
+
+/// 从第一遍场景的行带几何计算每个窗口化 `For` 的目标挂载窗口。
+///
+/// 纯计算：不触碰 runtime，也不运行任何用户 factory。目标与当前请求相同
+/// 时由 `set_row_windows` 的快速路径吸收，不会触发刷新。
+fn pending_row_windows(scene: &Scene) -> PendingRowWindows {
+    let offset = scene.scroll_offset() as f32;
+    let height = scene.viewport().height();
+    let bands = scene
+        .row_bands()
+        .iter()
+        .filter_map(|band| {
+            row_window_for(*band, offset, height)
+                .map(|(first, count)| (band.key(), RowWindow::new(first, count)))
+        })
+        .collect();
+    PendingRowWindows { bands }
 }
 
 fn focused_input(snapshot: &PresentationSnapshot) -> Option<NodeId> {
@@ -14568,6 +14746,362 @@ mod tests {
         assert!(
             host.counters.presents > before.presents,
             "a changed snapshot presents"
+        );
+    }
+
+    /// 一个带行工厂计数器的窗口化列表；测试据此区分纯场景构建与结构 turn。
+    #[component]
+    fn HostScrollingRows(runs: &'static AtomicUsize) -> MountResult<MountPlan> {
+        let store = Store::new();
+        let rows = memo(move || store.rows(Filter::All));
+        view! {
+            <view>
+                <button aria:label="Seed" on:click={move || -> Result<(), WriteError> {
+                    let mut transaction = Transaction::new();
+                    for index in 0..100 {
+                        transaction = transaction.write(store.insert(format!("r{index}")));
+                    }
+                    transaction.finish()
+                }}>"Seed"</button>
+                <For each={rows} store={store} key={|row: &TodoRow| row.id} row-height={px(20.0)}>
+                    {move |_row: RowView<TodoRow>| {
+                        runs.fetch_add(1, Ordering::SeqCst);
+                        view! { <text>"row"</text> }
+                    }}
+                </For>
+            </view>
+        }
+    }
+
+    /// 行的 blur 处理器关闭包住整个列表的 Show：blur 后第一遍场景的
+    /// 行带已经失效，宿主必须重建并重试，而不是把滚动变成错误。
+    #[component]
+    fn BlurClosesList() -> MountResult<MountPlan> {
+        let store = Store::new();
+        let rows = memo(move || store.rows(Filter::All));
+        let visible = signal(true);
+        view! {
+            <view>
+                <button aria:label="Seed" on:click={move || -> Result<(), WriteError> {
+                    let mut transaction = Transaction::new();
+                    for index in 0..100 {
+                        transaction = transaction.write(store.insert(format!("r{index}")));
+                    }
+                    transaction.finish()
+                }}>"Seed"</button>
+                <Show when={visible}>
+                    <For each={rows} store={store} key={|row: &TodoRow| row.id} row-height={px(20.0)}>
+                        {move |row: RowView<TodoRow>| view! {
+                            <button
+                                aria:label={once(format!("row {}", row.key().raw()))}
+                                on:blur={move |_event: BlurEvent| { visible.set(false); }}
+                            >"row"</button>
+                        }}
+                    </For>
+                </Show>
+            </view>
+        }
+    }
+
+    #[test]
+    fn a_blur_that_unmounts_the_list_retries_the_stale_row_window_batch() {
+        let mut runtime = Runtime::new();
+        runtime
+            .declare_windows(|catalog| {
+                catalog.window(WindowSpec::new(MAIN).primary().sized(480, 240), |_| {
+                    view! { <BlurClosesList /> }
+                })
+            })
+            .expect("declare the window");
+        runtime.show(MAIN).expect("show the window");
+        runtime.click_label("Seed").expect("seed one hundred rows");
+        let mut host = Host::open(runtime, HostConfig::hidden()).expect("open the host");
+        host.render().expect("the first frame");
+        let label = host
+            .runtime
+            .presentation_of(host.windows[MAIN].ctx)
+            .expect("snapshot")
+            .elements()
+            .find_map(|element| {
+                element
+                    .label()
+                    .filter(|label| label.starts_with("row "))
+                    .map(str::to_owned)
+            })
+            .expect("a mounted row button");
+        host.runtime.focus(&label).expect("focus the row");
+
+        host.windows.get_mut(MAIN).expect("window").scroll_offset = 400;
+        host.render()
+            .expect("the blur-rewritten batch is retried instead of failing the frame");
+        let snapshot = host
+            .runtime
+            .presentation_of(host.windows[MAIN].ctx)
+            .expect("snapshot");
+        assert!(
+            snapshot.row_bands().is_empty(),
+            "the blur handler closed the Show around the windowed list"
+        );
+        assert!(
+            snapshot.elements().all(|element| element
+                .label()
+                .is_none_or(|label| !label.starts_with("row "))),
+            "the list rows are unmounted after the blur"
+        );
+    }
+
+    /// 两个窗口化列表：第一个在 Show 里，行的 blur 关闭它；第二个继续存在。
+    #[component]
+    fn BlurHidesFirstList() -> MountResult<MountPlan> {
+        let store = Store::new();
+        let rows = memo(move || store.rows(Filter::All));
+        let first_visible = signal(true);
+        view! {
+            <view>
+                <button aria:label="Seed" on:click={move || -> Result<(), WriteError> {
+                    let mut transaction = Transaction::new();
+                    for index in 0..100 {
+                        transaction = transaction.write(store.insert(format!("r{index}")));
+                    }
+                    transaction.finish()
+                }}>"Seed"</button>
+                <Show when={first_visible}>
+                    <For each={rows} store={store} key={|row: &TodoRow| row.id} row-height={px(20.0)}>
+                        {move |row: RowView<TodoRow>| view! {
+                            <button
+                                aria:label={once(format!("first {}", row.key().raw()))}
+                                on:blur={move |_event: BlurEvent| { first_visible.set(false); }}
+                            >"first"</button>
+                        }}
+                    </For>
+                </Show>
+                <For each={rows} store={store} key={|row: &TodoRow| row.id} row-height={px(20.0)}>
+                    {move |row: RowView<TodoRow>| view! {
+                        <text>{once(format!("second {}", row.key().raw()))}</text>
+                    }}
+                </For>
+            </view>
+        }
+    }
+
+    #[test]
+    fn a_blur_that_removes_one_band_retries_the_surviving_band() {
+        let mut runtime = Runtime::new();
+        runtime
+            .declare_windows(|catalog| {
+                catalog.window(WindowSpec::new(MAIN).primary().sized(480, 240), |_| {
+                    view! { <BlurHidesFirstList /> }
+                })
+            })
+            .expect("declare the window");
+        runtime.show(MAIN).expect("show the window");
+        runtime.click_label("Seed").expect("seed one hundred rows");
+        let mut host = Host::open(runtime, HostConfig::hidden()).expect("open the host");
+        host.render().expect("the first frame");
+        let label = host
+            .runtime
+            .presentation_of(host.windows[MAIN].ctx)
+            .expect("snapshot")
+            .elements()
+            .find_map(|element| {
+                element
+                    .label()
+                    .filter(|label| label.starts_with("first "))
+                    .map(str::to_owned)
+            })
+            .expect("a mounted first-list row");
+        host.runtime.focus(&label).expect("focus the row");
+
+        let before = host.counters;
+        host.windows.get_mut(MAIN).expect("window").scroll_offset = 400;
+        host.render()
+            .expect("the surviving band applies after the stale batch is retried");
+        assert_eq!(
+            host.counters.scene_builds - before.scene_builds,
+            3,
+            "a blur rewrite rebuilds pass 1 once and then the changed pass 2"
+        );
+        let snapshot = host
+            .runtime
+            .presentation_of(host.windows[MAIN].ctx)
+            .expect("snapshot");
+        assert_eq!(
+            snapshot.row_bands().len(),
+            1,
+            "the blur handler closed the first list"
+        );
+        assert!(
+            snapshot.row_bands()[0].first_row() > 0,
+            "the retried batch applied to the surviving list"
+        );
+        assert!(
+            snapshot.elements().all(|element| element
+                .label()
+                .is_none_or(|label| !label.starts_with("first "))),
+            "the first list's rows are unmounted"
+        );
+    }
+
+    /// 行工厂在 armed 时拒绝任何新挂载的行。
+    #[component]
+    fn HostFailingRows(armed: &'static AtomicBool) -> MountResult<MountPlan> {
+        let store = Store::new();
+        let rows = memo(move || store.rows(Filter::All));
+        view! {
+            <view>
+                <button aria:label="Seed" on:click={move || -> Result<(), WriteError> {
+                    let mut transaction = Transaction::new();
+                    for index in 0..100 {
+                        transaction = transaction.write(store.insert(format!("r{index}")));
+                    }
+                    transaction.finish()
+                }}>"Seed"</button>
+                <For each={rows} store={store} key={|row: &TodoRow| row.id} row-height={px(20.0)}>
+                    {move |_row: RowView<TodoRow>| {
+                        if armed.load(Ordering::SeqCst) {
+                            return Err(MountError::Component("row boom"));
+                        }
+                        view! { <text>"row"</text> }
+                    }}
+                </For>
+            </view>
+        }
+    }
+
+    #[test]
+    fn a_row_factory_failure_during_scroll_keeps_the_host_alive() {
+        let armed = leak(AtomicBool::new(false));
+        let mut runtime = Runtime::new();
+        runtime
+            .declare_windows(move |catalog| {
+                catalog.window(WindowSpec::new(MAIN).primary().sized(480, 240), move |_| {
+                    view! { <HostFailingRows armed={armed} /> }
+                })
+            })
+            .expect("declare the window");
+        runtime.show(MAIN).expect("show the window");
+        runtime.click_label("Seed").expect("seed one hundred rows");
+        let mut host = Host::open(runtime, HostConfig::hidden()).expect("open the host");
+        host.render().expect("the first frame");
+        assert!(host.take_diagnostics().is_empty());
+
+        armed.store(true, Ordering::SeqCst);
+        host.windows.get_mut(MAIN).expect("window").scroll_offset = 400;
+        host.render()
+            .expect("a row factory failure stays a recoverable diagnostic");
+        let diagnostics = host.take_diagnostics();
+        assert!(
+            diagnostics
+                .iter()
+                .any(|message| message.contains("row window sync failed")),
+            "the failure is reported instead of killing the session: {diagnostics:?}"
+        );
+        let snapshot = host
+            .runtime
+            .presentation_of(host.windows[MAIN].ctx)
+            .expect("snapshot");
+        assert_eq!(
+            snapshot.row_bands()[0].first_row(),
+            0,
+            "the runtime rolled back to the committed window"
+        );
+        assert_eq!(
+            host.scene(MAIN).expect("scene").scroll_offset(),
+            400,
+            "the host keeps rendering at the scrolled offset"
+        );
+
+        armed.store(false, Ordering::SeqCst);
+        host.render().expect("the healed factory applies");
+        assert!(
+            host.runtime
+                .presentation_of(host.windows[MAIN].ctx)
+                .expect("snapshot")
+                .row_bands()[0]
+                .first_row()
+                > 0,
+            "the next frame applies the requested window once the factory heals"
+        );
+    }
+
+    #[test]
+    fn scene_building_defers_row_window_factories_to_the_structure_turn() {
+        let runs = leak(AtomicUsize::new(0));
+        let mut runtime = Runtime::new();
+        runtime
+            .declare_windows(move |catalog| {
+                catalog.window(WindowSpec::new(MAIN).primary().sized(480, 240), move |_| {
+                    view! { <HostScrollingRows runs={runs} /> }
+                })
+            })
+            .expect("declare the window");
+        runtime.show(MAIN).expect("show the window");
+        runtime.click_label("Seed").expect("seed one hundred rows");
+        let mut host = Host::open(runtime, HostConfig::hidden()).expect("open the host");
+        host.render().expect("the first frame");
+        let mounted = runs.load(Ordering::SeqCst);
+        assert!(mounted > 0, "the initial window mounts rows");
+
+        // 第一遍场景只计算目标窗口：不运行任何行 factory，也不应用请求。
+        let before = host.counters;
+        let (targets, first_row, pending) = host
+            .with_window(MAIN, |host, window| {
+                window.scroll_offset = 400;
+                let pending = host.ensure_scene(window)?;
+                let targets = pending
+                    .as_ref()
+                    .map(|pending| pending.row_windows.bands.len())
+                    .unwrap_or(0);
+                let snapshot = host
+                    .runtime
+                    .presentation_of(window.ctx)
+                    .map_err(HostError::Snapshot)?;
+                Ok((targets, snapshot.row_bands()[0].first_row(), pending))
+            })
+            .expect("the pure first pass");
+        assert_eq!(targets, 1, "the first pass reports one pending band");
+        assert_eq!(
+            host.counters.scene_builds - before.scene_builds,
+            1,
+            "the pure first pass builds exactly one scene"
+        );
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            mounted,
+            "scene building never runs a row factory"
+        );
+        assert_eq!(
+            first_row, 0,
+            "the first pass does not apply the pending window"
+        );
+
+        // 结构 turn 在构建调用栈之外挂载进入窗口的行，并推进 revision。
+        let pending = pending.expect("the first pass produced a pending scene");
+        host.with_window(MAIN, |host, window| {
+            host.settle_input_scene(window, pending)
+        })
+        .expect("the input boundary applies the batch");
+        assert_eq!(
+            host.counters.scene_builds - before.scene_builds,
+            2,
+            "a changed batch rebuilds exactly one second pass"
+        );
+        assert!(
+            runs.load(Ordering::SeqCst) > mounted,
+            "the structure turn mounts the entering rows outside scene building"
+        );
+        let snapshot = host
+            .runtime
+            .presentation_of(host.windows[MAIN].ctx)
+            .expect("the committed snapshot");
+        assert!(
+            snapshot.row_bands()[0].first_row() > 0,
+            "the batch applied at the input boundary"
+        );
+        assert_eq!(
+            host.scene(MAIN).expect("the input scene").scroll_offset(),
+            400,
+            "the input scene follows the requested offset"
         );
     }
 

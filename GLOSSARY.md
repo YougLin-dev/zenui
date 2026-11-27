@@ -77,7 +77,7 @@ _Avoid_: virtual list, lazy list
 _Avoid_: list range, viewport band
 
 **Row window**:
-宿主从行带几何、已应用滚动偏移与视口高度换算、经 `Runtime::set_row_window` 应用的 `(first, count)` 挂载区间；运行时是唯一挂载或卸载行的一方。
+宿主从行带几何、已应用滚动偏移与视口高度换算、经 `Runtime::set_row_windows` 批量应用的 `(first, count)` 挂载区间；同一屏的全部行带（包括嵌套行带）在一个原子结构 turn 里预校验并应用，任一失败则整批不落地。运行时是唯一挂载或卸载行的一方。
 _Avoid_: visible range, slice
 
 **Row height**:
