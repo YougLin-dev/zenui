@@ -629,3 +629,23 @@ fn nested_transactions_report_busy_and_do_not_poison_the_store() {
     insert(&store, 2);
     assert_eq!(store.len(), 1);
 }
+
+#[test]
+fn a_weak_reader_stops_reading_after_the_last_store_handle_is_dropped() {
+    let store = store();
+    let id = insert(&store, 1);
+    let reader = store.weak_reader();
+    let text = reader(id, TEXT).expect("the live row reads");
+    assert_eq!(
+        *text
+            .downcast::<String>()
+            .expect("the TEXT field is a string"),
+        "note 1"
+    );
+
+    drop(store);
+    assert!(
+        reader(id, TEXT).is_none(),
+        "a runtime reader must not keep the model store alive"
+    );
+}

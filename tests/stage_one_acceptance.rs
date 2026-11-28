@@ -39,7 +39,7 @@ fn the_target_todo_completes_the_stage_one_workflow() {
 
     app.click_text("Active").expect("filter active");
     assert_eq!(app.for_items().len(), 1);
-    assert_eq!(app.for_items()[0].todo, before[1].todo);
+    assert_eq!(app.for_items()[0].row, before[1].row);
     app.click_text("All").expect("filter all");
     assert_eq!(app.for_items().len(), 2);
 
@@ -48,11 +48,11 @@ fn the_target_todo_completes_the_stage_one_workflow() {
     assert!(app.set_caret("Edit Alpha", 2), "Alpha has a text input");
     app.click_text("Reverse").expect("reorder");
     let after = app.for_items();
-    assert_eq!(after[0].todo, before_reorder[1].todo);
-    assert_eq!(after[1].todo, before_reorder[0].todo);
+    assert_eq!(after[0].row, before_reorder[1].row);
+    assert_eq!(after[1].row, before_reorder[0].row);
     let alpha = after
         .iter()
-        .find(|item| item.todo == before_reorder[0].todo)
+        .find(|item| item.row == before_reorder[0].row)
         .expect("Alpha is still mounted");
     assert_eq!(
         alpha.instance, before_reorder[0].instance,

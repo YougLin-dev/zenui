@@ -19,4 +19,4 @@ pub use change::ChangeSet;
 pub use id::{FieldId, FilterId, RowId, StoreId};
 pub use row::{FieldDef, FilterSpec, Row, RowKey, Schema, SchemaBuilder, SchemaError};
 pub use rows::{RowSet, RowSetData, Rows};
-pub use store::{Commit, CommitObserver, Store, StoreError, TransactionError, Tx};
+pub use store::{Commit, CommitObserver, ErasedFieldRead, Store, StoreError, TransactionError, Tx};

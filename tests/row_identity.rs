@@ -28,10 +28,18 @@ fn row_label(todo: TodoId) -> String {
     format!("row {}", todo.raw())
 }
 
-fn todo_rows(app: &Runtime) -> Vec<(RowId, TodoId)> {
+fn todo_rows(app: &Runtime, seen: &Rc<RefCell<Vec<(RowId, TodoId)>>>) -> Vec<(RowId, TodoId)> {
+    let seen = seen.borrow();
     app.for_items()
         .iter()
-        .map(|item| (item.row, item.todo.expect("todo row")))
+        .map(|item| {
+            let key = seen
+                .iter()
+                .find(|(row, _)| *row == item.row)
+                .map(|(_, key)| *key)
+                .expect("the factory recorded this row");
+            (item.row, key)
+        })
         .collect()
 }
 
@@ -46,7 +54,7 @@ fn presentation_order(app: &Runtime, first: &str, second: &str) -> Vec<String> {
 }
 
 #[component]
-fn ReorderHost() -> MountResult<MountPlan> {
+fn ReorderHost(seen: Rc<RefCell<Vec<(RowId, TodoId)>>>) -> MountResult<MountPlan> {
     let store = Store::new();
     let rows = memo(move || store.rows(Filter::All));
     view! {
@@ -64,6 +72,7 @@ fn ReorderHost() -> MountResult<MountPlan> {
             <For each={rows} store={store} key={|row: &TodoRow| row.id}>
                 {move |row: RowView<TodoRow>| {
                     let id = row.key();
+                    seen.borrow_mut().push((row.id(), id));
                     view! {
                         <text-input
                             aria:label={once(row_label(id))}
@@ -79,9 +88,13 @@ fn ReorderHost() -> MountResult<MountPlan> {
 
 #[test]
 fn reorder_keeps_the_focused_rows_caret_and_selection() {
-    let mut app = mount(|| view! { <ReorderHost /> });
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let mut app = mount({
+        let seen = Rc::clone(&seen);
+        move || view! { <ReorderHost seen={seen} /> }
+    });
     app.click_label("seed").expect("seed two rows");
-    let rows = todo_rows(&app);
+    let rows = todo_rows(&app, &seen);
     assert_eq!(rows.len(), 2);
     let first_label = row_label(rows[0].1);
     let first = editor(&app, &first_label);
@@ -103,7 +116,7 @@ fn reorder_keeps_the_focused_rows_caret_and_selection() {
 
     app.click_label("reverse").expect("reorder the rows");
     assert_eq!(
-        todo_rows(&app)
+        todo_rows(&app, &seen)
             .iter()
             .map(|(_, key)| *key)
             .collect::<Vec<_>>(),
@@ -142,7 +155,7 @@ fn reorder_keeps_the_focused_rows_caret_and_selection() {
 
 /// 删除/重建同一业务标题，以及旧 `Field` 句柄的删除后读取。
 #[component]
-fn ReinsertHost() -> MountResult<MountPlan> {
+fn ReinsertHost(seen: Rc<RefCell<Vec<(RowId, TodoId)>>>) -> MountResult<MountPlan> {
     let store = Store::new();
     let rows = memo(move || store.rows(Filter::All));
     let a_key = signal(None::<TodoId>);
@@ -160,6 +173,7 @@ fn ReinsertHost() -> MountResult<MountPlan> {
             Some(field) => match field.get() {
                 Ok(title) => format!("memo {title}"),
                 Err(FieldError::Missing(id)) => format!("memo missing {}", id.raw()),
+                Err(other) => panic!("unexpected field error: {other}"),
             },
             None => String::from("memo idle"),
         }
@@ -195,6 +209,7 @@ fn ReinsertHost() -> MountResult<MountPlan> {
                 let text = match field.read_once() {
                     Ok(title) => format!("title {title} #{count}"),
                     Err(FieldError::Missing(id)) => format!("missing {} #{count}", id.raw()),
+                    Err(other) => panic!("unexpected field error: {other}"),
                 };
                 probe.set(text);
             }}>"Probe"</button>
@@ -203,6 +218,7 @@ fn ReinsertHost() -> MountResult<MountPlan> {
             <For each={rows} store={store} key={|row: &TodoRow| row.id}>
                 {move |row: RowView<TodoRow>| {
                     let id = row.key();
+                    seen.borrow_mut().push((row.id(), id));
                     view! {
                         <text-input
                             aria:label={once(row_label(id))}
@@ -218,9 +234,13 @@ fn ReinsertHost() -> MountResult<MountPlan> {
 
 #[test]
 fn delete_and_reinsert_with_the_same_title_starts_a_fresh_row() {
-    let mut app = mount(|| view! { <ReinsertHost /> });
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let mut app = mount({
+        let seen = Rc::clone(&seen);
+        move || view! { <ReinsertHost seen={seen} /> }
+    });
     app.click_label("seed").expect("seed A and B");
-    let before = todo_rows(&app);
+    let before = todo_rows(&app, &seen);
     assert_eq!(before.len(), 2);
     let (old_row, old_key) = before[0];
     let old_label = row_label(old_key);
@@ -248,7 +268,7 @@ fn delete_and_reinsert_with_the_same_title_starts_a_fresh_row() {
 
     app.click_label("delete-a").expect("delete A");
     assert_eq!(app.node_status(old_node), NodeStatus::Stale);
-    assert_eq!(todo_rows(&app), vec![before[1]]);
+    assert_eq!(todo_rows(&app, &seen), vec![before[1]]);
     assert_eq!(
         app.presentation().expect("snapshot").focus(),
         Some(other_node),
@@ -273,7 +293,7 @@ fn delete_and_reinsert_with_the_same_title_starts_a_fresh_row() {
 
     app.click_label("reinsert-a")
         .expect("reinsert a row titled A");
-    let after = todo_rows(&app);
+    let after = todo_rows(&app, &seen);
     assert_eq!(after.len(), 2);
     let (new_row, new_key) = after[1];
     assert_ne!(
@@ -335,7 +355,7 @@ fn delete_and_reinsert_with_the_same_title_starts_a_fresh_row() {
 
 /// 过滤移出再移回：行身份不变，元素与本地编辑状态重新开始。
 #[component]
-fn FilterHost() -> MountResult<MountPlan> {
+fn FilterHost(seen: Rc<RefCell<Vec<(RowId, TodoId)>>>) -> MountResult<MountPlan> {
     let store = Store::new();
     let active = memo(move || store.rows(Filter::Active));
     let a_key = signal(None::<TodoId>);
@@ -364,6 +384,7 @@ fn FilterHost() -> MountResult<MountPlan> {
             <For each={active} store={store} key={|row: &TodoRow| row.id}>
                 {move |row: RowView<TodoRow>| {
                     let id = row.key();
+                    seen.borrow_mut().push((row.id(), id));
                     view! {
                         <text-input
                             aria:label={once(row_label(id))}
@@ -379,10 +400,14 @@ fn FilterHost() -> MountResult<MountPlan> {
 
 #[test]
 fn filtering_a_row_out_and_back_in_mounts_a_fresh_element() {
-    let mut app = mount(|| view! { <FilterHost /> });
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let mut app = mount({
+        let seen = Rc::clone(&seen);
+        move || view! { <FilterHost seen={seen} /> }
+    });
     app.click_label("seed")
         .expect("seed under the active filter");
-    let before = todo_rows(&app);
+    let before = todo_rows(&app, &seen);
     assert_eq!(before.len(), 2);
     let (row_id, key) = before[0];
     let label = row_label(key);
@@ -404,7 +429,7 @@ fn filtering_a_row_out_and_back_in_mounts_a_fresh_element() {
 
     app.click_label("complete-a")
         .expect("completing A removes it from Active");
-    assert_eq!(todo_rows(&app), vec![before[1]]);
+    assert_eq!(todo_rows(&app, &seen), vec![before[1]]);
     assert_eq!(app.node_status(old_node), NodeStatus::Stale);
     assert_eq!(
         app.presentation().expect("snapshot").focus(),
@@ -414,7 +439,7 @@ fn filtering_a_row_out_and_back_in_mounts_a_fresh_element() {
 
     app.click_label("reactivate-a")
         .expect("uncompleting A returns it to Active");
-    let after = todo_rows(&app);
+    let after = todo_rows(&app, &seen);
     assert_eq!(after.len(), 2);
     assert_eq!(
         after[0],

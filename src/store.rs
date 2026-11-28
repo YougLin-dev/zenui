@@ -3,11 +3,14 @@ use std::marker::PhantomData;
 
 use zenui_core::model::{
     ChangeSet, Commit, FieldDef, FieldId, FilterId, FilterSpec, Row as ModelRow, RowId, RowSet,
-    SchemaBuilder, Store as ModelStore, StoreError as ModelError, TransactionError, Tx as ModelTx,
+    SchemaBuilder, Store as ModelStore, StoreError as ModelError, StoreId, TransactionError,
+    Tx as ModelTx,
 };
 use zenui_core::{Fatal, Filter, RowKey, ValueError};
 
-use crate::context::{DepKey, FieldKind, Phase, filter_slot, with_state, with_state_of};
+use crate::context::{DepKey, Phase, filter_slot, with_state, with_state_of};
+use crate::node::FieldKey;
+use crate::runtime::ModelFieldRead;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct TodoId(RowKey);
@@ -43,13 +46,6 @@ pub(crate) const fn filter_kind(filter: FilterId) -> Filter {
         1 => Filter::Active,
         2 => Filter::Completed,
         _ => Filter::All,
-    }
-}
-
-const fn field_kind(field: FieldId) -> FieldKind {
-    match field.index() {
-        0 => FieldKind::Title,
-        _ => FieldKind::Completed,
     }
 }
 
@@ -179,12 +175,31 @@ impl Store {
         with_state_of(self.runtime, |state| state.store_is_empty(filter))
     }
 
+    /// 业务键在构造时解析为行身份；删除并以同一标题重建后，旧句柄读到 `Missing`。
     pub fn title(self, id: TodoId) -> Field<String> {
-        Field::new(self.runtime, id, FieldKind::Title)
+        let (store, row) = with_state_of(self.runtime, |state| {
+            (state.todo_store.id(), state.todo_store.id_of_key(id))
+        });
+        Field::from_key(FieldKey::new(
+            self.runtime,
+            store,
+            row,
+            TITLE_FIELD,
+            Some(id),
+        ))
     }
 
     pub fn completed(self, id: TodoId) -> Field<bool> {
-        Field::new(self.runtime, id, FieldKind::Completed)
+        let (store, row) = with_state_of(self.runtime, |state| {
+            (state.todo_store.id(), state.todo_store.id_of_key(id))
+        });
+        Field::from_key(FieldKey::new(
+            self.runtime,
+            store,
+            row,
+            COMPLETED_FIELD,
+            Some(id),
+        ))
     }
 
     pub fn insert(self, title: impl Into<String>) -> WriteOp<TodoId> {
@@ -199,8 +214,8 @@ impl Store {
             })
             .map_err(WriteError::Model)?;
             log.wrote();
-            log.wrote_field(id, FieldKind::Title);
-            log.wrote_field(id, FieldKind::Completed);
+            log.wrote_field(id, TITLE_FIELD);
+            log.wrote_field(id, COMPLETED_FIELD);
             Ok(id)
         })
     }
@@ -208,7 +223,7 @@ impl Store {
     pub fn set_completed(self, id: TodoId, done: bool) -> WriteOp<()> {
         WriteOp::new(self.runtime, move |tx, _next_key, log| {
             let row = tx.id_of_key(id).ok_or(WriteError::Missing(id))?;
-            log.wrote_field(id, FieldKind::Completed);
+            log.wrote_field(id, COMPLETED_FIELD);
             let current = tx.get(row).ok_or(WriteError::Missing(id))?;
             if current.completed == done {
                 return Ok(());
@@ -223,7 +238,7 @@ impl Store {
         let title = title.into();
         WriteOp::new(self.runtime, move |tx, _next_key, log| {
             let row = tx.id_of_key(id).ok_or(WriteError::Missing(id))?;
-            log.wrote_field(id, FieldKind::Title);
+            log.wrote_field(id, TITLE_FIELD);
             let current = tx.get(row).ok_or(WriteError::Missing(id))?;
             if current.title == title {
                 return Ok(());
@@ -237,8 +252,8 @@ impl Store {
     pub fn remove(self, id: TodoId) -> WriteOp<()> {
         WriteOp::new(self.runtime, move |tx, _next_key, log| {
             let row = tx.id_of_key(id).ok_or(WriteError::Missing(id))?;
-            log.wrote_field(id, FieldKind::Title);
-            log.wrote_field(id, FieldKind::Completed);
+            log.wrote_field(id, TITLE_FIELD);
+            log.wrote_field(id, COMPLETED_FIELD);
             if tx.contains(row) {
                 log.wrote();
             }
@@ -255,8 +270,8 @@ impl Store {
                     continue;
                 }
                 if let Some(key) = tx.key_of(row) {
-                    log.wrote_field(key, FieldKind::Title);
-                    log.wrote_field(key, FieldKind::Completed);
+                    log.wrote_field(key, TITLE_FIELD);
+                    log.wrote_field(key, COMPLETED_FIELD);
                 }
                 match tx.remove(row) {
                     Ok(()) => removed += 1,
@@ -318,37 +333,29 @@ impl fmt::Debug for Store {
     }
 }
 
+/// typed、类型擦除的字段句柄：runtime + `FieldKey`。
+///
+/// `FieldKey` 用 `StoreId + RowId + FieldId` 标识来源；行身份自带代际，因此
+/// 删除并以同一业务键重建后，旧句柄继续读到 `Missing`，不会命中新行。
 pub struct Field<T> {
-    pub(crate) runtime: u32,
-    pub(crate) id: TodoId,
-    pub(crate) kind: FieldKind,
+    key: FieldKey,
     _marker: PhantomData<fn() -> T>,
     _not_send: PhantomData<*const ()>,
 }
 
 impl<T> Field<T> {
-    const fn new(runtime: u32, id: TodoId, kind: FieldKind) -> Self {
+    /// 绑定槽只保存字段键；求值时按键还原同一句柄。
+    pub(crate) const fn from_key(key: FieldKey) -> Self {
         Self {
-            runtime,
-            id,
-            kind,
+            key,
             _marker: PhantomData,
             _not_send: PhantomData,
         }
     }
 
-    /// 绑定槽只保存字段键；求值时按键还原同一句柄。
-    pub(crate) const fn from_key(key: crate::node::FieldKey) -> Self {
-        Self::new(key.runtime, key.id, key.kind)
-    }
-
     /// 绑定槽的字段键；值类型由持有槽的类型决定。
-    pub(crate) const fn field_key(self) -> crate::node::FieldKey {
-        crate::node::FieldKey {
-            runtime: self.runtime,
-            id: self.id,
-            kind: self.kind,
-        }
+    pub(crate) const fn field_key(self) -> FieldKey {
+        self.key
     }
 }
 
@@ -356,11 +363,19 @@ impl<T> Field<T>
 where
     T: crate::signal::ReactiveValue,
 {
+    /// 读取字段当前值并注册依赖；行已删除时返回 typed `FieldError`。
+    pub fn get(self) -> Result<T, FieldError> {
+        self.read_value(false)
+    }
+
+    /// setup 阶段的一次性读取：不注册依赖。
+    pub fn read_once(self) -> Result<T, FieldError> {
+        self.read_value(true)
+    }
+
     /// 类型擦除读取：字段值的类型由构造字段的 accessor 决定。
     pub(crate) fn read_value(self, once: bool) -> Result<T, FieldError> {
-        let value = with_state_of(self.runtime, |state| {
-            state.read_field(self.id, self.kind, once)
-        })?;
+        let value = with_state_of(self.key.runtime, |state| state.read_field(self.key, once))?;
         Ok(*value
             .downcast::<T>()
             .expect("field value type matches its accessor"))
@@ -376,42 +391,55 @@ impl<T> Clone for Field<T> {
 
 impl<T> fmt::Debug for Field<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Field")
-            .field("id", &self.id)
-            .field("kind", &self.kind)
-            .finish()
+        f.debug_struct("Field").field("key", &self.key).finish()
     }
 }
 
-impl Field<String> {
-    pub fn get(self) -> Result<String, FieldError> {
-        with_state_of(self.runtime, |state| state.read_title(self.id, false))
-    }
-
-    pub fn read_once(self) -> Result<String, FieldError> {
-        with_state_of(self.runtime, |state| state.read_title(self.id, true))
-    }
+/// 通用行 Store 的响应式字段入口；`RowView::field` 与直接持有 Store 的代码共用。
+pub trait RowStoreField<R: ModelRow> {
+    /// 按行身份与已注册字段构造句柄；读取时经 runtime 注册的类型擦除读取器。
+    fn field<T: crate::signal::ReactiveValue>(&self, row: RowId, field: FieldId) -> Field<T>;
 }
 
-impl Field<bool> {
-    pub fn get(self) -> Result<bool, FieldError> {
-        with_state_of(self.runtime, |state| state.read_completed(self.id, false))
-    }
-
-    pub fn read_once(self) -> Result<bool, FieldError> {
-        with_state_of(self.runtime, |state| state.read_completed(self.id, true))
+impl<R: ModelRow> RowStoreField<R> for ModelStore<R> {
+    fn field<T: crate::signal::ReactiveValue>(&self, row: RowId, field: FieldId) -> Field<T> {
+        let (runtime, store, todo) = with_state(|state| {
+            let store = self.id();
+            state.register_store_reader(store, crate::runtime::StoreReader::of(self.clone()));
+            // Todo 行经 `RowView::field` 与 `Store::title` 必须得到同一个键，
+            // 否则两条 accessor 路径的写入失效互不相通。
+            let todo = if store == state.todo_store.id() {
+                state.todo_store.key_of(row)
+            } else {
+                None
+            };
+            (state.id, store, todo)
+        });
+        // 直接持有 Store 的调用方没有 `For` 的 attach 路径；字段句柄本身
+        // 订阅提交，写入才能进入 PendingChanges 并推进字段代数。
+        crate::runtime::observe_store_commits(self);
+        Field::from_key(FieldKey::new(runtime, store, Some(row), field, todo))
     }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FieldError {
+    /// Todo accessor 的业务键已不存在。
     Missing(TodoId),
+    /// 通用行身份已删除或代际失效。
+    MissingRow(RowId),
+    /// 该 Store 的 schema 未注册这个字段。
+    UnknownField { store: StoreId, field: FieldId },
 }
 
 impl fmt::Display for FieldError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Missing(id) => write!(f, "row {} is no longer live", id.raw()),
+            Self::MissingRow(row) => write!(f, "row {row:?} is no longer live"),
+            Self::UnknownField { store, field } => {
+                write!(f, "store {store:?} has no field {}", field.index())
+            }
         }
     }
 }
@@ -467,7 +495,7 @@ impl From<ValueError> for WriteError {
 #[derive(Default)]
 struct WriteLog {
     writes: u64,
-    fields: Vec<(TodoId, FieldKind)>,
+    fields: Vec<(TodoId, FieldId)>,
 }
 
 impl WriteLog {
@@ -475,8 +503,8 @@ impl WriteLog {
         self.writes += 1;
     }
 
-    fn wrote_field(&mut self, id: TodoId, kind: FieldKind) {
-        self.fields.push((id, kind));
+    fn wrote_field(&mut self, id: TodoId, field: FieldId) {
+        self.fields.push((id, field));
     }
 }
 
@@ -603,40 +631,41 @@ impl crate::runtime::State {
         empty
     }
 
-    pub(crate) fn read_title(&mut self, id: TodoId, once: bool) -> Result<String, FieldError> {
-        let value = self.read_field(id, FieldKind::Title, once)?;
-        Ok(*value.downcast::<String>().expect("title fields hold text"))
-    }
-
-    pub(crate) fn read_completed(&mut self, id: TodoId, once: bool) -> Result<bool, FieldError> {
-        let value = self.read_field(id, FieldKind::Completed, once)?;
-        Ok(*value
-            .downcast::<bool>()
-            .expect("completed fields hold a bool"))
-    }
-
     /// 一次字段读取的唯一实现；返回类型擦除值，由 `Field<T>` 还原。
+    ///
+    /// 读取通过 StoreId 对应的已注册读取器完成；Todo accessor 的旧句柄
+    /// 仍返回 `FieldError::Missing(TodoId)`，通用行返回 `MissingRow(RowId)`。
     pub(crate) fn read_field(
         &mut self,
-        id: TodoId,
-        kind: FieldKind,
+        key: FieldKey,
         once: bool,
     ) -> Result<Box<dyn std::any::Any>, FieldError> {
         if !once && self.phase == Phase::Memo {
-            self.note_dep(DepKey::Field(id, kind));
+            self.note_dep(DepKey::Field(key));
         }
         if once {
             self.once_reads += 1;
         }
-        let row = self
-            .todo_store
-            .id_of_key(id)
-            .and_then(|row| self.todo_store.get(row))
-            .ok_or(FieldError::Missing(id))?;
-        Ok(match kind {
-            FieldKind::Title => Box::new(row.title),
-            FieldKind::Completed => Box::new(row.completed),
-        })
+        let Some(row) = key.row else {
+            return Err(match key.todo {
+                Some(todo) => FieldError::Missing(todo),
+                None => FieldError::UnknownField {
+                    store: key.store,
+                    field: key.field,
+                },
+            });
+        };
+        match self.read_model_field(key.store, row, key.field) {
+            ModelFieldRead::Value(value) => Ok(value),
+            ModelFieldRead::MissingRow => Err(match key.todo {
+                Some(todo) => FieldError::Missing(todo),
+                None => FieldError::MissingRow(row),
+            }),
+            ModelFieldRead::UnknownField => Err(FieldError::UnknownField {
+                store: key.store,
+                field: key.field,
+            }),
+        }
     }
 
     /// 事务只在 Event/Delivery turn 中执行；失败不改变模型，但会记录到命令边界，
@@ -668,8 +697,10 @@ impl crate::runtime::State {
                 self.next_todo_key = next_key;
                 // 相等写入不脏任何依赖，但仍是应用对字段的处理；
                 // 文本编辑器用尝试代数区分“写了旧值”和“没有写”。
-                for (id, kind) in log.fields {
-                    self.note_field_write(id, kind);
+                for (id, field) in log.fields {
+                    if let Some(row) = self.todo_store.id_of_key(id) {
+                        self.note_field_write(self.todo_store.id(), row, field);
+                    }
                 }
                 self.store_counters.commits += 1;
                 self.store_counters.io_writes += log.writes;
@@ -698,29 +729,63 @@ impl crate::runtime::State {
         if changes.is_empty() {
             return;
         }
+        let runtime = self.id;
+        let store = self.todo_store.id();
         let mut coarse_rows = false;
-        for id in &changes.inserted {
+        for row in &changes.inserted {
             coarse_rows = true;
-            if let Some(key) = commit.key_of(*id) {
-                self.bump(DepKey::Field(key, FieldKind::Title));
-                self.bump(DepKey::Field(key, FieldKind::Completed));
-            }
+            let Some(key) = commit.key_of(*row) else {
+                continue;
+            };
+            self.bump(DepKey::Field(FieldKey::new(
+                runtime,
+                store,
+                Some(*row),
+                TITLE_FIELD,
+                Some(key),
+            )));
+            self.bump(DepKey::Field(FieldKey::new(
+                runtime,
+                store,
+                Some(*row),
+                COMPLETED_FIELD,
+                Some(key),
+            )));
         }
         let mut purged = Vec::new();
-        for id in &changes.removed {
+        for row in &changes.removed {
             coarse_rows = true;
-            if let Some(key) = commit.key_of(*id) {
-                // 先标脏消费者，再丢弃已删除行的写入历史：绑定本帧仍会求值
-                // 并读到 FieldMissing，历史表不会随删除行数增长。
-                self.bump(DepKey::Field(key, FieldKind::Title));
-                self.bump(DepKey::Field(key, FieldKind::Completed));
-                purged.push(key);
-            }
+            let Some(key) = commit.key_of(*row) else {
+                continue;
+            };
+            // 先标脏消费者，再丢弃已删除行的写入历史：绑定本帧仍会求值
+            // 并读到 FieldMissing，历史表不会随删除行数增长。
+            self.bump(DepKey::Field(FieldKey::new(
+                runtime,
+                store,
+                Some(*row),
+                TITLE_FIELD,
+                Some(key),
+            )));
+            self.bump(DepKey::Field(FieldKey::new(
+                runtime,
+                store,
+                Some(*row),
+                COMPLETED_FIELD,
+                Some(key),
+            )));
+            purged.push(*row);
         }
         self.purge_row_history(&purged);
         for (row, field) in &changes.fields {
             if let Some(key) = self.todo_store.key_of(*row) {
-                self.bump(DepKey::Field(key, field_kind(*field)));
+                self.bump(DepKey::Field(FieldKey::new(
+                    runtime,
+                    store,
+                    Some(*row),
+                    *field,
+                    Some(key),
+                )));
             }
         }
         if coarse_rows || changes.order {

@@ -5,6 +5,16 @@ use std::rc::Rc;
 
 use zenui::prelude::*;
 
+fn labels_with_prefix(app: &Runtime, prefix: &str) -> Vec<String> {
+    app.presentation()
+        .expect("snapshot")
+        .elements()
+        .filter_map(SnapshotElement::label)
+        .filter(|label| label.starts_with(prefix))
+        .map(str::to_owned)
+        .collect()
+}
+
 #[component]
 fn TwoButtons(focuses: Rc<Cell<u32>>, blurs: Rc<Cell<u32>>) -> MountResult<MountPlan> {
     let a_focus = focuses.clone();
@@ -194,12 +204,8 @@ fn tab_and_arrow_traversal_follow_the_mounted_order() {
     let mut app = Runtime::new();
     app.mount(|| view! { <OrderFixture /> }).expect("mount");
     app.click_text("Seed").expect("seed two rows");
-    let ids: Vec<u64> = app
-        .for_items()
-        .iter()
-        .map(|item| item.todo.expect("todo row").raw())
-        .collect();
-    assert_eq!(ids.len(), 2);
+    let rows = labels_with_prefix(&app, "row ");
+    assert_eq!(rows.len(), 2);
 
     app.focus("first").expect("focus first");
     let mut seen = vec![app.focused().and_then(|focus| focus.label).unwrap()];
@@ -214,8 +220,8 @@ fn tab_and_arrow_traversal_follow_the_mounted_order() {
             String::from("draft"),
             String::from("inner"),
             String::from("shown"),
-            format!("row {}", ids[0]),
-            format!("row {}", ids[1]),
+            rows[0].clone(),
+            rows[1].clone(),
             String::from("last"),
         ],
         "the disabled button is skipped and components/Show/For descend in mount order"
@@ -234,7 +240,7 @@ fn tab_and_arrow_traversal_follow_the_mounted_order() {
     app.focus_previous().expect("backward");
     assert_eq!(
         app.focused().and_then(|focus| focus.label),
-        Some(format!("row {}", ids[1]))
+        Some(rows[1].clone())
     );
 
     app.blur().expect("no focus");
@@ -310,24 +316,16 @@ fn reorder_keeps_focus_on_the_same_control() {
     let mut app = Runtime::new();
     app.mount(|| view! { <Rows /> }).expect("mount");
     app.click_text("Seed").expect("seed");
-    let before: Vec<u64> = app
-        .for_items()
-        .iter()
-        .map(|item| item.todo.expect("todo row").raw())
-        .collect();
+    let before = labels_with_prefix(&app, "row ");
 
-    app.focus(&format!("row {}", before[0])).expect("focus");
+    app.focus(&before[0]).expect("focus");
     app.click_text("Reverse").expect("reorder");
 
-    let after: Vec<u64> = app
-        .for_items()
-        .iter()
-        .map(|item| item.todo.expect("todo row").raw())
-        .collect();
+    let after = labels_with_prefix(&app, "row ");
     assert_eq!(after[1], before[0], "the row really moved");
     assert_eq!(
         app.focused().and_then(|focus| focus.label),
-        Some(format!("row {}", before[0])),
+        Some(before[0].clone()),
         "the surviving control keeps focus across reorder"
     );
 }
@@ -401,18 +399,14 @@ fn deleting_the_focused_row_settles_once_to_a_surviving_control() {
     })
     .expect("mount");
     app.click_text("Seed").expect("seed");
-    let ids: Vec<u64> = app
-        .for_items()
-        .iter()
-        .map(|item| item.todo.expect("todo row").raw())
-        .collect();
+    let rows = labels_with_prefix(&app, "row ");
+    let deletes = labels_with_prefix(&app, "delete ");
 
-    app.focus(&format!("row {}", ids[1])).expect("focus B");
+    app.focus(&rows[1]).expect("focus B");
     assert_eq!(focuses.get(), 1);
     assert_eq!(cause.get(), Some(FocusCause::Command));
 
-    app.click_label(&format!("delete {}", ids[1]))
-        .expect("delete the second row");
+    app.click_label(&deletes[1]).expect("delete the second row");
 
     assert_eq!(focuses.get(), 2, "settlement dispatches one focus");
     assert_eq!(
@@ -427,7 +421,7 @@ fn deleting_the_focused_row_settles_once_to_a_surviving_control() {
     );
     assert_eq!(
         app.focused().and_then(|focus| focus.label),
-        Some(format!("row {}", ids[0])),
+        Some(rows[0].clone()),
         "the previous same-tag control takes over"
     );
 }
@@ -890,9 +884,8 @@ fn cascade(rows: usize) -> (Runtime, Rc<Cell<u32>>, Rc<Cell<u32>>) {
 #[test]
 fn a_cascade_that_converges_on_the_cap_keeps_its_valid_target() {
     let (mut app, last_focuses, last_blurs) = cascade(8);
-    let first = app.for_items()[0].todo.expect("todo row");
-    app.focus(&format!("row {}", first.raw()))
-        .expect("focus the first row");
+    let first = labels_with_prefix(&app, "row ").remove(0);
+    app.focus(&first).expect("focus the first row");
 
     assert_eq!(
         app.focused().and_then(|focus| focus.label),
@@ -907,9 +900,8 @@ fn a_cascade_that_converges_on_the_cap_keeps_its_valid_target() {
     );
 
     let (mut app, last_focuses, last_blurs) = cascade(7);
-    let first = app.for_items()[0].todo.expect("todo row");
-    app.focus(&format!("row {}", first.raw()))
-        .expect("focus the first row");
+    let first = labels_with_prefix(&app, "row ").remove(0);
+    app.focus(&first).expect("focus the first row");
     assert_eq!(
         app.focused().and_then(|focus| focus.label),
         Some(String::from("last")),

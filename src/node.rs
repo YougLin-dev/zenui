@@ -14,10 +14,10 @@ use std::sync::Arc;
 use zenui_core::model::RowSet;
 use zenui_style::{Color, Length, Opacity, Property, StyleValue};
 
-use crate::context::FieldKind;
 use crate::presentation::SnapshotNode;
 use crate::signal::ReactiveValue;
 use crate::store::TodoId;
+
 use crate::view::ReadFault;
 
 /// 一棵已提交树的稳定键；单调分配、不复用。
@@ -622,11 +622,36 @@ pub(crate) struct SourceRef {
 }
 
 /// 字段源；值类型由持有它的 `BindingSlot<T>` 决定。
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+///
+/// 身份是 `StoreId + RowId + FieldId`，RowId 自带代际：删除后以同一业务键
+/// 重建行会产生新的 RowId，旧句柄读不到新行。`todo` 由 Todo Store 的行身份
+/// 推导，只用于行删除后保留 `FieldError::Missing(TodoId)` 诊断；非 Todo
+/// Store 恒为 `None`，同一存活行经 `Store` 或 `RowView` 得到的键因此相同。
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub(crate) struct FieldKey {
     pub(crate) runtime: u32,
-    pub(crate) id: TodoId,
-    pub(crate) kind: FieldKind,
+    pub(crate) store: zenui_core::model::StoreId,
+    pub(crate) row: Option<zenui_core::model::RowId>,
+    pub(crate) field: zenui_core::model::FieldId,
+    pub(crate) todo: Option<TodoId>,
+}
+
+impl FieldKey {
+    pub(crate) const fn new(
+        runtime: u32,
+        store: zenui_core::model::StoreId,
+        row: Option<zenui_core::model::RowId>,
+        field: zenui_core::model::FieldId,
+        todo: Option<TodoId>,
+    ) -> Self {
+        Self {
+            runtime,
+            store,
+            row,
+            field,
+            todo,
+        }
+    }
 }
 
 /// once 来源的诊断 id；不携带值。
@@ -662,7 +687,7 @@ impl ReadSlot {
             Self::Static | Self::Once(_) => None,
             Self::Signal(source) => Some(crate::context::DepKey::Signal(source.id)),
             Self::Memo(source) => Some(crate::context::DepKey::Memo(source.id)),
-            Self::Field(key) => Some(crate::context::DepKey::Field(key.id, key.kind)),
+            Self::Field(key) => Some(crate::context::DepKey::Field(key)),
         }
     }
 }

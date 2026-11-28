@@ -826,40 +826,44 @@ impl crate::runtime::State {
 
     /// 字段写入尝试代数：每次应用写入都推进，相等写入也算；
     /// 与脏依赖代数分开，避免相等写入让依赖失效。
-    pub(crate) fn field_write_epoch(
-        &self,
-        id: crate::store::TodoId,
-        kind: crate::context::FieldKind,
-    ) -> u64 {
-        self.field_writes.get(&(id, kind)).copied().unwrap_or(0)
+    pub(crate) fn field_write_epoch(&self, key: crate::node::FieldKey) -> u64 {
+        self.field_writes.get(&key).copied().unwrap_or(0)
     }
 
     /// 行删除后丢弃它的字段写入历史。
     ///
-    /// `TodoId` 单调分配、删除后不复用，因此这些代数不会再有读者；保留
-    /// 它们会让交互历史随删除行数无界增长。已经标脏的 memo/绑定在删除
-    /// 提交时仍保留脏标记，本帧照常求值并读到 `FieldMissing`。
-    pub(crate) fn purge_row_history(&mut self, ids: &[crate::store::TodoId]) {
-        if ids.is_empty() {
+    /// 行身份 `RowId` 删除后不复用，因此这些代数不会再有读者；保留它们会让
+    /// 交互历史随删除行数无界增长。已经标脏的 memo/绑定在删除提交时仍保留
+    /// 脏标记，本帧照常求值并读到 `FieldMissing`。
+    pub(crate) fn purge_row_history(&mut self, rows: &[zenui_core::model::RowId]) {
+        if rows.is_empty() {
             return;
         }
-        let removed: BTreeSet<crate::store::TodoId> = ids.iter().copied().collect();
+        let removed: BTreeSet<zenui_core::model::RowId> = rows.iter().copied().collect();
         self.field_writes
-            .retain(|(row, _), _| !removed.contains(row));
-        self.write_epochs
-            .retain(|key, _| !matches!(key, DepKey::Field(row, _) if removed.contains(row)));
+            .retain(|key, _| key.row.is_none_or(|row| !removed.contains(&row)));
+        self.write_epochs.retain(|key, _| {
+            !matches!(key, DepKey::Field(field) if field.row.is_some_and(|row| removed.contains(&row)))
+        });
     }
 
     /// 记录一次应用字段写入尝试；由 `Store` 事务在提交时调用。
     pub(crate) fn note_field_write(
         &mut self,
-        id: crate::store::TodoId,
-        kind: crate::context::FieldKind,
+        store: zenui_core::model::StoreId,
+        row: zenui_core::model::RowId,
+        field: zenui_core::model::FieldId,
     ) {
-        let epoch = self.field_writes.entry((id, kind)).or_insert(0);
+        let todo = if store == self.todo_store.id() {
+            self.todo_store.key_of(row)
+        } else {
+            None
+        };
+        let key = crate::node::FieldKey::new(self.id, store, Some(row), field, todo);
+        let epoch = self.field_writes.entry(key).or_insert(0);
         *epoch = epoch.wrapping_add(1);
         // 与 Signal 写入相同：相等写入也要让编辑器绑定重新观察。
-        self.mark_editor_consumers_dirty(DepKey::Field(id, kind));
+        self.mark_editor_consumers_dirty(DepKey::Field(key));
     }
 
     /// 绑定槽来源的写入代数；已释放、代际不符或不存在的槽按 0 处理。

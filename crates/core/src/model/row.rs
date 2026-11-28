@@ -18,22 +18,29 @@ pub trait Row: Clone + 'static {
 }
 
 type FieldDiff<R> = Box<dyn Fn(&R, &R) -> bool>;
+type FieldRead<R> = Box<dyn Fn(&R) -> Box<dyn std::any::Any>>;
 
-/// 模型声明的可观察字段与它的相等判定。
+/// 模型声明的可观察字段、相等判定与类型擦除读取。
 ///
-/// `Store` 在提交时用这些字段比较提交前后的行，产出精确的 `ChangeSet.fields`。
+/// `Store` 在提交时用这些字段比较提交前后的行，产出精确的 `ChangeSet.fields`；
+/// `Field<T>` 绑定通过注册的读取器按 `RowId + FieldId` 取值。
 /// 未注册字段的修改仍会写入行数据，但不参与字段变化、过滤成员迁移或绑定通知。
 pub struct FieldDef<R: Row> {
     id: FieldId,
     differs: FieldDiff<R>,
+    read: FieldRead<R>,
 }
 
 impl<R: Row> FieldDef<R> {
-    /// 用字段访问器比较前后值。
-    pub fn comparing<T: PartialEq + 'static>(id: FieldId, get: fn(&R) -> &T) -> Self {
+    /// 用字段访问器比较前后值并读取当前值。
+    ///
+    /// 值必须 `Clone`：绑定读取返回的是按值克隆的类型擦除快照，不借出 Store
+    /// 内部行数据。
+    pub fn comparing<T: PartialEq + Clone + 'static>(id: FieldId, get: fn(&R) -> &T) -> Self {
         Self {
             id,
             differs: Box::new(move |before, after| get(before) != get(after)),
+            read: Box::new(move |row| Box::new(get(row).clone())),
         }
     }
 
@@ -43,6 +50,10 @@ impl<R: Row> FieldDef<R> {
 
     pub(crate) fn differs(&self, before: &R, after: &R) -> bool {
         (self.differs)(before, after)
+    }
+
+    pub(crate) fn read(&self, row: &R) -> Box<dyn std::any::Any> {
+        (self.read)(row)
     }
 }
 
