@@ -77,8 +77,8 @@ use crate::tray::{
 };
 use zenui_render::{
     GpuRenderer, HighContrastColors, InteractionPaths, Point, Rect, RenderPalette,
-    RenderTargetConfig, Scene, SceneCache, SceneElement, SceneEnv, SceneRowBand, Scrollbar,
-    TextAssets, Viewport, Visual, wgpu,
+    RenderTargetConfig, Scene, SceneCache, SceneEnv, SceneRowBand, Scrollbar, TextAssets, Viewport,
+    Visual, wgpu,
 };
 
 /// 宿主私有的窗口消息注册表；其他模块不得自行定义 `WM_APP + N`。
@@ -2089,7 +2089,7 @@ impl Host {
             .unwrap_or(window.snapshot_revision);
         // 输入前用最近一次构建的场景重命中指针；悬停变了说明这份场景已经
         // 不能表达当前瞬态，必须重建。
-        let hover_changed = Self::rehit_hover(window);
+        let hover_changed = self.rehit_hover(window);
         let fresh = !hover_changed
             && window.scene.as_ref().is_some_and(|scene| {
                 let key = scene.cache_key();
@@ -2649,15 +2649,10 @@ impl Host {
 
         // 指针操作会移动焦点或 caret；先结束任何组合，避免 preedit 跟随到别处。
         self.cancel_compositions(window)?;
-        let Some((node, visual, caret, disabled)) = window.scene.as_ref().and_then(|scene| {
+        let Some((node, visual, caret)) = window.scene.as_ref().and_then(|scene| {
             let node = scene.hit_test(point)?;
             let element = scene.node(node)?;
-            Some((
-                node,
-                element.visual(),
-                element.caret_index(point),
-                element.disabled(),
-            ))
+            Some((node, element.visual(), element.caret_index(point)))
         }) else {
             window.hovered = None;
             window.pressed = None;
@@ -2667,8 +2662,8 @@ impl Host {
                 .map_err(HostError::WindowState);
         };
 
-        // disabled 控件不聚焦、不激活，也不改变焦点。
-        if disabled {
+        // 禁用状态按整个元素路径判定；子元素不能因为自身没写 disabled 就激活。
+        if self.runtime.node_effectively_disabled(node).unwrap_or(true) {
             window.hovered = None;
             window.pressed = None;
             return Ok(());
@@ -2683,24 +2678,21 @@ impl Host {
             .is_ok_and(|report| report.reveal().needs_reveal());
         ignore_expected_dispatch(press)?;
 
-        match visual {
-            Visual::TextInput => {
-                // 可见切片内的点击通常不需要移动；caret 落在视口外时由同一
-                // 显露规则拉回。焦点与 caret 都没变时不做显露。
-                window.reveal_requested |= reveal;
-            }
-            Visual::Checkbox { .. } | Visual::Button { .. } => {
-                window.pressed = Some(node);
-                // 捕获转移会同步向旧捕获窗口送出 WM_CAPTURECHANGED；
-                // 在禁止重入的窗口里调用 SetCapture。
-                // 安全：捕获指针，拖动离开后的松开仍回到本窗口，但不再激活。
-                self.without_routing(Some(window.hwnd()), |_| unsafe {
-                    SetCapture(window.hwnd());
-                });
-            }
-            Visual::Container | Visual::Text => {
-                window.pressed = None;
-            }
+        if visual == Visual::TextInput {
+            // 可见切片内的点击通常不需要移动；caret 落在视口外时由同一
+            // 显露规则拉回。焦点与 caret 都没变时不做显露。
+            window.reveal_requested |= reveal;
+        }
+        // 按压目标是路由后的最近 click 元素，而不是命中的内层子节点；
+        // 松开时在同一目标上才激活。
+        window.pressed = self.runtime.click_target(node).ok().flatten();
+        if window.pressed.is_some() {
+            // 捕获转移会同步向旧捕获窗口送出 WM_CAPTURECHANGED；
+            // 在禁止重入的窗口里调用 SetCapture。
+            // 安全：捕获指针，拖动离开后的松开仍回到本窗口，但不再激活。
+            self.without_routing(Some(window.hwnd()), |_| unsafe {
+                SetCapture(window.hwnd());
+            });
         }
         Ok(())
     }
@@ -2807,10 +2799,20 @@ impl Host {
         let hovered = window
             .scene
             .as_ref()
-            .and_then(|scene| hover_at(scene, point));
+            .and_then(|scene| hover_at(scene, point))
+            .filter(|node| {
+                !self
+                    .runtime
+                    .node_effectively_disabled(*node)
+                    .unwrap_or(true)
+            });
         let mut changed = hovered != window.hovered;
         window.hovered = hovered;
-        if window.pressed.is_some() && window.pressed != hovered {
+        // 按压目标是路由后的祖先；指针仍在同一目标的子树内时保持按住。
+        if window.pressed.is_some()
+            && hovered.and_then(|hit| self.runtime.click_target(hit).ok().flatten())
+                != window.pressed
+        {
             window.pressed = None;
             changed = true;
         }
@@ -2922,23 +2924,19 @@ impl Host {
         // `WM_CAPTURECHANGED`，嵌套的 `with_host` 不能与外层 `&mut Host` 重叠。
         window.release_capture = true;
         window.paint_requested = true;
-        let activated = target.is_some_and(|node| {
-            window.scene.as_ref().is_some_and(|scene| {
-                scene.hit_test(point) == Some(node)
-                    && scene.node(node).is_some_and(|element| !element.disabled())
-            })
+        let activated = target.is_some_and(|pressed| {
+            !self
+                .runtime
+                .node_effectively_disabled(pressed)
+                .unwrap_or(true)
+                && window.scene.as_ref().is_some_and(|scene| {
+                    scene.hit_test(point).is_some_and(|hit| {
+                        self.runtime.click_target(hit).ok().flatten() == Some(pressed)
+                    })
+                })
         });
         if activated && let Some(node) = target {
-            let visual = window
-                .scene
-                .as_ref()
-                .and_then(|scene| scene.node(node))
-                .map(SceneElement::visual);
-            let report = match visual {
-                Some(Visual::Button { .. }) => self.runtime.activate_node(node),
-                Some(Visual::Checkbox { checked }) => self.runtime.change_node(node, !checked),
-                _ => Ok(TurnReport::default()),
-            };
+            let report = self.runtime.activate_node(node);
             // 激活处理器可能卸载当前焦点并结算到新的可见目标；runtime 在
             // 这个 turn 里报告了焦点变化，宿主必须像其它输入一样申请显露。
             window.reveal_requested |= report
@@ -2950,7 +2948,13 @@ impl Host {
         window.hovered = window
             .scene
             .as_ref()
-            .and_then(|scene| hover_at(scene, point));
+            .and_then(|scene| hover_at(scene, point))
+            .filter(|node| {
+                !self
+                    .runtime
+                    .node_effectively_disabled(*node)
+                    .unwrap_or(true)
+            });
         Ok(())
     }
 
@@ -4285,7 +4289,7 @@ impl Host {
         }
         // 构建前用上一份场景重命中最后指针位置：场景变化后，悬停路径必须
         // 从当前可命中的节点重新开始，而不是沿用旧目标。
-        Self::rehit_hover(window);
+        self.rehit_hover(window);
         refresh_interaction_paths(snapshot, window);
         let requested = window.scroll_offset;
         let preserve_press = window.preserve_press_on_next_rebuild;
@@ -4368,7 +4372,7 @@ impl Host {
     ///
     /// 场景构建前与输入派发前调用。按压目标是 capture-based 的，不在这里
     /// 重新评估；目标失效由构建后的 [`Host::revalidate_pointer`] 清除。
-    fn rehit_hover(window: &mut WindowHost) -> bool {
+    fn rehit_hover(&self, window: &mut WindowHost) -> bool {
         let Some(point) = window.pointer else {
             return false;
         };
@@ -4378,8 +4382,13 @@ impl Host {
         let hit = (!scene.scrollbar().is_some_and(|bar| bar.hit(point)))
             .then(|| scene.hit_test(point))
             .flatten();
-        let enabled =
-            hit.filter(|node| scene.node(*node).is_some_and(|element| !element.disabled()));
+        let enabled = hit.filter(|node| {
+            scene.node(*node).is_some_and(|element| !element.disabled())
+                && !self
+                    .runtime
+                    .node_effectively_disabled(*node)
+                    .unwrap_or(true)
+        });
         if enabled == window.hovered {
             return false;
         }
@@ -4406,13 +4415,27 @@ impl Host {
         let hit = (!scene.scrollbar().is_some_and(|bar| bar.hit(point)))
             .then(|| scene.hit_test(point))
             .flatten();
-        let enabled = hit.filter(|node| scene.node(*node).is_some_and(|e| !e.disabled()));
+        let enabled = hit.filter(|node| {
+            scene.node(*node).is_some_and(|e| !e.disabled())
+                && !self
+                    .runtime
+                    .node_effectively_disabled(*node)
+                    .unwrap_or(true)
+        });
         let hover_changed = enabled != window.hovered;
-        let press_stale = window
-            .pressed
-            .is_some_and(|pressed| scene.node(pressed).is_none_or(|element| element.disabled()));
+        let press_stale = window.pressed.is_some_and(|pressed| {
+            scene.node(pressed).is_none_or(|element| element.disabled())
+                || self
+                    .runtime
+                    .node_effectively_disabled(pressed)
+                    .unwrap_or(true)
+        });
         let press_cleared = press_stale
-            || (clear_press && window.pressed.is_some_and(|pressed| hit != Some(pressed)));
+            || (clear_press
+                && window.pressed.is_some_and(|pressed| {
+                    hit.and_then(|hit| self.runtime.click_target(hit).ok().flatten())
+                        != Some(pressed)
+                }));
         if !hover_changed && !press_cleared {
             return false;
         }
@@ -11725,6 +11748,110 @@ mod tests {
         assert!(
             host.windows[MAIN].reveal_requested,
             "the activation's settled focus requests reveal"
+        );
+    }
+
+    #[test]
+    fn a_pointer_click_reaches_a_clickable_view_and_blocks_disabled_subtrees() {
+        let row_clicks = Rc::new(Cell::new(0));
+        let nested_clicks = Rc::new(Cell::new(0));
+        let blocked_clicks = Rc::new(Cell::new(0));
+        let mut runtime = Runtime::new();
+        runtime
+            .declare_windows({
+                let row_clicks = row_clicks.clone();
+                let nested_clicks = nested_clicks.clone();
+                let blocked_clicks = blocked_clicks.clone();
+                move |catalog| {
+                    let row_clicks = row_clicks.clone();
+                    let nested_clicks = nested_clicks.clone();
+                    let blocked_clicks = blocked_clicks.clone();
+                    catalog.window(WindowSpec::new(MAIN).primary().sized(320, 240), move |_| {
+                        let row_clicks = row_clicks.clone();
+                        let nested_clicks = nested_clicks.clone();
+                        let blocked_clicks = blocked_clicks.clone();
+                        view! {
+                            <view>
+                                <view
+                                    aria:label="row"
+                                    style:height={once(px(80.0))}
+                                    on:click={move || row_clicks.set(row_clicks.get() + 1)}
+                                >
+                                    <button
+                                        aria:label="nested"
+                                        on:click={move || {
+                                            nested_clicks.set(nested_clicks.get() + 1)
+                                        }}
+                                    >"Nested"</button>
+                                </view>
+                                <view aria:label="locked" disabled={once(true)} style:height={once(px(80.0))}>
+                                    <button
+                                        aria:label="blocked"
+                                        on:click={move || {
+                                            blocked_clicks.set(blocked_clicks.get() + 1)
+                                        }}
+                                    >"Blocked"</button>
+                                </view>
+                            </view>
+                        }
+                    })?;
+                    Ok(())
+                }
+            })
+            .expect("declare the click-routing window");
+        let mut host = Host::open(runtime, HostConfig::hidden()).expect("open the hidden host");
+        host.render().expect("first frame");
+
+        let (row, nested, blocked, scale) = {
+            let snapshot = host.runtime.presentation().expect("snapshot");
+            let scene = host.scene(MAIN).expect("scene");
+            let rect = |label: &str| {
+                let id = snapshot.find_label(label).expect("element label").id();
+                scene.node(id).expect("scene node").rect()
+            };
+            (
+                rect("row"),
+                rect("nested"),
+                rect("blocked"),
+                scene.viewport().scale(),
+            )
+        };
+        let click = |host: &mut Host, point: Point| {
+            let lparam = pointer_lparam(point, scale);
+            with_main(host, |host, window| host.pointer_pressed(window, lparam));
+            with_main(host, |host, window| host.pointer_released(window, lparam));
+            host.render().expect("render after the click");
+        };
+
+        click(&mut host, Point::new(row.x + 8.0, row.y + row.height - 4.0));
+        assert_eq!(row_clicks.get(), 1, "the row view receives the click");
+        assert_eq!(nested_clicks.get(), 0);
+
+        click(
+            &mut host,
+            Point::new(
+                nested.x + nested.width / 2.0,
+                nested.y + nested.height / 2.0,
+            ),
+        );
+        assert_eq!(nested_clicks.get(), 1);
+        assert_eq!(
+            row_clicks.get(),
+            1,
+            "the nested button stops closest-wins propagation"
+        );
+
+        click(
+            &mut host,
+            Point::new(
+                blocked.x + blocked.width / 2.0,
+                blocked.y + blocked.height / 2.0,
+            ),
+        );
+        assert_eq!(
+            blocked_clicks.get(),
+            0,
+            "a disabled ancestor blocks native activation"
         );
     }
 

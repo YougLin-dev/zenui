@@ -50,6 +50,53 @@ fn editor() -> (Runtime, Rc<RefCell<Vec<CompositionEvent>>>) {
 }
 
 #[test]
+fn window_keydown_during_composition_is_consumed_without_defaults() {
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let mut app = Runtime::new();
+    app.declare_windows({
+        let events = events.clone();
+        move |catalog| {
+            catalog.window(WindowSpec::new("main").primary(), move |_| {
+                let events = events.clone();
+                view! { <Editor events={events} /> }
+            })?;
+            Ok(())
+        }
+    })
+    .expect("declare the window");
+    let window = app.show("main").expect("show the window");
+    app.focus("editor").expect("focus the composing input");
+    app.input("editor", "ab").expect("type the committed text");
+    app.compose_start("editor").expect("start composition");
+    app.compose_update("editor", "ni").expect("update preedit");
+
+    let report = app
+        .dispatch_intent(Intent::keydown_window(
+            window,
+            Key::Enter,
+            Modifiers::default(),
+        ))
+        .expect("window Enter during composition");
+    assert!(
+        report.outcome().consumed(),
+        "the composing editor consumes Enter"
+    );
+    assert_eq!(app.texts(), vec![String::from("ab")]);
+    assert_eq!(app.preedit("editor"), Some(String::from("ni")));
+
+    let report = app
+        .dispatch_intent(Intent::keydown_window(
+            window,
+            Key::Backspace,
+            Modifiers::default(),
+        ))
+        .expect("Backspace during composition is not rejected");
+    assert!(report.outcome().consumed());
+    assert_eq!(app.texts(), vec![String::from("ab")]);
+    assert_eq!(app.preedit("editor"), Some(String::from("ni")));
+}
+
+#[test]
 fn commit_inserts_at_the_local_caret_and_cancel_restores_it() {
     let (mut app, events) = editor();
     app.input("editor", "ab").expect("type the committed text");

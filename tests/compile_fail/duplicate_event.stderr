@@ -1,0 +1,5 @@
+error: duplicate event handler `on:click`
+ --> tests/compile_fail/duplicate_event.rs:5:39
+  |
+5 |         <button on:click={move || {}} on:click={move || {}}>"Add"</button>
+  |                                       ^^^^^^^^

@@ -95,6 +95,7 @@ fn lower_intrinsic(
     let mut inline_styles = Vec::new();
     let mut class_seen = false;
     let mut style_names = Vec::new();
+    let mut event_names = Vec::new();
     for attribute in element.attributes() {
         if let NodeAttribute::Attribute(attribute) = attribute {
             let key = attribute.key.to_string();
@@ -119,6 +120,15 @@ fn lower_intrinsic(
                 style_names.push(key.clone());
                 inline_styles.push(lower_style(&key, attribute)?);
                 continue;
+            }
+            if key.starts_with("on:") {
+                if event_names.contains(&key) {
+                    return Err(syn::Error::new_spanned(
+                        &attribute.key,
+                        format!("duplicate event handler `{key}`"),
+                    ));
+                }
+                event_names.push(key);
             }
         }
         attributes.push(lower_attribute(attribute)?);

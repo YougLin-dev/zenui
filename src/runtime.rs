@@ -2139,34 +2139,32 @@ impl State {
     }
 
     /// 从命中元素沿父链找最近的可处理 click；交互控件无 handler 时停止。
+    ///
+    /// 自身或祖先 `disabled` 让整个派发成为空操作；按钮与复选框即使没有
+    /// `on:click` 也是激活目标，因为它们有内建默认动作。
     fn closest_click_target(&self, hit: NodeId) -> Result<Option<usize>, DispatchError> {
-        let mut node = hit.node();
-        loop {
-            let slot = self
-                .nodes
-                .get(node)
-                .map_err(|_| DispatchError::StaleNode(hit))?;
-            if slot.kind == Some(NodeKindTag::Element) {
-                let payload = slot.payload as usize;
-                let live = self
-                    .elements
-                    .get(payload)
-                    .is_some_and(|element| element.id.node() == node);
-                if !live {
-                    return Err(DispatchError::StaleNode(hit));
-                }
-                if self.has_click_handler(payload) || self.is_submit_button(payload) {
-                    return Ok(Some(payload));
-                }
-                if self.is_interactive_control(payload) {
-                    return Ok(None);
-                }
-            }
-            let Some(parent) = slot.parent else {
-                return Ok(None);
-            };
-            node = parent;
+        let element = self.element_for_node(hit)?;
+        let path = self.element_path(element);
+        if path.iter().any(|slot| self.element_is_disabled(*slot)) {
+            return Ok(None);
         }
+        for payload in path.into_iter().rev() {
+            if self.has_click_handler(payload)
+                || self.is_submit_button(payload)
+                || self.is_activation_control(payload)
+            {
+                return Ok(Some(payload));
+            }
+            if self.is_interactive_control(payload) {
+                return Ok(None);
+            }
+        }
+        Ok(None)
+    }
+
+    /// 内建可激活控件；没有 handler 时仍有默认动作。
+    fn is_activation_control(&self, element: usize) -> bool {
+        matches!(self.element_tag(element), "button" | "checkbox")
     }
 
     /// 从根到命中元素的元素路径；结构节点透明。
@@ -2286,6 +2284,34 @@ impl State {
         };
         self.element_binding_table(element)
             .is_some_and(|table| table.bool_current(attr.binding) == Some(true))
+    }
+
+    /// 自身或任一祖先禁用；整个子树不参与输入、焦点与事件派发。
+    ///
+    /// 目标解析必须先看完整路径，不能只看命中元素自己的 `disabled`。
+    fn element_effectively_disabled(&self, element: usize) -> bool {
+        let mut node = self.elements[element].id.node();
+        loop {
+            let Ok(slot) = self.nodes.get(node) else {
+                // 路径已失效时按禁用处理，避免把旧节点重新变成可激活目标。
+                return true;
+            };
+            if slot.kind == Some(NodeKindTag::Element) {
+                let payload = slot.payload as usize;
+                if self
+                    .elements
+                    .get(payload)
+                    .is_some_and(|held| held.id.node() == node)
+                    && self.element_is_disabled(payload)
+                {
+                    return true;
+                }
+            }
+            let Some(parent) = slot.parent else {
+                return false;
+            };
+            node = parent;
+        }
     }
 
     /// `value` 绑定的写入代数；静态值与缺失绑定返回 `None`。
@@ -3080,7 +3106,7 @@ impl State {
         operation: NodeOperation,
     ) -> Result<(), DispatchError> {
         self.require_text_input(node, element, operation)?;
-        if self.element_is_disabled(element) {
+        if self.element_effectively_disabled(element) {
             return Err(DispatchError::Rejected {
                 node,
                 operation,
@@ -3224,7 +3250,7 @@ impl State {
 
     /// 原生控件与显式挂接 focus/blur 的元素参与遍历；禁用元素不参与接任或 Tab 顺序。
     fn is_focusable(&self, element: usize) -> bool {
-        !self.element_is_disabled(element) && self.element_is_inherently_focusable(element)
+        !self.element_effectively_disabled(element) && self.element_is_inherently_focusable(element)
     }
 
     /// 元素本身的键盘可聚焦语义；`disabled` 与可见性由调用方另行组合。
@@ -4410,6 +4436,24 @@ fn event_kind(event: &Event) -> EventKind {
         Event::CompositionUpdate(_) => EventKind::CompositionUpdate,
         Event::CompositionEnd(_) => EventKind::CompositionEnd,
         Event::CompositionCancel(_) => EventKind::CompositionCancel,
+    }
+}
+
+fn event_kind_name(kind: EventKind) -> &'static str {
+    match kind {
+        EventKind::Click => "click",
+        EventKind::Input => "input",
+        EventKind::Change => "change",
+        EventKind::Submit => "submit",
+        EventKind::KeyDown => "keydown",
+        EventKind::KeyDownCapture => "keydown_capture",
+        EventKind::KeyDownBubble => "keydown_bubble",
+        EventKind::Focus => "focus",
+        EventKind::Blur => "blur",
+        EventKind::CompositionStart => "compositionstart",
+        EventKind::CompositionUpdate => "compositionupdate",
+        EventKind::CompositionEnd => "compositionend",
+        EventKind::CompositionCancel => "compositioncancel",
     }
 }
 
@@ -6836,6 +6880,18 @@ impl Runtime {
                 let element_node = with_state(|state| {
                     state.register_node(NodeKindTag::Element, owner, parent_node)
                 });
+                // 同一种事件只允许一个槽；第二个槽永远不会被路由到。
+                let mut event_kinds = Vec::new();
+                for attr in &plan.attrs {
+                    if let Attr::Event(event) = attr {
+                        let kind = event_kind(event);
+                        if event_kinds.contains(&kind) {
+                            with_state(|state| state.dispose_owner(owner));
+                            return Err(MountError::DuplicateHandler(event_kind_name(kind)));
+                        }
+                        event_kinds.push(kind);
+                    }
+                }
                 let children =
                     match self.mount_plan(MountPlan::new(plan.children), owner, Some(element_node))
                     {
@@ -8209,6 +8265,9 @@ impl Runtime {
         let state = self.state.clone();
         context::install(&state, || {
             let element = with_state(|state| state.element_for_node(node))?;
+            if with_state(|state| state.element_effectively_disabled(element)) {
+                return Ok(TurnReport::default());
+            }
             let tree = with_state(|state| state.tree_for_element(element));
             let reveal_before = tree.map(|tree| with_state(|state| state.reveal_probe(tree)));
             let (event_id, event) =
@@ -8223,7 +8282,12 @@ impl Runtime {
                 }
                 Err(panic) => report.push_error(TurnError::HandlerPanicked(panic)),
             }
-            self.finish_command().map_err(DispatchError::Command)?;
+            if self
+                .finish_command_changed()
+                .map_err(DispatchError::Command)?
+            {
+                report.mark_changed();
+            }
             finish_reveal(&mut report, tree, reveal_before.as_ref());
             Ok(report)
         })
@@ -8231,6 +8295,9 @@ impl Runtime {
 
     /// 路由后的激活：先运行最近 click handler，再执行 `type=submit` 表单默认。
     fn activate_element(&mut self, element: usize) -> Result<TurnReport, DispatchError> {
+        if with_state(|state| state.element_effectively_disabled(element)) {
+            return Ok(TurnReport::default());
+        }
         let node = with_state(|state| state.elements[element].id);
         let tree = with_state(|state| state.tree_for_element(element));
         let before = tree.map(|tree| with_state(|state| state.reveal_probe(tree)));
@@ -8249,12 +8316,24 @@ impl Runtime {
         Ok(report)
     }
 
-    /// `type=submit` 按钮的 click 默认：提交最近 form 一次。
+    /// 内建 click 默认：按钮提交最近 form，复选框切换一次。
     fn apply_click_default(
         &mut self,
         element: usize,
         report: &mut TurnReport,
     ) -> Result<(), DispatchError> {
+        if with_state(|state| state.element_tag(element) == "checkbox") {
+            let next = with_state(|state| match state.element_local(element) {
+                LocalState::Checkbox { checked } => Some(!checked),
+                _ => None,
+            });
+            if let Some(next) = next {
+                let id = with_state(|state| state.elements[element].id);
+                let changed = self.change_node(id, next)?;
+                report.absorb(changed);
+            }
+            return Ok(());
+        }
         if !with_state(|state| state.is_submit_button(element)) {
             return Ok(());
         }
@@ -8306,6 +8385,25 @@ impl Runtime {
     /// 路由原语：等价于派发一个指针 Click Intent。
     pub fn activate_node(&mut self, node: NodeId) -> Result<TurnReport, DispatchError> {
         self.dispatch_intent(Intent::click(node))
+    }
+
+    /// 命中节点最终会激活的元素；`None` 表示没有可用的 click 目标。
+    ///
+    /// 宿主在按下时解析并记住该目标，松开时再用同一目标比较，避免容器
+    /// 子节点或槽位复用把激活落到错误元素。自身或祖先禁用返回 `None`。
+    pub fn click_target(&self, node: NodeId) -> Result<Option<NodeId>, DispatchError> {
+        let state = self.state.borrow();
+        match state.closest_click_target(node)? {
+            Some(element) => Ok(Some(state.elements[element].id)),
+            None => Ok(None),
+        }
+    }
+
+    /// 节点是否处于禁用子树；宿主据此抑制 hover/press 与激活。
+    pub fn node_effectively_disabled(&self, node: NodeId) -> Result<bool, DispatchError> {
+        let state = self.state.borrow();
+        let element = state.element_for_node(node)?;
+        Ok(state.element_effectively_disabled(element))
     }
 
     /// Press turn：最近可聚焦祖先获得焦点，text-input 按宿主偏移放置 caret。
@@ -8427,7 +8525,16 @@ impl Runtime {
                     }
                     let focused =
                         with_state(|state| state.presented_focus_in(TreeSlot::Window(window.key)));
-                    self.route_keydown(focused, Some(window), key, modifiers)?
+                    // 组合中的按键不进入普通路由与 L4 默认；窗口目标与节点
+                    // 目标必须遵守同一条 L0 规则。
+                    if let Some(element) = focused
+                        && with_state(|state| state.element_local(element).is_composing())
+                    {
+                        let node = with_state(|state| state.elements[element].id);
+                        self.keydown_node(node, key)?
+                    } else {
+                        self.route_keydown(focused, Some(window), key, modifiers)?
+                    }
                 }
                 EventTarget::App => TurnReport::default(),
             };
@@ -8501,7 +8608,12 @@ impl Runtime {
         }
         report.set_outcome(key_event.is_consumed(), key_event.prevents_default());
         with_state(|state| state.phase = Phase::Idle);
-        self.finish_command().map_err(DispatchError::Command)?;
+        if self
+            .finish_command_changed()
+            .map_err(DispatchError::Command)?
+        {
+            report.mark_changed();
+        }
         Ok(report)
     }
 
@@ -8591,16 +8703,12 @@ impl Runtime {
                 } else {
                     self.focus_next_in(window)
                 };
-                if result.is_ok() {
-                    report.mark_changed();
-                }
                 result.map_err(|_| DispatchError::TargetClosed)?;
             }
             Key::Enter | Key::Space => {
                 let Some(element) = hit else {
                     return Ok(());
                 };
-                let id = with_state(|state| state.elements[element].id);
                 let tag = with_state(|state| state.element_tag(element));
                 match (key, tag) {
                     (Key::Enter | Key::Space, "button") => {
@@ -8609,34 +8717,11 @@ impl Runtime {
                         }) {
                             let activated = self.activate_element(element)?;
                             report.absorb(activated);
-                            report.mark_changed();
                         }
                     }
-                    (Key::Space, "checkbox") => {
-                        let next = with_state(|state| match state.element_local(element) {
-                            LocalState::Checkbox { checked } => Some(!checked),
-                            _ => None,
-                        });
-                        if let Some(next) = next {
-                            let has_change = with_state(|state| {
-                                state.element_events(element).iter().any(|event| {
-                                    state
-                                        .events
-                                        .get(*event)
-                                        .and_then(Option::as_ref)
-                                        .is_some_and(|event| event_kind(event) == EventKind::Change)
-                                })
-                            });
-                            if has_change {
-                                let change = self.change_node(id, next)?;
-                                report.absorb(change);
-                            } else {
-                                with_state(|state| {
-                                    state.update_local(element, LocalUpdate::Change(next))
-                                });
-                            }
-                            report.mark_changed();
-                        }
+                    (Key::Enter | Key::Space, "checkbox") => {
+                        let activated = self.activate_element(element)?;
+                        report.absorb(activated);
                     }
                     (Key::Enter, "text-input") => {
                         let form = with_state(|state| state.ancestor_form(element));
@@ -8647,7 +8732,6 @@ impl Runtime {
                             if has_submit {
                                 let submitted = self.submit_node(form_id)?;
                                 report.absorb(submitted);
-                                report.mark_changed();
                             }
                         }
                     }
@@ -9504,13 +9588,16 @@ impl Runtime {
 
     /// 按 Node ID 派发一次复选框 change。
     ///
-    /// 有 `on:change` 时先更新 proposed 再运行一次 handler；没有 handler 时
-    /// 直接本地切换。受控 checkbox 在 flush 后按 `checked` 绑定对齐，非受控
-    /// 的本地值由呈现层继续报告。
+    /// `on:change` 先运行，本地值只在 handler 未 panic 后应用；受控 checkbox
+    /// 在 flush 后按 `checked` 绑定对齐，非受控的本地值由呈现层继续报告。
+    /// 自身或祖先禁用时整次派发为空操作。
     pub fn change_node(&mut self, node: NodeId, value: bool) -> Result<TurnReport, DispatchError> {
         let state = self.state.clone();
         context::install(&state, || {
             let element = with_state(|state| state.element_for_node(node))?;
+            if with_state(|state| state.element_effectively_disabled(element)) {
+                return Ok(TurnReport::default());
+            }
             let tree = with_state(|state| state.tree_for_element(element));
             let reveal_before = tree.map(|tree| with_state(|state| state.reveal_probe(tree)));
             let before = with_state(|state| match state.element_local(element) {
@@ -9525,25 +9612,33 @@ impl Runtime {
             };
             let event = with_state(|state| state.take_element_event(element, EventKind::Change));
             let mut report = TurnReport::default();
+            let mut apply = true;
             if let Some((event_id, event)) = event {
                 with_state(|state| {
                     state.phase = Phase::Event;
                     state.fault = None;
                     state.write_error = None;
-                    state.update_local(element, LocalUpdate::Change(value));
                 });
-                let panic = invoke_event(event_id, event, |event| {
-                    if let Event::Change(handler) = event {
-                        handler(value);
-                    }
-                })
-                .err();
+                let outcome = invoke_event(event_id, event, |event| match event {
+                    Event::Change(handler) => handler(value),
+                    _ => HandlerOutcome::Ok,
+                });
                 with_state(|state| state.phase = Phase::Idle);
-                if let Some(panic) = panic {
-                    let _ = self.finish_command();
-                    return Err(DispatchError::Panic(panic));
+                match outcome {
+                    Ok(HandlerOutcome::Ok) => {}
+                    Ok(HandlerOutcome::Err(error)) => {
+                        report.push_error(TurnError::HandlerFailed(error));
+                        apply = false;
+                    }
+                    Err(panic) => {
+                        // handler 失败时 proposed 值不落地；已提交的模型写入仍由
+                        // 收尾 flush 处理。
+                        let _ = self.finish_command();
+                        return Err(DispatchError::Panic(panic));
+                    }
                 }
-            } else {
+            }
+            if apply {
                 with_state(|state| state.update_local(element, LocalUpdate::Change(value)));
             }
             self.finish_command().map_err(DispatchError::Command)?;
@@ -9580,6 +9675,9 @@ impl Runtime {
         let state = self.state.clone();
         context::install(&state, || {
             let element = with_state(|state| state.element_for_node(node))?;
+            if with_state(|state| state.element_effectively_disabled(element)) {
+                return Ok(TurnReport::default());
+            }
             let tree = with_state(|state| state.tree_for_element(element));
             let reveal_before = tree.map(|tree| with_state(|state| state.reveal_probe(tree)));
             let (event_id, event) =
@@ -9592,9 +9690,13 @@ impl Runtime {
             let mut report = TurnReport::default();
             record_handler_outcome(outcome, &mut report);
             with_state(|state| state.phase = Phase::Idle);
-            self.finish_command().map_err(DispatchError::Command)?;
+            if self
+                .finish_command_changed()
+                .map_err(DispatchError::Command)?
+            {
+                report.mark_changed();
+            }
             report.set_outcome(submit_event.is_consumed(), submit_event.is_prevented());
-            report.mark_changed();
             finish_reveal(&mut report, tree, reveal_before.as_ref());
             Ok(report)
         })
@@ -9618,6 +9720,9 @@ impl Runtime {
         let state = self.state.clone();
         context::install(&state, || {
             let element = with_state(|state| state.element_for_node(node))?;
+            if with_state(|state| state.element_effectively_disabled(element)) {
+                return Ok(TurnReport::default());
+            }
             let tree = with_state(|state| state.tree_for_element(element));
             let reveal_before = tree.map(|tree| with_state(|state| state.reveal_probe(tree)));
             if with_state(|state| state.element_local(element).is_composing()) {
@@ -9905,6 +10010,17 @@ impl Runtime {
     fn finish_command(&mut self) -> Result<(), MountError> {
         self.finish_command_without_ui()?;
         self.refresh_internal()
+    }
+
+    /// 收尾并报告本次 flush 是否推进了任一树的 revision。
+    ///
+    /// `changed` 必须来自实际提交，而不是命令类型：空 click、无移动的 Tab
+    /// 与无写入的 submit 都不能让宿主做第二次场景构建。
+    fn finish_command_changed(&mut self) -> Result<bool, MountError> {
+        self.finish_command_without_ui()?;
+        let before = with_state(|state| state.next_tree_revision);
+        self.refresh_internal()?;
+        Ok(with_state(|state| state.next_tree_revision) != before)
     }
 
     /// 事件 handler 结束后的统一收尾。
@@ -10469,7 +10585,10 @@ fn collect_focusable(state: &State, nodes: &[MountedNode], order: &mut Vec<usize
                 if state.is_focusable(*id) {
                     order.push(*id);
                 }
-                collect_focusable(state, &state.elements[*id].children, order);
+                // 禁用元素的子树整体退出焦点顺序，不能只跳过元素本身。
+                if !state.element_is_disabled(*id) {
+                    collect_focusable(state, &state.elements[*id].children, order);
+                }
             }
             MountedNode::Component(id) => {
                 collect_focusable(state, &state.components[*id].children, order);
