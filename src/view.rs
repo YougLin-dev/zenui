@@ -41,6 +41,8 @@ pub enum MountError {
     /// 组件 setup 的 `Read::read_once()?` 读取失败。
     Read(ReadFault),
     DuplicateKey,
+    /// 同一个元素声明了同一种事件处理器；第二个槽永远不会运行。
+    DuplicateHandler(&'static str),
     Write(WriteError),
     /// Store 拒绝的读取或投影。
     Store(StoreError),
@@ -78,6 +80,7 @@ impl fmt::Display for MountError {
             Self::Field(error) => write!(f, "{error}"),
             Self::Read(fault) => write!(f, "{fault}"),
             Self::DuplicateKey => f.write_str("duplicate For key before interface publication"),
+            Self::DuplicateHandler(kind) => write!(f, "duplicate `{kind}` handler on one element"),
             Self::Write(error) => write!(f, "{error}"),
             Self::Store(error) => write!(f, "{error}"),
             Self::WrongStore { expected, found } => write!(
@@ -901,7 +904,7 @@ impl<E: Into<HandlerError>> IntoHandlerOutcome for Result<(), E> {
 pub enum Event {
     Click(Box<dyn FnMut() -> HandlerOutcome>),
     Input(Box<dyn FnMut(String) -> HandlerOutcome>),
-    Change(Box<dyn FnMut(bool)>),
+    Change(Box<dyn FnMut(bool) -> HandlerOutcome>),
     Submit(Box<dyn FnMut(&mut SubmitEvent) -> HandlerOutcome>),
     KeyDown(Box<dyn FnMut(&mut KeyEvent) -> HandlerOutcome>),
     KeyDownCapture(Box<dyn FnMut(&mut KeyEvent) -> HandlerOutcome>),
@@ -1208,8 +1211,13 @@ where
     })))
 }
 
-pub fn on_change(handler: impl FnMut(bool) + 'static) -> Attr {
-    Attr::Event(Event::Change(Box::new(handler)))
+pub fn on_change<R>(mut handler: impl FnMut(bool) -> R + 'static) -> Attr
+where
+    R: IntoHandlerOutcome,
+{
+    Attr::Event(Event::Change(Box::new(move |value| {
+        handler(value).into_handler_outcome()
+    })))
 }
 
 pub fn on_submit<R>(mut handler: impl FnMut(&mut SubmitEvent) -> R + 'static) -> Attr
