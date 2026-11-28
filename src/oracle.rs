@@ -607,6 +607,11 @@ fn try_random_op(rng: &mut Rng, model: &Model) -> Option<Op> {
         7 => (model.rows.len() < MAX_ROWS).then_some(Op::AddRow(window)),
         8 => Some(Op::Reorder(window)),
         9 => {
+            // Scroll 同时应用到两个窗口；隐藏/关闭挂起窗口会拒绝结构输入，
+            // 因此只在两个窗口都可见时生成该操作。
+            if visible.len() < WINDOW_COUNT {
+                return None;
+            }
             let (_, _, total) = model.effective_row_window();
             Some(Op::Scroll(
                 window,

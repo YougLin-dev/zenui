@@ -897,6 +897,8 @@ pub enum WindowError {
     State(&'static str),
     /// 窗口仍然存活，但处于隐藏状态。
     Hidden,
+    /// 窗口仍有待结算的关闭确认，输入与结构写入挂起。
+    Suspended,
     /// 该 activation 已关闭或被更新的一代取代。
     Stale,
     /// 一个行窗口批次里同一个行带出现了不止一次。
@@ -924,6 +926,7 @@ impl fmt::Display for WindowError {
             }
             Self::State(message) => f.write_str(message),
             Self::Hidden => f.write_str("the window is hidden"),
+            Self::Suspended => f.write_str("the window is suspended by a pending close"),
             Self::Stale => f.write_str("the window activation is no longer live"),
             Self::DuplicateRowBand => {
                 f.write_str("a row-window batch names the same band more than once")
