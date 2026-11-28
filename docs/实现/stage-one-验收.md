@@ -37,7 +37,7 @@ tasks: delivered=2 | 2 remaining | Add | All | Active | Done | Reverse | Clear d
 
 这证明同一个 target Todo 走完输入、添加、完成、筛选、重排、删除、窗口任务和 app 任务；它不证明原生呈现。本页保留阶段一时的输出记录；#152 之后 `Preview import` 已被真实的 `Import file` 流程替换。
 
-`view!` 数据位由 `IntoText`/`IntoNode` 等类型接受 handle、字面量与 `once`，没有对任意零参数闭包的实现；事件位才是 typed handler 闭包。示例中的 `FilterButton`、`TodoItem` 与 `For` factory 捕获 Copy handle；`title.clone()` 只为 `once` 文本位保留一个独立字符串，`value.clone()` 在 input handler 中把值同时交给本地编辑状态和模型事务，其余分支不复制状态。
+`view!` 数据位由 `IntoText`/`IntoNode` 等类型接受 handle、字面量与 `once`，没有对任意零参数闭包的实现；事件位才是 typed handler 闭包（#384 起，`view!` 会在文本子节点、intrinsic 的 `value`/`disabled`/`checked`/`aria:*`/`style:*` 与 `Show when` 把无参数闭包降为隐式 memo，再以 memo 句柄进入这些类型）。示例中的 `FilterButton`、`TodoItem` 与 `For` factory 捕获 Copy handle；`title.clone()` 只为 `once` 文本位保留一个独立字符串，`value.clone()` 在 input handler 中把值同时交给本地编辑状态和模型事务，其余分支不复制状态。
 
 ## 路线图完成判据对照
 

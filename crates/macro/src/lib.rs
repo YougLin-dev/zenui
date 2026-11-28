@@ -60,9 +60,12 @@ fn lower_block(block: &Block) -> syn::Result<TokenStream> {
                 ::zenui::view::text_static(#literal)
             })
         }
-        expression => Ok(quote_spanned! {expression.span()=>
-            ::zenui::view::child(#expression)
-        }),
+        expression => {
+            let value = data_position(expression)?;
+            Ok(quote_spanned! {expression.span()=>
+                ::zenui::view::child(#value)
+            })
+        }
     }
 }
 
@@ -176,8 +179,9 @@ fn lower_style(key: &str, attribute: &rstml::node::KeyedAttribute) -> syn::Resul
         }
     };
     let expression = unbraced(expression(attribute)?);
+    let value = data_position(expression)?;
     Ok(quote_spanned! {expression.span()=>
-        ::zenui::view::#constructor(#expression)
+        ::zenui::view::#constructor(#value)
     })
 }
 
@@ -427,11 +431,22 @@ fn lower_attribute(attribute: &NodeAttribute) -> syn::Result<TokenStream> {
                     ::zenui::view::attr(#key, ::zenui::once(#literal))
                 });
             }
+            let value = if closure_sugar_attribute(&key) {
+                data_position(expression)?
+            } else {
+                quote! { #expression }
+            };
             Ok(quote_spanned! {expression.span()=>
-                ::zenui::view::attr(#key, #expression)
+                ::zenui::view::attr(#key, #value)
             })
         }
     }
+}
+
+/// 方案 §6.2 只在这些 intrinsic 数据属性上把闭包降为 memo；
+/// `role`/`id`/`type` 仍只接受 handle、`Once` 或字面量。
+fn closure_sugar_attribute(key: &str) -> bool {
+    matches!(key, "value" | "disabled" | "checked") || key.starts_with("aria:")
 }
 
 /// 闭包第一个参数的类型形状；用于兼容旧的按值 payload 与 `String`/`bool` 签名。
@@ -471,6 +486,36 @@ fn closure_expression(expression: &Expr) -> Option<&syn::ExprClosure> {
             syn::Stmt::Expr(expr, _) => closure_expression(expr),
             _ => None,
         },
+        _ => None,
+    }
+}
+
+/// 数据位置的闭包字面量在挂载时降为隐式 `memo`（方案 §6.2 的位置表）。
+///
+/// 只认字面闭包本身；带语句或多语句的块保持原表达式，交给类型检查。
+/// 闭包按 `move` 捕获：`memo` 要求 `'static`，而句柄（Signal/Memo/Field）
+/// 是 `Copy`，移动捕获后仍可在其他位置使用。
+fn data_position(expression: &Expr) -> syn::Result<TokenStream> {
+    let Some(closure) = closure_literal(expression) else {
+        return Ok(quote! { #expression });
+    };
+    if !closure.inputs.is_empty() {
+        return Err(syn::Error::new_spanned(
+            closure,
+            "data-position closures take no arguments; use `on:*` for event payloads",
+        ));
+    }
+    let mut closure = closure.clone();
+    closure.capture = Some(syn::token::Move::default());
+    Ok(quote_spanned! {expression.span()=>
+        ::zenui::memo(#closure)
+    })
+}
+
+/// 严格匹配闭包字面量：只解一层单表达式块，不进入多语句块。
+fn closure_literal(expression: &Expr) -> Option<&syn::ExprClosure> {
+    match unbraced(expression) {
+        Expr::Closure(closure) => Some(closure),
         _ => None,
     }
 }
@@ -589,7 +634,7 @@ fn lower_show(element: &NodeElement<rstml::Infallible>) -> syn::Result<TokenStre
     let when = when.ok_or_else(|| syn::Error::new_spanned(element.name(), "Show needs `when`"))?;
     let when = match bool_literal(when) {
         Some(literal) => quote! { ::zenui::once(#literal) },
-        None => quote! { #when },
+        None => data_position(when)?,
     };
     let then = children_plan(element)?;
     let fallback = match fallback {
@@ -853,5 +898,68 @@ mod tests {
     fn components_must_return_a_mount_result() {
         let error = expand_component(quote! { fn Bad() -> u8 { 0 } }).unwrap_err();
         assert!(error.to_string().contains("MountResult"));
+    }
+
+    #[test]
+    fn data_position_closures_lower_to_implicit_memos() {
+        let expanded = expand(quote! {
+            <view>
+                <text>{|| format!("{}", count.get())}</text>
+                <button disabled={|| count.get() == 0}>"Clear"</button>
+                <view style:color={|| tint.get()} />
+                <Show when={|| shown.get()}><text>"Shown"</text></Show>
+            </view>
+        })
+        .expect("data closures lower");
+        let tokens = expanded.to_string();
+        assert_eq!(
+            tokens.matches("zenui :: memo").count(),
+            4,
+            "text, attribute, style and Show positions each become a memo: {tokens}"
+        );
+    }
+
+    #[test]
+    fn event_and_factory_closures_are_not_data_memos() {
+        let expanded = expand(quote! {
+            <button on:click={|| save()}>"Save"</button>
+        })
+        .expect("event closures lower as handlers");
+        assert!(
+            !expanded.to_string().contains("memo"),
+            "an event handler is not a data position"
+        );
+
+        let expanded = expand(quote! {
+            <For each={rows} key={|row| row.id}>
+                {|row| Ok(MountPlan::new(vec![]))}
+            </For>
+        })
+        .expect("For key and row factory lower as closures");
+        assert!(
+            !expanded.to_string().contains("memo"),
+            "For key and the row factory are not data positions"
+        );
+    }
+
+    #[test]
+    fn only_listed_data_attributes_lower_closures() {
+        let expanded = expand(quote! {
+            <view role={|| format!("role")} />
+        })
+        .expect("an unlisted attribute keeps the expression");
+        assert!(
+            !expanded.to_string().contains("memo"),
+            "role is not in the §6.2 closure position table"
+        );
+    }
+
+    #[test]
+    fn data_position_closures_must_take_no_arguments() {
+        let error = expand(quote! {
+            <button disabled={|value: bool| value}>"Blocked"</button>
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("take no arguments"));
     }
 }
