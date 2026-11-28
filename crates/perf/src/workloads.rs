@@ -737,6 +737,43 @@ fn memory_soak() -> PerfResult<Measurement> {
         high.memo_deps_storage_bytes,
         after.memo_deps_storage_bytes,
     );
+    growth(
+        "free_signal_slots",
+        high.free_signal_slots,
+        after.free_signal_slots,
+    );
+    growth(
+        "free_memo_slots",
+        high.free_memo_slots,
+        after.free_memo_slots,
+    );
+    growth(
+        "binding_consumer_edges",
+        high.binding_consumer_edges,
+        after.binding_consumer_edges,
+    );
+    growth(
+        "binding_consumer_nodes",
+        high.binding_consumer_nodes,
+        after.binding_consumer_nodes,
+    );
+    growth(
+        "field_write_entries",
+        high.field_write_entries,
+        after.field_write_entries,
+    );
+    growth(
+        "write_epoch_entries",
+        high.write_epoch_entries,
+        after.write_epoch_entries,
+    );
+    growth("owner_records", high.owner_records, after.owner_records);
+    put(
+        &mut counters,
+        "signal_memo_bytes",
+        memory.signal_memo_bytes as u64,
+    );
+    put(&mut counters, "owner_bytes", memory.owner_bytes as u64);
 
     Ok(Measurement {
         counters,
@@ -753,6 +790,15 @@ fn memory_soak() -> PerfResult<Measurement> {
             ("storage_growth_memo_deps_storage", 16),
             ("storage_growth_memo_storage_bytes", 256),
             ("storage_growth_memo_deps_storage_bytes", 256),
+            ("storage_growth_free_signal_slots", 4),
+            ("storage_growth_free_memo_slots", 4),
+            ("storage_growth_binding_consumer_edges", 64),
+            ("storage_growth_binding_consumer_nodes", 16),
+            ("storage_growth_field_write_entries", 8),
+            ("storage_growth_write_epoch_entries", 8),
+            ("storage_growth_owner_records", 4),
+            ("signal_memo_bytes", 512 * 1024),
+            ("owner_bytes", 256 * 1024),
             (
                 "rowset_bytes",
                 (ROWS * std::mem::size_of::<RowId>() * 2 + 512) as u64,

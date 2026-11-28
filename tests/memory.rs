@@ -137,6 +137,94 @@ fn mounted_nodes_follow_the_window_while_the_rowset_follows_the_total() {
     );
 }
 
+#[component]
+fn Payload() -> MountResult<MountPlan> {
+    // 4000+ 字节的 owned 值：释放后必须从 `signal_memo_bytes` 消失。
+    let draft = signal("payload-".repeat(500));
+    let len = memo(move || draft.get().len().to_string());
+    view! { <text>{len}</text> }
+}
+
+#[component]
+fn ReactiveChurn() -> MountResult<MountPlan> {
+    let open = signal(false);
+    view! {
+        <view>
+            <button aria:label="toggle" on:click={move || open.set(!open.get())}>"Toggle"</button>
+            <Show when={open}>
+                <Payload />
+            </Show>
+        </view>
+    }
+}
+
+#[test]
+fn reactive_slots_recycle_and_release_owned_value_bytes() {
+    let mut app = Runtime::new();
+    app.mount(|| view! { <ReactiveChurn /> }).expect("mount");
+    let baseline = app.memory_report();
+    let base_storage = app.storage_report();
+    assert_eq!(baseline.live_signals, 1, "only the host toggle signal");
+    assert_eq!(baseline.live_memos, 0);
+
+    app.click_label("toggle").expect("open the payload");
+    let opened = app.memory_report();
+    let opened_storage = app.storage_report();
+    assert_eq!(opened.live_signals, 2);
+    assert_eq!(opened.live_memos, 1);
+    assert!(
+        opened.signal_memo_bytes >= 4_000,
+        "the owned payload is counted: {opened:?}"
+    );
+
+    app.click_label("toggle").expect("close the payload");
+    let closed = app.memory_report();
+    assert_eq!(closed.live_signals, 1);
+    assert_eq!(closed.live_memos, 0);
+    assert!(
+        closed.signal_memo_bytes <= baseline.signal_memo_bytes + 512,
+        "the released payload bytes leave the report: baseline={baseline:?} closed={closed:?}"
+    );
+    let closed_storage = app.storage_report();
+    assert_eq!(
+        closed_storage.free_signal_slots,
+        base_storage.free_signal_slots + 1,
+        "the payload signal returns to the free list"
+    );
+    assert_eq!(
+        closed_storage.free_memo_slots,
+        base_storage.free_memo_slots + 1,
+        "the payload memo returns to the free list"
+    );
+
+    for _ in 0..20 {
+        app.click_label("toggle").expect("remount the payload");
+        app.click_label("toggle").expect("release the payload");
+    }
+    let after = app.storage_report();
+    assert_eq!(
+        after.signal_slots, opened_storage.signal_slots,
+        "signal slots are reused instead of appended: opened={opened_storage:?} after={after:?}"
+    );
+    assert_eq!(
+        after.memo_slots, opened_storage.memo_slots,
+        "memo slots are reused instead of appended: opened={opened_storage:?} after={after:?}"
+    );
+    assert_eq!(
+        after.binding_consumer_edges, closed_storage.binding_consumer_edges,
+        "consumer edges follow the mounted payload: after={after:?}"
+    );
+    assert_eq!(
+        after.binding_consumer_nodes, closed_storage.binding_consumer_nodes,
+        "consumer nodes follow the mounted payload: after={after:?}"
+    );
+    let final_mem = app.memory_report();
+    assert!(
+        final_mem.signal_memo_bytes <= baseline.signal_memo_bytes + 512,
+        "churn does not retain payload bytes: baseline={baseline:?} final={final_mem:?}"
+    );
+}
+
 #[test]
 fn two_windows_share_one_rowset_projection() {
     let mut app = Runtime::new();
@@ -224,5 +312,24 @@ fn storage_stays_bounded_across_window_and_row_churn() {
             && after.memo_storage_bytes == high.memo_storage_bytes
             && after.memo_deps_storage_bytes <= high.memo_deps_storage_bytes + 256,
         "memo and dependency storage are reused across churn: high={high:?} after={after:?}"
+    );
+    assert!(
+        after.binding_consumer_edges <= high.binding_consumer_edges + 64
+            && after.binding_consumer_nodes <= high.binding_consumer_nodes + 64,
+        "binding consumer edges follow mounted nodes: high={high:?} after={after:?}"
+    );
+    assert!(
+        after.field_write_entries <= high.field_write_entries + 8
+            && after.write_epoch_entries <= high.write_epoch_entries + 8,
+        "deleted rows release their interaction history: high={high:?} after={after:?}"
+    );
+    assert!(
+        after.owner_records <= high.owner_records + 4,
+        "owner records follow mounted structure: high={high:?} after={after:?}"
+    );
+    assert!(
+        app.memory_report().owner_bytes <= 64 * 1024,
+        "owner bookkeeping stays bounded: {:?}",
+        app.memory_report()
     );
 }

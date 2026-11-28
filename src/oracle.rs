@@ -37,11 +37,14 @@ use crate::view::{ReadFault, ReadValue};
 // memo 重算：oracle 自己的拓扑缓存，生产 `MemoCell` 保持只读。
 // ---------------------------------------------------------------------------
 
+/// oracle 的槽位键：槽位复用后代际不同，缓存不能只按 id 命中。
+type MemoKey = (u32, u32);
+
 struct OracleMemos {
     runtime: u32,
-    values: BTreeMap<u32, Rc<dyn Any>>,
-    computing: BTreeSet<u32>,
-    poisoned: BTreeSet<u32>,
+    values: BTreeMap<MemoKey, Rc<dyn Any>>,
+    computing: BTreeSet<MemoKey>,
+    poisoned: BTreeSet<MemoKey>,
 }
 
 thread_local! {
@@ -58,20 +61,24 @@ enum Step {
 }
 
 /// `Memo::read_result` 的 oracle 入口；oracle 未安装时返回 `None`。
-pub(crate) fn memo_read<T: ReactiveValue>(runtime: u32, id: u32) -> Option<Result<T, ReadFault>> {
+pub(crate) fn memo_read<T: ReactiveValue>(
+    runtime: u32,
+    id: u32,
+    generation: u32,
+) -> Option<Result<T, ReadFault>> {
     let active = ORACLE.with(|cell| {
         cell.borrow()
             .as_ref()
             .is_some_and(|oracle| oracle.runtime == runtime)
     });
-    active.then(|| memo_read_installed::<T>(id))
+    active.then(|| memo_read_installed::<T>((id, generation)))
 }
 
-fn memo_read_installed<T: ReactiveValue>(id: u32) -> Result<T, ReadFault> {
+fn memo_read_installed<T: ReactiveValue>(key: MemoKey) -> Result<T, ReadFault> {
     loop {
-        match memo_step(id) {
+        match memo_step(key) {
             Step::Ready => {
-                let value = oracle_value(id).expect("a ready oracle memo has a value");
+                let value = oracle_value(key).expect("a ready oracle memo has a value");
                 return Ok((*value.downcast::<T>().expect("oracle memo value type")).clone());
             }
             Step::Cycle => return Err(ReadFault::GraphCycle),
@@ -81,39 +88,43 @@ fn memo_read_installed<T: ReactiveValue>(id: u32) -> Result<T, ReadFault> {
             // 重算只能知道“会 panic”，无法从源推出被保留的旧值，因此按合同
             // 读取生产保留值；没有旧值时仍是 typed fault。
             Step::Poisoned => {
-                return production_memo_value::<T>(id).ok_or(ReadFault::ComputedPanicked);
+                return production_memo_value::<T>(key).ok_or(ReadFault::ComputedPanicked);
             }
             Step::Compute(compute) => {
                 let outcome = catch_panic(|| compute.call());
-                memo_complete(id, outcome)?;
+                memo_complete(key, outcome)?;
             }
         }
     }
 }
 
-fn memo_step(id: u32) -> Step {
+fn memo_step(key: MemoKey) -> Step {
+    let (id, generation) = key;
     let (compute, disposed) = crate::context::with_state(|state| {
         let cell = &state.memos[id as usize];
-        (cell.compute.clone(), cell.disposed)
+        (
+            cell.compute.clone(),
+            cell.disposed || cell.generation != generation,
+        )
     });
     let mut oracle = ORACLE
         .with(|cell| cell.borrow_mut().take())
         .expect("oracle evaluation is active");
     let step = if disposed {
-        oracle.computing.remove(&id);
+        oracle.computing.remove(&key);
         Step::Disposed
-    } else if oracle.poisoned.contains(&id) {
-        oracle.computing.remove(&id);
+    } else if oracle.poisoned.contains(&key) {
+        oracle.computing.remove(&key);
         Step::Poisoned
-    } else if oracle.values.contains_key(&id) {
+    } else if oracle.values.contains_key(&key) {
         Step::Ready
-    } else if !oracle.computing.insert(id) {
+    } else if !oracle.computing.insert(key) {
         Step::Cycle
     } else {
         match compute {
             Some(compute) => Step::Compute(compute),
             None => {
-                oracle.computing.remove(&id);
+                oracle.computing.remove(&key);
                 Step::Missing
             }
         }
@@ -122,18 +133,18 @@ fn memo_step(id: u32) -> Step {
     step
 }
 
-fn memo_complete(id: u32, outcome: Result<Box<dyn Any>, PanicInfo>) -> Result<(), ReadFault> {
+fn memo_complete(key: MemoKey, outcome: Result<Box<dyn Any>, PanicInfo>) -> Result<(), ReadFault> {
     let mut oracle = ORACLE
         .with(|cell| cell.borrow_mut().take())
         .expect("oracle evaluation is active");
-    oracle.computing.remove(&id);
+    oracle.computing.remove(&key);
     let result = match outcome {
         Ok(value) => {
-            oracle.values.insert(id, Rc::from(value));
+            oracle.values.insert(key, Rc::from(value));
             Ok(())
         }
         Err(_panic) => {
-            oracle.poisoned.insert(id);
+            oracle.poisoned.insert(key);
             Err(ReadFault::ComputedPanicked)
         }
     };
@@ -141,11 +152,11 @@ fn memo_complete(id: u32, outcome: Result<Box<dyn Any>, PanicInfo>) -> Result<()
     result
 }
 
-fn oracle_value(id: u32) -> Option<Rc<dyn Any>> {
+fn oracle_value(key: MemoKey) -> Option<Rc<dyn Any>> {
     ORACLE.with(|cell| {
         cell.borrow()
             .as_ref()
-            .and_then(|oracle| oracle.values.get(&id).cloned())
+            .and_then(|oracle| oracle.values.get(&key).cloned())
     })
 }
 
@@ -1199,8 +1210,9 @@ fn verify_memos(runtime: &Runtime) -> Result<(), String> {
             .collect()
     };
     for id in &live {
+        let key = (*id, runtime.state.borrow().memos[*id as usize].generation);
         // 毒化是生产合同的一部分：重算必须同样 panic，值则保留最后一次提交。
-        match (force_memo(*id)?, poisoned.contains(id)) {
+        match (force_memo(key)?, poisoned.contains(id)) {
             (Fresh::Panicked, true) | (Fresh::Value, false) => {}
             (Fresh::Panicked, false) => {
                 return Err(format!(
@@ -1236,7 +1248,8 @@ fn verify_memos(runtime: &Runtime) -> Result<(), String> {
         let Some(compute) = &cell.compute else {
             return Err(format!("memo {id}: live memo has no compute"));
         };
-        let fresh = oracle_value(*id).ok_or_else(|| format!("memo {id}: no fresh oracle value"))?;
+        let key = (*id, cell.generation);
+        let fresh = oracle_value(key).ok_or_else(|| format!("memo {id}: no fresh oracle value"))?;
         if !compute.eq(&**committed, &*fresh) {
             return Err(format!(
                 "memo {id}: committed value differs from an independent recomputation"
@@ -1253,9 +1266,10 @@ enum Fresh {
     Panicked,
 }
 
-fn force_memo(id: u32) -> Result<Fresh, String> {
+fn force_memo(key: MemoKey) -> Result<Fresh, String> {
+    let id = key.0;
     loop {
-        match memo_step(id) {
+        match memo_step(key) {
             Step::Ready => return Ok(Fresh::Value),
             Step::Cycle => {
                 return Err(format!("memo {id}: cycle during independent recomputation"));
@@ -1273,10 +1287,10 @@ fn force_memo(id: u32) -> Result<Fresh, String> {
             Step::Poisoned => return Ok(Fresh::Panicked),
             Step::Compute(compute) => match catch_panic(|| compute.call()) {
                 Ok(value) => {
-                    memo_complete(id, Ok(value)).map_err(|fault| format!("memo {id}: {fault}"))?;
+                    memo_complete(key, Ok(value)).map_err(|fault| format!("memo {id}: {fault}"))?;
                 }
                 Err(panic) => {
-                    let _ = memo_complete(id, Err(panic));
+                    let _ = memo_complete(key, Err(panic));
                     return Ok(Fresh::Panicked);
                 }
             },
@@ -1285,10 +1299,11 @@ fn force_memo(id: u32) -> Result<Fresh, String> {
 }
 
 /// 生产 memo 最后一次已提交值；只用于毒化 memo 的合同回落。
-fn production_memo_value<T: ReactiveValue>(id: u32) -> Option<T> {
+fn production_memo_value<T: ReactiveValue>(key: MemoKey) -> Option<T> {
+    let (id, generation) = key;
     crate::context::with_state(|state| {
         let cell = &state.memos[id as usize];
-        if cell.disposed {
+        if cell.disposed || cell.generation != generation {
             return None;
         }
         cell.value

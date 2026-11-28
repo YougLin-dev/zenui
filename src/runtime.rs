@@ -417,8 +417,8 @@ const HIDDEN_TARGET: &str = "target window is hidden";
 const SUSPENDED_TARGET: &str = "target window input is suspended";
 
 pub(crate) enum Resource {
-    Signal(u32),
-    Memo(u32),
+    Signal(u32, u32),
+    Memo(u32, u32),
     Event(usize),
     /// 随 owner 释放的 arena 节点；保证文本/Show/For 等没有元素槽的节点也能回收。
     Node(NodeRef),
@@ -426,6 +426,17 @@ pub(crate) enum Resource {
 
 /// 窗口根 keydown 处理器；调用时从 state 克隆 Rc，避免持有 State 借用。
 type WindowKeyDownHandler = Rc<RefCell<Box<dyn FnMut(&mut KeyEvent) -> HandlerOutcome>>>;
+
+type Cleanup = Box<dyn FnOnce()>;
+
+/// 已从 owner 摘除、等待在 State 借用之外释放的一批资源与 cleanup。
+///
+/// cleanup 是用户代码，必须在没有借用 `RefCell<State>` 时执行；资源释放
+/// 推迟到同一批次，保证 cleanup 仍能读取本 owner 的 Signal/Memo。
+pub(crate) struct Disposal {
+    cleanups: Vec<Cleanup>,
+    resources: Vec<Resource>,
+}
 
 pub(crate) struct OwnerRecord {
     parent: Option<u32>,
@@ -435,6 +446,8 @@ pub(crate) struct OwnerRecord {
     elements: Vec<usize>,
     /// 本 owner 直接创建的组件槽位；析构时清空并归还。
     components: Vec<usize>,
+    /// `on_cleanup` 登记的回调；释放时按注册逆序执行。
+    cleanups: Vec<Cleanup>,
     disposed: bool,
 }
 
@@ -1021,6 +1034,11 @@ impl PendingChanges {
             .map(|(store, _)| *store)
     }
 
+    /// 自上次 drain 以来提交过的 Store；通用投影 `For` 据此保守重跑。
+    fn stores(&self) -> impl Iterator<Item = StoreId> + '_ {
+        self.log.iter().map(|(store, _)| *store)
+    }
+
     fn mark(&self) -> usize {
         self.log.len()
     }
@@ -1064,9 +1082,43 @@ pub(crate) fn observe_store_commits<R: Row>(store: &zenui_core::model::Store<R>)
     );
 }
 
+/// 在 State 借用之外执行已摘除 owner 的 cleanup 与资源释放。
+///
+/// `with_state`/`with_state_of` 在闭包返回、释放借用后调用；cleanup 因此
+/// 可以安全地通过公开句柄读取仍存活的 Signal/Memo。批次内先按后序执行
+/// 全部 cleanup，再释放资源，保证父/子 cleanup 都能看到本批次的存活状态。
+pub(crate) fn drain_disposals(state: &Rc<RefCell<State>>) {
+    loop {
+        let mut batch = {
+            let mut borrowed = state.borrow_mut();
+            if borrowed.pending_disposals.is_empty() {
+                return;
+            }
+            std::mem::take(&mut borrowed.pending_disposals)
+        };
+        state.borrow_mut().disposing += 1;
+        for disposal in &mut batch {
+            // 同层 cleanup 按注册逆序执行；每条独立捕获 panic。
+            for cleanup in disposal.cleanups.drain(..).rev() {
+                if let Err(panic) = catch_panic(cleanup) {
+                    state.borrow_mut().record_cleanup_panic(panic);
+                }
+            }
+        }
+        state.borrow_mut().disposing -= 1;
+        for disposal in batch {
+            state.borrow_mut().release_resources(disposal.resources);
+        }
+    }
+}
+
 pub(crate) struct State {
     pub(crate) id: u32,
     pub(crate) read_only: u32,
+    /// 正在执行 owner cleanup；期间拒绝创建资源与写入。
+    pub(crate) disposing: u32,
+    /// 等待在 State 借用之外执行的 owner 释放批次（cleanup 是用户代码）。
+    pub(crate) pending_disposals: Vec<Disposal>,
     /// 正在挂载或刷新的树；元素挂载时记录自己的树，查找为 O(1)。
     building_tree: Option<TreeSlot>,
     /// 统一 UI 节点身份；旧 payload 存储仍由 elements/components/trees 承担。
@@ -1117,7 +1169,22 @@ pub(crate) struct State {
     pub(crate) appearance: Appearance,
     pub(crate) signals: Vec<SignalCell>,
     pub(crate) memos: Vec<MemoCell>,
+    /// 已释放的 Signal/Memo 槽位；复用时递增代际。
+    pub(crate) free_signals: Vec<u32>,
+    pub(crate) free_memos: Vec<u32>,
     pub(crate) reverse: BTreeMap<DepKey, BTreeSet<u32>>,
+    /// 绑定消费者索引：来源 → 依赖它的挂载节点；`by_node` 是释放时的反向表。
+    ///
+    /// 与 `reverse`（memo 之间的依赖边）分开：这里只登记绑定/结构触发。
+    consumer_edges: BTreeMap<DepKey, Vec<crate::node::ConsumerRef>>,
+    consumer_nodes: BTreeMap<(TreeKey, NodeRef), Vec<DepKey>>,
+    /// 待求值的值绑定节点与结构触发节点；来源写入/挂载时标脏。
+    dirty_value_nodes: BTreeSet<(TreeKey, NodeRef)>,
+    dirty_structure_nodes: BTreeSet<(TreeKey, NodeRef)>,
+    /// `memo_deps_unsettled` 的复用工作区；避免每次绑定检查都分配集合。
+    pub(crate) memo_walk_stack: RefCell<Vec<u32>>,
+    pub(crate) memo_walk_seen: RefCell<Vec<u32>>,
+    pub(crate) memo_walk_stamp: Cell<u32>,
     pub(crate) computing: Vec<(u32, Vec<DepKey>)>,
     pub(crate) once_reads: u64,
     owners: BTreeMap<u32, OwnerRecord>,
@@ -1251,11 +1318,15 @@ pub struct FocusInfo {
 }
 
 /// Runtime 开发诊断；由下一次公开刷新报告交付。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RuntimeDiagnostic {
     /// 未声明 `row-height` 的 `For` 超过 [`NON_WINDOWED_FOR_WARN_ROWS`]；
     /// 仍会全量挂载，诊断只提示 O(总行数) 的挂载成本。
     NonWindowedFor { total_rows: usize },
+    /// 旧代际的 Signal/Memo 句柄读取了已经复用的槽位；读取已拒绝。
+    StaleSource { slot: u32 },
+    /// owner cleanup 回调 panic；释放链继续，panic 被收敛。
+    CleanupPanicked(PanicInfo),
 }
 
 /// 自上次公开 [`Runtime::refresh`] 报告以来的有效呈现变化。
@@ -1412,10 +1483,39 @@ impl State {
             .live_values()
             .map(ForData::bookkeeping_bytes)
             .sum();
+        let signal_memo_bytes = self
+            .signals
+            .iter()
+            .filter(|signal| !signal.disposed)
+            .map(|signal| size_of::<crate::signal::SignalCell>() + signal.value_bytes)
+            .sum::<usize>()
+            + self
+                .memos
+                .iter()
+                .filter(|memo| !memo.disposed)
+                .map(|memo| {
+                    size_of::<crate::signal::MemoCell>()
+                        + memo.value_bytes
+                        + memo.deps.capacity() * size_of::<crate::context::DepKey>()
+                })
+                .sum::<usize>();
+        let owner_bytes = self
+            .owners
+            .values()
+            .map(|owner| {
+                size_of::<OwnerRecord>()
+                    + owner.resources.capacity() * size_of::<Resource>()
+                    + owner.elements.capacity() * size_of::<usize>()
+                    + owner.components.capacity() * size_of::<usize>()
+                    + owner.children.capacity() * size_of::<usize>()
+            })
+            .sum::<usize>();
 
         MemoryReport {
             mounted_node_bytes,
             for_bookkeeping_bytes,
+            signal_memo_bytes,
+            owner_bytes,
             rowset_bytes,
             rowset_shared_count,
             rowset_count: unique.len(),
@@ -1446,6 +1546,9 @@ impl State {
                 .sum(),
             signal_slots: self.signals.len(),
             memo_slots: self.memos.len(),
+            free_signal_slots: self.free_signals.len(),
+            free_memo_slots: self.free_memos.len(),
+            owner_records: self.owners.len(),
             memo_deps_live: self.memos.iter().map(|memo| memo.deps.len()).sum(),
             memo_deps_storage: self.memos.iter().map(|memo| memo.deps.capacity()).sum(),
             memo_storage_bytes: self.memos.capacity()
@@ -1458,6 +1561,10 @@ impl State {
                 * std::mem::size_of::<crate::context::DepKey>(),
             dep_entries: self.reverse.len(),
             consumer_edges: self.reverse.values().map(BTreeSet::len).sum(),
+            binding_consumer_edges: self.consumer_edges.values().map(Vec::len).sum(),
+            binding_consumer_nodes: self.consumer_nodes.len(),
+            field_write_entries: self.field_writes.len(),
+            write_epoch_entries: self.write_epochs.len(),
             cached_row_sets: self.rowset_cache.iter().flatten().count(),
         }
     }
@@ -1615,12 +1722,15 @@ impl State {
                 resources: Vec::new(),
                 elements: Vec::new(),
                 components: Vec::new(),
+                cleanups: Vec::new(),
                 disposed: false,
             },
         );
         Self {
             id: NEXT_RUNTIME.fetch_add(1, Ordering::Relaxed),
             read_only: 0,
+            disposing: 0,
+            pending_disposals: Vec::new(),
             building_tree: None,
             nodes: NodeArena::new(),
             arena_trees: BTreeMap::new(),
@@ -1647,7 +1757,16 @@ impl State {
             appearance: Appearance::Light,
             signals: Vec::new(),
             memos: Vec::new(),
+            free_signals: Vec::new(),
+            free_memos: Vec::new(),
             reverse: BTreeMap::new(),
+            consumer_edges: BTreeMap::new(),
+            consumer_nodes: BTreeMap::new(),
+            dirty_value_nodes: BTreeSet::new(),
+            dirty_structure_nodes: BTreeSet::new(),
+            memo_walk_stack: RefCell::new(Vec::new()),
+            memo_walk_seen: RefCell::new(Vec::new()),
+            memo_walk_stamp: Cell::new(0),
             computing: Vec::new(),
             once_reads: 0,
             owners,
@@ -1719,6 +1838,7 @@ impl State {
         };
         self.push_text_trace(trace);
         self.mark_element_changed(element);
+        self.mark_element_value_dirty(element);
     }
 
     /// 为元素槽位分配 arena 节点；槽位复用换 generation，旧 NodeId 解析失败。
@@ -1909,6 +2029,21 @@ impl State {
         }
     }
 
+    /// 本地编辑改变了编辑器文本：值阶段必须重新观察模型值，即使在 handler
+    /// panic、没有任何 Signal/Store 写入的情况下也要回滚未结算的本地文本。
+    fn mark_element_value_dirty(&mut self, element: usize) {
+        let Some(tree) = self
+            .tree_for_element(element)
+            .and_then(|slot| self.arena_trees.get(&slot).copied())
+        else {
+            return;
+        };
+        let Some(element) = self.elements.get(element) else {
+            return;
+        };
+        self.mark_value_node_dirty(tree, element.id.node());
+    }
+
     /// 标记当前正在挂载/刷新的树；没有树上下文时无操作。
     fn mark_building_tree_changed(&mut self) {
         if let Some(key) = self.building_tree {
@@ -1945,6 +2080,7 @@ impl State {
     fn retire_node(&mut self, node: NodeRef) {
         if let Some(tree) = self.nodes.tree_of(node) {
             self.binding_patches.remove_node(tree, node);
+            self.unregister_node_consumers(tree, node);
         }
         self.nodes.release(node);
     }
@@ -2537,6 +2673,183 @@ impl State {
         }
     }
 
+    /// 登记当前 owner 的 cleanup 回调；必须在挂载/结构阶段调用。
+    pub(crate) fn push_cleanup(&mut self, cleanup: Cleanup) {
+        assert_eq!(
+            self.disposing, 0,
+            "on_cleanup() cannot run during owner cleanup"
+        );
+        let Some(owner) = self.current_owner else {
+            panic!(
+                "on_cleanup() must run under an owner (phase {:?})",
+                self.phase
+            );
+        };
+        if let Some(record) = self.owners.get_mut(&owner) {
+            record.cleanups.push(cleanup);
+        }
+    }
+
+    /// 记录一个被捕获的 cleanup panic；同一消息只上报一次。
+    pub(crate) fn record_cleanup_panic(&mut self, panic: PanicInfo) {
+        let diagnostic = RuntimeDiagnostic::CleanupPanicked(panic);
+        if !self.diagnostics.contains(&diagnostic) {
+            self.diagnostics.push(diagnostic);
+        }
+    }
+
+    /// 登记一个绑定来源的消费者，并把节点标脏以完成首次求值。
+    pub(crate) fn register_consumer(
+        &mut self,
+        tree: TreeKey,
+        node: NodeRef,
+        part: u16,
+        source: crate::node::ReadSlot,
+        kind: crate::node::ConsumerKind,
+    ) {
+        let Some(key) = source.dep_key() else {
+            return;
+        };
+        self.register_source_key(tree, node, part, key, kind);
+    }
+
+    /// `For` 直接投影某个 Store 时，任一提交都保守地标脏它的结构触发。
+    ///
+    /// 通用 Store 的 filter 不共享 Todo 的三个 `Rows` 槽；按 StoreId 登记
+    /// 避免不同 Store 的同名 filter 槽互相触发，也不需要逐字段反向索引。
+    pub(crate) fn register_rows_consumer(&mut self, tree: TreeKey, node: NodeRef, store: StoreId) {
+        self.register_source_key(
+            tree,
+            node,
+            0,
+            DepKey::Projection(store),
+            crate::node::ConsumerKind::Structural,
+        );
+    }
+
+    fn register_source_key(
+        &mut self,
+        tree: TreeKey,
+        node: NodeRef,
+        part: u16,
+        key: DepKey,
+        kind: crate::node::ConsumerKind,
+    ) {
+        let consumer = crate::node::ConsumerRef::new(node, part, kind);
+        let edges = self.consumer_edges.entry(key).or_default();
+        if !edges.contains(&consumer) {
+            edges.push(consumer);
+        }
+        let deps = self.consumer_nodes.entry((tree, node)).or_default();
+        if !deps.contains(&key) {
+            deps.push(key);
+        }
+        self.mark_node_dirty(tree, node, kind);
+    }
+
+    /// 节点卸载时移除它登记的全部消费者边与脏标记。
+    pub(crate) fn unregister_node_consumers(&mut self, tree: TreeKey, node: NodeRef) {
+        if let Some(keys) = self.consumer_nodes.remove(&(tree, node)) {
+            for key in keys {
+                if let Some(edges) = self.consumer_edges.get_mut(&key) {
+                    edges.retain(|consumer| consumer.node() != node);
+                    if edges.is_empty() {
+                        self.consumer_edges.remove(&key);
+                    }
+                }
+            }
+        }
+        self.dirty_value_nodes.remove(&(tree, node));
+        self.dirty_structure_nodes.remove(&(tree, node));
+    }
+
+    /// 来源释放时移除它的消费者边，并让这些绑定重新求值以读到 `Disposed`。
+    pub(crate) fn detach_source_consumers(&mut self, key: DepKey) {
+        let Some(edges) = self.consumer_edges.remove(&key) else {
+            return;
+        };
+        for consumer in edges {
+            let node = consumer.node();
+            let Some(tree) = self.nodes.tree_of(node) else {
+                continue;
+            };
+            if let Some(keys) = self.consumer_nodes.get_mut(&(tree, node)) {
+                keys.retain(|dep| *dep != key);
+                if keys.is_empty() {
+                    self.consumer_nodes.remove(&(tree, node));
+                }
+            }
+            self.mark_node_dirty(tree, node, consumer.kind());
+        }
+    }
+
+    /// 来源写入后标脏依赖它的节点；树遍历只求值这些节点。
+    pub(crate) fn mark_consumers_dirty(&mut self, key: DepKey) {
+        let Some(edges) = self.consumer_edges.get(&key) else {
+            return;
+        };
+        for consumer in edges {
+            let node = consumer.node();
+            if let Some(tree) = self.nodes.tree_of(node) {
+                match consumer.kind() {
+                    crate::node::ConsumerKind::Binding | crate::node::ConsumerKind::Editor => {
+                        self.dirty_value_nodes.insert((tree, node));
+                    }
+                    crate::node::ConsumerKind::Structural => {
+                        self.dirty_structure_nodes.insert((tree, node));
+                    }
+                }
+            }
+        }
+    }
+
+    /// 相等写入：只有文本输入的 `value` 绑定需要重新观察以结算本地编辑。
+    ///
+    /// 普通值绑定按值变化代数跳过，不必为一次相等写入标脏整张共享绑定表。
+    pub(crate) fn mark_editor_consumers_dirty(&mut self, key: DepKey) {
+        let Some(edges) = self.consumer_edges.get(&key) else {
+            return;
+        };
+        for consumer in edges {
+            if consumer.kind() != crate::node::ConsumerKind::Editor {
+                continue;
+            }
+            let node = consumer.node();
+            if let Some(tree) = self.nodes.tree_of(node) {
+                self.dirty_value_nodes.insert((tree, node));
+            }
+        }
+    }
+
+    fn mark_node_dirty(&mut self, tree: TreeKey, node: NodeRef, kind: crate::node::ConsumerKind) {
+        match kind {
+            crate::node::ConsumerKind::Binding | crate::node::ConsumerKind::Editor => {
+                self.dirty_value_nodes.insert((tree, node));
+            }
+            crate::node::ConsumerKind::Structural => {
+                self.dirty_structure_nodes.insert((tree, node));
+            }
+        }
+    }
+
+    /// 取走一个值节点的脏标记；求值失败时调用方会重新标脏。
+    pub(crate) fn take_value_dirty(&mut self, tree: TreeKey, node: NodeRef) -> bool {
+        self.dirty_value_nodes.remove(&(tree, node))
+    }
+
+    pub(crate) fn mark_value_node_dirty(&mut self, tree: TreeKey, node: NodeRef) {
+        self.dirty_value_nodes.insert((tree, node));
+    }
+
+    /// 取走一个结构触发节点的脏标记。
+    pub(crate) fn take_structure_dirty(&mut self, tree: TreeKey, node: NodeRef) -> bool {
+        self.dirty_structure_nodes.remove(&(tree, node))
+    }
+
+    pub(crate) fn mark_structure_node_dirty(&mut self, tree: TreeKey, node: NodeRef) {
+        self.dirty_structure_nodes.insert((tree, node));
+    }
+
     pub(crate) fn create_owner(&mut self, parent: Option<u32>) -> u32 {
         let id = self.next_owner;
         self.next_owner += 1;
@@ -2548,6 +2861,7 @@ impl State {
                 resources: Vec::new(),
                 elements: Vec::new(),
                 components: Vec::new(),
+                cleanups: Vec::new(),
                 disposed: false,
             },
         );
@@ -2559,8 +2873,13 @@ impl State {
         id
     }
 
-    /// 先释放本 Owner 的订阅/信号/Memo/事件，再递归释放子 Owner；
-    /// 这样已卸载分支的旧回调不会命中新一代界面。
+    /// 从树上摘除一个 owner 子树，把资源释放与 cleanup 交给
+    /// [`drain_disposals`] 在 State 借用之外执行。
+    ///
+    /// 子 owner 先入队，批次按后序执行：子 cleanup 先于父 cleanup，且全部
+    /// cleanup 都在本批次资源释放之前运行，因此仍可读取存活状态。这样
+    /// 已卸载分支的旧回调不会命中新一代界面，用户代码也不会在
+    /// `RefCell<State>` 被借用时重入 runtime。
     pub(crate) fn dispose_owner(&mut self, id: u32) {
         let Some(record) = self.owners.get_mut(&id) else {
             return;
@@ -2573,6 +2892,7 @@ impl State {
         let resources = std::mem::take(&mut record.resources);
         let elements = std::mem::take(&mut record.elements);
         let components = std::mem::take(&mut record.components);
+        let cleanups = std::mem::take(&mut record.cleanups);
         let parent = record.parent;
 
         // 随 owner 释放的行带请求不会再有宿主读取；同时丢弃，避免窗口化
@@ -2582,7 +2902,6 @@ impl State {
                 self.row_windows.remove(&band);
             }
         }
-        self.release_resources(resources);
         for child in children {
             self.dispose_owner(child);
         }
@@ -2602,32 +2921,59 @@ impl State {
             }
             self.owners.remove(&id);
         }
+        self.pending_disposals.push(Disposal {
+            cleanups,
+            resources,
+        });
     }
 
+    /// 释放 owner 直接持有的资源。
+    ///
+    /// Signal/Memo 槽位回收复用：释放时先与所有消费方互相解绑（消费方的
+    /// `deps` 与反向边两向清理），再把槽位放回 free list。这样复用槽位不会
+    /// 让新值的写入沿旧订阅边失效无关 memo，旧绑定也不会读到新代际的值；
+    /// 代际校验兜住残留句柄。
     fn release_resources(&mut self, resources: Vec<Resource>) {
         for resource in resources {
             match resource {
-                Resource::Signal(signal) => {
-                    if let Some(cell) = self.signals.get_mut(signal as usize) {
-                        cell.disposed = true;
-                        // 释放值的堆分配；disposed 保证任何旧句柄都不能读它。
-                        cell.value = std::rc::Rc::new(()) as std::rc::Rc<dyn std::any::Any>;
-                    }
-                    self.reverse.remove(&DepKey::Signal(signal));
-                    self.write_epochs.remove(&DepKey::Signal(signal));
-                }
-                Resource::Memo(memo) => {
-                    let deps = if let Some(cell) = self.memos.get_mut(memo as usize) {
-                        cell.disposed = true;
-                        cell.compute = None;
-                        cell.value = None;
-                        cell.dirty = true;
-                        cell.poisoned = None;
-                        cell.cycle = false;
-                        std::mem::take(&mut cell.deps)
-                    } else {
-                        Vec::new()
+                Resource::Signal(signal, generation) => {
+                    let Some(cell) = self.signals.get_mut(signal as usize) else {
+                        continue;
                     };
+                    if cell.generation != generation {
+                        continue;
+                    }
+                    cell.disposed = true;
+                    // 释放值的堆分配；disposed 保证任何旧句柄都不能读它。
+                    cell.value = std::rc::Rc::new(()) as std::rc::Rc<dyn std::any::Any>;
+                    cell.value_bytes = 0;
+                    // generation 用尽的槽位 retire，不回绕复用；旧句柄永远失效。
+                    let retired = cell.generation == u32::MAX;
+                    let key = DepKey::Signal(signal);
+                    self.unlink_consumers(key);
+                    self.detach_source_consumers(key);
+                    self.write_epochs.remove(&key);
+                    if !retired {
+                        self.free_signals.push(signal);
+                    }
+                }
+                Resource::Memo(memo, generation) => {
+                    let Some(cell) = self.memos.get_mut(memo as usize) else {
+                        continue;
+                    };
+                    if cell.generation != generation {
+                        continue;
+                    }
+                    cell.disposed = true;
+                    cell.compute = None;
+                    cell.value = None;
+                    cell.value_bytes = 0;
+                    cell.dirty = true;
+                    cell.poisoned = None;
+                    cell.cycle = false;
+                    // generation 用尽的槽位同样 retire，不回绕复用。
+                    let retired = cell.generation == u32::MAX;
+                    let deps = std::mem::take(&mut cell.deps);
                     for dep in deps {
                         let empty = self.reverse.get_mut(&dep).is_some_and(|consumers| {
                             consumers.remove(&memo);
@@ -2637,8 +2983,13 @@ impl State {
                             self.reverse.remove(&dep);
                         }
                     }
-                    self.reverse.remove(&DepKey::Memo(memo));
-                    self.write_epochs.remove(&DepKey::Memo(memo));
+                    let key = DepKey::Memo(memo);
+                    self.unlink_consumers(key);
+                    self.detach_source_consumers(key);
+                    self.write_epochs.remove(&key);
+                    if !retired {
+                        self.free_memos.push(memo);
+                    }
                 }
                 Resource::Event(event) => {
                     if let Some(cell) = self.events.get_mut(event) {
@@ -2647,6 +2998,18 @@ impl State {
                     }
                 }
                 Resource::Node(node) => self.retire_node(node),
+            }
+        }
+    }
+
+    /// 移除一个来源的反向边，并从每个消费方 memo 的依赖表中删掉该来源。
+    fn unlink_consumers(&mut self, key: DepKey) {
+        let Some(consumers) = self.reverse.remove(&key) else {
+            return;
+        };
+        for consumer in consumers {
+            if let Some(cell) = self.memos.get_mut(consumer as usize) {
+                cell.deps.retain(|dep| *dep != key);
             }
         }
     }
@@ -3114,6 +3477,8 @@ impl State {
             _ => return,
         }
         self.mark_element_changed(element);
+        // 受控控件的本地值必须与绑定值对账；处理器没有写入时也要回滚。
+        self.mark_element_value_dirty(element);
     }
 
     fn text_input(&self, target: &FindTarget) -> Option<usize> {
@@ -4898,6 +5263,13 @@ pub struct MemoryReport {
     pub mounted_node_bytes: usize,
     /// 已挂载 `For` 的驱动、行身份与窗口簿记。
     pub for_bookkeeping_bytes: usize,
+    /// 未释放 Signal/Memo 的槽头、值估算与 memo 依赖表容量。
+    ///
+    /// 值的堆字节是诊断估算：`String` 按容量、其他类型按 inline 大小；
+    /// 共享 `RowSet` 缓冲只计入 [`MemoryReport::rowset_bytes`]。
+    pub signal_memo_bytes: usize,
+    /// owner 记录与它们登记的资源/元素/子 owner 列表容量。
+    pub owner_bytes: usize,
     /// 共享 `RowSet` 投影的堆字节；同一份投影只计一次。
     pub rowset_bytes: usize,
     /// 这些共享投影上的活跃句柄数（`Arc` strong count 之和）。
@@ -4927,6 +5299,11 @@ pub struct StorageReport {
     pub binding_slots: usize,
     pub signal_slots: usize,
     pub memo_slots: usize,
+    /// free list 中可复用的 Signal/Memo 槽位；与 storage 长度一起说明回收率。
+    pub free_signal_slots: usize,
+    pub free_memo_slots: usize,
+    /// owner 记录数；普通元素不单独创建 owner，只有组件/Show/For/窗口/应用。
+    pub owner_records: usize,
     /// 已挂载 memo 的依赖条目总数。
     pub memo_deps_live: usize,
     /// memo 依赖列表的容量总和（条目数）；soak 用它确认不按 churn 历史增长。
@@ -4936,7 +5313,14 @@ pub struct StorageReport {
     /// memo 依赖列表容量对应的字节数。
     pub memo_deps_storage_bytes: usize,
     pub dep_entries: usize,
+    /// memo 之间的依赖边（`State::reverse`）。
     pub consumer_edges: usize,
+    /// 绑定/结构触发消费者边与节点数；来源写入只沿这些边标脏。
+    pub binding_consumer_edges: usize,
+    pub binding_consumer_nodes: usize,
+    /// 字段写入尝试与失效代数条目；删除行后必须释放。
+    pub field_write_entries: usize,
+    pub write_epoch_entries: usize,
     pub cached_row_sets: usize,
 }
 
@@ -6371,6 +6755,16 @@ impl Runtime {
             }
             // 3) 一个求值轮次消费整批请求。批标记只在这段调用内存活：
             // refresh_for 据此记录哪些行带已经提交，调用结束即清零。
+            // 行窗口请求没有响应式来源；显式标脏对应的 For 触发。
+            for band in &changed_bands {
+                let payload = with_state(|state| state.for_payload_for_band(key, *band));
+                if let Some(payload) = payload {
+                    let node = with_state(|state| state.nodes.for_node(payload).node);
+                    if let Some(tree_key) = with_state(|state| state.nodes.tree_of(node)) {
+                        with_state(|state| state.mark_structure_node_dirty(tree_key, node));
+                    }
+                }
+            }
             with_state(|state| {
                 state.bump_refresh_round();
                 state.row_window_batch = Some(RowWindowBatch {
@@ -6510,13 +6904,23 @@ impl Runtime {
         if self.tree_keys().is_empty() {
             return Err(MountError::Component("no committed interface is mounted"));
         }
-        let consumed = {
+        let (consumed, stores) = {
             let mut state = self.state.borrow_mut();
             state.read_faults.clear();
             // 上一个 turn 的补丁已经交付；新 turn 从空日志开始。
             let _ = state.binding_patches.take();
-            state.pending.borrow().mark()
+            let mut stores: Vec<StoreId> = state.pending.borrow().stores().collect();
+            stores.sort();
+            stores.dedup();
+            (state.pending.borrow().mark(), stores)
         };
+        // 通用 Store 的投影 `For` 没有 Todo filter 的 `Rows` 槽；按 StoreId
+        // 保守标脏：任一提交都可能改变成员、顺序或行数据。
+        for store in stores {
+            self.state
+                .borrow_mut()
+                .mark_consumers_dirty(DepKey::Projection(store));
+        }
         self.settle_quarantined_memos();
         self.take_flush_faults()?;
         if let Err(error) = self.refresh_all_once() {
@@ -6914,9 +7318,10 @@ impl Runtime {
                 let payload = with_state(|state| {
                     let tree = state.building_tree_key();
                     let node = state.register_node(NodeKindTag::Text, parent, parent_node);
-                    let binding = {
+                    let (binding, source) = {
                         let table = state.nodes.binding_table_mut(tree);
-                        slot.into_binding(table)
+                        let binding = slot.into_binding(table);
+                        (binding, table.read_slot(binding))
                     };
                     let payload = state.nodes.reserve_text(TextData {
                         binding,
@@ -6927,6 +7332,15 @@ impl Runtime {
                         .nodes
                         .set_payload(node, payload)
                         .expect("the text node is live");
+                    if let Some(source) = source {
+                        state.register_consumer(
+                            tree,
+                            node,
+                            0,
+                            source,
+                            crate::node::ConsumerKind::Binding,
+                        );
+                    }
                     payload
                 });
                 Ok(MountedNode::Text(payload))
@@ -7043,6 +7457,16 @@ impl Runtime {
                         bindings.push((part, binding));
                         inline_styles.push(MountedInlineStyle { property, binding });
                     }
+                    // 文本输入的 value 绑定需要观察相等写入；其他绑定按值变化跳过。
+                    let editor_bindings: Vec<BindingRef> = if tag == "text-input" {
+                        attrs
+                            .iter()
+                            .filter(|attr| attr.name == "value")
+                            .map(|attr| attr.binding)
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
                     let semantics = SnapshotSemantics::new(
                         inherent_focusable(state, tag, &events),
                         actions_for_events(state, &events),
@@ -7055,6 +7479,25 @@ impl Runtime {
                         edit: local,
                         semantics,
                     });
+                    // 绑定槽就位后登记消费者；列表里的 part 与绑定槽一一对应。
+                    let consumer_sources: Vec<(u16, ReadSlot, crate::node::ConsumerKind)> =
+                        match state.nodes.binding_table(tree) {
+                            Some(table) => bindings
+                                .iter()
+                                .filter_map(|(part, binding)| {
+                                    table.read_slot(*binding).map(|source| {
+                                        let kind = if editor_bindings.contains(binding) {
+                                            crate::node::ConsumerKind::Editor
+                                        } else {
+                                            crate::node::ConsumerKind::Binding
+                                        };
+                                        (part.raw(), source, kind)
+                                    })
+                                })
+                                .collect(),
+                            // 没有任何绑定（也没有 attribute/style）的元素不建表。
+                            None => Vec::new(),
+                        };
                     {
                         let mut replaced = Vec::new();
                         {
@@ -7069,6 +7512,14 @@ impl Runtime {
                         for old in replaced {
                             state.nodes.release_binding(tree, old);
                         }
+                    }
+                    for (part, source, kind) in consumer_sources {
+                        state.register_consumer(tree, element_node, part, source, kind);
+                    }
+                    // 编辑器/复选框的本地状态必须与绑定值对账一次；静态值
+                    // 没有消费者边，也要在首次值阶段初始化。
+                    if matches!(tag, "text-input" | "checkbox") {
+                        state.mark_value_node_dirty(tree, element_node);
                     }
                     let tag_id = state.nodes.intern_tag(tag);
                     state.nodes.place_element_data(
@@ -7139,10 +7590,20 @@ impl Runtime {
                     with_state(|state| state.register_node(NodeKindTag::Show, owner, parent_node));
                 let payload = with_state(|state| {
                     let tree = state.building_tree_key();
-                    let when = {
+                    let (when, source) = {
                         let table = state.nodes.binding_table_mut(tree);
-                        plan.when.into_binding(table)
+                        let when = plan.when.into_binding(table);
+                        (when, table.read_slot(when))
                     };
+                    if let Some(source) = source {
+                        state.register_consumer(
+                            tree,
+                            show_node,
+                            0,
+                            source,
+                            crate::node::ConsumerKind::Structural,
+                        );
+                    }
                     let payload = state.nodes.reserve_show(ShowData {
                         owner,
                         node: show_node,
@@ -7192,11 +7653,27 @@ impl Runtime {
                     let tree = state.building_tree_key();
                     let rows = match rows {
                         ForRows::Read(read) => {
-                            let table = state.nodes.binding_table_mut(tree);
-                            MountedForRows::Read(read.into_binding(table))
+                            let (binding, source) = {
+                                let table = state.nodes.binding_table_mut(tree);
+                                let binding = read.into_binding(table);
+                                (binding, table.read_slot(binding))
+                            };
+                            if let Some(source) = source {
+                                state.register_consumer(
+                                    tree,
+                                    for_node,
+                                    0,
+                                    source,
+                                    crate::node::ConsumerKind::Structural,
+                                );
+                            }
+                            MountedForRows::Read(binding)
                         }
                         ForRows::Projection(filter) => MountedForRows::Projection(filter),
                     };
+                    // 任一 Store 提交都让 For 重跑一次：`refresh_for` 用
+                    // `row_live` 剔除已删除行，静态快照与 `Read` 来源同样需要。
+                    state.register_rows_consumer(tree, for_node, store);
                     let payload = state.nodes.reserve_for(ForData {
                         owner,
                         node: for_node,
@@ -7297,10 +7774,89 @@ impl Runtime {
                     guard.restore();
                     result
                 }
-                MountedNode::Show(payload) => self.refresh_show(*payload),
-                MountedNode::For(payload) => self.refresh_for(*payload),
+                MountedNode::Show(payload) => {
+                    // 只有来源写入/刚挂载的触发需要重跑；分支里的值绑定由
+                    // 自己的消费者边驱动，值阶段单独处理。
+                    let node = with_state(|state| state.nodes.show(*payload).node);
+                    let dirty = with_state(|state| {
+                        state
+                            .nodes
+                            .tree_of(node)
+                            .is_some_and(|tree| state.take_structure_dirty(tree, node))
+                    });
+                    if dirty {
+                        let result = self.refresh_show(*payload);
+                        if result.is_err()
+                            && let Some(tree) = with_state(|state| state.nodes.tree_of(node))
+                        {
+                            with_state(|state| state.mark_structure_node_dirty(tree, node));
+                        }
+                        result
+                    } else {
+                        // 自身触发未变时仍要下钻：分支里可能有独立变脏的嵌套触发。
+                        self.refresh_show_branch_structure(*payload)
+                    }
+                }
+                MountedNode::For(payload) => {
+                    let node = with_state(|state| state.nodes.for_node(*payload).node);
+                    let dirty = with_state(|state| {
+                        state
+                            .nodes
+                            .tree_of(node)
+                            .is_some_and(|tree| state.take_structure_dirty(tree, node))
+                    });
+                    if dirty {
+                        let result = self.refresh_for(*payload);
+                        if result.is_err()
+                            && let Some(tree) = with_state(|state| state.nodes.tree_of(node))
+                        {
+                            with_state(|state| state.mark_structure_node_dirty(tree, node));
+                        }
+                        result
+                    } else {
+                        // 已挂载行里的嵌套触发独立标脏，仍需遍历到它们。
+                        self.refresh_for_rows_structure(*payload)
+                    }
+                }
             };
             if let Err(error) = result
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    /// 自身触发已结算的 Show：只把已挂载分支的结构触发继续向下求值。
+    fn refresh_show_branch_structure(&mut self, payload: u32) -> Result<(), MountError> {
+        let data = with_state(|state| state.nodes.take_show(payload));
+        let mut guard = ShowPayloadGuard {
+            payload,
+            data: Some(data),
+        };
+        if let Some(branch) = &mut guard.data_mut().active {
+            self.refresh_structure_nodes(&mut branch.children)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// 自身触发已结算的 For：只把已挂载行的结构触发继续向下求值。
+    fn refresh_for_rows_structure(&mut self, payload: u32) -> Result<(), MountError> {
+        let data = with_state(|state| state.nodes.take_for(payload));
+        let mut guard = ForPayloadGuard {
+            payload,
+            data: Some(data),
+        };
+        let data = guard.data_mut();
+        let mut first_error = None;
+        for key in &data.order {
+            if let Some(item) = data.items.get_mut(key)
+                && let Err(error) = self.refresh_structure_nodes(&mut item.children)
                 && first_error.is_none()
             {
                 first_error = Some(error);
@@ -7315,9 +7871,28 @@ impl Runtime {
     fn refresh_value_nodes(&mut self, nodes: &mut [MountedNode]) -> Result<(), MountError> {
         for node in nodes {
             match node {
-                MountedNode::Text(payload) => self.refresh_text(*payload)?,
+                MountedNode::Text(payload) => {
+                    // 只有登记过的来源写入才会标脏；静态/once 文本永不重算。
+                    let dirty = with_state(|state| {
+                        let data = state.nodes.text(*payload);
+                        state.take_value_dirty(data.tree, data.node)
+                    });
+                    if dirty {
+                        self.refresh_text(*payload)?;
+                    }
+                }
                 MountedNode::Element(id) => {
-                    self.refresh_element(*id);
+                    let (tree, element_node) = with_state(|state| {
+                        (
+                            state.element_tree(*id),
+                            state.elements.get(*id).map(|element| element.id.node()),
+                        )
+                    });
+                    if let (Some(tree), Some(element_node)) = (tree, element_node)
+                        && with_state(|state| state.take_value_dirty(tree, element_node))
+                    {
+                        self.refresh_element(*id);
+                    }
                     let mut guard = ChildrenGuard::take(ChildrenOwner::Element(*id));
                     let result = self.refresh_value_nodes(guard.children_mut());
                     guard.restore();
@@ -7397,6 +7972,16 @@ impl Runtime {
                 state.record_read_fault(fault);
             }
         });
+        let failed = with_state(|state| {
+            state
+                .nodes
+                .binding_table(tree)
+                .is_some_and(|table| table.has_fault(binding))
+        });
+        if failed {
+            // 读取失败保留最后值；下一帧继续重试，直到来源恢复或节点卸载。
+            with_state(|state| state.mark_value_node_dirty(tree, node));
+        }
         Ok(())
     }
 
@@ -7544,6 +8129,7 @@ impl Runtime {
 
         let mut attrs_changed = false;
         let mut styles_changed = false;
+        let mut had_fault = false;
         let mut faults = Vec::new();
         with_state(|state| {
             for (plan, next) in attr_plans.iter().zip(attr_values) {
@@ -7576,6 +8162,7 @@ impl Runtime {
                         // 失败不替换 current：属性保持最后已提交值，首次失败则缺席。
                         plan.mark_fault(state, tree, fault.clone());
                         faults.push(fault);
+                        had_fault = true;
                     }
                 }
             }
@@ -7597,6 +8184,7 @@ impl Runtime {
                     Some(ReadValue::Fault(fault)) => {
                         plan.mark_fault(state, tree, fault.clone());
                         faults.push(fault);
+                        had_fault = true;
                     }
                 }
             }
@@ -7604,6 +8192,10 @@ impl Runtime {
                 state.record_read_fault(fault);
             }
         });
+        if had_fault {
+            // 带 fault 的槽保留最后值，并在下一帧继续重试。
+            with_state(|state| state.mark_value_node_dirty(tree, node));
+        }
         let (committed, epoch) = match value_binding {
             Some(binding) => with_state(|state| {
                 let Some(table) = state.element_binding_table(id) else {
@@ -7755,6 +8347,8 @@ impl Runtime {
                             slot.fault = Some(fault.clone());
                         }
                         state.record_read_fault(fault);
+                        // 带 fault 的触发保留当前分支，下一帧继续重试。
+                        state.mark_structure_node_dirty(tree, node);
                     });
                     if let Some(branch) = &mut show.active {
                         self.refresh_structure_nodes(&mut branch.children)?;
@@ -7967,6 +8561,8 @@ impl Runtime {
                                     slot.fault = Some(fault.clone());
                                 }
                                 state.record_read_fault(fault);
+                                // 带 fault 的触发保留最后行集，下一帧继续重试。
+                                state.mark_structure_node_dirty(tree, node);
                             });
                             // 槽位可能已写入一个被拒绝的拟议投影；源失败时回到
                             // 最后一次真正提交的行集，而不是那个拟议值。
@@ -15052,6 +15648,8 @@ mod binding_tests {
             .get_mut(source.id as usize)
             .expect("the width signal")
             .disposed = true;
+        // 复刻生产释放路径：卸载消费者边并让绑定重新求值。
+        state.detach_source_consumers(DepKey::Signal(source.id));
     }
 
     #[test]
@@ -15139,6 +15737,7 @@ mod binding_tests {
             memo.value = None;
             memo.dirty = true;
             memo.poisoned = None;
+            state.detach_source_consumers(DepKey::Memo(source.id));
         }
 
         let report = app.refresh().expect("refresh");
@@ -15185,6 +15784,7 @@ mod binding_tests {
             slot.current = None;
             slot.fault = None;
             state.memos[source.id as usize].disposed = true;
+            state.detach_source_consumers(DepKey::Memo(source.id));
         }
 
         let report = app
@@ -15249,6 +15849,7 @@ mod binding_tests {
                 .update(b, |row| row.title = String::from("bb"))
                 .expect("heal b");
             state.memos[memo_id].disposed = true;
+            state.detach_source_consumers(DepKey::Memo(memo_id as u32));
         }
 
         let report = app.refresh().expect("a fault keeps the committed rows");

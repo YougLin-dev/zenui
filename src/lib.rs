@@ -47,7 +47,7 @@ pub use runtime::{
     StorageReport, TurnError, TurnOutcome, TurnReport,
 };
 pub use session::{SessionCtx, SessionError, SessionPolicy};
-pub use signal::{Memo, MemoCompute, Once, ReactiveValue, Signal, memo, once, signal};
+pub use signal::{Memo, MemoCompute, Once, ReactiveValue, Signal, memo, on_cleanup, once, signal};
 pub use store::{Field, FieldError, Store, TodoId, TodoRow, Transaction, WriteError, WriteOp};
 pub use task::{DeliveryReport, Task, TaskError, TaskScope, TaskStatus, TaskToken};
 pub use tray::{TrayError, TraySpec};
@@ -95,8 +95,8 @@ pub mod prelude {
         StyleDeclaration, StyleOrigin, StyleValue, Submenu, SubmitEvent, Task, TaskError,
         TaskScope, TaskStatus, TaskToken, TextEditState, TodoId, TodoRow, Transaction, TrayError,
         TraySpec, TurnError, TurnOutcome, TurnReport, WindowCatalog, WindowCtx, WindowError,
-        WindowInfo, WindowRole, WindowSpec, WriteError, WriteOp, component, em, memo, once, px,
-        signal, view,
+        WindowInfo, WindowRole, WindowSpec, WriteError, WriteOp, component, em, memo, on_cleanup,
+        once, px, signal, view,
     };
     pub use zenui_core::Filter;
 }

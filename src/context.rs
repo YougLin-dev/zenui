@@ -29,6 +29,8 @@ pub(crate) enum DepKey {
     Memo(u32),
     Field(TodoId, FieldKind),
     Rows(u8),
+    /// 通用行 Store 的投影来源；任一提交都保守地标脏该 Store 的 `For`。
+    Projection(zenui_core::model::StoreId),
 }
 
 pub(crate) const fn filter_slot(filter: Filter) -> u8 {
@@ -79,19 +81,28 @@ pub(crate) fn current_state() -> Option<Rc<RefCell<State>>> {
 pub(crate) fn with_state<R>(f: impl FnOnce(&mut State) -> R) -> R {
     let state = CURRENT.with(|current| current.borrow().last().cloned());
     let state = state.expect("state access requires an installed ZenUI runtime");
-    let mut state = state.borrow_mut();
-    f(&mut state)
+    let result = {
+        let mut borrowed = state.borrow_mut();
+        f(&mut borrowed)
+    };
+    // owner 释放把用户 cleanup 推迟到这里：借用已释放，回调可以再进 runtime。
+    crate::runtime::drain_disposals(&state);
+    result
 }
 
 pub(crate) fn with_state_of<R>(runtime: u32, f: impl FnOnce(&mut State) -> R) -> R {
     let state = CURRENT.with(|current| current.borrow().last().cloned());
     let state = state.expect("state access requires an installed ZenUI runtime");
-    let mut state = state.borrow_mut();
-    assert_eq!(
-        state.id, runtime,
-        "a handle from another ZenUI Runtime must not access this one"
-    );
-    f(&mut state)
+    let result = {
+        let mut borrowed = state.borrow_mut();
+        assert_eq!(
+            borrowed.id, runtime,
+            "a handle from another ZenUI Runtime must not access this one"
+        );
+        f(&mut borrowed)
+    };
+    crate::runtime::drain_disposals(&state);
+    result
 }
 
 pub(crate) fn release_read_only(runtime: u32) {
