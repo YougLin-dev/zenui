@@ -2589,16 +2589,35 @@ impl State {
                 Resource::Signal(signal) => {
                     if let Some(cell) = self.signals.get_mut(signal as usize) {
                         cell.disposed = true;
+                        // 释放值的堆分配；disposed 保证任何旧句柄都不能读它。
+                        cell.value = std::rc::Rc::new(()) as std::rc::Rc<dyn std::any::Any>;
                     }
+                    self.reverse.remove(&DepKey::Signal(signal));
+                    self.write_epochs.remove(&DepKey::Signal(signal));
                 }
                 Resource::Memo(memo) => {
-                    if let Some(cell) = self.memos.get_mut(memo as usize) {
+                    let deps = if let Some(cell) = self.memos.get_mut(memo as usize) {
                         cell.disposed = true;
                         cell.compute = None;
                         cell.value = None;
                         cell.dirty = true;
                         cell.poisoned = None;
+                        cell.cycle = false;
+                        std::mem::take(&mut cell.deps)
+                    } else {
+                        Vec::new()
+                    };
+                    for dep in deps {
+                        let empty = self.reverse.get_mut(&dep).is_some_and(|consumers| {
+                            consumers.remove(&memo);
+                            consumers.is_empty()
+                        });
+                        if empty {
+                            self.reverse.remove(&dep);
+                        }
                     }
+                    self.reverse.remove(&DepKey::Memo(memo));
+                    self.write_epochs.remove(&DepKey::Memo(memo));
                 }
                 Resource::Event(event) => {
                     if let Some(cell) = self.events.get_mut(event) {
@@ -12661,8 +12680,7 @@ mod binding_tests {
 
     #[component]
     fn PanicText() -> MountResult<MountPlan> {
-        let failing: Memo<String> = memo(|| panic!("virgin memo boom"));
-        view! { <text>{failing}</text> }
+        panic!("branch setup boom")
     }
 
     #[component]
@@ -12761,7 +12779,17 @@ mod binding_tests {
             let _ = Transaction::new().write(store.insert("ghost")).finish();
             panic!("write then panic");
         });
-        view! { <Show when={failing}><text>"x"</text></Show> }
+        // Read via `get` inside the factory: the poisoned memo becomes a factory
+        // panic, so the activation fails after the model write.
+        let then = ChildrenFactory::from(move || {
+            let _ = failing.get();
+            view! { <text>"x"</text> }
+        });
+        Ok(MountPlan::new(vec![zenui::view::show(
+            once(true),
+            then,
+            None,
+        )]))
     }
 
     #[test]
@@ -12792,8 +12820,7 @@ mod binding_tests {
     #[component]
     fn LiveThenPanicText() -> MountResult<MountPlan> {
         let live = signal(String::from("live"));
-        let failing: Memo<String> = memo(|| panic!("virgin memo boom"));
-        view! { <view><text>{live}</text><text>{failing}</text></view> }
+        view! { <view><text>{live}</text><PanicText /></view> }
     }
 
     #[test]
@@ -12807,7 +12834,7 @@ mod binding_tests {
         .expect("declare the window");
         let error = app
             .show("main")
-            .expect_err("the second text evaluates a poisoned memo");
+            .expect_err("the second child panics during the first refresh");
         assert!(matches!(error, WindowError::Mount(MountError::Panic(_))));
         let mut state = app.state.borrow_mut();
         assert!(
@@ -14600,8 +14627,13 @@ mod binding_tests {
 
     #[component]
     fn PanicShow() -> MountResult<MountPlan> {
-        let failing: Memo<bool> = memo(|| panic!("show memo boom"));
-        view! { <Show when={failing}><text>"x"</text></Show> }
+        let then =
+            ChildrenFactory::from(|| -> MountResult<MountPlan> { panic!("show factory boom") });
+        Ok(MountPlan::new(vec![zenui::view::show(
+            once(true),
+            then,
+            None,
+        )]))
     }
 
     #[component]
@@ -14616,11 +14648,11 @@ mod binding_tests {
     }
 
     #[test]
-    fn a_show_source_panic_at_mount_is_a_contained_mount_error() {
+    fn a_show_factory_panic_at_mount_is_a_contained_mount_error() {
         let mut app = Runtime::new();
         let error = app
             .mount(|| view! { <PanicShow /> })
-            .expect_err("the memo panic fails the mount");
+            .expect_err("the factory panic fails the mount");
         assert!(matches!(error, MountError::Panic(_)));
         let state = app.state.borrow();
         assert!(
@@ -14636,18 +14668,25 @@ mod binding_tests {
     }
 
     #[test]
-    fn a_for_source_panic_at_mount_is_a_contained_mount_error() {
+    fn a_for_source_panic_at_mount_is_a_typed_fault() {
         let mut app = Runtime::new();
-        let error = app
-            .mount(|| view! { <PanicFor /> })
-            .expect_err("the memo panic fails the mount");
-        assert!(matches!(error, MountError::Panic(_)));
-        let state = app.state.borrow();
+        app.mount(|| view! { <PanicFor /> })
+            .expect("the source fault does not fail the mount");
+        let report = app.refresh().expect("refresh reports the source fault");
         assert!(
-            state.nodes.binding_tables.is_empty(),
-            "the failed mount drops its binding table"
+            report.faults().contains(&ReadFault::ComputedPanicked),
+            "the For source fault is typed: {:?}",
+            report.faults()
         );
-        assert_eq!(state.nodes.live(), 0, "no node stays live");
+        assert_eq!(
+            app.for_items().len(),
+            0,
+            "a faulting source mounts an empty committed row set"
+        );
+        assert!(
+            !app.state.borrow().nodes.binding_tables.is_empty(),
+            "the mounted tree keeps its binding table"
+        );
     }
 
     #[test]
