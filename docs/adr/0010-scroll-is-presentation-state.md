@@ -129,3 +129,8 @@ Offset-zero regression evidence compares a scene built with the default environm
 Layout still runs over the full mounted tree on every scene build. The viewport culling introduced for long imported lists skips shaping, glyph runs, caret stops and paint for offscreen elements, but it does not skip Taffy layout; a 5000-row list therefore remains O(rows) per scroll rebuild until ADR-0011 defines a committed window. The scene benchmark is extended with scroll rows at 100, 500, 1000 and 5000 rows and reports build time plus element and visible counts; it remains a measurement, not a wall-clock assertion.
 
 （本段的长列表成本结论已被 ADR-0011 取代：声明 `row-height` 的 `For` 只挂载可见行窗口，窗口内滚动构建与窗口更新成本同总行数无关；scene_bench 现在测量 100/1,000/10,000 行与 32 行窗口。未声明 `row-height` 的列表仍按上述全量布局规则运行。）
+
+
+## 状态更新（2026-11，补充）
+
+性能门禁将“未跨行滚动不运行 runtime turn、跨行滚动至多一个结构 turn 与一次场景构建”记录为 `scroll_10k_within_row` 与 `scroll_10k_cross_row`；实现与本 ADR 的偏移所有权一致。见 [性能门禁](../实现/性能门禁.md)。

@@ -830,6 +830,67 @@ impl AuxArenas {
             + self.binding_lists.live()
             + self.semantics.live()
     }
+
+    /// live 辅助列表的堆字节；class 样式切片是进程级静态数据，只计句柄。
+    fn memory_bytes(&self) -> usize {
+        let attrs: usize = self
+            .attrs
+            .live_values()
+            .map(|list| {
+                std::mem::size_of::<Vec<MountedAttr>>()
+                    + list.capacity() * std::mem::size_of::<MountedAttr>()
+            })
+            .sum();
+        let class_styles = self.class_styles.live()
+            * std::mem::size_of::<&'static [zenui_style::StyleDeclaration]>();
+        let inline_styles: usize = self
+            .inline_styles
+            .live_values()
+            .map(|list| {
+                std::mem::size_of::<Vec<MountedInlineStyle>>()
+                    + list.capacity() * std::mem::size_of::<MountedInlineStyle>()
+            })
+            .sum();
+        let events: usize = self
+            .events
+            .live_values()
+            .map(|list| {
+                std::mem::size_of::<Vec<usize>>() + list.capacity() * std::mem::size_of::<usize>()
+            })
+            .sum();
+        let edits: usize = self
+            .edits
+            .live_values()
+            .map(|local| {
+                std::mem::size_of::<LocalState>()
+                    + match local {
+                        LocalState::TextInput(editor) => {
+                            editor.value.capacity()
+                                + editor.history.undo_bytes
+                                + editor.history.redo_bytes
+                        }
+                        LocalState::None | LocalState::Checkbox { .. } => 0,
+                    }
+            })
+            .sum();
+        let binding_lists: usize = self
+            .binding_lists
+            .live_values()
+            .map(crate::node::BindingList::heap_bytes)
+            .sum();
+        let semantics = self.semantics.live() * std::mem::size_of::<SnapshotSemantics>();
+        attrs + class_styles + inline_styles + events + edits + binding_lists + semantics
+    }
+
+    fn storage_slots(&self) -> usize {
+        self.attrs.storage_len()
+            + self.class_styles.storage_len()
+            + self.inline_styles.storage_len()
+            + self.events.storage_len()
+            + self.edits.storage_len()
+            + self.binding_lists.storage_len()
+            + self.semantics.storage_len()
+    }
 }
 
 impl fmt::Debug for NodeArena {
@@ -1037,6 +1098,12 @@ pub(crate) struct State {
     /// 旧 `RowSet` 投影缓存，按 membership/order revision 失效。
     pub(crate) rowset_cache: [Option<CachedRowSet>; 3],
     pub(crate) store_counters: Counters,
+    /// 动态绑定槽求值次数；与 `store_counters` 的 Store 指标分开。
+    ///
+    /// 性能门禁按 turn 读取差值；静态/once 槽在挂载时提交，不计入。
+    pub(crate) binding_evaluations: u64,
+    /// 成功完成的 memo compute 次数；只统计生产 memo 路径。
+    pub(crate) memo_recomputes: u64,
     pub(crate) phase: Phase,
     pub(crate) fault: Option<ContextFault>,
     pub(crate) appearance: Appearance,
@@ -1271,6 +1338,105 @@ impl State {
         live
     }
 
+    /// 当前 live 数据的内存报告；诊断与内存门禁使用。
+    pub(crate) fn memory_report(&self) -> MemoryReport {
+        use std::mem::size_of;
+
+        let mut projections: Vec<&RowSet> = self
+            .rowset_cache
+            .iter()
+            .flatten()
+            .map(|cached| &cached.set)
+            .collect();
+        for for_node in self.nodes.forces.live_values() {
+            if let Some(rows) = &for_node.committed_rows {
+                projections.push(rows);
+            }
+        }
+        let mut unique: Vec<&RowSet> = Vec::new();
+        let mut rowset_bytes = 0;
+        let mut rowset_shared_count = 0;
+        for set in projections {
+            if unique.iter().any(|seen| seen.shares_with(set)) {
+                continue;
+            }
+            rowset_bytes += set.heap_bytes();
+            rowset_shared_count += set.shared_count();
+            unique.push(set);
+        }
+
+        let mounted_node_bytes = self.nodes.slots.live() * size_of::<crate::node::NodeSlot>()
+            + self.nodes.texts.live() * size_of::<TextData>()
+            + self.nodes.elements.iter().flatten().count() * size_of::<crate::node::ElementData>()
+            + self.nodes.shows.live() * size_of::<ShowData>()
+            + self
+                .components
+                .len()
+                .saturating_sub(self.free_components.len())
+                * size_of::<MountedComponent>()
+            + self.nodes.aux.memory_bytes()
+            + self
+                .nodes
+                .binding_tables
+                .values()
+                .map(crate::node::BindingTable::memory_bytes)
+                .sum::<usize>();
+        let for_bookkeeping_bytes = self
+            .nodes
+            .forces
+            .live_values()
+            .map(ForData::bookkeeping_bytes)
+            .sum();
+
+        MemoryReport {
+            mounted_node_bytes,
+            for_bookkeeping_bytes,
+            rowset_bytes,
+            rowset_shared_count,
+            rowset_count: unique.len(),
+            live_nodes: self.nodes.slots.live(),
+            live_memos: self.memos.iter().filter(|memo| !memo.disposed).count(),
+            live_signals: self
+                .signals
+                .iter()
+                .filter(|signal| !signal.disposed)
+                .count(),
+        }
+    }
+
+    /// arena 存储长度与依赖图规模；用于 churn 后的高水位比较。
+    pub(crate) fn storage_report(&self) -> StorageReport {
+        StorageReport {
+            node_slots: self.nodes.slots.storage_len(),
+            element_payloads: self.nodes.elements.len(),
+            text_payloads: self.nodes.texts.storage_len(),
+            show_payloads: self.nodes.shows.storage_len(),
+            for_payloads: self.nodes.forces.storage_len(),
+            aux_slots: self.nodes.aux.storage_slots(),
+            binding_slots: self
+                .nodes
+                .binding_tables
+                .values()
+                .map(crate::node::BindingTable::storage_len)
+                .sum(),
+            signal_slots: self.signals.len(),
+            memo_slots: self.memos.len(),
+            memo_deps_live: self.memos.iter().map(|memo| memo.deps.len()).sum(),
+            memo_deps_storage: self.memos.iter().map(|memo| memo.deps.capacity()).sum(),
+            memo_storage_bytes: self.memos.capacity()
+                * std::mem::size_of::<crate::signal::MemoCell>(),
+            memo_deps_storage_bytes: self
+                .memos
+                .iter()
+                .map(|memo| memo.deps.capacity())
+                .sum::<usize>()
+                * std::mem::size_of::<crate::context::DepKey>(),
+            dep_entries: self.reverse.len(),
+            consumer_edges: self.reverse.values().map(BTreeSet::len).sum(),
+            cached_row_sets: self.rowset_cache.iter().flatten().count(),
+        }
+    }
+
     /// 测试/差分 oracle：全部已挂载树。
     #[cfg(test)]
     pub(crate) fn oracle_trees(&self) -> Vec<TreeKey> {
@@ -1448,6 +1614,8 @@ impl State {
             next_todo_key: 1,
             rowset_cache: [None, None, None],
             store_counters: Counters::default(),
+            binding_evaluations: 0,
+            memo_recomputes: 0,
             phase: Phase::Idle,
             fault: None,
             appearance: Appearance::Light,
@@ -4065,6 +4233,22 @@ pub struct MountedItem {
     children: Vec<MountedNode>,
 }
 
+impl ForData {
+    /// For 持久簿记：驱动、已挂载行身份与窗口元数据。
+    ///
+    /// 行元素本身按挂载节点计；`committed_rows` 只持有共享投影的句柄，
+    /// `RowSet` 数据在内存报告里单列。
+    fn bookkeeping_bytes(&self) -> usize {
+        let per_item = std::mem::size_of::<RowId>()
+            + std::mem::size_of::<MountedItem>()
+            + std::mem::size_of::<Vec<MountedNode>>();
+        std::mem::size_of::<Self>()
+            + self.items.len() * per_item
+            + self.order.capacity() * std::mem::size_of::<RowId>()
+            + std::mem::size_of::<Option<RowSet>>()
+    }
+}
+
 /// `row_height × rows` 保持单位不变；定点乘法饱和，极端行数不会回绕。
 fn rows_height(row_height: Length, rows: usize) -> Length {
     let factor = i64::try_from(rows).unwrap_or(i64::MAX);
@@ -4593,6 +4777,61 @@ fn find_element(state: &State, nodes: &[MountedNode], target: &FindTarget) -> Op
         }
     }
     None
+}
+
+/// 运行时内存报告（诊断）。
+///
+/// UI/For 持久内存与共享 `RowSet` 投影分开计：已挂载节点的槽位、payload、
+/// 辅助列表和绑定槽字符串计入 `mounted_node_bytes`；For 的行身份与窗口
+/// 簿记计入 `for_bookkeeping_bytes`；共享投影按分配去重后单列为
+/// `rowset_bytes`/`rowset_shared_count`。快照、布局、场景和字体缓存不属于
+/// 本报告。数字用于门禁与趋势，不是产品内存承诺。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MemoryReport {
+    /// 已挂载节点的槽位、payload、辅助列表与绑定槽堆字节。
+    pub mounted_node_bytes: usize,
+    /// 已挂载 `For` 的驱动、行身份与窗口簿记。
+    pub for_bookkeeping_bytes: usize,
+    /// 共享 `RowSet` 投影的堆字节；同一份投影只计一次。
+    pub rowset_bytes: usize,
+    /// 这些共享投影上的活跃句柄数（`Arc` strong count 之和）。
+    pub rowset_shared_count: usize,
+    /// 去重的共享投影数量。
+    pub rowset_count: usize,
+    /// 已挂载节点槽位数。
+    pub live_nodes: usize,
+    /// 未释放的 memo 数。
+    pub live_memos: usize,
+    /// 未释放的 signal 数。
+    pub live_signals: usize,
+}
+
+/// 运行时 arena 存储报告（诊断）。
+///
+/// 存储长度是复用后的容量，不是 live 数据量；内存门禁用它与高水位比较，
+/// 证明反复 churn 不会按历史累积。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StorageReport {
+    pub node_slots: usize,
+    pub element_payloads: usize,
+    pub text_payloads: usize,
+    pub show_payloads: usize,
+    pub for_payloads: usize,
+    pub aux_slots: usize,
+    pub binding_slots: usize,
+    pub signal_slots: usize,
+    pub memo_slots: usize,
+    /// 已挂载 memo 的依赖条目总数。
+    pub memo_deps_live: usize,
+    /// memo 依赖列表的容量总和（条目数）；soak 用它确认不按 churn 历史增长。
+    pub memo_deps_storage: usize,
+    /// memo 槽数组容量对应的字节数。
+    pub memo_storage_bytes: usize,
+    /// memo 依赖列表容量对应的字节数。
+    pub memo_deps_storage_bytes: usize,
+    pub dep_entries: usize,
+    pub consumer_edges: usize,
+    pub cached_row_sets: usize,
 }
 
 /// 应用运行时：声明窗口目录、挂载界面、驱动任务并生成呈现快照。
@@ -6938,7 +7177,7 @@ impl Runtime {
 
     /// 求值一个文本槽；`Static`/`Once` 在挂载时已提交，不再重算。
     fn refresh_text(&mut self, payload: u32) -> Result<(), MountError> {
-        let (binding, source, tree, node) = with_state(|state| {
+        let (binding, source, tree, node, skip) = with_state(|state| {
             let data = state.nodes.text(payload);
             let table = state
                 .nodes
@@ -6947,13 +7186,21 @@ impl Runtime {
             let slot = table
                 .slot::<String>(data.binding)
                 .expect("a mounted text binding slot is live");
-            (data.binding, slot.source, data.tree, data.node)
+            // 源的值变化代数未推进时，已提交值仍然精确；带 fault 的槽每轮重试。
+            let skip = !slot.source.is_static()
+                && !slot.source.is_disposed(state)
+                && !table.has_fault(data.binding)
+                && table.last_epoch(data.binding) == slot.source.change_epoch(state)
+                && !slot.source.is_dirty(state);
+            (data.binding, slot.source, data.tree, data.node, skip)
         });
-        if source.is_static() {
+        if source.is_static() || skip {
             return Ok(());
         }
         let next = source.evaluate::<String>();
         with_state(|state| {
+            state.binding_evaluations = state.binding_evaluations.saturating_add(1);
+            let epoch = source.change_epoch(state);
             let mut value_patch = None;
             let mut fault = None;
             {
@@ -6969,9 +7216,13 @@ impl Runtime {
                             value_patch = Some((old, value));
                         }
                         slot.fault = None;
+                        if let Some(epoch) = epoch {
+                            slot.record_epoch(epoch);
+                        }
                     }
                     ReadValue::Fault(next_fault) => {
                         // 读取失败保留最后已提交文本；没有最后值时呈现为空串。
+                        // 不记录 epoch，下一轮继续重试。
                         slot.fault = Some(next_fault.clone());
                         fault = Some(next_fault);
                     }
@@ -7045,8 +7296,52 @@ impl Runtime {
                 .map(|attr| AttrPlan::describe(table, attr.name, attr.binding))
                 .collect()
         });
-        let attr_values: Vec<Option<ReadValue<AttrCurrent>>> =
-            attr_plans.iter().map(AttrPlan::evaluate).collect();
+        // 属性列表在 scratch 里，已提交值仍从绑定槽读取；文本编辑器据此
+        // 辨认模型写入。先确定 value 绑定：文本输入用它观察每次写入尝试，
+        // 其它绑定只在值变化代数推进时求值。
+        let value_binding = scratch
+            .attrs()
+            .iter()
+            .find(|attr| attr.name == "value")
+            .map(|attr| attr.binding);
+        let value_is_editor = with_state(|state| state.element_tag(id) == "text-input");
+        let attr_evaluate: Vec<bool> = with_state(|state| {
+            let Some(table) = state.nodes.binding_table(tree) else {
+                return attr_plans.iter().map(|_| true).collect();
+            };
+            attr_plans
+                .iter()
+                .map(|plan| {
+                    if plan.source.is_static() {
+                        return false;
+                    }
+                    let editor_value = value_is_editor
+                        && plan.name == "value"
+                        && plan.value_type == BindingType::Text
+                        && Some(plan.binding) == value_binding;
+                    let epoch = if editor_value {
+                        plan.source.epoch(state)
+                    } else {
+                        plan.source.change_epoch(state)
+                    };
+                    plan.source.is_disposed(state)
+                        || table.has_fault(plan.binding)
+                        || table.last_epoch(plan.binding) != epoch
+                        || plan.source.is_dirty(state)
+                })
+                .collect()
+        });
+        let attr_values: Vec<Option<ReadValue<AttrCurrent>>> = attr_plans
+            .iter()
+            .zip(attr_evaluate)
+            .map(|(plan, should_evaluate)| {
+                if should_evaluate {
+                    plan.evaluate()
+                } else {
+                    None
+                }
+            })
+            .collect();
         let style_plans: Vec<StylePlan> = with_state(|state| {
             let Some(table) = state.nodes.binding_table(tree) else {
                 return Vec::new();
@@ -7057,19 +7352,64 @@ impl Runtime {
                 .map(|style| StylePlan::describe(table, style.property, style.binding))
                 .collect()
         });
-        let style_values: Vec<Option<ReadValue<StyleValue>>> =
-            style_plans.iter().map(StylePlan::evaluate).collect();
+        let style_evaluate: Vec<bool> = with_state(|state| {
+            let Some(table) = state.nodes.binding_table(tree) else {
+                return style_plans.iter().map(|_| true).collect();
+            };
+            style_plans
+                .iter()
+                .map(|plan| {
+                    if plan.source.is_static() {
+                        return false;
+                    }
+                    plan.source.is_disposed(state)
+                        || table.has_fault(plan.binding)
+                        || table.last_epoch(plan.binding) != plan.source.change_epoch(state)
+                        || plan.source.is_dirty(state)
+                })
+                .collect()
+        });
+        let style_values: Vec<Option<ReadValue<StyleValue>>> = style_plans
+            .iter()
+            .zip(style_evaluate)
+            .map(|(plan, should_evaluate)| {
+                if should_evaluate {
+                    plan.evaluate()
+                } else {
+                    None
+                }
+            })
+            .collect();
 
         let mut attrs_changed = false;
         let mut styles_changed = false;
         let mut faults = Vec::new();
         with_state(|state| {
             for (plan, next) in attr_plans.iter().zip(attr_values) {
+                if next.is_some() {
+                    state.binding_evaluations = state.binding_evaluations.saturating_add(1);
+                }
                 match next {
-                    // 静态/once 值在挂载时已写入，永不重算。
+                    // 静态/once 值与跳过的动态值都保持已提交值。
                     None => {}
                     Some(ReadValue::Value(next)) => {
                         attrs_changed |= plan.commit_value(state, tree, node, next);
+                        // 成功求值后记录代数；故障不记录，下一轮重试。
+                        let editor_value = value_is_editor
+                            && plan.name == "value"
+                            && plan.value_type == BindingType::Text
+                            && Some(plan.binding) == value_binding;
+                        let epoch = if editor_value {
+                            plan.source.epoch(state)
+                        } else {
+                            plan.source.change_epoch(state)
+                        };
+                        if let Some(epoch) = epoch {
+                            state
+                                .nodes
+                                .binding_table_mut(tree)
+                                .record_epoch(plan.binding, epoch);
+                        }
                     }
                     Some(ReadValue::Fault(fault)) => {
                         // 失败不替换 current：属性保持最后已提交值，首次失败则缺席。
@@ -7079,10 +7419,19 @@ impl Runtime {
                 }
             }
             for (plan, next) in style_plans.iter().zip(style_values) {
+                if next.is_some() {
+                    state.binding_evaluations = state.binding_evaluations.saturating_add(1);
+                }
                 match next {
                     None => {}
                     Some(ReadValue::Value(next)) => {
                         styles_changed |= plan.commit_value(state, tree, node, next);
+                        if let Some(epoch) = plan.source.change_epoch(state) {
+                            state
+                                .nodes
+                                .binding_table_mut(tree)
+                                .record_epoch(plan.binding, epoch);
+                        }
                     }
                     Some(ReadValue::Fault(fault)) => {
                         plan.mark_fault(state, tree, fault.clone());
@@ -7094,14 +7443,6 @@ impl Runtime {
                 state.record_read_fault(fault);
             }
         });
-
-        // 属性列表在 scratch 里，已提交值仍从绑定槽读取；文本编辑器据此
-        // 辨认模型写入。
-        let value_binding = scratch
-            .attrs()
-            .iter()
-            .find(|attr| attr.name == "value")
-            .map(|attr| attr.binding);
         let (committed, epoch) = match value_binding {
             Some(binding) => with_state(|state| {
                 let Some(table) = state.element_binding_table(id) else {
@@ -7181,7 +7522,7 @@ impl Runtime {
         let binding = show.when;
         let tree = with_state(|state| state.nodes.tree_of(node))
             .expect("a mounted Show node belongs to a tree");
-        let (source, committed) = with_state(|state| {
+        let (source, committed, skip) = with_state(|state| {
             let table = state
                 .nodes
                 .binding_table(tree)
@@ -7189,7 +7530,14 @@ impl Runtime {
             let slot = table
                 .slot::<bool>(binding)
                 .expect("a mounted Show binding slot is live");
-            (slot.source, slot.current)
+            // 值变化代数未推进且没有 fault 时，已提交分支仍然精确。
+            let skip = !slot.source.is_static()
+                && slot.current.is_some()
+                && !slot.source.is_disposed(state)
+                && !table.has_fault(binding)
+                && table.last_epoch(binding) == slot.source.change_epoch(state)
+                && !slot.source.is_dirty(state);
+            (slot.source, slot.current, skip)
         });
         // `Static`/`Once` 在挂载时提交；动态源失败时保持当前分支。
         let active = if source.is_static() {
@@ -7197,11 +7545,17 @@ impl Runtime {
                 return Ok(());
             };
             active
+        } else if skip {
+            committed.expect("a skipped Show slot has a committed branch")
         } else {
+            with_state(|state| {
+                state.binding_evaluations = state.binding_evaluations.saturating_add(1);
+            });
             match source.evaluate::<bool>() {
                 ReadValue::Value(value) => {
                     let changed = committed != Some(value);
                     with_state(|state| {
+                        let epoch = source.change_epoch(state);
                         if let Some(slot) = state
                             .nodes
                             .binding_table_mut(tree)
@@ -7210,6 +7564,9 @@ impl Runtime {
                             slot.fault = None;
                             if changed {
                                 slot.current = Some(value);
+                            }
+                            if let Some(epoch) = epoch {
+                                slot.record_epoch(epoch);
                             }
                         }
                         if changed {
@@ -7384,7 +7741,7 @@ impl Runtime {
         let mut source_error = None;
         let rows: Option<RowSet> = match for_node.rows {
             MountedForRows::Read(binding) => {
-                let (source, committed) = with_state(|state| {
+                let (source, committed, skip) = with_state(|state| {
                     let table = state
                         .nodes
                         .binding_table(tree)
@@ -7392,15 +7749,27 @@ impl Runtime {
                     let slot = table
                         .slot::<RowSet>(binding)
                         .expect("a mounted For binding slot is live");
-                    (slot.source, slot.current.clone())
+                    // 行集 memo 的值变化 algebra 未推进时，投影保持不变；带
+                    // fault 的槽仍每轮重试。
+                    let skip = !slot.source.is_static()
+                        && slot.current.is_some()
+                        && !slot.source.is_disposed(state)
+                        && !table.has_fault(binding)
+                        && table.last_epoch(binding) == slot.source.change_epoch(state)
+                        && !slot.source.is_dirty(state);
+                    (slot.source, slot.current.clone(), skip)
                 });
-                if source.is_static() {
+                if source.is_static() || skip {
                     committed
                 } else {
+                    with_state(|state| {
+                        state.binding_evaluations = state.binding_evaluations.saturating_add(1);
+                    });
                     match source.evaluate::<RowSet>() {
                         ReadValue::Value(next) => {
                             let changed = committed.as_ref() != Some(&next);
                             with_state(|state| {
+                                let epoch = source.change_epoch(state);
                                 if let Some(slot) = state
                                     .nodes
                                     .binding_table_mut(tree)
@@ -7409,6 +7778,9 @@ impl Runtime {
                                     slot.fault = None;
                                     if changed {
                                         slot.current = Some(next.clone());
+                                    }
+                                    if let Some(epoch) = epoch {
+                                        slot.record_epoch(epoch);
                                     }
                                 }
                                 if changed {
@@ -9578,6 +9950,18 @@ impl Runtime {
         self.state.borrow().store_counters
     }
 
+    /// 当前 live 数据的内存报告；UI/For 持久内存与共享 `RowSet` 分开计。
+    ///
+    /// 诊断与内存门禁使用；见 [`MemoryReport`] 的计费边界。
+    pub fn memory_report(&self) -> MemoryReport {
+        self.state.borrow().memory_report()
+    }
+
+    /// arena 存储与依赖图的容量报告；反复 churn 后应与高水位持平。
+    pub fn storage_report(&self) -> StorageReport {
+        self.state.borrow().storage_report()
+    }
+
     /// 当前焦点窗口的呈现 revision。
     ///
     /// 每个树维护自己的计数器；这里只读取当前活动树的版本，不再混合
@@ -9603,6 +9987,18 @@ impl Runtime {
             .tree(TreeSlot::Window(window.key))
             .map(|tree| tree.revision)
             .ok_or(WindowError::Stale)
+    }
+
+    /// 动态绑定槽求值总次数；静态/once 槽与 setup 读取不计入。
+    ///
+    /// 性能门禁按 turn 读取差值；该计数与 Store 指标独立。
+    pub fn binding_evaluations(&self) -> u64 {
+        self.state.borrow().binding_evaluations
+    }
+
+    /// 完成的 memo compute 总次数；相等值与毒化恢复都按一次结算计数。
+    pub fn memo_recomputes(&self) -> u64 {
+        self.state.borrow().memo_recomputes
     }
 
     /// 实际构建 presentation snapshot 根的总次数；revision 未变的读取复用

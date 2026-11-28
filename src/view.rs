@@ -355,13 +355,72 @@ impl ReadSlot {
         }
     }
 
-    /// 值绑定的写入代数；静态来源没有写入路径。
+    /// 值绑定的写入尝试代数；静态来源没有写入路径。
+    ///
+    /// Signal/Field 的相等写入也推进它，文本编辑器据此辨认“处理器处理过
+    /// 这次编辑”；普通绑定用 [`ReadSlot::change_epoch`] 跳过相等写入。
     pub(crate) fn epoch(self, state: &crate::runtime::State) -> Option<u64> {
         match self {
             Self::Static | Self::Once(_) => None,
             Self::Signal(source) => Some(state.source_write_epoch(source)),
             Self::Memo(source) => Some(state.source_memo_revision(source)),
             Self::Field(key) => Some(state.field_write_epoch(key.id, key.kind)),
+        }
+    }
+
+    /// 来源 memo 是否仍有未结算的脏状态。
+    ///
+    /// 值变化代数只在 memo 完成计算后推进；dirty 但尚未结算的 memo 必须
+    /// 通过绑定求值触发的读取路径补救，不能按代数相等跳过。
+    pub(crate) fn is_dirty(self, state: &crate::runtime::State) -> bool {
+        let Self::Memo(source) = self else {
+            return false;
+        };
+        state
+            .memos
+            .get(source.id as usize)
+            .is_none_or(|cell| cell.dirty || cell.computing)
+            || state.memo_deps_unsettled(source.id)
+    }
+
+    /// 来源是否已经释放；释放不推进值变化代数，跳过求值前必须单独检查。
+    pub(crate) fn is_disposed(self, state: &crate::runtime::State) -> bool {
+        match self {
+            Self::Static | Self::Once(_) => false,
+            Self::Signal(source) => state
+                .signals
+                .get(source.id as usize)
+                .is_some_and(|cell| cell.disposed),
+            Self::Memo(source) => state
+                .memos
+                .get(source.id as usize)
+                .is_some_and(|cell| cell.disposed),
+            Self::Field(_) => false,
+        }
+    }
+
+    /// 值变化代数：只有值真的改变才推进。
+    ///
+    /// 绑定刷新用它判断能否跳过求值；memo 的相等重算不推进 revision，
+    /// 因此下游绑定也不需要重算。
+    pub(crate) fn change_epoch(self, state: &crate::runtime::State) -> Option<u64> {
+        match self {
+            Self::Static | Self::Once(_) => None,
+            Self::Signal(source) => Some(
+                state
+                    .write_epochs
+                    .get(&crate::context::DepKey::Signal(source.id))
+                    .copied()
+                    .unwrap_or(0),
+            ),
+            Self::Memo(source) => Some(state.source_memo_revision(source)),
+            Self::Field(key) => Some(
+                state
+                    .write_epochs
+                    .get(&crate::context::DepKey::Field(key.id, key.kind))
+                    .copied()
+                    .unwrap_or(0),
+            ),
         }
     }
 }

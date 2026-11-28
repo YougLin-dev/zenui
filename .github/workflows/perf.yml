@@ -1,0 +1,100 @@
+name: perf
+
+# 固定 Windows runner 上的性能/内存门禁（§20.3）。
+#
+# - perf：每晚与手动触发，release PR（label `release`）也运行。
+# - soak：每周与手动触发，release PR 也运行。
+# - 失败阻塞发布，不是普通 PR 的 required check。
+#
+# runner 必须带 `perf-windows` 标签并在仓库外登记（CPU/内存/OS 写进
+# docs/实现/性能门禁.md）。基线只在同一 runner 上用
+# `cargo run -p zenui-perf --release -- record --runner perf-windows`
+# 录制；`--require-time` 会在指纹不匹配时直接失败并要求重录。
+
+on:
+  schedule:
+    # 每晚 02:00 UTC 跑 perf；每周一 03:00 UTC 跑 soak。
+    - cron: "0 2 * * *"
+    - cron: "0 3 * * 1"
+  workflow_dispatch:
+  pull_request:
+    types: [labeled]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: perf-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  perf:
+    name: perf (perf-windows)
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      github.event.schedule == '0 2 * * *' ||
+      (github.event_name == 'pull_request' && github.event.label.name == 'release')
+    runs-on: [self-hosted, windows, perf-windows]
+    timeout-minutes: 60
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      # 运行时指纹里需要稳定的 CPU 标识；runner 的 `PROCESSOR_IDENTIFIER`
+      # 由系统提供，这里只记录构建版本。
+      ZENUI_PERF_RUNNER: perf-windows
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Toolchain
+        run: |
+          cargo --version
+          rustc --version --verbose
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: perf
+          workspaces: "."
+          cache-bin: "false"
+          cache-on-failure: "true"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # 计数硬上限在任何机器上都检查；时间只在与基线相同的 runner/指纹上
+      # 启用。`--require-time` 让尚未重录基线的 runner 直接失败。
+      - name: Performance gates
+        run: cargo run --release -p zenui-perf --locked -- check --runner perf-windows --require-time
+
+  soak:
+    name: soak (perf-windows)
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      github.event.schedule == '0 3 * * 1' ||
+      (github.event_name == 'pull_request' && github.event.label.name == 'release')
+    runs-on: [self-hosted, windows, perf-windows]
+    timeout-minutes: 90
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      ZENUI_PERF_RUNNER: perf-windows
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Toolchain
+        run: |
+          cargo --version
+          rustc --version --verbose
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: perf-soak
+          workspaces: "."
+          cache-bin: "false"
+          cache-on-failure: "true"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Soak gates
+        run: cargo run --release -p zenui-perf --locked -- check --runner perf-windows --require-time --bench memory_soak

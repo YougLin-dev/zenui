@@ -90,6 +90,21 @@ impl RowSet {
     pub fn shares_with(&self, other: &Self) -> bool {
         self.0.shares_with(&other.0)
     }
+
+    /// 共享这份投影的活跃句柄数（包含当前句柄本身）。
+    ///
+    /// 诊断/内存报告使用；计数包含所有消费者持有的克隆。调用方在单线程
+    /// 运行时上读取，因此结果是同一时刻的快照。
+    pub fn shared_count(&self) -> usize {
+        Arc::strong_count(&self.0)
+    }
+
+    /// 这份共享投影实际占用的堆字节：`RowSetData` 头加每行一个 `RowId`。
+    ///
+    /// 句柄本身（`Arc` 指针）不计入；同一份投影无论被多少消费者共享只算一次。
+    pub fn heap_bytes(&self) -> usize {
+        std::mem::size_of::<RowSetData>() + self.len() * std::mem::size_of::<RowId>()
+    }
 }
 
 /// 先比较共享身份，再比较来源 store 与**顺序**；纯重排因此改变相等性。

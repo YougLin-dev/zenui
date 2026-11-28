@@ -466,7 +466,7 @@ impl crate::runtime::State {
     /// 失效只标直接消费者；flush 的 worklist 会把变化逐级传播。事件阶段读取
     /// 一个仍 clean 的下游 memo 时，必须沿订阅边确认上游已经结算，否则会拿到
     /// 旧缓存。这里只遍历 memo 边，源（Signal/Field/Rows）的变化已经直接标脏。
-    fn memo_deps_unsettled(&self, id: u32) -> bool {
+    pub(crate) fn memo_deps_unsettled(&self, id: u32) -> bool {
         let mut stack: Vec<u32> = self.memos[self.memo_index(id)]
             .deps
             .iter()
@@ -546,6 +546,7 @@ impl crate::runtime::State {
         compute: Rc<dyn MemoCompute>,
     ) {
         self.phase = previous_phase;
+        self.memo_recomputes = self.memo_recomputes.saturating_add(1);
         let (_, deps) = self.computing.pop().expect("memo compute stack");
         let index = self.memo_index(id);
         let cell = &mut self.memos[index];
