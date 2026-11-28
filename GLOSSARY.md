@@ -68,7 +68,75 @@ _Avoid_: host worker, UI task, dialog task, file drop
 拥有原生窗口、事件循环、DPI 与 surface，并驱动 target runtime 的平台层。
 _Avoid_: platform backend, shell
 
-**Presentation snapshot**:
+**turn**:
+一次派发（用户输入、UIA 动作或任务交付）从 handler、模型/UI 写入、flush、快照发布到宿主动作结算的同步边界。一个 turn 可以包含多次提交，发布会累计这些变化；空 click、相等写入与纯 runtime 计数变化仍构成 turn，但不产生 effective change。
+_Avoid_: frame, event loop iteration
+
+**Intent**:
+平台输入或测试助手表达的、尚未绑定具体处理器的动作：来源、目标、`IntentPayload`（Click、Activate、Press、KeyDown）与修饰键。runtime 在已提交树上按 closest-wins 解析目标并生成 `TurnReport`；它不是 UIA 的 `UiAction`。
+_Avoid_: input event (when meaning the semantic action), UIA command
+
+**UiAction**:
+UIA provider 排入窗口动作队列的 Node 载荷：Invoke、Toggle、ReplaceValue、SetSelection、SetFocus。UI 线程按 FIFO 重验窗口、NodeId、启用、可见、挂起与组合状态后调用对应 runtime 命令；Scroll 不是 UiAction。
+_Avoid_: UIA command (when meaning the Node payload), native click
+
+**TurnReport**:
+一次 turn 的公开报告：`TurnOutcome`、错误列表、`RevealFlags` 与 `changed`。`changed` 只在呈现有效变化时为真；宿主据 outcome 决定是否执行原生默认动作，据 reveal 置位显露。
+_Avoid_: event result, frame report
+
+**TurnOutcome**:
+turn 的 `consumed` 与 `prevent_default` 两个布尔结果；处理器、窗口根 keydown 与宿主默认动作共同决定。它不表示模型事务是否提交成功，后者由错误与模型结果表达。
+_Avoid_: handler result, default action flag
+
+**effective change**:
+会改变已发布呈现的提交：属性、文本、直接子序、焦点、外观或行带等。相等写入、空 click、只推进内部代数或计数的操作不是 effective change；它们不推进树 revision、不构建快照。
+_Avoid_: dirty state, write
+
+**closest-wins**:
+派发沿“最深命中节点 → 祖先 → 窗口根”的顺序选择第一个拥有该事件处理器的元素；只有它运行，行内按钮自己的处理器因此优先于行处理器。原生交互控件没有处理器时阻断祖先穿透；未消费只影响默认动作，不会把同一事件交给下一个祖先处理器。capture/bubble 变体显式增加祖先或根观察；窗口根 keydown 是最后兜底。
+_Avoid_: bubble order, event propagation
+
+**PresentationKey**:
+跨快照稳定的呈现身份，是 `NodeRef` 的 8 B 公开编码；元素与文本节点都携带。renderer 用它索引节点与应用 `PresentationDelta`，槽位复用时 generation 改变，旧 key 不会命中新节点。
+_Avoid_: snapshot id, render id
+
+**Read**:
+intrinsic 数据位与组件 prop 接受的值源：`Signal`、`Memo`、`Field`、`Once` 或静态值。挂载期转换为绑定槽；动态源只在值变化代数或（文本输入的）写入尝试代数推进时求值，静态/once 值在挂载时提交后不再重算。
+_Avoid_: binding value, observable
+
+**ForSource**:
+`For` 的行集读源抽象：`Rows` 投影、`RowSet` 读源或已预挂载的行来源。它决定行身份顺序；`store` 与 `key` 分别提供行数据与业务键，三者共同建立 keyed 行映射。
+_Avoid_: list data, row provider
+
+**RowView**:
+`For` 行 factory 的参数。`id()` 是行身份，`key()` 是业务键，`get()` 是本次挂载的快照；行重新进入挂载窗口时得到新的 `RowView` 与本地状态。
+_Avoid_: row handle, row item
+
+**OwnerRef**:
+owner arena 的 8 B 身份（32-bit slot + 32-bit generation），随 Owner 释放失效。元素、资源与子 Owner 通过它归属清理链；旧 OwnerRef 不能命中复用槽位。
+_Avoid_: owner id, scope id
+
+**BindingPart**:
+绑定在节点上的稳定部位标识（文本、属性、样式、Show when、For each、值等）。绑定补丁按 `(tree, node, part)` 去重，同一 turn 的重复求值不会产生重复补丁。
+_Avoid_: binding key, attribute id
+
+**BindingTable**:
+每棵树的类型化绑定槽表，按值类型分 arena；元素只保存 `BindingListId`，槽记录 source、current、fault、generation 与上次成功结算的源代数。槽位复用换 generation，旧 `BindingRef` 失效。
+_Avoid_: binding map, slot table
+
+**StoreId**:
+Store 实例的稳定身份。`RowSetData` 记录来源 `StoreId`；`For` 拒绝来自其他 Store 的行集，跨 Store 的身份不会被当作同一行。
+_Avoid_: store index, model id
+
+**ReadFault**:
+typed 读取失败：Disposed、FieldMissing、ComputedPanicked 或 GraphCycle。绑定保留最后已提交值并把 fault 记在槽位上，`RefreshReport::faults()` 报告本轮遇到的失败；故障槽下一轮继续重试。
+_Avoid_: read error, missing value
+
+**CloseOutcome**:
+关闭处理器对一次 `CloseRequest` 的结算：Allow 释放父窗口与确认窗口，Deny 释放确认窗口并恢复父窗口，Pending 保持 epoch 待决并要求同一 closing turn 内显示确认窗口。它不同于窗口方法返回的 typed `CloseError`。
+_Avoid_: close result, confirm result
+
+**PresentationSnapshot**（presentation snapshot）:
 从已提交界面状态生成的不可变、结构共享的派生描述，含稳定 node ID、tag、渲染所需属性、文本与本地编辑状态；不含几何、闭包或句柄，也不是第二棵保留树。对外唯一发布的单位是 `PresentationSnapshot`，它包裹内部的 `Arc<SnapshotRoot>`：同一树 revision 的读取共享同一个根，`Clone` 只增加引用计数，旧根在最后一个引用释放后回收；相等性先比较 revision 与指针身份，再退化到内容比较。元素与文本节点都携带跨快照稳定的 `PresentationKey`。
 _Avoid_: render tree, view tree, frame
 
@@ -76,19 +144,19 @@ _Avoid_: render tree, view tree, frame
 宿主逐帧维护的 hover/press/focus“最深节点 → 根”路径集合，按 `Arc<[NodeId]>` 共享。`hover:`/`active:` 条件对路径内任意元素成立，内建 hover/pressed 视觉只落在最深节点；路径不进入 presentation snapshot 或响应式图。路径内容变化推进 `generation`，与快照 revision、环境代际一起构成场景缓存键。
 _Avoid_: hover node, hit path
 
-**Environment generation**:
+**EnvGeneration**（environment generation）:
 每个窗口独立的呈现环境代际，随系统偏好、DPI、滚动偏移与焦点 modality 变化递增；它不是树 revision，也不进入快照。文本缩放/DPI 变化据此重建布局、整形与行带，高对比度据此重建调色板与场景，而 `tree.revision` 保持不变。
 _Avoid_: env version, ui revision
 
-**Reveal flags**:
+**RevealFlags**（reveal flags）:
 一次 turn 报告（`TurnReport::reveal`）中的焦点、caret/selection 与组合变化标志；由 runtime 在 turn 开始与结算时比较同一棵树的焦点节点、caret 与 anchor（selection 由二者派生）以及 preedit 得出。宿主只在任一标志为真时置位待决显露，显式滚动清除它；标志不进入快照或响应式图。
 _Avoid_: scroll request, focus event
 
-**Presentation delta**:
+**PresentationDelta**（presentation delta）:
 一次提交相对上次成功发布的累计变化，按 `PresentationKey` 给出 changed（含祖先路径）、inserted、removed、removed subtrees 与 layout roots，以及焦点/外观/行带标志；不携带旧值或父链。renderer 用它失效增量缓存，UIA 不消费 delta。
 _Avoid_: diff, patch
 
-**Presentation update**:
+**PresentationUpdate**（presentation update）:
 `PresentationSnapshot` 与可选 `PresentationDelta` 的发布单位。delta 为 `None` 表示完整根：首次发布、隐藏窗口重新显示后的首次发布、顶层根序列变化或无法安全累计时使用。renderer 侧的 `PresentationView` 维护 `applied_revision`，只接受与已应用 revision 连续且与快照同代的 delta；断档时丢弃 delta、按最新根全量重建。
 _Avoid_: frame packet, sync message
 
@@ -165,14 +233,14 @@ presentation snapshot 中用于命中测试与事件派发的稳定元素身份�
 _Avoid_: element index, view ID
 
 **Accessibility tree**:
-每个已提交窗口从 presentation snapshot 与同一份 `Scene` 派生的只读 UIA 树；发布时整体替换，节点身份沿用 Node ID，provider 解析当前发布而不是保留第二份界面。每个已发布窗口有自己的 fragment root（ADR-0012）。写 pattern、TextPattern 的 Select 与窗口根的 ScrollPattern 从这棵树派生动作并排给 UI 线程，不在 provider 线程修改 Runtime；事件由相邻两次发布派生，见 accessibility event。
+每个已提交窗口从 presentation snapshot 与同一份 `Scene` 派生的只读 UIA 树；发布时整体替换，不消费 `PresentationDelta`，而是在相邻两次已发布树之间做比较，节点身份沿用 Node ID，provider 解析当前发布而不是保留第二份界面。每个已发布窗口有自己的 fragment root（ADR-0012）。写 pattern、TextPattern 的 Select 与窗口根的 ScrollPattern 从这棵树派生动作并排给 UI 线程，不在 provider 线程修改 Runtime；事件由相邻两次发布派生，见 accessibility event。
 _Avoid_: a11y DOM, accessibility model (when meaning a separate retained tree)
 
 **Accessibility provider**:
 每个已发布窗口的 UIA fragment root 与元素 provider；持有窗口发布单元的弱引用，按调用线程解析当前不可变树，不保存第二份界面，也不在 provider 线程修改 Runtime。写操作经每窗口动作队列交给 UI 线程重验；隐藏、过期或清除发布的查询返回 `UIA_E_ELEMENTNOTAVAILABLE`。
 _Avoid_: a11y proxy, retained UIA model
 
-**Provider action**:
+**ProviderAction**（provider action）:
 provider 线程排入、UI 线程按 FIFO 取出并重验的一条写请求：`Node(UiActionRequest)` 或 `Scroll(ScrollRequest)`，两者共享每窗口 1024 上限、顺序与隐藏/关闭/零客户区清空。请求只含 POD 身份与载荷，不含 `WindowCtx`；Scroll 请求不携带 NodeId。
 _Avoid_: UIA queue item, host action
 
@@ -181,7 +249,7 @@ Provider action 的 Node 载荷：Invoke、Toggle、ReplaceValue、SetSelection�
 _Avoid_: UIA command (when meaning the Node payload), native click
 
 **Accessibility event**:
-相邻两次已发布 UIA 树按 runtime ID 比较后产生、在发布线程投递的一次通知；顺序为结构、属性、焦点。只有前台窗口投递焦点事件，后台焦点变化不在激活时补发；焦点清空以 `GetFocus` 为空表达，没有单独事件。hover/press 与滚动几何不进入树，因此不产生事件。
+相邻两次已发布 UIA 树按 runtime ID 比较后产生、在发布线程投递的一次通知；顺序为结构、属性、焦点。UIA 整树发布并比较相邻发布，`PresentationDelta` 只给 renderer，不参与事件派生。只有前台窗口投递焦点事件，后台焦点变化不在激活时补发；焦点清空以 `GetFocus` 为空表达，没有单独事件。hover/press 与滚动几何不进入树，因此不产生事件。
 _Avoid_: accessibility notification (when meaning transient UI changes), screen reader message
 
 **ScrollPattern**:

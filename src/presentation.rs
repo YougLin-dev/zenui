@@ -183,6 +183,22 @@ impl PresentationSnapshot {
         &self.root.roots
     }
 
+    /// 根内全部呈现节点数，包含元素与文本；O(节点数)。
+    ///
+    /// 性能门禁用它区分“重建一个快照根”和“重建了更多节点”。
+    pub fn node_count(&self) -> usize {
+        fn count(nodes: &[SnapshotNode]) -> usize {
+            nodes
+                .iter()
+                .map(|node| match node {
+                    SnapshotNode::Element(element) => 1 + count(&element.children),
+                    SnapshotNode::Text(_) => 1,
+                })
+                .sum()
+        }
+        count(&self.root.roots)
+    }
+
     /// 当前焦点元素；没有可聚焦的已提交目标时为 `None`。
     pub fn focus(&self) -> Option<NodeId> {
         self.root.focus

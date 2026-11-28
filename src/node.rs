@@ -468,7 +468,10 @@ impl<T> Pool<T> {
         self.live
     }
 
-    #[cfg(test)]
+    pub(crate) fn live_values(&self) -> impl Iterator<Item = &T> + '_ {
+        self.values.iter().flatten()
+    }
+
     pub(crate) fn storage_len(&self) -> usize {
         self.values.len()
     }
@@ -660,6 +663,11 @@ pub(crate) struct BindingSlot<T> {
     /// 本次求值失败；可与 `current` 同时存在。
     pub(crate) fault: Option<ReadFault>,
     pub(crate) generation: u32,
+    /// 上次成功求值时的源代数 + 1；0 表示从未结算。
+    ///
+    /// 用 +1 编码而不是 `Option<u64>`，保持槽位 8 B 增量。代数回绕到
+    /// `u64::MAX + 1 == 0` 时只多求值一次，语义不受影响。
+    pub(crate) last_epoch: u64,
 }
 
 impl<T> BindingSlot<T> {
@@ -674,7 +682,18 @@ impl<T> BindingSlot<T> {
             current,
             fault,
             generation,
+            last_epoch: 0,
         }
+    }
+
+    /// 上次成功结算的源代数；从未结算时为 `None`。
+    pub(crate) fn last_epoch(&self) -> Option<u64> {
+        self.last_epoch.checked_sub(1)
+    }
+
+    /// 记录一次成功结算；故障求值不记录，下一轮仍会重试。
+    pub(crate) fn record_epoch(&mut self, epoch: u64) {
+        self.last_epoch = epoch.wrapping_add(1);
     }
 }
 
@@ -739,6 +758,27 @@ pub(crate) struct BindingArena<T> {
     cells: Vec<BindingCell<T>>,
     free: Vec<u32>,
     live: usize,
+}
+
+impl<T: BindingValue> BindingArena<T> {
+    /// live 槽头与值自身的堆字节；共享投影的数据不计入。
+    pub(crate) fn memory_bytes(&self) -> usize {
+        self.cells
+            .iter()
+            .filter_map(|cell| match cell {
+                BindingCell::Live(slot) => Some(slot),
+                BindingCell::Vacant { .. } => None,
+            })
+            .map(|slot| {
+                std::mem::size_of::<BindingSlot<T>>()
+                    + slot.current.as_ref().map_or(0, T::heap_bytes)
+            })
+            .sum()
+    }
+
+    pub(crate) fn storage_len(&self) -> usize {
+        self.cells.len()
+    }
 }
 
 impl<T> BindingArena<T> {
@@ -849,6 +889,13 @@ pub(crate) trait BindingValue: ReactiveValue + PartialEq + 'static {
 
     fn arena(table: &BindingTable) -> &BindingArena<Self>;
     fn arena_mut(table: &mut BindingTable) -> &mut BindingArena<Self>;
+
+    /// 已提交值自身的堆字节；槽头由调用方按 `BindingSlot<T>` 计入。
+    ///
+    /// 共享投影（`RowSet`）返回 0：它的数据单独计预算，所有槽只持有句柄。
+    fn heap_bytes(_value: &Self) -> usize {
+        0
+    }
 }
 
 macro_rules! binding_value {
@@ -865,9 +912,31 @@ macro_rules! binding_value {
             }
         }
     };
+    ($type:ty, $table:expr, $field:ident, heap = $heap:expr) => {
+        impl BindingValue for $type {
+            const TABLE: u8 = $table;
+
+            fn arena(table: &BindingTable) -> &BindingArena<Self> {
+                &table.$field
+            }
+
+            fn arena_mut(table: &mut BindingTable) -> &mut BindingArena<Self> {
+                &mut table.$field
+            }
+
+            fn heap_bytes(value: &Self) -> usize {
+                $heap(value)
+            }
+        }
+    };
 }
 
-binding_value!(String, TEXT_TABLE, text);
+binding_value!(
+    String,
+    TEXT_TABLE,
+    text,
+    heap = |value: &String| value.capacity()
+);
 binding_value!(bool, BOOL_TABLE, bools);
 binding_value!(Color, COLOR_TABLE, colors);
 binding_value!(Length, LENGTH_TABLE, lengths);
@@ -963,6 +1032,96 @@ impl BindingTable {
         T::arena_mut(self).get_mut(reference)
     }
 
+    /// 任意类型槽位的上次结算代数；`None` 表示从未结算或引用已过期。
+    pub(crate) fn last_epoch(&self, reference: BindingRef) -> Option<u64> {
+        match reference.table() {
+            TEXT_TABLE => self.text.get(reference).and_then(BindingSlot::last_epoch),
+            BOOL_TABLE => self.bools.get(reference).and_then(BindingSlot::last_epoch),
+            COLOR_TABLE => self.colors.get(reference).and_then(BindingSlot::last_epoch),
+            LENGTH_TABLE => self
+                .lengths
+                .get(reference)
+                .and_then(BindingSlot::last_epoch),
+            OPACITY_TABLE => self
+                .opacities
+                .get(reference)
+                .and_then(BindingSlot::last_epoch),
+            ROW_SET_TABLE => self
+                .row_sets
+                .get(reference)
+                .and_then(BindingSlot::last_epoch),
+            _ => None,
+        }
+    }
+
+    /// 槽位是否带着上次求值的 fault；fault 存在时每轮重试。
+    pub(crate) fn has_fault(&self, reference: BindingRef) -> bool {
+        match reference.table() {
+            TEXT_TABLE => self
+                .text
+                .get(reference)
+                .is_some_and(|slot| slot.fault.is_some()),
+            BOOL_TABLE => self
+                .bools
+                .get(reference)
+                .is_some_and(|slot| slot.fault.is_some()),
+            COLOR_TABLE => self
+                .colors
+                .get(reference)
+                .is_some_and(|slot| slot.fault.is_some()),
+            LENGTH_TABLE => self
+                .lengths
+                .get(reference)
+                .is_some_and(|slot| slot.fault.is_some()),
+            OPACITY_TABLE => self
+                .opacities
+                .get(reference)
+                .is_some_and(|slot| slot.fault.is_some()),
+            ROW_SET_TABLE => self
+                .row_sets
+                .get(reference)
+                .is_some_and(|slot| slot.fault.is_some()),
+            _ => false,
+        }
+    }
+
+    /// 记录一次成功结算的源代数；静态/once 槽不参与。
+    pub(crate) fn record_epoch(&mut self, reference: BindingRef, epoch: u64) {
+        match reference.table() {
+            TEXT_TABLE => {
+                if let Some(slot) = self.text.get_mut(reference) {
+                    slot.record_epoch(epoch);
+                }
+            }
+            BOOL_TABLE => {
+                if let Some(slot) = self.bools.get_mut(reference) {
+                    slot.record_epoch(epoch);
+                }
+            }
+            COLOR_TABLE => {
+                if let Some(slot) = self.colors.get_mut(reference) {
+                    slot.record_epoch(epoch);
+                }
+            }
+            LENGTH_TABLE => {
+                if let Some(slot) = self.lengths.get_mut(reference) {
+                    slot.record_epoch(epoch);
+                }
+            }
+            OPACITY_TABLE => {
+                if let Some(slot) = self.opacities.get_mut(reference) {
+                    slot.record_epoch(epoch);
+                }
+            }
+            ROW_SET_TABLE => {
+                if let Some(slot) = self.row_sets.get_mut(reference) {
+                    slot.record_epoch(epoch);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// 释放任意类型的槽；`false` 表示 ref 已过期或类型不可识别。
     pub(crate) fn release(&mut self, reference: BindingRef) -> bool {
         match reference.table() {
@@ -1051,6 +1210,25 @@ impl BindingTable {
             + self.row_sets.live()
     }
 
+    /// 已提交绑定值的槽头与字符串堆字节；`RowSet` 数据单独计预算。
+    pub(crate) fn memory_bytes(&self) -> usize {
+        self.text.memory_bytes()
+            + self.bools.memory_bytes()
+            + self.colors.memory_bytes()
+            + self.lengths.memory_bytes()
+            + self.opacities.memory_bytes()
+            + self.row_sets.memory_bytes()
+    }
+
+    pub(crate) fn storage_len(&self) -> usize {
+        self.text.storage_len()
+            + self.bools.storage_len()
+            + self.colors.storage_len()
+            + self.lengths.storage_len()
+            + self.opacities.storage_len()
+            + self.row_sets.storage_len()
+    }
+
     /// 测试/差分 oracle：枚举一种值类型的全部 live 槽。
     ///
     /// 返回已提交值、来源与 fault。静态/once 槽没有可重算的来源，调用方跳过
@@ -1082,6 +1260,12 @@ pub(crate) struct BindingList {
 }
 
 impl BindingList {
+    /// 列表头与 `(PartId, BindingRef)` 条目的堆字节。
+    pub(crate) fn heap_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.entries.capacity() * std::mem::size_of::<(PartId, BindingRef)>()
+    }
+
     /// 写入一个 part；返回被替换的旧引用，调用方必须把它归还绑定表。
     ///
     /// 正常挂载按 part 去重，替换只用于防御未来新增的写入路径。

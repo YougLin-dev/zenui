@@ -57,3 +57,8 @@ A preference sample, a DPI scale change, a change in the applied scroll offset o
 Applications see high contrast as a palette override and text scale as a layout input, without code changes. Applications that use literal colors or fixed `px` row heights keep responsibility for their own accessibility in those places; the SDK pages state both boundaries. The scene cache, row-band geometry and UIA tree already key off the scaled layout, so no separate invalidation path is added.
 
 The behavior is recorded in [stage-three 高对比度验收](../实现/stage-three-高对比度-验收.md) and [stage-three 文本缩放验收](../实现/stage-three-文本缩放-验收.md); the combined visible run and system-chrome check are in [stage-three 系统偏好验收](../实现/stage-three-系统偏好-验收.md). Reduced motion remains out of scope until an animation or ticker exists. Multi-monitor and mixed-DPI behavior remains #63. System menus, the tray and window chrome are drawn by Windows and follow the system theme without ZenUI involvement.
+
+
+## 状态更新（2026-11）
+
+性能/内存门禁在固定 runner 上记录环境相关路径的计数与时间；本条的系统偏好契约不变：文本缩放、DPI 与高对比度推进每窗口 `env_generation` 并重建场景/UIA 几何，不推进树 revision，应用外观仍走快照 revision。见 [性能门禁](../实现/性能门禁.md)。

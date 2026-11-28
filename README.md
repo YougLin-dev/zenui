@@ -77,6 +77,10 @@ target API 的公开行为测试位于根包 `tests/`，其中 `tests/tasks.rs` 
 - [技术架构](docs/实现/技术架构.md)：目标技术模型、研究借鉴与架构边界。
 - [渲染与平台](docs/实现/渲染与平台.md)：布局、文本、绘制、内容接入和宿主能力。
 - [验证重点](docs/实现/验证重点.md)：目标模型落地时需要验证的关键语义。
+- [性能门禁](docs/实现/性能门禁.md)：固定负载、基线文件、计数硬上限、时间噪声预算与固定 runner 运行方式。
+- [门禁覆盖](docs/实现/门禁覆盖.md)：方案 §9.3/§20 的正确性、性能、文档与 ADR 门禁到测试/页面/剩余工作的映射。
+- [可见验收矩阵](docs/实现/stage-three-可见验收矩阵.md)：Phase 0–5 可见 Windows 要求与既有证据等级。
+- [Windows 手动检查清单](docs/实现/windows-手动检查清单.md)：真实桌面逐项执行与证据记录入口。
 - [ADR-0007](docs/adr/0007-window-catalog-and-close-epoch.md)：窗口目录、per-activation 权威与关闭 epoch。
 - [ADR-0008](docs/adr/0008-file-picker-host-tasks.md)：打开文件选择器、宿主任务、显式所有权与 STA 模态对话框。
 - [ADR-0009](docs/adr/0009-file-dialog-family.md)：打开/保存/文件夹对话框家族、kind 矩阵与单路径校验。

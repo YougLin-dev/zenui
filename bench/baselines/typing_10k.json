@@ -1,0 +1,65 @@
+{
+  "schema": 1,
+  "bench": "typing_10k",
+  "runner": "dev",
+  "fingerprint": {
+    "os": "windows",
+    "arch": "x86_64",
+    "cpu": "Intel64 Family 6 Model 183 Stepping 1, GenuineIntel",
+    "logical_cores": 24,
+    "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+    "profile": "release",
+    "fonts": "system-default"
+  },
+  "git": "cec07df92d89-dirty",
+  "recorded_unix_seconds": 1795827321,
+  "noise": {
+    "warn": 0.1,
+    "fail": 0.15
+  },
+  "limits": {
+    "allocations": 2000,
+    "bindings_evaluated": 4,
+    "changed_turns": 1,
+    "delta_full_roots": 0,
+    "layout_roots": 1,
+    "memo_recomputed": 0,
+    "mounted_nodes_growth": 0,
+    "revision_advanced": 1,
+    "scene_builds": 1,
+    "scene_elements": 128,
+    "snapshot_nodes_rebuilt": 4,
+    "snapshot_roots_built": 1
+  },
+  "measured": {
+    "allocations": 1809,
+    "appearance_changed_turns": 0,
+    "bindings_evaluated": 1,
+    "changed_turns": 1,
+    "delta_full_roots": 0,
+    "layout_roots": 1,
+    "memo_recomputed": 0,
+    "mounted_nodes": 143,
+    "mounted_nodes_growth": 0,
+    "revision_advanced": 1,
+    "row_bands_changed_turns": 0,
+    "scene_builds": 1,
+    "scene_elements": 105,
+    "snapshot_nodes_changed": 2,
+    "snapshot_nodes_inserted": 0,
+    "snapshot_nodes_rebuilt": 2,
+    "snapshot_nodes_removed": 0,
+    "snapshot_roots_built": 1,
+    "snapshot_total_nodes": 141
+  },
+  "timing_ns": {
+    "samples": 51,
+    "median_ns": 17055900,
+    "p50_ns": 17055900,
+    "p95_ns": 22335500,
+    "min_ns": 15415900,
+    "fast_ns": 15766660,
+    "repeats": 32
+  },
+  "clock_ns": 3445200
+}
