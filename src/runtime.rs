@@ -917,9 +917,12 @@ struct MountedTree {
     nodes: Vec<MountedNode>,
     owner: u32,
     focused: Option<usize>,
+    /// 记录焦点时的元素身份；槽位复用后 `focused` 不再代表原节点。
+    focused_id: Option<NodeId>,
     /// 焦点元素的 tag；元素卸载后仍用于同 tag 焦点接任。
     focused_tag: Option<&'static str>,
-    settle_before: Option<Vec<usize>>,
+    /// 刷新前的全部元素顺序及其身份；接任只从这些旧身份里选。
+    settle_before: Option<Vec<(usize, NodeId)>>,
     /// 只在这棵树出现有效呈现变化时取新值；不同树互不影响。
     revision: u64,
     /// 最近一次构建的呈现快照；revision 仍匹配时重复读取共享同一个 `Arc`
@@ -1168,8 +1171,10 @@ pub(crate) struct State {
     next_row_band: u64,
     /// 正在刷新的树在刷新前的焦点元素，供窗口化 For 的行 grace 使用。
     refresh_focus: Option<usize>,
-    /// 本帧窗口化 For 卸载了焦点所在行；刷新后清除焦点而不是结算到邻居。
-    window_focus_dropped: Option<usize>,
+    /// 与 `refresh_focus` 同时捕获的节点身份；槽位复用后原行不再可信。
+    refresh_focus_id: Option<NodeId>,
+    /// 本帧窗口化 For 卸载了焦点所在行；刷新后按身份清除焦点而不是结算到邻居。
+    window_focus_dropped: Option<NodeId>,
     /// 正在进行的批量行窗口结构 turn；只有该 turn 内的刷新会记录哪些
     /// 行带已经消费并提交了请求。
     row_window_batch: Option<RowWindowBatch>,
@@ -1661,6 +1666,7 @@ impl State {
             owner_bands: BTreeMap::new(),
             next_row_band: 1,
             refresh_focus: None,
+            refresh_focus_id: None,
             window_focus_dropped: None,
             row_window_batch: None,
             tasks: BTreeMap::new(),
@@ -2363,7 +2369,16 @@ impl State {
 
     /// 当前焦点目标；焦点属于树，而不是整个应用。
     fn focused_in(&self, key: TreeSlot) -> Option<usize> {
-        self.tree(key).and_then(|tree| tree.focused)
+        let tree = self.tree(key)?;
+        let slot = tree.focused?;
+        let id = tree.focused_id?;
+        self.element_is_current(slot, id).then_some(slot)
+    }
+
+    /// 原始焦点记录，不检查槽位是否已被复用；结算需要看到旧身份。
+    fn focused_record(&self, key: TreeSlot) -> Option<(usize, NodeId)> {
+        let tree = self.tree(key)?;
+        Some((tree.focused?, tree.focused_id?))
     }
 
     /// 树在显露相关状态上的指纹：焦点节点与聚焦输入的 caret/selection/preedit。
@@ -2393,12 +2408,14 @@ impl State {
     }
 
     fn set_focused_in(&mut self, key: TreeSlot, focused: Option<usize>) {
+        let id = focused.and_then(|element| self.elements.get(element).map(|held| held.id));
         let tag = focused.and_then(|element| self.element_tag_opt(element));
         let changed = self.tree_mut(key).is_some_and(|tree| {
-            if tree.focused == focused {
+            if tree.focused == focused && tree.focused_id == id {
                 return false;
             }
             tree.focused = focused;
+            tree.focused_id = id;
             tree.focused_tag = tag;
             true
         });
@@ -3258,9 +3275,10 @@ impl State {
     /// 再退到任意下一控件、任意上一控件；本帧新挂载的控件不会因返场抢焦点，
     /// 当时禁用、本帧重新启用的旧控件仍然可以接任。
     fn focus_settlement(&mut self, key: TreeSlot) -> Option<FocusSettlement> {
-        let old = self.focused_in(key)?;
+        let (old, old_id) = self.focused_record(key)?;
         let after = self.focus_order(key);
-        if after.contains(&old) {
+        // 同一个身份仍在新的可聚焦集合里才是有效焦点；槽位复用不算。
+        if after.contains(&old) && self.element_is_current(old, old_id) {
             return None;
         }
         let (before, tag) = {
@@ -3270,10 +3288,11 @@ impl State {
                 tree.focused_tag,
             )
         };
-        let target = focus_replacement(self, &before, &after, old, tag);
+        let target = focus_replacement(self, &before, &after, old, old_id, tag);
         Some(FocusSettlement {
             old,
-            blur_old: self.element_is_mounted(old),
+            // 只有仍在同一槽位上的原身份才接收 blur；复用槽位不是旧控件。
+            blur_old: self.element_is_current(old, old_id),
             target,
         })
     }
@@ -4525,6 +4544,7 @@ impl Drop for TreeRefreshGuard {
                 state.put_tree(self.key, tree);
                 state.building_tree = self.previous_tree;
                 state.refresh_focus = None;
+                state.refresh_focus_id = None;
                 state.window_focus_dropped = None;
                 state.phase = self.previous_phase;
             });
@@ -4956,6 +4976,7 @@ impl Runtime {
                         nodes: tree,
                         owner: 0,
                         focused: None,
+                        focused_id: None,
                         focused_tag: None,
                         settle_before: None,
                         revision: 0,
@@ -5382,6 +5403,7 @@ impl Runtime {
                         nodes: tree,
                         owner,
                         focused: None,
+                        focused_id: None,
                         focused_tag: None,
                         settle_before: None,
                         revision: 0,
@@ -6298,6 +6320,7 @@ impl Runtime {
                         let (previous_phase, previous_tree) = with_state(|state| {
                             let previous = (state.phase, state.building_tree);
                             state.refresh_focus = None;
+                            state.refresh_focus_id = None;
                             state.phase = Phase::Binding;
                             state.building_tree = Some(key);
                             previous
@@ -6522,10 +6545,21 @@ impl Runtime {
                 let previous_tree = state.building_tree;
                 state.phase = Phase::Binding;
                 state.building_tree = Some(key);
-                let focused = state.focused_in(key);
-                // 窗口化 For 在刷新里据此判断聚焦行是否仍在挂载窗口内。
+                let focused = state.tree(key).and_then(|tree| tree.focused);
+                let focused_id = state.tree(key).and_then(|tree| tree.focused_id);
+                // 窗口化 For 在刷新里据此判断聚焦行是否仍在挂载窗口内；
+                // 槽位可能在同帧被兄弟子树复用，身份要一起捕获。
                 state.refresh_focus = focused;
-                let settle_before = focused.is_some().then(|| state.element_order(key));
+                state.refresh_focus_id = focused.zip(focused_id).map(|(_, id)| id);
+                let settle_before = focused.is_some().then(|| {
+                    state
+                        .element_order(key)
+                        .into_iter()
+                        .filter_map(|slot| {
+                            state.elements.get(slot).map(|element| (slot, element.id))
+                        })
+                        .collect()
+                });
                 if let Some(entry) = state.tree_mut(key) {
                     entry.settle_before = settle_before;
                 }
@@ -6534,6 +6568,7 @@ impl Runtime {
             let Some(tree) = taken else {
                 with_state(|state| {
                     state.refresh_focus = None;
+                    state.refresh_focus_id = None;
                     state.building_tree = previous_tree;
                 });
                 return Ok(false);
@@ -6551,11 +6586,16 @@ impl Runtime {
             };
             let fault = with_state(|state| {
                 state.refresh_focus = None;
+                state.refresh_focus_id = None;
                 // 焦点行被滚动窗口卸载时直接清除焦点；它不能结算到相邻行，
-                // 那会把 Tab 的语义变成一次隐式焦点跳转（ADR-0011）。
+                // 那会把 Tab 的语义变成一次隐式焦点跳转（ADR-0011）。按身份
+                // 比较：复用同一槽位的兄弟子树不算原焦点。
                 if let Some(dropped) = state.window_focus_dropped.take()
-                    && state.focused_in(key) == Some(dropped)
-                    && !state.element_is_mounted(dropped)
+                    && let Some((slot, id)) = state
+                        .tree(key)
+                        .and_then(|tree| Some((tree.focused?, tree.focused_id?)))
+                    && id == dropped
+                    && !state.element_is_current(slot, id)
                 {
                     state.set_focused_in(key, None);
                 }
@@ -6587,6 +6627,7 @@ impl Runtime {
                 state.phase = Phase::Binding;
                 state.building_tree = Some(key);
                 state.refresh_focus = None;
+                state.refresh_focus_id = None;
                 (state.take_tree(key), previous_phase, previous_tree)
             });
             let Some(tree) = taken else {
@@ -6604,6 +6645,7 @@ impl Runtime {
             with_state(|state| {
                 state.phase = previous_phase;
                 state.refresh_focus = None;
+                state.refresh_focus_id = None;
             });
             match result {
                 Ok(result) => result,
@@ -6615,8 +6657,11 @@ impl Runtime {
     fn clear_invalid_focus(&mut self) {
         let mut state = self.state.borrow_mut();
         for key in state.trees.keys().copied().collect::<Vec<_>>() {
-            let focused = state.focused_in(key);
-            if focused.is_some_and(|id| !state.element_is_mounted(id) || !state.is_focusable(id)) {
+            let Some((slot, id)) = state.focused_record(key) else {
+                continue;
+            };
+            // 槽位被复用后 `focused_in` 已经不再指向原身份，也必须清除。
+            if !state.element_is_current(slot, id) || !state.is_focusable(slot) {
                 state.set_focused_in(key, None);
             }
         }
@@ -7915,13 +7960,18 @@ impl Runtime {
             // 更远则由宿主在应用新窗口前完成 blur 与组合取消。只在已挂载行
             // 里查找焦点所属行，因此刷新成本与总行数无关。
             let focused = with_state(|state| {
-                state.refresh_focus.and_then(|focused| {
-                    for_node
-                        .items
-                        .iter()
-                        .find(|(_, item)| contains_element(state, &item.children, focused))
-                        .map(|(id, _)| *id)
-                })
+                let focused = state.refresh_focus?;
+                let focused_id = state.refresh_focus_id?;
+                // 槽位可能已被同帧挂载的兄弟子树复用；旧身份不再挂载时
+                // 不能把新行当成本次刷新前的焦点行。
+                if !state.element_is_current(focused, focused_id) {
+                    return None;
+                }
+                for_node
+                    .items
+                    .iter()
+                    .find(|(_, item)| contains_element(state, &item.children, focused))
+                    .map(|(id, _)| *id)
             });
             if let Some(row) = focused {
                 // 投影变化时按新顺序定位；未变化时用已提交行下标，保持 O(窗口)。
@@ -7940,7 +7990,9 @@ impl Runtime {
                     }
                     count = count.min(total - first);
                     if index < first || index >= first + count {
-                        with_state(|state| state.window_focus_dropped = state.refresh_focus);
+                        with_state(|state| {
+                            state.window_focus_dropped = state.refresh_focus_id;
+                        });
                     }
                 }
             }
@@ -10286,38 +10338,45 @@ fn contains_band(state: &State, nodes: &[MountedNode], band: u64) -> bool {
 
 fn focus_replacement(
     state: &State,
-    before: &[usize],
+    before: &[(usize, NodeId)],
     after: &[usize],
     old: usize,
+    old_id: NodeId,
     tag: Option<&'static str>,
 ) -> Option<usize> {
-    let index = before.iter().position(|id| *id == old)?;
+    let index = before
+        .iter()
+        .position(|(slot, id)| *slot == old && *id == old_id)?;
     let tag = tag?;
     let live: BTreeSet<usize> = after.iter().copied().collect();
-    let same_tag = |id: &usize| live.contains(id) && state.element_tag(*id) == tag;
+    // 候选必须仍是刷新前的同一身份；复用槽位上的新控件不能返场接任。
+    let current =
+        |(slot, id): &(usize, NodeId)| live.contains(slot) && state.element_is_current(*slot, *id);
+    let same_tag =
+        |candidate: &(usize, NodeId)| current(candidate) && state.element_tag(candidate.0) == tag;
     before[index + 1..]
         .iter()
-        .find(|id| same_tag(id))
-        .copied()
+        .find(|candidate| same_tag(candidate))
+        .map(|(slot, _)| *slot)
         .or_else(|| {
             before[..index]
                 .iter()
                 .rev()
-                .find(|id| same_tag(id))
-                .copied()
+                .find(|candidate| same_tag(candidate))
+                .map(|(slot, _)| *slot)
         })
         .or_else(|| {
             before[index + 1..]
                 .iter()
-                .find(|id| live.contains(id))
-                .copied()
+                .find(|candidate| current(candidate))
+                .map(|(slot, _)| *slot)
         })
         .or_else(|| {
             before[..index]
                 .iter()
                 .rev()
-                .find(|id| live.contains(id))
-                .copied()
+                .find(|candidate| current(candidate))
+                .map(|(slot, _)| *slot)
         })
 }
 
