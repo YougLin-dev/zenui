@@ -48,7 +48,9 @@ pub use runtime::{
 };
 pub use session::{SessionCtx, SessionError, SessionPolicy};
 pub use signal::{Memo, MemoCompute, Once, ReactiveValue, Signal, memo, on_cleanup, once, signal};
-pub use store::{Field, FieldError, Store, TodoId, TodoRow, Transaction, WriteError, WriteOp};
+pub use store::{
+    Field, FieldError, RowStoreField, Store, TodoId, TodoRow, Transaction, WriteError, WriteOp,
+};
 pub use task::{DeliveryReport, Task, TaskError, TaskScope, TaskStatus, TaskToken};
 pub use tray::{TrayError, TraySpec};
 pub use view::{
@@ -88,9 +90,9 @@ pub mod prelude {
         MenuStateError, Modifiers, MountError, MountPlan, MountResult, NodeId, NodeOperation,
         NodeStatus, Once, Opacity, PanicInfo, PresentationDelta, PresentationKey,
         PresentationSnapshot, PresentationUpdate, Property, ReactiveValue, Read, ReadFault,
-        ReadValue, RefreshReport, Row, RowId, RowKey, RowSet, RowStore, RowView, RowWindow,
-        Runtime, SessionCtx, SessionError, SessionPolicy, ShortcutError, ShortcutKey, Signal,
-        SnapshotAction, SnapshotActions, SnapshotAttr, SnapshotElement, SnapshotNode,
+        ReadValue, RefreshReport, Row, RowId, RowKey, RowSet, RowStore, RowStoreField, RowView,
+        RowWindow, Runtime, SessionCtx, SessionError, SessionPolicy, ShortcutError, ShortcutKey,
+        Signal, SnapshotAction, SnapshotActions, SnapshotAttr, SnapshotElement, SnapshotNode,
         SnapshotRowBand, SnapshotSemantics, SnapshotText, SnapshotValue, StorageReport, Store,
         StyleDeclaration, StyleOrigin, StyleValue, Submenu, SubmitEvent, Task, TaskError,
         TaskScope, TaskStatus, TaskToken, TextEditState, TodoId, TodoRow, Transaction, TrayError,

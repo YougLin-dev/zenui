@@ -119,6 +119,7 @@ fn QuarantineHost() -> MountResult<MountPlan> {
                         match store.title(id).get() {
                             Ok(title) => format!("memo {title}"),
                             Err(FieldError::Missing(_)) => String::from("memo gone"),
+                            Err(other) => panic!("unexpected field error: {other}"),
                         }
                     });
                     // 行 owner 的资源：factory 失败时必须随拟议行一起释放。
@@ -265,6 +266,7 @@ fn SettlementCommitHost() -> MountResult<MountPlan> {
                         match store.title(id).get() {
                             Ok(title) => format!("memo {title}"),
                             Err(FieldError::Missing(_)) => String::from("memo gone"),
+                            Err(other) => panic!("unexpected field error: {other}"),
                         }
                     });
                     let row_disabled = memo(move || is_a && disabled.get());
@@ -403,6 +405,7 @@ fn DeepQuarantineHost() -> MountResult<MountPlan> {
             Some(key) => match store.title(key).get() {
                 Ok(title) => format!("outer {title}"),
                 Err(FieldError::Missing(_)) => String::from("outer gone"),
+                Err(other) => panic!("unexpected field error: {other}"),
             },
             None => String::from("outer idle"),
         }
@@ -414,6 +417,7 @@ fn DeepQuarantineHost() -> MountResult<MountPlan> {
             Some(key) => match store.title(key).get() {
                 Ok(title) => format!("inner {title}"),
                 Err(FieldError::Missing(_)) => String::from("inner gone"),
+                Err(other) => panic!("unexpected field error: {other}"),
             },
             None => String::from("inner idle"),
         }
@@ -514,6 +518,7 @@ fn FilterLeaveHost() -> MountResult<MountPlan> {
                         match store.completed(id).get() {
                             Ok(done) => format!("done {done}"),
                             Err(FieldError::Missing(_)) => String::from("gone"),
+                            Err(other) => panic!("unexpected field error: {other}"),
                         }
                     });
                     view! { <text>{label}</text> }

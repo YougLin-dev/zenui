@@ -8,11 +8,11 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
 
-use zenui_core::model::{ChangeSet, FilterId, Row, RowId, StoreId};
+use zenui_core::model::{ChangeSet, FieldId, FilterId, Row, RowId, StoreId};
 use zenui_core::{Counters, PanicInfo, RowSet, catch_panic};
 use zenui_style::{Color, Length, Opacity, Property, StyleValue};
 
-use crate::context::{self, ContextFault, DepKey, FieldKind, Phase, with_state};
+use crate::context::{self, ContextFault, DepKey, Phase, with_state};
 use crate::dispatch::{DispatchError, NodeOperation};
 use crate::menu::{
     CommandError, CommandEvent, CommandHandler, CommandSource, MenuCommand, MenuCommandState,
@@ -31,7 +31,7 @@ use crate::presentation::{
 };
 use crate::session::{SessionAction, SessionCtx, SessionError, SessionPolicy};
 use crate::signal::{MemoCell, SignalCell};
-use crate::store::{CachedRowSet, TodoId, TodoRow, WriteError};
+use crate::store::{CachedRowSet, TodoRow, WriteError};
 use crate::task::{TaskRecord, WakeCallback};
 use crate::text_edit::{self, Edit, Movement};
 use crate::tray::{TrayError, TraySpec};
@@ -436,6 +436,34 @@ type Cleanup = Box<dyn FnOnce()>;
 pub(crate) struct Disposal {
     cleanups: Vec<Cleanup>,
     resources: Vec<Resource>,
+}
+
+/// 通用行 Store 的类型擦除读取入口；按 `StoreId` 注册到 runtime。
+///
+/// `Field<T>` 只保存 `StoreId + RowId + FieldId`，读取都经这里分派回
+/// typed Store，避免运行时依赖具体的 `R`。
+#[derive(Clone)]
+pub(crate) struct StoreReader {
+    read: ErasedFieldRead,
+    pub(crate) field_ids: Rc<[FieldId]>,
+}
+
+type ErasedFieldRead = Rc<dyn Fn(RowId, FieldId) -> Option<Box<dyn std::any::Any>>>;
+
+impl StoreReader {
+    pub(crate) fn of<R: Row>(store: zenui_core::model::Store<R>) -> Self {
+        Self {
+            read: Rc::from(store.weak_reader()),
+            field_ids: store.field_ids().into(),
+        }
+    }
+}
+
+/// 一次字段读取的 typed 结果；区分已删除行与未注册字段。
+pub(crate) enum ModelFieldRead {
+    Value(Box<dyn std::any::Any>),
+    MissingRow,
+    UnknownField,
 }
 
 pub(crate) struct OwnerRecord {
@@ -1039,6 +1067,11 @@ impl PendingChanges {
         self.log.iter().map(|(store, _)| *store)
     }
 
+    /// 每次提交的 Store 归属与净变化；字段失效按精确 `(row, field)` 应用。
+    fn entries(&self) -> impl Iterator<Item = (StoreId, &ChangeSet)> + '_ {
+        self.log.iter().map(|(store, changes)| (*store, changes))
+    }
+
     fn mark(&self) -> usize {
         self.log.len()
     }
@@ -1147,10 +1180,12 @@ pub(crate) struct State {
     pub(crate) write_epochs: BTreeMap<DepKey, u64>,
     /// 字段写入尝试代数；相等写入同样推进，文本编辑器据此判断处理器
     /// 是否处理过这次编辑。
-    pub(crate) field_writes: BTreeMap<(TodoId, FieldKind), u64>,
+    pub(crate) field_writes: BTreeMap<crate::node::FieldKey, u64>,
     pub(crate) write_error: Option<WriteError>,
     /// Todo 是通用行模型的第一个实例化；行身份与业务键都由它维护。
     pub(crate) todo_store: zenui_core::model::Store<TodoRow>,
+    /// 按 `StoreId` 注册的通用行读取器；`Field<T>` 读取与删除行失效都经它。
+    pub(crate) store_readers: BTreeMap<StoreId, StoreReader>,
     /// 业务键种子；只在事务成功提交后推进，失败的事务不消耗键。
     pub(crate) next_todo_key: u64,
     /// 旧 `RowSet` 投影缓存，按 membership/order revision 失效。
@@ -1301,11 +1336,8 @@ struct CloseReplyRequest {
 pub struct ItemInfo {
     /// 行数据来源 Store。
     pub store: StoreId,
-    /// 行身份。
+    /// 行身份；业务键用应用自己的 Store 按它解析。
     pub row: RowId,
-    /// 挂载时捕获的 Todo 业务键；第二个模型或非 Todo Store 的行返回 `None`。
-    /// 行被删除但旧映射仍保留时，这个键也不变。
-    pub todo: Option<TodoId>,
     pub instance: u64,
     pub owner: u32,
 }
@@ -1713,6 +1745,9 @@ impl State {
     }
 
     fn new() -> Self {
+        let todo_store = zenui_core::model::Store::new(crate::store::todo_schema());
+        let mut store_readers = BTreeMap::new();
+        store_readers.insert(todo_store.id(), StoreReader::of(todo_store.clone()));
         let mut owners = BTreeMap::new();
         owners.insert(
             0,
@@ -1745,7 +1780,8 @@ impl State {
             write_epochs: BTreeMap::new(),
             field_writes: BTreeMap::new(),
             write_error: None,
-            todo_store: zenui_core::model::Store::new(crate::store::todo_schema()),
+            todo_store: todo_store.clone(),
+            store_readers,
             next_todo_key: 1,
             rowset_cache: [None, None, None],
             store_counters: Counters::default(),
@@ -2830,6 +2866,37 @@ impl State {
                 self.dirty_structure_nodes.insert((tree, node));
             }
         }
+    }
+
+    /// 登记一个通用行 Store 的类型擦除读取器；同一 Store 重复登记覆盖。
+    pub(crate) fn register_store_reader(&mut self, store: StoreId, reader: StoreReader) {
+        self.store_readers.insert(store, reader);
+    }
+
+    /// 按 StoreId 读取字段；未登记 Store 视为行不存在，未注册字段单独报告。
+    pub(crate) fn read_model_field(
+        &self,
+        store: StoreId,
+        row: RowId,
+        field: FieldId,
+    ) -> ModelFieldRead {
+        let Some(reader) = self.store_readers.get(&store) else {
+            return ModelFieldRead::MissingRow;
+        };
+        if !reader.field_ids.contains(&field) {
+            return ModelFieldRead::UnknownField;
+        }
+        match (reader.read)(row, field) {
+            Some(value) => ModelFieldRead::Value(value),
+            None => ModelFieldRead::MissingRow,
+        }
+    }
+
+    /// 该 Store 的 schema 字段；删除行时用来失效全部字段绑定。
+    pub(crate) fn store_field_ids(&self, store: StoreId) -> Option<Rc<[FieldId]>> {
+        self.store_readers
+            .get(&store)
+            .map(|reader| Rc::clone(&reader.field_ids))
     }
 
     /// 取走一个值节点的脏标记；求值失败时调用方会重新标脏。
@@ -4679,8 +4746,6 @@ pub struct MountedItem {
     owner: u32,
     /// 已提交投影中的下标；焦点 grace 在投影未变时 O(1) 取用。
     row_index: usize,
-    /// 挂载时捕获的 Todo 业务键；第二个模型为 None。行删除后保持稳定。
-    todo: Option<TodoId>,
     instance: u64,
     children: Vec<MountedNode>,
 }
@@ -6921,6 +6986,45 @@ impl Runtime {
                 .borrow_mut()
                 .mark_consumers_dirty(DepKey::Projection(store));
         }
+        // 通用行字段：精确字段变化按 (RowId, FieldId) 失效；删除行保守失效
+        // 该 Store 的全部已注册字段。Todo Store 的提交在 finish_transaction
+        // 里同步应用，这里跳过以免重复。
+        let state_rc = self.state.clone();
+        let todo_store = state_rc.borrow().todo_store.id();
+        let pending = Rc::clone(&state_rc.borrow().pending);
+        {
+            let pending = pending.borrow();
+            let mut state = state_rc.borrow_mut();
+            let runtime = state.id;
+            for (store, changes) in pending.entries() {
+                if store == todo_store {
+                    continue;
+                }
+                for (row, field) in &changes.fields {
+                    state.bump(DepKey::Field(crate::node::FieldKey::new(
+                        runtime,
+                        store,
+                        Some(*row),
+                        *field,
+                        None,
+                    )));
+                }
+                if let Some(fields) = state.store_field_ids(store) {
+                    for row in &changes.removed {
+                        for field in fields.iter() {
+                            state.bump(DepKey::Field(crate::node::FieldKey::new(
+                                runtime,
+                                store,
+                                Some(*row),
+                                *field,
+                                None,
+                            )));
+                        }
+                    }
+                }
+                state.purge_row_history(&changes.removed);
+            }
+        }
         self.settle_quarantined_memos();
         self.take_flush_faults()?;
         if let Err(error) = self.refresh_all_once() {
@@ -7649,6 +7753,9 @@ impl Runtime {
                 } = plan;
                 // 挂载期安装提交观察者：构造 `ForSource` 可以早于 runtime。
                 attach();
+                // 字段句柄按 StoreId 读取；行 factory 运行前完成注册。
+                let reader = driver.store_reader();
+                with_state(|state| state.register_store_reader(store, reader));
                 let payload = with_state(|state| {
                     let tree = state.building_tree_key();
                     let rows = match rows {
@@ -8755,13 +8862,6 @@ impl Runtime {
                         break;
                     }
                 };
-                let todo = with_state(|state| {
-                    if for_node.store == state.todo_store.id() {
-                        state.todo_store.key_of(id)
-                    } else {
-                        None
-                    }
-                });
                 let erased = ErasedRowView {
                     id,
                     store: ErasedStore {
@@ -8800,7 +8900,6 @@ impl Runtime {
                     MountedItem {
                         owner,
                         row_index: index,
-                        todo,
                         instance,
                         children,
                     },
@@ -11503,7 +11602,6 @@ fn collect_items(state: &State, nodes: &[MountedNode], items: &mut Vec<ItemInfo>
                         items.push(ItemInfo {
                             store: for_node.store,
                             row: *id,
-                            todo: item.todo,
                             instance: item.instance,
                             owner: item.owner,
                         });
@@ -15206,7 +15304,7 @@ mod binding_tests {
 
     #[test]
     fn equal_store_writes_do_not_bump_field_or_row_dependencies() {
-        use crate::context::{FieldKind, filter_slot};
+        use crate::context::filter_slot;
 
         let mut app = Runtime::new();
         app.declare_windows(|catalog| {
@@ -15217,18 +15315,41 @@ mod binding_tests {
         .expect("declare the window");
         let window = app.show("main").expect("show the window");
         app.click_label("seed").expect("seed the row");
-        let id = app
-            .for_items()
-            .first()
-            .expect("row item")
-            .todo
-            .expect("todo row");
+        let (id, row, runtime, store) = {
+            let state = app.state.borrow();
+            let row = state.todo_store.ids()[0];
+            let id = state.todo_store.key_of(row).expect("todo row");
+            (id, row, state.id, state.todo_store.id())
+        };
         assert!(app.texts().iter().any(|text| text == "row"));
 
-        let fields = [
-            DepKey::Field(id, FieldKind::Title),
-            DepKey::Field(id, FieldKind::Completed),
-        ];
+        let (view_key, store_key) = crate::context::install(&app.state, || {
+            let model = app.state.borrow().todo_store.clone();
+            let view: crate::store::Field<String> =
+                crate::store::RowStoreField::field(&model, row, crate::store::TITLE_FIELD);
+            let store = crate::store::Store::new();
+            (view.field_key(), store.title(id).field_key())
+        });
+        assert_eq!(
+            view_key, store_key,
+            "RowView::field and Store::title share one Todo field key"
+        );
+
+        let title = crate::node::FieldKey::new(
+            runtime,
+            store,
+            Some(row),
+            crate::store::TITLE_FIELD,
+            Some(id),
+        );
+        let completed = crate::node::FieldKey::new(
+            runtime,
+            store,
+            Some(row),
+            crate::store::COMPLETED_FIELD,
+            Some(id),
+        );
+        let fields = [DepKey::Field(title), DepKey::Field(completed)];
         let rows = [
             DepKey::Rows(filter_slot(Filter::All)),
             DepKey::Rows(filter_slot(Filter::Active)),
@@ -15246,8 +15367,8 @@ mod binding_tests {
         let attempts = {
             let state = app.state.borrow();
             [
-                state.field_write_epoch(id, FieldKind::Title),
-                state.field_write_epoch(id, FieldKind::Completed),
+                state.field_write_epoch(title),
+                state.field_write_epoch(completed),
             ]
         };
         let io_writes = app.counters().io_writes;
@@ -15262,11 +15383,11 @@ mod binding_tests {
                 .collect();
             assert_eq!(after, before, "equal writes bump no field or row epoch");
             assert!(
-                state.field_write_epoch(id, FieldKind::Title) > attempts[0],
+                state.field_write_epoch(title) > attempts[0],
                 "the title write attempt is still recorded"
             );
             assert!(
-                state.field_write_epoch(id, FieldKind::Completed) > attempts[1],
+                state.field_write_epoch(completed) > attempts[1],
                 "the completed write attempt is still recorded"
             );
         }

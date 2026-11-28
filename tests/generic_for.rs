@@ -311,7 +311,10 @@ fn FaultedStaticBands(
 
 /// Todo 列表保持既有形态：`Store` 属性 + `Memo<RowSet>` 读源，行工厂收 RowView。
 #[component]
-fn TodoList(keys: Rc<RefCell<Vec<TodoId>>>) -> MountResult<MountPlan> {
+fn TodoList(
+    keys: Rc<RefCell<Vec<TodoId>>>,
+    seen: Rc<RefCell<Vec<RowId>>>,
+) -> MountResult<MountPlan> {
     let store = Store::new();
     let rows = memo(move || store.rows(Filter::All));
     view! {
@@ -325,6 +328,7 @@ fn TodoList(keys: Rc<RefCell<Vec<TodoId>>>) -> MountResult<MountPlan> {
             <For each={rows} store={store} key={|row: &TodoRow| row.id}>
                 {move |row: RowView<TodoRow>| {
                     keys.borrow_mut().push(row.key());
+                    seen.borrow_mut().push(row.id());
                     let label = format!("todo {}:{}", row.key().raw(), row.get().title);
                     view! { <text>{once(label)}</text> }
                 }}
@@ -358,10 +362,6 @@ fn a_second_model_mounts_rows_through_row_view() {
     assert!(
         items.iter().all(|item| item.store == store.id()),
         "every row reports the note store"
-    );
-    assert!(
-        items.iter().all(|item| item.todo.is_none()),
-        "a second model has no Todo business key"
     );
 
     // 直接写入普通模型 Store 后，投影在下一次 refresh 取到新行。
@@ -870,33 +870,33 @@ fn a_failed_repair_reconciles_the_window_span_not_the_mounted_count() {
 #[test]
 fn todo_rows_still_mount_through_for_source_and_row_view() {
     let keys = Rc::new(RefCell::new(Vec::new()));
+    let seen = Rc::new(RefCell::new(Vec::new()));
 
     let mut app = Runtime::new();
     app.mount({
         let keys = Rc::clone(&keys);
-        move || view! { <TodoList keys={keys} /> }
+        let seen = Rc::clone(&seen);
+        move || view! { <TodoList keys={keys} seen={seen} /> }
     })
     .expect("mount the todo list");
     app.click_text("Seed").expect("seed two todos");
 
     let items = app.for_items();
     assert_eq!(items.len(), 2);
-    let todo_keys: Vec<TodoId> = items
-        .iter()
-        .map(|item| item.todo.expect("todo rows keep their business key"))
-        .collect();
     assert_eq!(
-        todo_keys,
-        *keys.borrow(),
-        "RowView::key and ItemInfo::todo resolve the same business key"
+        items.iter().map(|item| item.row).collect::<Vec<_>>(),
+        *seen.borrow(),
+        "ItemInfo::row matches the identity the factory received"
     );
-    assert_eq!(
-        app.texts()
-            .iter()
-            .filter(|text| text.starts_with("todo "))
-            .count(),
-        2
-    );
+    let texts = app.texts();
+    for (key, title) in keys.borrow().iter().zip(["first", "second"]) {
+        assert!(
+            texts
+                .iter()
+                .any(|text| text == &format!("todo {}:{title}", key.raw())),
+            "RowView::key reaches the rendered row"
+        );
+    }
 }
 
 fn editor(app: &Runtime, label: &str) -> NodeId {
@@ -1091,5 +1091,193 @@ fn deleting_and_reinserting_the_same_key_in_one_turn_mounts_a_fresh_row() {
     assert_eq!(
         app.insert_text_node(old_node, "Z"),
         Err(DispatchError::StaleNode(old_node))
+    );
+}
+
+fn probe_id(row: RowId) -> String {
+    format!("{}:{}", row.slot(), row.generation().raw())
+}
+
+fn probe_text(app: &Runtime) -> String {
+    app.texts()
+        .into_iter()
+        .find(|text| text.contains('='))
+        .expect("the Probe button wrote a reading")
+}
+
+/// 每行经 `RowView::field` 绑定 TEXT；测试保留句柄，经 UI 探针读取错误分类。
+#[component]
+fn BoundNoteList(
+    store: RowStore<Note>,
+    fields: Rc<RefCell<BTreeMap<RowId, Field<String>>>>,
+    unknown: Rc<RefCell<Option<Field<String>>>>,
+    mounts: Rc<Cell<u32>>,
+) -> MountResult<MountPlan> {
+    let rows = store.rows(AllNotes)?;
+    let probe = signal(String::from("idle"));
+    let probe_fields = Rc::clone(&fields);
+    let probe_unknown = Rc::clone(&unknown);
+    view! {
+        <view>
+            <button aria:label="probe" on:click={move || {
+                let mut parts = Vec::new();
+                for (row, field) in probe_fields.borrow().iter() {
+                    let id = probe_id(*row);
+                    parts.push(match field.read_once() {
+                        Ok(text) => format!("{id}={text}"),
+                        Err(FieldError::MissingRow(_)) => format!("{id}=missing"),
+                        Err(FieldError::Missing(todo)) => {
+                            format!("{id}=todo-missing-{}", todo.raw())
+                        }
+                        Err(FieldError::UnknownField { .. }) => format!("{id}=unknown"),
+                    });
+                }
+                if let Some(field) = *probe_unknown.borrow() {
+                    parts.push(match field.read_once() {
+                        Ok(text) => format!("unknown={text}"),
+                        Err(FieldError::MissingRow(_)) => String::from("unknown=missing"),
+                        Err(FieldError::Missing(_)) => String::from("unknown=todo-missing"),
+                        Err(FieldError::UnknownField { .. }) => String::from("unknown=unknown"),
+                    });
+                }
+                probe.set(parts.join(","));
+            }}>"Probe"</button>
+            <text>{probe}</text>
+            <For each={rows} key={|note: &Note| note.key}>
+                {move |row: RowView<Note>| {
+                    mounts.set(mounts.get() + 1);
+                    let text = row.field::<String>(TEXT);
+                    fields.borrow_mut().insert(row.id(), text);
+                    // 未注册字段的探针只绑定到 note 1，删除/重建时便于断言。
+                    if row.key() == 1 && unknown.borrow().is_none() {
+                        *unknown.borrow_mut() = Some(row.field::<String>(FieldId::new(9)));
+                    }
+                    view! { <text>{text}</text> }
+                }}
+            </For>
+        </view>
+    }
+}
+
+#[test]
+fn row_view_field_updates_the_mounted_binding_without_a_remount() {
+    let store = note_store();
+    let alpha = insert(&store, note(1, "alpha"));
+    let beta = insert(&store, note(2, "beta"));
+    let fields = Rc::new(RefCell::new(BTreeMap::new()));
+    let unknown = Rc::new(RefCell::new(None));
+    let mounts = Rc::new(Cell::new(0));
+
+    let mut app = Runtime::new();
+    app.mount({
+        let store = store.clone();
+        let fields = Rc::clone(&fields);
+        let unknown = Rc::clone(&unknown);
+        let mounts = Rc::clone(&mounts);
+        move || {
+            view! { <BoundNoteList store={store} fields={fields} unknown={unknown} mounts={mounts} /> }
+        }
+    })
+    .expect("mount the bound note list");
+    assert_eq!(mounts.get(), 2);
+    let instances = instances_by_row(&app);
+    app.click_label("probe").expect("probe the live fields");
+    assert!(
+        probe_text(&app).contains(&format!("{}={}", probe_id(alpha), "alpha")),
+        "the row handle reads its field: {}",
+        probe_text(&app)
+    );
+    assert!(probe_text(&app).contains(&format!("{}={}", probe_id(beta), "beta")));
+    assert!(app.texts().iter().any(|text| text == "alpha"));
+
+    store
+        .update(alpha, |note| note.text = String::from("changed"))
+        .expect("update the bound field");
+    app.refresh().expect("the field write reaches the binding");
+
+    assert!(
+        app.texts().iter().any(|text| text == "changed"),
+        "the mounted text reads the new field value: {:?}",
+        app.texts()
+    );
+    assert!(!app.texts().iter().any(|text| text == "alpha"));
+    assert_eq!(mounts.get(), 2, "the row does not remount");
+    assert_eq!(instances_by_row(&app), instances, "instances stay mounted");
+    app.click_label("probe").expect("probe the updated field");
+    assert!(
+        probe_text(&app).contains(&format!("{}={}", probe_id(alpha), "changed")),
+        "the handle reads the updated value: {}",
+        probe_text(&app)
+    );
+
+    store
+        .update(beta, |note| note.text = String::from("direct"))
+        .expect("update the second field");
+    app.refresh().expect("the second write reaches the binding");
+    assert!(app.texts().iter().any(|text| text == "direct"));
+    assert_eq!(mounts.get(), 2, "the second row does not remount");
+}
+
+#[test]
+fn a_deleted_rows_field_keeps_its_identity_across_reinsertion() {
+    let store = note_store();
+    let old_row = insert(&store, note(1, "alpha"));
+    let other = insert(&store, note(2, "beta"));
+    let fields = Rc::new(RefCell::new(BTreeMap::new()));
+    let unknown = Rc::new(RefCell::new(None));
+    let mounts = Rc::new(Cell::new(0));
+
+    let mut app = Runtime::new();
+    app.mount({
+        let store = store.clone();
+        let fields = Rc::clone(&fields);
+        let unknown = Rc::clone(&unknown);
+        let mounts = Rc::clone(&mounts);
+        move || {
+            view! { <BoundNoteList store={store} fields={fields} unknown={unknown} mounts={mounts} /> }
+        }
+    })
+    .expect("mount the bound note list");
+    app.click_label("probe").expect("probe the live fields");
+    assert!(probe_text(&app).contains(&format!("{}={}", probe_id(old_row), "alpha")));
+    assert!(
+        probe_text(&app).contains("unknown=unknown"),
+        "an unregistered field reads UnknownField: {}",
+        probe_text(&app)
+    );
+
+    store.remove(old_row).expect("delete the row");
+    app.refresh().expect("the deletion reaches the tree");
+    assert_eq!(rows_of(&app), vec![other]);
+    app.click_label("probe").expect("probe the deleted row");
+    assert!(
+        probe_text(&app).contains(&format!("{}=missing", probe_id(old_row))),
+        "the field handle follows the deleted row identity: {}",
+        probe_text(&app)
+    );
+    assert!(
+        probe_text(&app).contains("unknown=unknown"),
+        "the schema check precedes row liveness: {}",
+        probe_text(&app)
+    );
+
+    let new_row = insert(&store, note(1, "omega"));
+    app.refresh().expect("the reinsertion reaches the tree");
+    assert_ne!(new_row, old_row, "the same key gets a new RowId");
+    assert_eq!(rows_of(&app), vec![other, new_row]);
+    assert!(
+        app.texts().iter().any(|text| text == "omega"),
+        "the fresh row binds its own field"
+    );
+    app.click_label("probe")
+        .expect("probe after the reinsertion");
+    let reading = probe_text(&app);
+    assert!(
+        reading.contains(&format!("{}=missing", probe_id(old_row))),
+        "the old handle never resolves the reinserted row: {reading}"
+    );
+    assert!(
+        reading.contains(&format!("{}={}", probe_id(new_row), "omega")),
+        "the new row's handle reads the new value: {reading}"
     );
 }

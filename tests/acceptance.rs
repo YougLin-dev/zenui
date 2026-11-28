@@ -733,14 +733,11 @@ fn RetainedTodoRows() -> MountResult<MountPlan> {
 }
 
 #[test]
-fn a_retained_mounted_row_keeps_its_captured_todo_key() {
+fn a_retained_mounted_row_keeps_its_mounted_identity() {
     let mut app = mount(|| view! { <RetainedTodoRows /> });
     app.click_text("Seed").expect("seed two rows");
     let before = app.for_items();
     assert_eq!(before.len(), 2);
-    assert!(before.iter().all(|item| item.todo.is_some()));
-    let before_rows: Vec<RowId> = before.iter().map(|item| item.row).collect();
-    let before_keys: Vec<Option<TodoId>> = before.iter().map(|item| item.todo).collect();
     let texts = app.texts();
 
     let failure = app.click_text("Swap").expect_err("the fresh C row fails");
@@ -751,12 +748,7 @@ fn a_retained_mounted_row_keeps_its_captured_todo_key() {
     assert_eq!(app.texts(), texts, "the old mapping remains");
     let after = app.for_items();
     assert_eq!(
-        after.iter().map(|item| item.row).collect::<Vec<_>>(),
-        before_rows
-    );
-    assert_eq!(
-        after.iter().map(|item| item.todo).collect::<Vec<_>>(),
-        before_keys,
-        "a retained row keeps the business key captured when it mounted"
+        after, before,
+        "a retained row keeps the identity captured when it mounted"
     );
 }

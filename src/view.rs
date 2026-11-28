@@ -6,8 +6,8 @@ use std::rc::Rc;
 
 use zenui_core::PanicInfo;
 use zenui_core::model::{
-    FilterId, FilterSpec, Row, RowId, RowKey, RowSet, Rows, Store as ModelStore, StoreError,
-    StoreId,
+    FieldId, FilterId, FilterSpec, Row, RowId, RowKey, RowSet, Rows, Store as ModelStore,
+    StoreError, StoreId,
 };
 
 use zenui_style::{Color, Length, Opacity, Property, StyleDeclaration};
@@ -366,7 +366,7 @@ impl ReadSlot {
             Self::Static | Self::Once(_) => None,
             Self::Signal(source) => Some(state.source_write_epoch(source)),
             Self::Memo(source) => Some(state.source_memo_revision(source)),
-            Self::Field(key) => Some(state.field_write_epoch(key.id, key.kind)),
+            Self::Field(key) => Some(state.field_write_epoch(key)),
         }
     }
 
@@ -429,7 +429,7 @@ impl ReadSlot {
             Self::Field(key) => Some(
                 state
                     .write_epochs
-                    .get(&crate::context::DepKey::Field(key.id, key.kind))
+                    .get(&crate::context::DepKey::Field(key))
                     .copied()
                     .unwrap_or(0),
             ),
@@ -544,16 +544,22 @@ impl<R: Row, F: FilterSpec<R>> From<Rows<R, F>> for ForSource<R> {
 
 /// 一个已解析行的挂载快照：`id()` 是行身份，`key()` 是业务键，`get()` 是行数据。
 ///
-/// 快照不随后续 Store 写入变化；响应式字段读取由后续版本的行字段句柄承担。
+/// 快照不随后续 Store 写入变化；`field()` 返回按行身份读取的响应式句柄，
+/// 行内字段更新不需要重新挂载。
 #[derive(Clone)]
 pub struct RowView<R: Row> {
     id: RowId,
+    store: ModelStore<R>,
     snapshot: R,
 }
 
 impl<R: Row> RowView<R> {
-    pub(crate) fn new(id: RowId, snapshot: R) -> Self {
-        Self { id, snapshot }
+    pub(crate) fn new(id: RowId, store: ModelStore<R>, snapshot: R) -> Self {
+        Self {
+            id,
+            store,
+            snapshot,
+        }
     }
 
     pub const fn id(&self) -> RowId {
@@ -566,6 +572,14 @@ impl<R: Row> RowView<R> {
 
     pub fn get(&self) -> &R {
         &self.snapshot
+    }
+
+    /// 按已注册 `FieldId` 读取该行的响应式字段。
+    ///
+    /// 句柄携带 `RowId`：行删除后即使同一业务键重建，旧句柄仍读到
+    /// `FieldError::MissingRow`。字段未在 schema 注册时读到 `UnknownField`。
+    pub fn field<T: ReactiveValue>(&self, field: FieldId) -> Field<T> {
+        crate::store::RowStoreField::field(&self.store, self.id, field)
     }
 }
 
@@ -712,6 +726,9 @@ pub(crate) trait ForDriver {
 
     fn projection_rowset(&self, filter: FilterId) -> Result<RowSet, StoreError>;
 
+    /// 类型擦除读取器；For 挂载时注册到 runtime，供 `Field<T>` 读取。
+    fn store_reader(&self) -> crate::runtime::StoreReader;
+
     fn mount_row(&self, view: ErasedRowView) -> MountResult<MountPlan>;
 }
 
@@ -749,6 +766,10 @@ impl<R: Row, K: RowKey> ForDriver for TypedForDriver<R, K> {
         self.store.rowset_from_filter(filter)
     }
 
+    fn store_reader(&self) -> crate::runtime::StoreReader {
+        crate::runtime::StoreReader::of(self.store.clone())
+    }
+
     fn mount_row(&self, view: ErasedRowView) -> MountResult<MountPlan> {
         debug_assert_eq!(
             view.store.store,
@@ -760,7 +781,7 @@ impl<R: Row, K: RowKey> ForDriver for TypedForDriver<R, K> {
             .downcast::<R>()
             .expect("a For driver only receives its own row type");
         let snapshot = Rc::try_unwrap(row).unwrap_or_else(|row| (*row).clone());
-        (self.item)(RowView::new(view.id, snapshot))
+        (self.item)(RowView::new(view.id, self.store.clone(), snapshot))
     }
 }
 

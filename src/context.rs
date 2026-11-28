@@ -4,7 +4,6 @@ use std::rc::Rc;
 use zenui_core::Filter;
 
 use crate::runtime::State;
-use crate::store::TodoId;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Phase {
@@ -17,17 +16,12 @@ pub enum Phase {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
-pub(crate) enum FieldKind {
-    Title,
-    Completed,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub(crate) enum DepKey {
     Appearance,
     Signal(u32),
     Memo(u32),
-    Field(TodoId, FieldKind),
+    /// 行字段：`StoreId + RowId + FieldId`；RowId 携带代际。
+    Field(crate::node::FieldKey),
     Rows(u8),
     /// 通用行 Store 的投影来源；任一提交都保守地标脏该 Store 的 `For`。
     Projection(zenui_core::model::StoreId),

@@ -54,7 +54,7 @@ fn filtering_remounts_rows_with_a_fresh_once_read() {
         "the completed row is filtered out"
     );
     assert!(
-        !app.for_items().iter().any(|item| item.todo == first.todo),
+        !app.for_items().iter().any(|item| item.row == first.row),
         "the hidden row is unmounted"
     );
 
@@ -62,7 +62,7 @@ fn filtering_remounts_rows_with_a_fresh_once_read() {
     let returned = app
         .for_items()
         .into_iter()
-        .find(|item| item.todo == first.todo)
+        .find(|item| item.row == first.row)
         .expect("the row returns");
     assert_ne!(
         returned.instance, first.instance,
@@ -84,7 +84,7 @@ fn filtering_remounts_rows_with_a_fresh_once_read() {
         .expect("reactivate the row");
     app.click_text("Active").expect("filter active again");
     assert!(
-        app.for_items().iter().any(|item| item.todo == first.todo),
+        app.for_items().iter().any(|item| item.row == first.row),
         "the candidate row returns to the active filter"
     );
 }
@@ -117,11 +117,11 @@ fn reorder_keeps_row_identity_owner_and_local_editing_state() {
     app.click_text("Reverse").expect("reorder");
 
     let after = app.for_items();
-    assert_eq!(after[0].todo, second.todo);
-    assert_eq!(after[1].todo, first.todo);
+    assert_eq!(after[0].row, second.row);
+    assert_eq!(after[1].row, first.row);
     let moved = after
         .iter()
-        .find(|item| item.todo == first.todo)
+        .find(|item| item.row == first.row)
         .expect("row A");
     assert_eq!(moved.instance, first.instance, "same component instance");
     assert_eq!(moved.owner, first.owner, "same Owner");
@@ -166,7 +166,7 @@ fn filtering_out_the_focused_row_does_not_let_the_remount_steal_focus() {
     let mut app = runtime();
     add(&mut app, "A");
     add(&mut app, "B");
-    let first = app.for_items()[0].todo;
+    let first = app.for_items()[0].row;
 
     app.focus("Edit A").expect("focus row A editor");
     app.change("Complete A", true).expect("complete A");
@@ -178,7 +178,7 @@ fn filtering_out_the_focused_row_does_not_let_the_remount_steal_focus() {
 
     app.click_text("Active").expect("filter active");
     assert!(
-        !app.for_items().iter().any(|item| item.todo == first),
+        !app.for_items().iter().any(|item| item.row == first),
         "row A is unmounted"
     );
     assert_eq!(

@@ -55,6 +55,9 @@ impl fmt::Display for StoreError {
 
 impl std::error::Error for StoreError {}
 
+/// 行字段的类型擦除读取器：`(RowId, FieldId)` → 克隆快照；行或字段不存在返回 `None`。
+pub type ErasedFieldRead = Box<dyn Fn(RowId, FieldId) -> Option<Box<dyn std::any::Any>>>;
+
 /// 事务闭包错误或 Store 自身拒绝（`Busy`、提交校验）。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TransactionError<E> {
@@ -288,6 +291,36 @@ impl<R: Row> Store<R> {
     pub fn with_row<T>(&self, id: RowId, f: impl FnOnce(&R) -> T) -> Option<T> {
         let data = self.inner.data.borrow();
         data.rows.get(id).map(f)
+    }
+
+    /// 按行身份与已注册字段读取类型擦除值；行已删除或字段未注册时返回 `None`。
+    ///
+    /// 返回的是克隆快照，调用方不持有 Store 内部借用。
+    pub fn read_field(&self, id: RowId, field: FieldId) -> Option<Box<dyn std::any::Any>> {
+        let data = self.inner.data.borrow();
+        let row = data.rows.get(id)?;
+        let def = data.fields.get(&field)?;
+        Some(def.read(row))
+    }
+
+    /// 类型擦除的弱读取器：登记到 runtime 后不延长 Store 的存活。
+    ///
+    /// 最后一个 Store 句柄释放后，读取按行不存在返回 `None`；schema 的字段
+    /// 集合不随行数据释放，调用方仍可用 [`Self::field_ids`] 区分未注册字段。
+    pub fn weak_reader(&self) -> ErasedFieldRead {
+        let weak = Rc::downgrade(&self.inner);
+        Box::new(move |id, field| {
+            let inner = weak.upgrade()?;
+            let data = inner.data.borrow();
+            let row = data.rows.get(id)?;
+            let def = data.fields.get(&field)?;
+            Some(def.read(row))
+        })
+    }
+
+    /// schema 注册的字段 id；删除行时用来失效该 Store 的全部字段绑定。
+    pub fn field_ids(&self) -> Vec<FieldId> {
+        self.inner.data.borrow().fields.keys().copied().collect()
     }
 
     pub fn key_of(&self, id: RowId) -> Option<R::Key> {

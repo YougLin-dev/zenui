@@ -109,8 +109,12 @@ _Avoid_: binding value, observable
 _Avoid_: list data, row provider
 
 **RowView**:
-`For` 行 factory 的参数。`id()` 是行身份，`key()` 是业务键，`get()` 是本次挂载的快照；行重新进入挂载窗口时得到新的 `RowView` 与本地状态。
+`For` 行 factory 的参数。`id()` 是行身份，`key()` 是业务键，`get()` 是本次挂载的快照，`field::<T>(FieldId)` 按本行身份建立响应式字段句柄；行重新进入挂载窗口时得到新的 `RowView` 与本地状态。
 _Avoid_: row handle, row item
+
+**Field**:
+typed 字段句柄，身份是 `StoreId + RowId + FieldId`，由 `RowView::field`、`RowStoreField::field` 或 Todo `Store` accessor 构造。读取返回 `Result<T, FieldError>`：通用行删除后是 `MissingRow(RowId)`，Todo accessor 是 `Missing(TodoId)`，schema 未注册字段是 `UnknownField`。删除并以同一业务键重建行会分配新 `RowId`，旧句柄不会命中新行；句柄以弱引用读取，不延长 Store 的存活。
+_Avoid_: row property, field cell
 
 **OwnerRef**:
 owner arena 的 8 B 身份（32-bit slot + 32-bit generation），随 Owner 释放失效。元素、资源与子 Owner 通过它归属清理链；旧 OwnerRef 不能命中复用槽位。
