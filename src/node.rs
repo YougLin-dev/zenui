@@ -606,17 +606,19 @@ impl PartId {
         Self(raw)
     }
 
-    #[cfg(test)]
     pub(crate) const fn raw(self) -> u16 {
         self.0
     }
 }
 
-/// 源句柄；runtime 身份 + arena 槽位。generation 由槽位自身校验。
+/// 源句柄；runtime 身份 + arena 槽位 + 槽位代际。
+///
+/// 槽位释放后会被新资源复用，代际让旧绑定句柄读不到新占用者。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct SourceRef {
     pub(crate) runtime: u32,
     pub(crate) id: u32,
+    pub(crate) generation: u32,
 }
 
 /// 字段源；值类型由持有它的 `BindingSlot<T>` 决定。
@@ -652,6 +654,16 @@ impl ReadSlot {
     /// 静态/once 值在挂载时写入 current，永不重算。
     pub(crate) const fn is_static(self) -> bool {
         matches!(self, Self::Static | Self::Once(_))
+    }
+
+    /// 动态来源的依赖键；静态/once 不参与订阅。
+    pub(crate) const fn dep_key(self) -> Option<crate::context::DepKey> {
+        match self {
+            Self::Static | Self::Once(_) => None,
+            Self::Signal(source) => Some(crate::context::DepKey::Signal(source.id)),
+            Self::Memo(source) => Some(crate::context::DepKey::Memo(source.id)),
+            Self::Field(key) => Some(crate::context::DepKey::Field(key.id, key.kind)),
+        }
     }
 }
 
@@ -1431,26 +1443,40 @@ impl BindingPatchLog {
     }
 }
 
-/// 绑定消费者的打包引用；反向订阅边在增量 flush 切片接入。
+/// 绑定消费者的打包引用；`State::consumers` 把来源 DepKey 映射到它们。
 ///
 /// 固定 16 B：NodeRef 8 B + PartId 2 B + kind/padding。
 #[repr(C)]
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub(crate) struct ConsumerRef {
     node: NodeRef,
     part: u16,
     kind: ConsumerKind,
 }
 
+impl ConsumerRef {
+    pub(crate) const fn new(node: NodeRef, part: u16, kind: ConsumerKind) -> Self {
+        Self { node, part, kind }
+    }
+
+    pub(crate) const fn node(self) -> NodeRef {
+        self.node
+    }
+
+    pub(crate) const fn kind(self) -> ConsumerKind {
+        self.kind
+    }
+}
+
 #[repr(u8)]
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[expect(
-    dead_code,
-    reason = "reverse subscription edges are wired by the incremental flush slice"
-)]
-enum ConsumerKind {
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub(crate) enum ConsumerKind {
+    /// 值绑定：文本/属性/样式。
     Binding = 0,
+    /// 结构触发：`Show::when` 与 `For` 的行集来源。
     Structural = 1,
+    /// 文本输入的 `value` 绑定：相等写入也要重新观察以结算本地编辑。
+    Editor = 2,
 }
 
 const _: () = assert!(std::mem::size_of::<ConsumerRef>() == 16);

@@ -38,7 +38,7 @@ pub(crate) const fn filter_id(filter: Filter) -> FilterId {
     }
 }
 
-const fn filter_kind(filter: FilterId) -> Filter {
+pub(crate) const fn filter_kind(filter: FilterId) -> Filter {
     match filter.index() {
         1 => Filter::Active,
         2 => Filter::Completed,
@@ -642,7 +642,10 @@ impl crate::runtime::State {
     /// 事务只在 Event/Delivery turn 中执行；失败不改变模型，但会记录到命令边界，
     /// 即使调用方忽略返回值，dispatch 仍会报告这个错误。
     fn finish_transaction(&mut self, ops: Vec<Op>) -> Result<(), WriteError> {
-        if !matches!(self.phase, Phase::Event | Phase::Delivery) || self.read_only > 0 {
+        if !matches!(self.phase, Phase::Event | Phase::Delivery)
+            || self.read_only > 0
+            || self.disposing > 0
+        {
             let error = WriteError::Context {
                 operation: "Transaction::finish",
                 phase: self.phase,
@@ -703,13 +706,18 @@ impl crate::runtime::State {
                 self.bump(DepKey::Field(key, FieldKind::Completed));
             }
         }
+        let mut purged = Vec::new();
         for id in &changes.removed {
             coarse_rows = true;
             if let Some(key) = commit.key_of(*id) {
+                // 先标脏消费者，再丢弃已删除行的写入历史：绑定本帧仍会求值
+                // 并读到 FieldMissing，历史表不会随删除行数增长。
                 self.bump(DepKey::Field(key, FieldKind::Title));
                 self.bump(DepKey::Field(key, FieldKind::Completed));
+                purged.push(key);
             }
         }
+        self.purge_row_history(&purged);
         for (row, field) in &changes.fields {
             if let Some(key) = self.todo_store.key_of(*row) {
                 self.bump(DepKey::Field(key, field_kind(*field)));

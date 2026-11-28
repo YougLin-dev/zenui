@@ -54,6 +54,7 @@ impl<T: ReactiveValue> MemoCompute for TypedMemoCompute<T> {
 pub struct Signal<T> {
     runtime: u32,
     id: u32,
+    generation: u32,
     _marker: PhantomData<fn() -> T>,
     _not_send: PhantomData<*const ()>,
 }
@@ -71,16 +72,18 @@ impl<T> Signal<T> {
         Self {
             runtime: source.runtime,
             id: source.id,
+            generation: source.generation,
             _marker: PhantomData,
             _not_send: PhantomData,
         }
     }
 
-    /// 绑定槽的来源描述；只携带 runtime 身份与槽位。
+    /// 绑定槽的来源描述；携带 runtime 身份、槽位与代际。
     pub(crate) fn source(self) -> crate::node::SourceRef {
         crate::node::SourceRef {
             runtime: self.runtime,
             id: self.id,
+            generation: self.generation,
         }
     }
 }
@@ -93,7 +96,9 @@ impl<T: ReactiveValue> Signal<T> {
     /// 所属 owner 已释放时 panic；在 `Memo` 计算中读取已释放的源也 panic。
     /// 可失败读取请使用 `Read`/`Field` 的 fault 路径。
     pub fn get(self) -> T {
-        match with_state_of(self.runtime, |state| state.try_read_signal(self.id, true)) {
+        match with_state_of(self.runtime, |state| {
+            state.try_read_signal(self.id, self.generation, true)
+        }) {
             Ok(value) => value,
             Err(crate::view::ReadFault::Disposed) => {
                 panic!("signal belongs to a disposed owner")
@@ -104,11 +109,15 @@ impl<T: ReactiveValue> Signal<T> {
 
     /// setup 阶段的一次性读取：不注册依赖，读取失败返回 typed fault。
     pub(crate) fn try_get_once(self) -> Result<T, crate::view::ReadFault> {
-        with_state_of(self.runtime, |state| state.try_read_signal(self.id, false))
+        with_state_of(self.runtime, |state| {
+            state.try_read_signal(self.id, self.generation, false)
+        })
     }
 
     pub fn set(self, value: T) {
-        with_state_of(self.runtime, |state| state.write_signal(self.id, value));
+        with_state_of(self.runtime, |state| {
+            state.write_signal(self.id, self.generation, value)
+        });
     }
 
     /// 只读作用域：内部的 setter 与模型事务在改动前被拒绝。
@@ -127,7 +136,7 @@ impl<T: ReactiveValue> Signal<T> {
         };
         let value = with_state_of(self.runtime, |state| {
             state.read_only += 1;
-            state.read_signal(self.id, true)
+            state.read_signal(self.id, self.generation, true)
         });
         f(&value)
     }
@@ -145,6 +154,7 @@ impl<T> fmt::Debug for Signal<T> {
 pub struct Memo<T> {
     runtime: u32,
     id: u32,
+    generation: u32,
     _marker: PhantomData<fn() -> T>,
     _not_send: PhantomData<*const ()>,
 }
@@ -162,16 +172,18 @@ impl<T> Memo<T> {
         Self {
             runtime: source.runtime,
             id: source.id,
+            generation: source.generation,
             _marker: PhantomData,
             _not_send: PhantomData,
         }
     }
 
-    /// 绑定槽的来源描述；只携带 runtime 身份与槽位。
+    /// 绑定槽的来源描述；携带 runtime 身份、槽位与代际。
     pub(crate) fn source(self) -> crate::node::SourceRef {
         crate::node::SourceRef {
             runtime: self.runtime,
             id: self.id,
+            generation: self.generation,
         }
     }
 }
@@ -223,14 +235,14 @@ impl<T: ReactiveValue> Memo<T> {
         // 差分 oracle：绕过生产 memo 缓存与 dirty 标记，按 oracle 自己的
         // 拓扑重算值；生产缓存必须保持原样，否则比较的两个结果会互相污染。
         #[cfg(test)]
-        if let Some(result) = crate::oracle::memo_read(self.runtime, self.id) {
+        if let Some(result) = crate::oracle::memo_read(self.runtime, self.id, self.generation) {
             return result;
         }
         let ready = with_state_of(self.runtime, |state| {
             if fault_on_poison {
-                state.memo_try_ready_binding::<T>(self.id)
+                state.memo_try_ready_binding::<T>(self.id, self.generation)
             } else {
-                state.memo_try_ready::<T>(self.id)
+                state.memo_try_ready::<T>(self.id, self.generation)
             }
         })?;
         if let Some(value) = ready {
@@ -259,7 +271,9 @@ impl<T: ReactiveValue> Memo<T> {
                 if fault_on_poison {
                     return Err(crate::view::ReadFault::ComputedPanicked);
                 }
-                match with_state_of(self.runtime, |state| state.memo_try_ready::<T>(self.id))? {
+                match with_state_of(self.runtime, |state| {
+                    state.memo_try_ready::<T>(self.id, self.generation)
+                })? {
                     Some(value) => Ok(value),
                     None => Err(crate::view::ReadFault::ComputedPanicked),
                 }
@@ -273,7 +287,11 @@ impl<T: ReactiveValue> Memo<T> {
     /// [`Memo::get`] 的最后值规则，本方法是这个切片的 typed 诊断出口。
     pub fn last_panic(self) -> Option<PanicInfo> {
         with_state_of(self.runtime, |state| {
-            state.memos[state.memo_index(self.id)].poisoned.clone()
+            let cell = &state.memos[state.memo_index(self.id)];
+            if cell.generation != self.generation {
+                return None;
+            }
+            cell.poisoned.clone()
         })
     }
 }
@@ -299,13 +317,14 @@ impl<T> Once<T> {
 }
 
 pub fn signal<T: ReactiveValue>(value: T) -> Signal<T> {
-    let (runtime, id) = with_state(|state| {
-        let id = state.create_signal(Box::new(value));
-        (state.id, id)
+    let (runtime, id, generation) = with_state(|state| {
+        let (id, generation) = state.create_signal(Box::new(value));
+        (state.id, id, generation)
     });
     Signal {
         runtime,
         id,
+        generation,
         _marker: PhantomData,
         _not_send: PhantomData,
     }
@@ -315,13 +334,14 @@ pub fn memo<T: ReactiveValue>(compute: impl Fn() -> T + 'static) -> Memo<T> {
     let erased: Rc<dyn MemoCompute> = Rc::new(TypedMemoCompute {
         compute: Box::new(compute),
     });
-    let (runtime, id) = with_state(|state| {
-        let id = state.create_memo(erased);
-        (state.id, id)
+    let (runtime, id, generation) = with_state(|state| {
+        let (id, generation) = state.create_memo(erased);
+        (state.id, id, generation)
     });
     Memo {
         runtime,
         id,
+        generation,
         _marker: PhantomData,
         _not_send: PhantomData,
     }
@@ -331,12 +351,44 @@ pub fn once<T>(value: T) -> Once<T> {
     Once { value }
 }
 
+/// 登记当前 owner 的清理回调。
+///
+/// 在组件 setup/挂载期间调用；owner 释放时同层回调按注册逆序执行，每个
+/// 回调有独立 panic 边界（panic 记录为 [`crate::RuntimeDiagnostic::CleanupPanicked`]）。
+/// 回调可以读取仍存活的 Signal/Memo，但不能创建资源、挂载节点或写
+/// Signal/Store：这些操作按上下文错误拒绝。
+///
+/// # Panics
+///
+/// 不在 owner 作用域内调用、或在另一个 cleanup 内调用时 panic；挂载边界
+/// 把 panic 收敛为 `MountError::Panic`。
+pub fn on_cleanup(f: impl FnOnce() + 'static) {
+    with_state(|state| state.push_cleanup(Box::new(f)));
+}
+
+/// 类型擦除值的诊断字节估算。
+///
+/// `String` 按容量计——它是 SDK 主要的事实堆值；其他类型按具体值的
+/// inline 大小计，`Rc<dyn Any>` 的分配再算两个计数 word。共享投影
+/// （`RowSet`）的缓冲由 `MemoryReport::rowset_bytes` 单列，这里只算句柄。
+fn erased_value_bytes(value: &dyn Any) -> usize {
+    let payload = match value.downcast_ref::<String>() {
+        Some(text) => text.capacity(),
+        None => std::mem::size_of_val(value),
+    };
+    payload + 2 * std::mem::size_of::<usize>()
+}
+
 pub(crate) struct SignalCell {
     pub(crate) value: Rc<dyn Any>,
     /// 应用写入代数。相等写入同样推进：文本编辑器据此判断处理器是否处理过
     /// 一次编辑，而不是比较写入前后的值。
     pub(crate) writes: u64,
     pub(crate) disposed: bool,
+    /// 槽位复用代际；旧句柄必须与当前代际一致才能读写。
+    pub(crate) generation: u32,
+    /// 值自身的诊断字节估算；内存门禁按 live 槽累加。
+    pub(crate) value_bytes: usize,
 }
 
 pub(crate) struct MemoCell {
@@ -354,6 +406,10 @@ pub(crate) struct MemoCell {
     /// 上一次中止由 memo 环触发；绑定读取据此报告 `GraphCycle` 而不是
     /// 泛化的 `ComputedPanicked`。
     pub(crate) cycle: bool,
+    /// 槽位复用代际；旧句柄必须与当前代际一致才能读取。
+    pub(crate) generation: u32,
+    /// 已提交值的诊断字节估算；值被释放时一起清零。
+    pub(crate) value_bytes: usize,
 }
 
 impl MemoCell {
@@ -368,6 +424,8 @@ impl MemoCell {
             disposed: false,
             poisoned: None,
             cycle: false,
+            generation: 0,
+            value_bytes: 0,
         }
     }
 }
@@ -381,24 +439,51 @@ impl crate::runtime::State {
         id as usize
     }
 
-    pub(crate) fn create_signal(&mut self, value: Box<dyn Any>) -> u32 {
+    pub(crate) fn create_signal(&mut self, value: Box<dyn Any>) -> (u32, u32) {
+        assert_eq!(
+            self.disposing, 0,
+            "signal() cannot be created during owner cleanup"
+        );
         assert!(
             self.current_owner.is_some(),
             "signal() must run under an owner (phase {:?})",
             self.phase
         );
-        let id = u32::try_from(self.signals.len()).expect("signal arena exhausted");
-        self.signals.push(SignalCell {
-            value: Rc::from(value),
-            writes: 0,
-            disposed: false,
-        });
-        self.attach_to_owner(crate::runtime::Resource::Signal(id));
-        id
+        let value_bytes = erased_value_bytes(&*value);
+        let (id, generation) = if let Some(id) = self.free_signals.pop() {
+            let cell = &mut self.signals[id as usize];
+            debug_assert!(cell.generation != u32::MAX, "retired slots never return");
+            let generation = cell.generation.wrapping_add(1);
+            *cell = SignalCell {
+                value: Rc::from(value),
+                writes: 0,
+                disposed: false,
+                generation,
+                value_bytes,
+            };
+            (id, generation)
+        } else {
+            let id = u32::try_from(self.signals.len()).expect("signal arena exhausted");
+            self.signals.push(SignalCell {
+                value: Rc::from(value),
+                writes: 0,
+                disposed: false,
+                generation: 0,
+                value_bytes,
+            });
+            (id, 0)
+        };
+        self.attach_to_owner(crate::runtime::Resource::Signal(id, generation));
+        (id, generation)
     }
 
-    pub(crate) fn read_signal<T: ReactiveValue>(&mut self, id: u32, track: bool) -> T {
-        match self.try_read_signal(id, track) {
+    pub(crate) fn read_signal<T: ReactiveValue>(
+        &mut self,
+        id: u32,
+        generation: u32,
+        track: bool,
+    ) -> T {
+        match self.try_read_signal(id, generation, track) {
             Ok(value) => value,
             Err(crate::view::ReadFault::Disposed) => {
                 panic!("signal belongs to a disposed owner")
@@ -410,12 +495,18 @@ impl crate::runtime::State {
     pub(crate) fn try_read_signal<T: ReactiveValue>(
         &mut self,
         id: u32,
+        generation: u32,
         track: bool,
     ) -> Result<T, crate::view::ReadFault> {
-        let cell = &self.signals[self.signal_index(id)];
-        if cell.disposed {
+        let index = self.signal_index(id);
+        if self.signals[index].disposed {
             return Err(crate::view::ReadFault::Disposed);
         }
+        if self.signals[index].generation != generation {
+            self.note_stale_source(id);
+            return Err(crate::view::ReadFault::Disposed);
+        }
+        let cell = &self.signals[index];
         let value = cell
             .value
             .clone()
@@ -427,13 +518,16 @@ impl crate::runtime::State {
         Ok((*value).clone())
     }
 
-    pub(crate) fn write_signal<T: ReactiveValue>(&mut self, id: u32, value: T) {
-        if !matches!(self.phase, Phase::Event | Phase::Delivery) || self.read_only > 0 {
+    pub(crate) fn write_signal<T: ReactiveValue>(&mut self, id: u32, generation: u32, value: T) {
+        if !matches!(self.phase, Phase::Event | Phase::Delivery)
+            || self.read_only > 0
+            || self.disposing > 0
+        {
             self.record_fault("Signal::set", self.phase);
             return;
         }
         let index = self.signal_index(id);
-        if self.signals[index].disposed {
+        if self.signals[index].disposed || self.signals[index].generation != generation {
             self.record_fault("Signal::set", self.phase);
             return;
         }
@@ -446,30 +540,47 @@ impl crate::runtime::State {
         // 相等写入不改变值，但仍是应用对这次写入的处理；编辑器依赖这个区别。
         self.signals[index].writes = self.signals[index].writes.wrapping_add(1);
         if current.equivalent(&value) {
+            // 只有文本输入的 value 绑定需要重新观察一次写入尝试。
+            self.mark_editor_consumers_dirty(DepKey::Signal(id));
             return;
         }
+        self.signals[index].value_bytes = erased_value_bytes(&value);
         self.signals[index].value = Rc::new(value);
         self.bump(DepKey::Signal(id));
     }
 
-    pub(crate) fn create_memo(&mut self, compute: Rc<dyn MemoCompute>) -> u32 {
+    pub(crate) fn create_memo(&mut self, compute: Rc<dyn MemoCompute>) -> (u32, u32) {
+        assert_eq!(
+            self.disposing, 0,
+            "memo() cannot be created during owner cleanup"
+        );
         assert!(
             self.current_owner.is_some(),
             "memo() must run under an owner (phase {:?})",
             self.phase
         );
-        let id = u32::try_from(self.memos.len()).expect("memo arena exhausted");
-        self.memos.push(MemoCell::new(compute));
-        self.attach_to_owner(crate::runtime::Resource::Memo(id));
-        id
+        let (id, generation) = if let Some(id) = self.free_memos.pop() {
+            let cell = &mut self.memos[id as usize];
+            let generation = cell.generation.wrapping_add(1);
+            *cell = MemoCell::new(compute);
+            cell.generation = generation;
+            (id, generation)
+        } else {
+            let id = u32::try_from(self.memos.len()).expect("memo arena exhausted");
+            self.memos.push(MemoCell::new(compute));
+            (id, 0)
+        };
+        self.attach_to_owner(crate::runtime::Resource::Memo(id, generation));
+        (id, generation)
     }
 
     /// `memo_ready` 的可失败版本；setup 读取与绑定求值用它拿到 typed fault。
     pub(crate) fn memo_try_ready<T: ReactiveValue>(
         &mut self,
         id: u32,
+        generation: u32,
     ) -> Result<Option<T>, crate::view::ReadFault> {
-        self.memo_try_ready_mode::<T>(id, false)
+        self.memo_try_ready_mode::<T>(id, generation, false)
     }
 
     /// 值绑定读取：毒化即使还有最后值也返回 typed fault，由绑定槽保留旧值
@@ -477,17 +588,23 @@ impl crate::runtime::State {
     pub(crate) fn memo_try_ready_binding<T: ReactiveValue>(
         &mut self,
         id: u32,
+        generation: u32,
     ) -> Result<Option<T>, crate::view::ReadFault> {
-        self.memo_try_ready_mode::<T>(id, true)
+        self.memo_try_ready_mode::<T>(id, generation, true)
     }
 
     fn memo_try_ready_mode<T: ReactiveValue>(
         &mut self,
         id: u32,
+        generation: u32,
         fault_on_poison: bool,
     ) -> Result<Option<T>, crate::view::ReadFault> {
         let index = self.memo_index(id);
         if self.memos[index].disposed {
+            return Err(crate::view::ReadFault::Disposed);
+        }
+        if self.memos[index].generation != generation {
+            self.note_stale_source(id);
             return Err(crate::view::ReadFault::Disposed);
         }
         if self.memos[index].computing {
@@ -541,20 +658,34 @@ impl crate::runtime::State {
     /// 一个仍 clean 的下游 memo 时，必须沿订阅边确认上游已经结算，否则会拿到
     /// 旧缓存。这里只遍历 memo 边，源（Signal/Field/Rows）的变化已经直接标脏。
     pub(crate) fn memo_deps_unsettled(&self, id: u32) -> bool {
-        let mut stack: Vec<u32> = self.memos[self.memo_index(id)]
-            .deps
-            .iter()
-            .filter_map(|key| match key {
-                DepKey::Memo(dep) => Some(*dep),
-                _ => None,
-            })
-            .collect();
-        let mut visited = BTreeSet::new();
+        // 复用 State 上的工作区：绑定刷新每帧都会调用这里，不能按调用分配
+        // 集合。`seen` 用 stamp 标记访问，stamp 回绕时整体重新计一次。
+        let mut stamp = self.memo_walk_stamp.get().wrapping_add(1);
+        if stamp == 0 {
+            stamp = 1;
+        }
+        self.memo_walk_stamp.set(stamp);
+        let mut stack = self.memo_walk_stack.borrow_mut();
+        stack.clear();
+        let mut seen = self.memo_walk_seen.borrow_mut();
+        seen.clear();
+        seen.resize(self.memos.len(), 0);
+        stack.extend(
+            self.memos[self.memo_index(id)]
+                .deps
+                .iter()
+                .filter_map(|key| match key {
+                    DepKey::Memo(dep) => Some(*dep),
+                    _ => None,
+                }),
+        );
         while let Some(memo) = stack.pop() {
-            if !visited.insert(memo) {
+            let index = self.memo_index(memo);
+            if seen[index] == stamp {
                 continue;
             }
-            let cell = &self.memos[self.memo_index(memo)];
+            seen[index] = stamp;
+            let cell = &self.memos[index];
             if cell.disposed {
                 return true;
             }
@@ -631,12 +762,14 @@ impl crate::runtime::State {
             Some(current) => !compute.eq(&**current, &*value),
             None => true,
         };
+        let was_poisoned = cell.poisoned.is_some();
         cell.compute = Some(compute);
         cell.poisoned = None;
         cell.cycle = false;
         if changed {
             cell.revision = cell.revision.wrapping_add(1);
         }
+        cell.value_bytes = erased_value_bytes(&*value);
         cell.value = Some(Rc::from(value));
 
         for key in &cell.deps {
@@ -650,6 +783,10 @@ impl crate::runtime::State {
         cell.deps = deps;
         if changed {
             self.invalidate_dependents(DepKey::Memo(id));
+        }
+        // 值变化让绑定重新求值；毒化清除时，之前带 fault 的绑定也要重试。
+        if changed || was_poisoned {
+            self.mark_consumers_dirty(DepKey::Memo(id));
         }
     }
 
@@ -670,6 +807,8 @@ impl crate::runtime::State {
         cell.computing = false;
         cell.dirty = true;
         cell.poisoned = Some(panic);
+        // 依赖它的绑定在下一帧读到 typed fault，而不是停在旧值。
+        self.mark_consumers_dirty(DepKey::Memo(id));
     }
 
     pub(crate) fn note_dep(&mut self, key: DepKey) {
@@ -682,6 +821,7 @@ impl crate::runtime::State {
         let epoch = self.write_epochs.entry(key).or_insert(0);
         *epoch = epoch.wrapping_add(1);
         self.invalidate_dependents(key);
+        self.mark_consumers_dirty(key);
     }
 
     /// 字段写入尝试代数：每次应用写入都推进，相等写入也算；
@@ -694,6 +834,22 @@ impl crate::runtime::State {
         self.field_writes.get(&(id, kind)).copied().unwrap_or(0)
     }
 
+    /// 行删除后丢弃它的字段写入历史。
+    ///
+    /// `TodoId` 单调分配、删除后不复用，因此这些代数不会再有读者；保留
+    /// 它们会让交互历史随删除行数无界增长。已经标脏的 memo/绑定在删除
+    /// 提交时仍保留脏标记，本帧照常求值并读到 `FieldMissing`。
+    pub(crate) fn purge_row_history(&mut self, ids: &[crate::store::TodoId]) {
+        if ids.is_empty() {
+            return;
+        }
+        let removed: BTreeSet<crate::store::TodoId> = ids.iter().copied().collect();
+        self.field_writes
+            .retain(|(row, _), _| !removed.contains(row));
+        self.write_epochs
+            .retain(|key, _| !matches!(key, DepKey::Field(row, _) if removed.contains(row)));
+    }
+
     /// 记录一次应用字段写入尝试；由 `Store` 事务在提交时调用。
     pub(crate) fn note_field_write(
         &mut self,
@@ -702,12 +858,15 @@ impl crate::runtime::State {
     ) {
         let epoch = self.field_writes.entry((id, kind)).or_insert(0);
         *epoch = epoch.wrapping_add(1);
+        // 与 Signal 写入相同：相等写入也要让编辑器绑定重新观察。
+        self.mark_editor_consumers_dirty(DepKey::Field(id, kind));
     }
 
-    /// 绑定槽来源的写入代数；已释放或不存在的槽按 0 处理。
+    /// 绑定槽来源的写入代数；已释放、代际不符或不存在的槽按 0 处理。
     pub(crate) fn source_write_epoch(&self, source: crate::node::SourceRef) -> u64 {
         self.signals
             .get(source.id as usize)
+            .filter(|cell| cell.generation == source.generation)
             .map_or(0, |cell| cell.writes)
     }
 
@@ -715,6 +874,7 @@ impl crate::runtime::State {
     pub(crate) fn source_memo_revision(&self, source: crate::node::SourceRef) -> u64 {
         self.memos
             .get(source.id as usize)
+            .filter(|cell| cell.generation == source.generation)
             .map_or(0, |cell| cell.revision)
     }
 
@@ -734,6 +894,9 @@ impl crate::runtime::State {
             // 依赖变化也是毒化的唯一解药：清除 poison 并允许下一次结算重算。
             self.memos[index].poisoned = None;
             self.memos[index].dirty = true;
+            // 读取该 memo 的绑定也要重新求值：即使 settle 后值相等，绑定
+            // 读取本身也是 quarantined memo 的惰性结算路径。
+            self.mark_consumers_dirty(DepKey::Memo(*memo));
         }
         self.reverse.insert(key, dependents);
     }
@@ -742,6 +905,14 @@ impl crate::runtime::State {
     pub(crate) fn record_read_fault(&mut self, fault: crate::view::ReadFault) {
         if !self.read_faults.contains(&fault) {
             self.read_faults.push(fault);
+        }
+    }
+
+    /// 旧代际句柄命中复用槽位；读取已被拒绝，只上报一次开发诊断。
+    pub(crate) fn note_stale_source(&mut self, slot: u32) {
+        let diagnostic = crate::runtime::RuntimeDiagnostic::StaleSource { slot };
+        if !self.diagnostics.contains(&diagnostic) {
+            self.diagnostics.push(diagnostic);
         }
     }
 

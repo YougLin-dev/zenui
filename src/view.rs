@@ -378,25 +378,25 @@ impl ReadSlot {
         let Self::Memo(source) = self else {
             return false;
         };
-        state
-            .memos
-            .get(source.id as usize)
-            .is_none_or(|cell| cell.dirty || cell.computing)
-            || state.memo_deps_unsettled(source.id)
+        state.memos.get(source.id as usize).is_none_or(|cell| {
+            cell.disposed || cell.generation != source.generation || cell.dirty || cell.computing
+        }) || state.memo_deps_unsettled(source.id)
     }
 
     /// 来源是否已经释放；释放不推进值变化代数，跳过求值前必须单独检查。
+    ///
+    /// 槽位复用后旧来源描述与新槽位代际不一致，同样按已释放处理。
     pub(crate) fn is_disposed(self, state: &crate::runtime::State) -> bool {
         match self {
             Self::Static | Self::Once(_) => false,
             Self::Signal(source) => state
                 .signals
                 .get(source.id as usize)
-                .is_some_and(|cell| cell.disposed),
+                .is_none_or(|cell| cell.disposed || cell.generation != source.generation),
             Self::Memo(source) => state
                 .memos
                 .get(source.id as usize)
-                .is_some_and(|cell| cell.disposed),
+                .is_none_or(|cell| cell.disposed || cell.generation != source.generation),
             Self::Field(_) => false,
         }
     }
@@ -409,11 +409,21 @@ impl ReadSlot {
         match self {
             Self::Static | Self::Once(_) => None,
             Self::Signal(source) => Some(
-                state
-                    .write_epochs
-                    .get(&crate::context::DepKey::Signal(source.id))
-                    .copied()
-                    .unwrap_or(0),
+                // 槽位复用后旧来源不再对应任何写入代数；按 0 处理，实际
+                // 拦截由 is_disposed 的代际校验完成。
+                if state
+                    .signals
+                    .get(source.id as usize)
+                    .is_none_or(|cell| cell.disposed || cell.generation != source.generation)
+                {
+                    0
+                } else {
+                    state
+                        .write_epochs
+                        .get(&crate::context::DepKey::Signal(source.id))
+                        .copied()
+                        .unwrap_or(0)
+                },
             ),
             Self::Memo(source) => Some(state.source_memo_revision(source)),
             Self::Field(key) => Some(

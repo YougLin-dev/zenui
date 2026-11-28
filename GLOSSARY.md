@@ -116,6 +116,14 @@ _Avoid_: row handle, row item
 owner arena 的 8 B 身份（32-bit slot + 32-bit generation），随 Owner 释放失效。元素、资源与子 Owner 通过它归属清理链；旧 OwnerRef 不能命中复用槽位。
 _Avoid_: owner id, scope id
 
+**Cleanup**:
+`on_cleanup` 在挂载期登记的 owner 收尾回调。同层按登记逆序执行，子 owner 先于父；全部 cleanup 在资源释放前运行，因此可以读取本 owner 仍存活的 Signal/Memo。创建 Signal/Memo、挂载或写入被拒绝为 Context 错误；单条 panic 收敛为 `RuntimeDiagnostic::CleanupPanicked`，后续回调继续。见 [ADR-0027](docs/adr/0027-reactive-slot-recycling-and-cleanup.md)。
+_Avoid_: destructor, drop hook
+
+**Source generation**:
+Signal/Memo 槽位的 32-bit 代际。槽位随 owner 释放进入 free list，复用时递增；句柄、SourceRef、绑定来源与 oracle 缓存都按代际校验。旧代际读取被拒绝（可失败读取为 `ReadFault::Disposed`），并由 `RuntimeDiagnostic::StaleSource` 上报。`DepKey` 仍以槽位索引为键，释放时的双向解绑保证索引不会命中新代际。
+_Avoid_: handle id, source id
+
 **BindingPart**:
 绑定在节点上的稳定部位标识（文本、属性、样式、Show when、For each、值等）。绑定补丁按 `(tree, node, part)` 去重，同一 turn 的重复求值不会产生重复补丁。
 _Avoid_: binding key, attribute id
