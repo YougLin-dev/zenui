@@ -86,6 +86,12 @@ impl<T> Signal<T> {
 }
 
 impl<T: ReactiveValue> Signal<T> {
+    /// 读取当前值并注册依赖。
+    ///
+    /// # Panics
+    ///
+    /// 所属 owner 已释放时 panic；在 `Memo` 计算中读取已释放的源也 panic。
+    /// 可失败读取请使用 `Read`/`Field` 的 fault 路径。
     pub fn get(self) -> T {
         match with_state_of(self.runtime, |state| state.try_read_signal(self.id, true)) {
             Ok(value) => value,
@@ -171,8 +177,15 @@ impl<T> Memo<T> {
 }
 
 impl<T: ReactiveValue> Memo<T> {
+    /// 读取 memo 的当前值（必要时重算）并注册依赖。
+    ///
+    /// # Panics
+    ///
+    /// 所属 owner 已释放、计算闭包 panic 且没有最后值、或读到计算中的自身
+    /// （memo 环）时 panic。绑定求值不走这条路径：它把同一情况转成
+    /// [`crate::view::ReadFault`] 并保留最后已提交值。
     pub fn get(self) -> T {
-        match self.read_result(true) {
+        match self.read_result(true, false) {
             Ok(value) => value,
             Err(crate::view::ReadFault::Disposed) => {
                 panic!("memo belongs to a disposed owner")
@@ -196,18 +209,30 @@ impl<T: ReactiveValue> Memo<T> {
 
     /// setup 阶段的一次性读取：不向上游 memo 注册依赖，失败返回 typed fault。
     pub(crate) fn try_get_once(self) -> Result<T, crate::view::ReadFault> {
-        self.read_result(false)
+        self.read_result(false, false)
     }
 
-    /// memo 读取的唯一实现；`track` 决定是否向正在计算的父 memo 注册依赖。
-    fn read_result(self, track: bool) -> Result<T, crate::view::ReadFault> {
+    /// 绑定求值读取：毒化 memo 即使保留最后值也返回 typed fault。
+    pub(crate) fn try_read_binding(self) -> Result<T, crate::view::ReadFault> {
+        self.read_result(false, true)
+    }
+
+    /// memo 读取的唯一实现；`track` 决定是否向正在计算的父 memo 注册依赖，
+    /// `fault_on_poison` 决定毒化且仍有最后值时返回旧值还是 `ComputedPanicked`。
+    fn read_result(self, track: bool, fault_on_poison: bool) -> Result<T, crate::view::ReadFault> {
         // 差分 oracle：绕过生产 memo 缓存与 dirty 标记，按 oracle 自己的
         // 拓扑重算值；生产缓存必须保持原样，否则比较的两个结果会互相污染。
         #[cfg(test)]
         if let Some(result) = crate::oracle::memo_read(self.runtime, self.id) {
             return result;
         }
-        let ready = with_state_of(self.runtime, |state| state.memo_try_ready::<T>(self.id))?;
+        let ready = with_state_of(self.runtime, |state| {
+            if fault_on_poison {
+                state.memo_try_ready_binding::<T>(self.id)
+            } else {
+                state.memo_try_ready::<T>(self.id)
+            }
+        })?;
         if let Some(value) = ready {
             if track && with_state_of(self.runtime, |state| state.phase) == Phase::Memo {
                 with_state_of(self.runtime, |state| state.note_dep(DepKey::Memo(self.id)));
@@ -231,6 +256,9 @@ impl<T: ReactiveValue> Memo<T> {
                 with_state_of(self.runtime, |state| {
                     state.abort_memo(self.id, panic, previous);
                 });
+                if fault_on_poison {
+                    return Err(crate::view::ReadFault::ComputedPanicked);
+                }
                 match with_state_of(self.runtime, |state| state.memo_try_ready::<T>(self.id))? {
                     Some(value) => Ok(value),
                     None => Err(crate::view::ReadFault::ComputedPanicked),
@@ -323,6 +351,9 @@ pub(crate) struct MemoCell {
     pub(crate) disposed: bool,
     /// compute panic 的诊断；依赖变化后清除，成功重算也会覆盖。
     pub(crate) poisoned: Option<PanicInfo>,
+    /// 上一次中止由 memo 环触发；绑定读取据此报告 `GraphCycle` 而不是
+    /// 泛化的 `ComputedPanicked`。
+    pub(crate) cycle: bool,
 }
 
 impl MemoCell {
@@ -336,6 +367,7 @@ impl MemoCell {
             computing: false,
             disposed: false,
             poisoned: None,
+            cycle: false,
         }
     }
 }
@@ -350,6 +382,11 @@ impl crate::runtime::State {
     }
 
     pub(crate) fn create_signal(&mut self, value: Box<dyn Any>) -> u32 {
+        assert!(
+            self.current_owner.is_some(),
+            "signal() must run under an owner (phase {:?})",
+            self.phase
+        );
         let id = u32::try_from(self.signals.len()).expect("signal arena exhausted");
         self.signals.push(SignalCell {
             value: Rc::from(value),
@@ -416,6 +453,11 @@ impl crate::runtime::State {
     }
 
     pub(crate) fn create_memo(&mut self, compute: Rc<dyn MemoCompute>) -> u32 {
+        assert!(
+            self.current_owner.is_some(),
+            "memo() must run under an owner (phase {:?})",
+            self.phase
+        );
         let id = u32::try_from(self.memos.len()).expect("memo arena exhausted");
         self.memos.push(MemoCell::new(compute));
         self.attach_to_owner(crate::runtime::Resource::Memo(id));
@@ -427,16 +469,48 @@ impl crate::runtime::State {
         &mut self,
         id: u32,
     ) -> Result<Option<T>, crate::view::ReadFault> {
-        let cell = &self.memos[self.memo_index(id)];
-        if cell.disposed {
+        self.memo_try_ready_mode::<T>(id, false)
+    }
+
+    /// 值绑定读取：毒化即使还有最后值也返回 typed fault，由绑定槽保留旧值
+    /// 并记录 `ComputedPanicked`，而不是把旧值当作成功的本次求值。
+    pub(crate) fn memo_try_ready_binding<T: ReactiveValue>(
+        &mut self,
+        id: u32,
+    ) -> Result<Option<T>, crate::view::ReadFault> {
+        self.memo_try_ready_mode::<T>(id, true)
+    }
+
+    fn memo_try_ready_mode<T: ReactiveValue>(
+        &mut self,
+        id: u32,
+        fault_on_poison: bool,
+    ) -> Result<Option<T>, crate::view::ReadFault> {
+        let index = self.memo_index(id);
+        if self.memos[index].disposed {
             return Err(crate::view::ReadFault::Disposed);
         }
-        if cell.computing {
+        if self.memos[index].computing {
+            // 环上的每个参与者都做标记：最终哪个 memo 的 compute 先中止，
+            // 绑定读取都能把它归为 GraphCycle。
+            let cycle: Vec<u32> = self.computing.iter().map(|(memo, _)| *memo).collect();
+            for memo in cycle {
+                self.memos[memo as usize].cycle = true;
+            }
             return Err(crate::view::ReadFault::GraphCycle);
         }
+        let cell = &self.memos[index];
         if cell.poisoned.is_some() {
-            // 毒化后不重试 compute：只有依赖变化能清除 poison。仍有最后值时
-            // 返回它，界面因此保持最后一次已提交状态。
+            // 毒化后不重试 compute：只有依赖变化能清除 poison。普通读取在
+            // 仍有最后值时返回它；绑定读取必须上报 fault，不能把旧值当作
+            // 本次求值成功。
+            if fault_on_poison {
+                return Err(if cell.cycle {
+                    crate::view::ReadFault::GraphCycle
+                } else {
+                    crate::view::ReadFault::ComputedPanicked
+                });
+            }
             if let Some(value) = &cell.value {
                 return Ok(Some(
                     (*value.clone().downcast::<T>().expect("memo value type")).clone(),
@@ -559,6 +633,7 @@ impl crate::runtime::State {
         };
         cell.compute = Some(compute);
         cell.poisoned = None;
+        cell.cycle = false;
         if changed {
             cell.revision = cell.revision.wrapping_add(1);
         }
@@ -644,9 +719,12 @@ impl crate::runtime::State {
     }
 
     fn invalidate_dependents(&mut self, key: DepKey) {
-        let dependents: BTreeSet<u32> = self.reverse.get(&key).cloned().unwrap_or_default();
-        for memo in dependents {
-            let index = self.memo_index(memo);
+        // 移出反向边再放回：集合本身不需要在每次源写入时克隆。
+        let Some(dependents) = self.reverse.remove(&key) else {
+            return;
+        };
+        for memo in &dependents {
+            let index = self.memo_index(*memo);
             if self.memos[index].disposed || self.memos[index].computing {
                 continue;
             }
@@ -657,6 +735,7 @@ impl crate::runtime::State {
             self.memos[index].poisoned = None;
             self.memos[index].dirty = true;
         }
+        self.reverse.insert(key, dependents);
     }
 
     /// 记录一次绑定读取失败；同一刷新内相同 fault 只报告一次。

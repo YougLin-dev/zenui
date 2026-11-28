@@ -1,6 +1,6 @@
 #![allow(unused_braces)]
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use zenui::prelude::*;
@@ -114,6 +114,12 @@ fn a_panicking_memo_keeps_its_last_value_until_a_dependency_changes() {
     assert!(
         app.texts().iter().any(|text| text == "value=1"),
         "the last committed value stays visible"
+    );
+    let report = app.refresh().expect("refresh reports the poison fault");
+    assert!(
+        report.faults().contains(&ReadFault::ComputedPanicked),
+        "a poisoned memo with a last value is still a typed binding fault: {:?}",
+        report.faults()
     );
 
     app.click_text("Probe").expect("probe");
@@ -287,7 +293,40 @@ fn a_panicking_component_setup_releases_resources_and_mount_can_retry() {
 }
 
 #[test]
-fn a_memo_without_a_last_value_panic_is_contained_during_refresh() {
+fn a_memo_cycle_becomes_a_graph_cycle_binding_fault() {
+    #[component]
+    fn Cycle() -> MountResult<MountPlan> {
+        let a_slot: Rc<RefCell<Option<Memo<String>>>> = Rc::new(RefCell::new(None));
+        let b_slot: Rc<RefCell<Option<Memo<String>>>> = Rc::new(RefCell::new(None));
+        let a = {
+            let b_slot = b_slot.clone();
+            memo(move || b_slot.borrow().expect("b").get())
+        };
+        let b = {
+            let a_slot = a_slot.clone();
+            memo(move || a_slot.borrow().expect("a").get())
+        };
+        *a_slot.borrow_mut() = Some(a);
+        *b_slot.borrow_mut() = Some(b);
+        view! { <text>{a}</text> }
+    }
+
+    let mut app = Runtime::new();
+    app.mount(|| view! { <Cycle /> }).expect("mount");
+    let report = app.refresh().expect("the cycle is a binding fault");
+    assert!(
+        report.faults().contains(&ReadFault::GraphCycle),
+        "the cycle is reported as GraphCycle, not a panic: {:?}",
+        report.faults()
+    );
+    assert!(
+        app.texts().iter().all(|text| !text.contains("cycle")),
+        "no poisoned content is rendered"
+    );
+}
+
+#[test]
+fn a_virgin_memo_panic_becomes_a_binding_fault_instead_of_a_mount_panic() {
     #[component]
     fn ShowHost(when: Memo<bool>, then: ChildrenFactory) -> MountResult<MountPlan> {
         Ok(MountPlan::new(vec![zenui::view::show(when, then, None)]))
@@ -310,23 +349,22 @@ fn a_memo_without_a_last_value_panic_is_contained_during_refresh() {
     let mut app = Runtime::new();
     app.mount(|| view! { <Host /> }).expect("mount");
 
-    let error = app
-        .click_text("Toggle")
-        .expect_err("the memo panic is contained during refresh");
-    match error {
-        MountError::Panic(panic) => assert!(
-            panic.message().contains("virgin memo boom"),
-            "unexpected panic: {panic}"
-        ),
-        other => panic!("expected a contained panic, got {other:?}"),
-    }
+    app.click_text("Toggle")
+        .expect("the memo fault stays inside the binding");
+    let report = app.refresh().expect("refresh reports the fault");
+    assert!(
+        report.faults().contains(&ReadFault::ComputedPanicked),
+        "the poisoned virgin memo is a typed binding fault: {:?}",
+        report.faults()
+    );
     assert!(
         app.texts()
             .iter()
-            .all(|text| !text.contains("virgin memo boom"))
+            .all(|text| !text.contains("virgin memo boom")),
+        "the poison message is not rendered as content"
     );
     app.click_text("Toggle")
-        .expect("the runtime stays usable after the refresh panic");
+        .expect("the runtime stays usable after the memo fault");
 }
 
 #[test]

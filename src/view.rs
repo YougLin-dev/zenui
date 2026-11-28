@@ -330,8 +330,8 @@ impl<T: ReactiveValue> Read<T> {
 impl ReadSlot {
     /// 求值一个动态绑定源；`Static`/`Once` 的值只在挂载时写入，调用方跳过。
     ///
-    /// `Field` 缺失与已释放的源返回 typed fault；memo 计算 panic 仍按
-    /// `Memo::get` 的既有契约向上传播，由刷新边界 contain。
+    /// `Field` 缺失、已释放的源、memo 毒化与 memo 环都返回 typed fault；
+    /// 绑定槽保留最后已提交值，刷新边界把 fault 记入 `RefreshReport`。
     pub(crate) fn evaluate<T>(self) -> ReadValue<T>
     where
         T: BindingValue,
@@ -346,10 +346,9 @@ impl ReadSlot {
                 Ok(value) => ReadValue::Value(value),
                 Err(fault) => ReadValue::Fault(fault),
             },
-            Self::Memo(source) => match Memo::<T>::from_source(source).try_get_once() {
+            Self::Memo(source) => match Memo::<T>::from_source(source).try_read_binding() {
                 Ok(value) => ReadValue::Value(value),
-                Err(ReadFault::Disposed) => ReadValue::Fault(ReadFault::Disposed),
-                Err(_) => ReadValue::Value(Memo::<T>::from_source(source).get()),
+                Err(fault) => ReadValue::Fault(fault),
             },
             Self::Field(key) => match Field::<T>::from_key(key).read_field() {
                 Ok(value) => ReadValue::Value(value),

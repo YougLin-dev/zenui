@@ -15,13 +15,7 @@ fn Broken() -> MountResult<MountPlan> {
 
 #[component]
 fn PanicText() -> MountResult<MountPlan> {
-    let failing: Memo<String> = memo(|| panic!("virgin memo boom"));
-    view! {
-        <view>
-            <text>{failing}</text>
-            <button aria:label="bound" disabled={once(true)}>"x"</button>
-        </view>
-    }
+    panic!("window setup boom")
 }
 
 #[component]
@@ -140,7 +134,7 @@ fn a_window_whose_first_refresh_panics_releases_its_bindings() {
         .expect_err("the refresh panic fails the open");
     match error {
         WindowError::Mount(MountError::Panic(panic)) => {
-            assert!(panic.message().contains("virgin memo boom"));
+            assert!(panic.message().contains("window setup boom"));
         }
         other => panic!("expected a contained panic, got {other:?}"),
     }
