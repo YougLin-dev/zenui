@@ -117,7 +117,7 @@ _Avoid_: bubble order, event propagation
 _Avoid_: snapshot id, render id
 
 **Read**:
-intrinsic 数据位与组件 prop 接受的值源：`Signal`、`Memo`、`Field`、`Once` 或静态值。挂载期转换为绑定槽；动态源只在值变化代数或（文本输入的）写入尝试代数推进时求值，静态/once 值在挂载时提交后不再重算。
+intrinsic 数据位与组件 prop 接受的值源：`Signal`、`Memo`、`Field`、`Once` 或静态值；文本子节点、intrinsic 的 `value`/`disabled`/`checked`/`aria:*`/`style:*` 与 `Show when` 的无参数闭包在挂载时降为隐式 memo，同样以读源进入绑定。挂载期转换为绑定槽；动态源只在值变化代数或（文本输入的）写入尝试代数推进时求值，静态/once 值在挂载时提交后不再重算。
 _Avoid_: binding value, observable
 
 **ForSource**:

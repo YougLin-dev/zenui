@@ -413,6 +413,48 @@ fn a_click_handler_can_prevent_the_submit_default() {
 }
 
 #[test]
+fn label_clicks_route_to_the_closest_handler_while_node_clicks_run_only_the_target() {
+    #[component]
+    fn Row(clicks: Rc<Cell<u32>>) -> MountResult<MountPlan> {
+        let clicks = clicks.clone();
+        view! {
+            <view
+                aria:label="row"
+                on:click={move |_event: &mut ClickEvent| clicks.set(clicks.get() + 1)}
+            >
+                <text aria:label="caption">"Row text"</text>
+            </view>
+        }
+    }
+
+    let clicks = Rc::new(Cell::new(0));
+    let mut app = Runtime::new();
+    app.mount({
+        let clicks = clicks.clone();
+        move || view! { <Row clicks={clicks} /> }
+    })
+    .expect("mount");
+
+    app.click_text("Row text").expect("the routed click");
+    assert_eq!(clicks.get(), 1, "click_text reaches the closest handler");
+
+    let caption = node(&app, "caption");
+    assert_eq!(
+        app.click_node(caption),
+        Err(DispatchError::WrongKind {
+            node: caption,
+            operation: NodeOperation::Click,
+        }),
+        "click_node is a direct primitive, not a routing helper"
+    );
+    assert_eq!(
+        clicks.get(),
+        1,
+        "click_node does not fall back to ancestors"
+    );
+}
+
+#[test]
 fn click_and_change_sources_distinguish_pointer_keyboard_and_uia() {
     #[component]
     fn Sources(seen: Rc<RefCell<Vec<EventSource>>>) -> MountResult<MountPlan> {

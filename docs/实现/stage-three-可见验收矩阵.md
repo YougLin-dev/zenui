@@ -23,7 +23,7 @@ CI 通过、隐藏 smoke 或 renderer 测试都不能单独升级为 A 级证据
 | 2 | 文本输入 / IME / lineage | [stage-three 外部替换与组合验收](stage-three-外部替换与组合-验收.md)、[stage-three 文本编辑历史验收](stage-three-文本编辑历史-验收.md) | A | 已记录 |
 | 2 | 焦点显露 | [stage-three 焦点显露验收](stage-three-焦点显露-验收.md) | A | 已记录（#180） |
 | 2 | 窗口化 For 编辑 | [stage-three 窗口化 For 验收](stage-three-窗口化-for-验收.md) | A | 已记录（#184，10k 行） |
-| 3 | IME、焦点、hover/press | [stage-three 外部替换与组合验收](stage-three-外部替换与组合-验收.md)、[stage-three 焦点显露验收](stage-three-焦点显露-验收.md)、[stage-three 辅助技术合同与朗读验收](stage-three-辅助技术总验收.md) | A | 已记录；hover/press 的逐像素视觉以该次运行为准 |
+| 3 | IME、焦点、hover/press | [stage-three 外部替换与组合验收](stage-three-外部替换与组合-验收.md)、[stage-three 焦点显露验收](stage-three-焦点显露-验收.md)、[stage-three 辅助技术合同与朗读验收](stage-three-辅助技术总验收.md)、[stage-three 宿主滚动验收](stage-three-宿主滚动-验收.md)（100% 步骤 9–11、150% 步骤 7–9） | A | 已记录；hover/press 的 NodeId/`checked` 读数与 100%/150% 截图见宿主滚动验收 |
 | 3 | DPI 100% / 150% | [stage-three 多窗口验收](stage-three-多窗口-验收.md)、[stage-three 滚动总验收](stage-three-滚动总验收.md) | A | 已记录 |
 | 3 | UIA（Inspect/Narrator） | [stage-three 辅助技术验收](stage-three-辅助技术-验收.md)、[辅助技术动作](stage-three-辅助技术动作-验收.md)、[辅助技术事件](stage-three-辅助技术事件-验收.md)、[辅助技术文本](stage-three-辅助技术文本-验收.md)、[辅助技术滚动](stage-three-辅助技术滚动-验收.md)、[辅助技术总验收](stage-three-辅助技术总验收.md) | A | 已记录 |
 | 3 | 菜单 / 快捷键 / 上下文菜单 | [菜单栏](stage-three-菜单栏-验收.md)、[快捷键](stage-three-快捷键-验收.md)、[上下文菜单](stage-three-上下文菜单-验收.md) | A | 已记录；节点级上下文菜单仍属后续工单 |

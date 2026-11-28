@@ -1,0 +1,5 @@
+error: data-position closures take no arguments; use `on:*` for event payloads
+ --> tests/compile_fail/data_closure_arity.rs:5:35
+  |
+5 |         view! { <button disabled={|value: bool| value}>"Blocked"</button> };
+  |                                   ^^^^^^^^^^^^^^^^^^^
