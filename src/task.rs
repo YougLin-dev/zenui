@@ -200,16 +200,37 @@ impl fmt::Display for TaskError {
 
 impl Error for TaskError {}
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// 一次 `drive_tasks` 批次的交付报告。
+///
+/// 每个批次是一个 Delivery turn：后续 step 在首个失败处停止，已提交的写入
+/// 在批次末统一 flush。continuation 失败、上下文 fault、写入错误与批次末
+/// flush 错误都保留在 `errors` 中，调用方读取报告而不是把它当成会话级错误。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DeliveryReport {
     pub delivered: usize,
     pub discarded: usize,
+    errors: Vec<MountError>,
 }
 
 impl DeliveryReport {
-    fn absorb(&mut self, other: Self) {
+    /// 本批次遇到的错误，按发生顺序。
+    pub fn errors(&self) -> &[MountError] {
+        &self.errors
+    }
+
+    /// 本批次是否没有错误。
+    pub fn is_ok(&self) -> bool {
+        self.errors.is_empty()
+    }
+
+    fn push_error(&mut self, error: MountError) {
+        self.errors.push(error);
+    }
+
+    fn absorb(&mut self, mut other: Self) {
         self.delivered += other.delivered;
         self.discarded += other.discarded;
+        self.errors.append(&mut other.errors);
     }
 }
 
@@ -735,12 +756,18 @@ impl Runtime {
     }
 
     /// 在当前线程交付已完成的结果；旧 activation 的结果在交付前被丢弃。
+    ///
+    /// 所有已就绪的 continuation 按 FIFO 在同一个 Delivery turn 中运行；首个
+    /// 失败停止后续 step，已写入的状态仍在批次末 flush 一次。错误随报告返回，
+    /// 因此调用方可以继续运行运行时。
     pub fn drive_tasks(&mut self) -> Result<DeliveryReport, MountError> {
         let state = self.state.clone();
         crate::context::install(&state, || {
             with_state(State::accept_ready_tasks);
             let mut report = DeliveryReport::default();
-            loop {
+            let mut ran_step = false;
+            let mut failed = false;
+            while !failed {
                 let Some(step) = with_state(State::next_delivery) else {
                     break;
                 };
@@ -754,6 +781,7 @@ impl Runtime {
                         value,
                         continuation,
                     } => {
+                        ran_step = true;
                         let previous = with_state(|state| {
                             let previous = (state.current_owner, state.read_only, state.phase);
                             state.current_owner = Some(owner);
@@ -768,36 +796,46 @@ impl Runtime {
                             read_only: previous.1,
                             phase: previous.2,
                         };
-                        let outcome = catch_unwind(AssertUnwindSafe(|| continuation(value)));
+                        let outcome = zenui_core::catch_panic(|| continuation(value));
                         let (fault, write_error) =
                             with_state(|state| (state.fault.take(), state.write_error.take()));
                         drop(context);
-                        let outcome = match outcome {
-                            Ok(result) => result,
-                            Err(_) => {
-                                with_state(|state| state.mark_panicked(id));
-                                return Err(MountError::Delivery("task continuation panicked"));
+                        match outcome {
+                            Ok(result) => {
+                                with_state(|state| state.mark_delivered(id));
+                                report.delivered += 1;
+                                if let Err(error) = result {
+                                    report.push_error(error);
+                                    failed = true;
+                                }
                             }
-                        };
-                        with_state(|state| state.mark_delivered(id));
-                        report.delivered += 1;
-
-                        let refresh_error = with_state(State::has_tree)
-                            .then(|| self.refresh_internal().err())
-                            .flatten();
-                        if let Some(error) = outcome
-                            .err()
-                            .or(fault.map(|fault| MountError::Context {
+                            Err(panic) => {
+                                with_state(|state| state.mark_panicked(id));
+                                report.push_error(MountError::Panic(panic));
+                                failed = true;
+                            }
+                        }
+                        if let Some(fault) = fault {
+                            report.push_error(MountError::Context {
                                 operation: fault.operation,
                                 phase: fault.phase,
-                            }))
-                            .or(write_error.map(MountError::Write))
-                            .or(refresh_error)
-                        {
-                            return Err(error);
+                            });
+                            failed = true;
+                        }
+                        if let Some(error) = write_error {
+                            report.push_error(MountError::Write(error));
+                            failed = true;
                         }
                     }
                 }
+            }
+            // step 之间的结构、绑定与焦点结算必须留到批次末；一次批次只 flush
+            // 一次，后续 continuation 看不到中间已提交结构。
+            if ran_step
+                && with_state(State::has_tree)
+                && let Err(error) = self.refresh_internal()
+            {
+                report.push_error(error);
             }
             Ok(report)
         })
@@ -811,8 +849,9 @@ impl Runtime {
         loop {
             self.wait_for_tasks();
             let delivered = self.drive_tasks()?;
+            let failed = !delivered.is_ok();
             report.absorb(delivered);
-            if !self.has_pending_tasks() {
+            if failed || !self.has_pending_tasks() {
                 break;
             }
         }

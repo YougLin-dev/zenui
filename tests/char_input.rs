@@ -1,6 +1,6 @@
 #![allow(unused_braces)]
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use zenui::prelude::*;
@@ -54,6 +54,43 @@ fn printable_text_runs_one_input_and_reports_the_change() {
     assert!(report.is_ok());
     assert_eq!(calls.get(), 1, "one insertion runs on:input exactly once");
     assert_eq!(input_value(&app, "probe"), "abX");
+}
+
+#[test]
+fn a_text_input_without_a_value_binding_publishes_its_local_edit() {
+    #[component]
+    fn Probe(seen: Rc<RefCell<Vec<String>>>) -> MountResult<MountPlan> {
+        view! {
+            <text-input
+                aria:label="loose"
+                on:input={move |next: String| seen.borrow_mut().push(next)}
+            />
+        }
+    }
+
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let mut app = Runtime::new();
+    app.mount({
+        let seen = Rc::clone(&seen);
+        move || view! { <Probe seen={seen} /> }
+    })
+    .expect("mount");
+    let input = app
+        .presentation()
+        .expect("snapshot")
+        .find_label("loose")
+        .expect("input")
+        .id();
+    app.focus("loose").expect("focus");
+    app.set_caret_node(input, 0).expect("caret");
+    app.type_text_node(input, "a").expect("type text");
+
+    assert_eq!(seen.borrow().as_slice(), ["a"]);
+    assert_eq!(
+        input_value(&app, "loose"),
+        "a",
+        "the snapshot publishes the editor text without a value binding"
+    );
 }
 
 #[test]

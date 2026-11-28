@@ -612,12 +612,21 @@ impl WindowAccessibility {
     }
 
     /// 按入队顺序取走动作；宿主在 UI 线程上调用。
+    #[cfg(test)]
     pub(crate) fn take_actions(&self) -> Vec<ProviderAction> {
         self.actions
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .drain(..)
             .collect()
+    }
+
+    /// 取走队首动作；宿主逐条执行，让每条动作成为独立 turn。
+    pub(crate) fn take_next_action(&self) -> Option<ProviderAction> {
+        self.actions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop_front()
     }
 
     fn hwnd(&self) -> HWND {
