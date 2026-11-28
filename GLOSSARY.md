@@ -69,11 +69,11 @@ _Avoid_: host worker, UI task, dialog task, file drop
 _Avoid_: platform backend, shell
 
 **turn**:
-一次派发（用户输入、UIA 动作或任务交付批次）从 handler、模型/UI 写入、flush、快照发布到宿主动作结算的同步边界。一个 turn 可以包含多次提交，发布会累计这些变化；空 click、相等写入与纯 runtime 计数变化仍构成 turn，但不产生 effective change。任务交付批次内的 continuation 只写状态，首个失败停止后续 step，批次末统一 flush 一次。
+一次派发（用户输入、命令、拖放、UIA 动作或任务交付批次）从 handler、模型/UI 写入、flush、快照发布到宿主动作结算的同步边界。一个 turn 可以包含多次提交，发布会累计这些变化；空 click、相等写入与纯 runtime 计数变化仍构成 turn，但不产生 effective change。任务交付批次内的 continuation 只写状态，首个失败停止后续 step，批次末统一 flush 一次。每个 turn 有处理器、窗口/会话请求与结构结算预算；超限记入 `TurnBudget` 报告并停止继续执行，已提交写入保留。处理器内再次派发的 `Intent` 在外层 turn 结束后按 FIFO 执行；直接原语在 turn 内调用返回 `DispatchError::Reentrant`。
 _Avoid_: frame, event loop iteration
 
 **Intent**:
-平台输入或测试助手表达的、尚未绑定具体处理器的动作：来源、目标、`IntentPayload`（Click、Activate、Press、KeyDown）与修饰键。runtime 在已提交树上按 closest-wins 解析目标并生成 `TurnReport`；它不是 UIA 的 `UiAction`。
+指针与键盘输入表达的、尚未绑定具体处理器的动作：来源、目标、`IntentPayload`（Click、Activate、Press、KeyDown）与修饰键。runtime 在已提交树上按 closest-wins 解析目标并生成 `TurnReport`；它不是 UIA 的 `UiAction`。菜单/托盘命令走 `CommandEvent` 与命令处理器，UIA 写动作走 `UiAction` 与直接原语，文件拖放走窗口级 `DropEvent`，IME 走 `compose_*`；这些入口共享 `TurnReport` 错误通道，但不是 `Intent` 载荷。
 _Avoid_: input event (when meaning the semantic action), UIA command
 
 **UiAction**:
@@ -81,8 +81,20 @@ UIA provider 排入窗口动作队列的 Node 载荷：Invoke、Toggle、Replace
 _Avoid_: UIA command (when meaning the Node payload), native click
 
 **TurnReport**:
-一次 turn 的公开报告：`TurnOutcome`、错误列表、`RevealFlags` 与 `changed`。`changed` 只在呈现有效变化时为真；宿主据 outcome 决定是否执行原生默认动作，据 reveal 置位显露。
+一次 turn 的公开报告：`TurnOutcome`、错误列表、`RevealFlags` 与 `changed`。`changed` 只在呈现有效变化时为真；宿主据 outcome 决定是否执行原生默认动作，据 reveal 置位显露。`errors` 是本次 turn 的唯一错误通道：元素处理器、窗口命令、拖放、焦点/组合处理器、factory、flush 与预算失败都进入这里；入口错误只表达目标级拒绝。
 _Avoid_: event result, frame report
+
+**HandlerOutcome**:
+事件槽的返回值：`Ok` 或 `Err(HandlerError)`。`Err` 与 panic 停止本事件剩余处理器、传播阶段与默认动作，但已提交写入保留并继续 flush；两者作为 `TurnError::HandlerFailed`/`TurnError::HandlerPanicked` 进入 `TurnReport.errors`。处理器尾值 `()`、`Result<(), E>` 与 `WriteOp<T>` 经适配器归一为它。
+_Avoid_: handler result, callback status
+
+**EventFlow**:
+typed 事件载荷（`ClickEvent`、`InputEvent`、`ChangeEvent`、`KeyEvent` 等）的传播决定：`consume` 停止后续捕获/冒泡阶段与全部默认动作，`prevent_default` 只跳过默认动作。它与 `HandlerOutcome::Err` 共享 fail-closed 语义，但属于事件载荷而不进入错误列表。
+_Avoid_: propagation flag, event result
+
+**TurnBudget**:
+一个 turn 的处理器、窗口/会话请求与结构/焦点结算轮数上限；默认 1024/64/8。超限不再运行用户处理器或接受请求，已执行写入保留，`TurnReport.errors` 记录 `BudgetExceeded`；请求队列同时以该上限约束长度。
+_Avoid_: rate limit, timeout
 
 **TurnOutcome**:
 turn 的 `consumed` 与 `prevent_default` 两个布尔结果；处理器、窗口根 keydown 与宿主默认动作共同决定。它不表示模型事务是否提交成功，后者由错误与模型结果表达。

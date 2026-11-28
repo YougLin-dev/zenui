@@ -789,10 +789,13 @@ fn a_failed_frame_does_not_leave_a_disabled_target_focused() {
     app.focus("victim").expect("focus victim");
     assert_eq!(focuses.get(), 1);
 
-    let failure = app
+    let report = app
         .click_text("Go")
-        .expect_err("the branch mount fails after the victim was disabled");
-    assert_eq!(failure, MountError::Component("bomb"));
+        .expect("the branch failure is contained in the turn report");
+    assert_eq!(
+        report.errors(),
+        [TurnError::ActionFailed(MountError::Component("bomb"))]
+    );
 
     assert_eq!(
         app.focused(),
@@ -928,13 +931,13 @@ fn a_panicking_focus_handler_restores_the_event_slot() {
     let mut app = Runtime::new();
     app.mount(|| view! { <PanicOnFocus /> }).expect("mount");
 
-    let error = app
+    let report = app
         .focus("panel")
-        .expect_err("the handler panic is contained");
-    match error {
-        MountError::Panic(panic) => assert_eq!(panic.message(), "boom"),
-        other => panic!("expected a contained panic, got {other:?}"),
-    }
+        .expect("the handler panic is contained in the report");
+    assert!(matches!(
+        report.errors(),
+        [TurnError::HandlerPanicked(panic)] if panic.message() == "boom"
+    ));
 
     assert_eq!(
         app.focused().map(|focus| focus.tag),

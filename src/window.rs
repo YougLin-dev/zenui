@@ -10,8 +10,11 @@ use crate::menu::{
     MenuSpec, ShortcutError,
 };
 use crate::presentation::Appearance;
+use crate::runtime::EventTarget;
 use crate::task::TaskScope;
-use crate::view::{HandlerOutcome, KeyEvent, MountError, MountPlan, MountResult};
+use crate::view::{
+    HandlerOutcome, IntoHandlerOutcome, KeyEvent, MountError, MountPlan, MountResult,
+};
 
 /// runtime 全局唯一的窗口激活令牌；可跨线程传递。
 ///
@@ -199,11 +202,24 @@ impl WindowCtx {
     /// 在窗口 factory 中注册文件拖放处理器；每个 activation 只能注册一次。
     ///
     /// 处理器由 [`crate::Runtime::drop_files`] 在 `Phase::Event` 中调用，可以写
-    /// Store/Signal、排队窗口请求并启动窗口或应用所有权任务。没有注册处理器的
+    /// Store/Signal、排队窗口请求并启动窗口或应用所有权任务。返回 `()`、
+    /// `Result<(), E>` 或 [`HandlerOutcome`]；`Err` 与 panic 不作为入口错误，
+    /// 而是进入返回的 `TurnReport::errors`，已提交写入保留。没有注册处理器的
     /// 窗口拒绝拖放；关闭窗口释放处理器，重新打开必须重新注册。
-    pub fn on_drop(self, handler: impl Fn(DropEvent) + 'static) -> Result<(), WindowError> {
+    pub fn on_drop<R>(
+        self,
+        mut handler: impl FnMut(DropEvent) -> R + 'static,
+    ) -> Result<(), WindowError>
+    where
+        R: IntoHandlerOutcome,
+    {
         crate::context::with_state_of(self.runtime, |state| {
-            state.register_drop_handler(self, Rc::new(handler))
+            state.register_drop_handler(
+                self,
+                Rc::new(RefCell::new(Box::new(move |event: DropEvent| {
+                    handler(event).into_handler_outcome()
+                }))),
+            )
         })
     }
 
@@ -212,22 +228,34 @@ impl WindowCtx {
     /// 菜单栏与上下文菜单声明的每个命令都必须有窗口或应用级处理器，否则这次
     /// 打开失败。应用级处理器由 `Runtime::on_app_command` 注册，可被多个窗口
     /// 共享；窗口处理器优先于应用级处理器。注册只发生在窗口 factory 自己的
-    /// Setup 中；嵌套组件的 Setup、事件与交付阶段都拒绝。关闭窗口释放全部
-    /// 窗口处理器，重新打开必须重新注册。
-    pub fn on_command(
+    /// Setup 中；嵌套组件的 Setup、事件与交付阶段都拒绝。返回 `()`、
+    /// `Result<(), E>` 或 [`HandlerOutcome`]；`Err` 与 panic 进入命令派发的
+    /// `TurnReport::errors`，已提交写入保留。关闭窗口释放全部窗口处理器，
+    /// 重新打开必须重新注册。
+    pub fn on_command<R>(
         self,
         id: &'static str,
-        handler: impl Fn(CommandEvent) + 'static,
-    ) -> Result<(), WindowError> {
+        mut handler: impl FnMut(&mut CommandEvent) -> R + 'static,
+    ) -> Result<(), WindowError>
+    where
+        R: IntoHandlerOutcome,
+    {
         crate::context::with_state_of(self.runtime, |state| {
-            state.register_command_handler(self, id, Rc::new(handler))
+            state.register_command_handler(
+                self,
+                id,
+                Rc::new(RefCell::new(Box::new(move |event: &mut CommandEvent| {
+                    handler(event).into_handler_outcome()
+                }))),
+            )
         })
     }
 
     /// 在窗口 factory 中注册只读菜单状态回调；每个 activation 只能注册一次。
     ///
     /// 宿主在菜单打开前按命令调用它，用返回值设置 enabled/checked。回调运行在
-    /// 只读作用域：Signal 写与 Store 事务被拒绝并返回 typed error，模型不变。
+    /// 只读作用域：Signal 写与 Store 事务被拒绝并返回 typed error，模型不变；
+    /// panic 被 contain 为带 `PanicInfo` 的错误，宿主保持菜单的声明状态。
     /// 没有注册回调时宿主使用命令声明的默认状态。关闭窗口释放回调，重新打开
     /// 必须在新的 factory 中重新注册。
     pub fn on_menu_state(
@@ -367,6 +395,11 @@ impl DropEvent {
         self.window
     }
 
+    /// 这次拖放的目标；Drop 只属于窗口 activation，不做 closest-wins。
+    pub const fn target(&self) -> EventTarget {
+        EventTarget::Window(self.window)
+    }
+
     /// 按源顺序读取路径；处理器可以检查后克隆需要保留的部分。
     pub fn paths(&self) -> &[PathBuf] {
         &self.paths
@@ -378,7 +411,7 @@ impl DropEvent {
     }
 }
 
-pub(crate) type DropHandler = Rc<dyn Fn(DropEvent)>;
+pub(crate) type DropHandler = Rc<RefCell<Box<dyn FnMut(DropEvent) -> HandlerOutcome>>>;
 
 /// 文件拖放被拒绝的原因。
 ///
@@ -398,10 +431,6 @@ pub enum DropError {
     Empty,
     /// 窗口没有在 factory 中注册 `on_drop` 处理器。
     NoHandler,
-    /// 处理器 panic；容器被捕获，运行时保持可用。
-    HandlerPanicked,
-    /// 处理器或其后的界面刷新失败。
-    Command(MountError),
 }
 
 impl fmt::Display for DropError {
@@ -415,20 +444,11 @@ impl fmt::Display for DropError {
             Self::Suspended => f.write_str("the window is awaiting close confirmation"),
             Self::Empty => f.write_str("a file drop needs at least one path"),
             Self::NoHandler => f.write_str("the window has no on_drop handler"),
-            Self::HandlerPanicked => f.write_str("the on_drop handler panicked"),
-            Self::Command(error) => write!(f, "{error}"),
         }
     }
 }
 
-impl std::error::Error for DropError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Command(error) => Some(error),
-            _ => None,
-        }
-    }
-}
+impl std::error::Error for DropError {}
 
 /// 关闭确认协议本身失败；父窗口保持打开，绝不回退为 Allow。
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -439,8 +459,8 @@ pub enum CloseError {
     ConfirmationNotDeclared,
     /// 处理器没有让声明的确认窗口变为可见。
     ConfirmationNotShown,
-    /// 处理器 panic；取消本次 epoch。
-    HandlerPanicked,
+    /// 处理器 panic；取消本次 epoch，已提交写入仍随关闭 turn 收尾。
+    HandlerPanicked(zenui_core::PanicInfo),
 }
 
 /// UI 处理期挂起的窗口生命周期请求；由 `Runtime::apply_window_requests` 结算。
@@ -901,6 +921,8 @@ pub enum WindowError {
     Suspended,
     /// 该 activation 已关闭或被更新的一代取代。
     Stale,
+    /// 本 turn 的窗口请求预算已耗尽；后续请求被拒绝。
+    BudgetExceeded,
     /// 一个行窗口批次里同一个行带出现了不止一次。
     DuplicateRowBand,
     WrongRuntime,
@@ -928,6 +950,9 @@ impl fmt::Display for WindowError {
             Self::Hidden => f.write_str("the window is hidden"),
             Self::Suspended => f.write_str("the window is suspended by a pending close"),
             Self::Stale => f.write_str("the window activation is no longer live"),
+            Self::BudgetExceeded => {
+                f.write_str("this turn already queued the maximum number of window requests")
+            }
             Self::DuplicateRowBand => {
                 f.write_str("a row-window batch names the same band more than once")
             }
@@ -967,9 +992,10 @@ impl fmt::Display for CloseError {
             Self::ConfirmationNotShown => {
                 f.write_str("the close handler did not show the declared confirmation window")
             }
-            Self::HandlerPanicked => {
-                f.write_str("the close handler panicked; the window stays open")
-            }
+            Self::HandlerPanicked(panic) => write!(
+                f,
+                "the close handler panicked; the window stays open: {panic}"
+            ),
         }
     }
 }

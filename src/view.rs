@@ -14,8 +14,10 @@ use zenui_style::{Color, Length, Opacity, Property, StyleDeclaration};
 
 use crate::context::Phase;
 use crate::node::{BindingRef, BindingTable, BindingValue, ReadSlot};
+use crate::presentation::NodeId;
+use crate::runtime::{EventSource, EventTarget, Modifiers};
 use crate::signal::{Memo, Once, ReactiveValue, Signal, once};
-use crate::store::{Field, FieldError, WriteError};
+use crate::store::{Field, FieldError, WriteError, WriteOp};
 
 pub type MountResult<T> = Result<T, MountError>;
 
@@ -922,29 +924,321 @@ impl IntoHandlerOutcome for () {
     }
 }
 
-impl<E: Into<HandlerError>> IntoHandlerOutcome for Result<(), E> {
+impl<T: 'static> IntoHandlerOutcome for WriteOp<T> {
     fn into_handler_outcome(self) -> HandlerOutcome {
-        match self {
+        match crate::store::Transaction::new().write(self).finish() {
             Ok(()) => HandlerOutcome::Ok,
             Err(error) => HandlerOutcome::Err(error.into()),
         }
     }
 }
 
+/// 事件处理器尾值的成功载荷：`()` 与 `WriteOp<T>` 在 turn 边界执行一次。
+pub trait IntoHandlerPayload {
+    fn into_handler_outcome(self) -> HandlerOutcome;
+}
+
+impl IntoHandlerPayload for () {
+    fn into_handler_outcome(self) -> HandlerOutcome {
+        HandlerOutcome::Ok
+    }
+}
+
+impl IntoHandlerPayload for HandlerOutcome {
+    fn into_handler_outcome(self) -> HandlerOutcome {
+        self
+    }
+}
+
+impl<T: 'static> IntoHandlerPayload for WriteOp<T> {
+    fn into_handler_outcome(self) -> HandlerOutcome {
+        match crate::store::Transaction::new().write(self).finish() {
+            Ok(()) => HandlerOutcome::Ok,
+            Err(error) => HandlerOutcome::Err(error.into()),
+        }
+    }
+}
+
+impl<T, E> IntoHandlerOutcome for Result<T, E>
+where
+    T: IntoHandlerPayload,
+    E: Into<HandlerError>,
+{
+    fn into_handler_outcome(self) -> HandlerOutcome {
+        match self {
+            Ok(value) => value.into_handler_outcome(),
+            Err(error) => HandlerOutcome::Err(error.into()),
+        }
+    }
+}
+
+/// 逻辑坐标下的指针位置；UIA 与无坐标的原语为 `None`。
+#[derive(Clone, Copy, Default, PartialEq, Debug)]
+pub struct Point {
+    x: f32,
+    y: f32,
+}
+
+impl Point {
+    pub const fn new(x: f32, y: f32) -> Self {
+        Self { x, y }
+    }
+
+    pub const fn x(self) -> f32 {
+        self.x
+    }
+
+    pub const fn y(self) -> f32 {
+        self.y
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MouseButton {
+    Primary,
+    Secondary,
+    Middle,
+    Other,
+}
+
+/// 一次事件的传播与默认动作决定。
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct EventFlow {
+    consumed: bool,
+    prevented: bool,
+}
+
+impl EventFlow {
+    pub const NONE: Self = Self {
+        consumed: false,
+        prevented: false,
+    };
+
+    /// 停止后续捕获/冒泡阶段与全部默认动作。
+    pub fn consume(&mut self) {
+        self.consumed = true;
+    }
+
+    /// 只跳过默认动作，传播继续。
+    pub fn prevent_default(&mut self) {
+        self.prevented = true;
+    }
+
+    pub const fn is_consumed(self) -> bool {
+        self.consumed
+    }
+
+    pub const fn prevents_default(self) -> bool {
+        self.prevented
+    }
+}
+
+#[derive(Clone, PartialEq, Debug)]
+pub struct ClickEvent {
+    source: EventSource,
+    target: NodeId,
+    current_target: NodeId,
+    position: Option<Point>,
+    button: Option<MouseButton>,
+    click_count: u8,
+    modifiers: Modifiers,
+    flow: EventFlow,
+}
+
+impl ClickEvent {
+    pub(crate) fn new(
+        source: EventSource,
+        target: NodeId,
+        position: Option<Point>,
+        button: Option<MouseButton>,
+        click_count: u8,
+        modifiers: Modifiers,
+    ) -> Self {
+        Self {
+            source,
+            target,
+            current_target: target,
+            position,
+            button,
+            click_count,
+            modifiers,
+            flow: EventFlow::NONE,
+        }
+    }
+
+    pub const fn source(&self) -> EventSource {
+        self.source
+    }
+
+    pub const fn target(&self) -> NodeId {
+        self.target
+    }
+
+    pub const fn current_target(&self) -> NodeId {
+        self.current_target
+    }
+
+    pub const fn position(&self) -> Option<Point> {
+        self.position
+    }
+
+    pub const fn button(&self) -> Option<MouseButton> {
+        self.button
+    }
+
+    pub const fn click_count(&self) -> u8 {
+        self.click_count
+    }
+
+    pub const fn modifiers(&self) -> Modifiers {
+        self.modifiers
+    }
+
+    pub fn consume(&mut self) {
+        self.flow.consume();
+    }
+
+    pub fn prevent_default(&mut self) {
+        self.flow.prevent_default();
+    }
+
+    pub const fn is_consumed(&self) -> bool {
+        self.flow.is_consumed()
+    }
+
+    pub const fn prevents_default(&self) -> bool {
+        self.flow.prevents_default()
+    }
+
+    pub(crate) fn set_current_target(&mut self, node: NodeId) {
+        self.current_target = node;
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct InputEvent {
+    source: EventSource,
+    target: NodeId,
+    current_target: NodeId,
+    value: String,
+    flow: EventFlow,
+}
+
+impl InputEvent {
+    pub(crate) fn new(source: EventSource, target: NodeId, value: String) -> Self {
+        Self {
+            source,
+            target,
+            current_target: target,
+            value,
+            flow: EventFlow::NONE,
+        }
+    }
+
+    pub const fn source(&self) -> EventSource {
+        self.source
+    }
+
+    pub const fn target(&self) -> NodeId {
+        self.target
+    }
+
+    pub const fn current_target(&self) -> NodeId {
+        self.current_target
+    }
+
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+
+    pub fn consume(&mut self) {
+        self.flow.consume();
+    }
+
+    pub fn prevent_default(&mut self) {
+        self.flow.prevent_default();
+    }
+
+    pub const fn is_consumed(&self) -> bool {
+        self.flow.is_consumed()
+    }
+
+    pub const fn prevents_default(&self) -> bool {
+        self.flow.prevents_default()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ChangeEvent {
+    source: EventSource,
+    target: NodeId,
+    current_target: NodeId,
+    proposed: bool,
+    flow: EventFlow,
+}
+
+impl ChangeEvent {
+    pub(crate) fn new(source: EventSource, target: NodeId, proposed: bool) -> Self {
+        Self {
+            source,
+            target,
+            current_target: target,
+            proposed,
+            flow: EventFlow::NONE,
+        }
+    }
+
+    pub const fn source(&self) -> EventSource {
+        self.source
+    }
+
+    pub const fn target(&self) -> NodeId {
+        self.target
+    }
+
+    pub const fn current_target(&self) -> NodeId {
+        self.current_target
+    }
+
+    /// 建议的新状态；不是当前绑定值。
+    pub const fn proposed(&self) -> bool {
+        self.proposed
+    }
+
+    pub fn consume(&mut self) {
+        self.flow.consume();
+    }
+
+    pub fn prevent_default(&mut self) {
+        self.flow.prevent_default();
+    }
+
+    pub const fn is_consumed(&self) -> bool {
+        self.flow.is_consumed()
+    }
+
+    pub const fn prevents_default(&self) -> bool {
+        self.flow.prevents_default()
+    }
+}
+
 pub enum Event {
-    Click(Box<dyn FnMut() -> HandlerOutcome>),
-    Input(Box<dyn FnMut(String) -> HandlerOutcome>),
-    Change(Box<dyn FnMut(bool) -> HandlerOutcome>),
+    Click(Box<dyn FnMut(&mut ClickEvent) -> HandlerOutcome>),
+    ClickCapture(Box<dyn FnMut(&mut ClickEvent) -> HandlerOutcome>),
+    ClickBubble(Box<dyn FnMut(&mut ClickEvent) -> HandlerOutcome>),
+    DblClick(Box<dyn FnMut(&mut ClickEvent) -> HandlerOutcome>),
+    Input(Box<dyn FnMut(&mut InputEvent) -> HandlerOutcome>),
+    Change(Box<dyn FnMut(&mut ChangeEvent) -> HandlerOutcome>),
     Submit(Box<dyn FnMut(&mut SubmitEvent) -> HandlerOutcome>),
     KeyDown(Box<dyn FnMut(&mut KeyEvent) -> HandlerOutcome>),
     KeyDownCapture(Box<dyn FnMut(&mut KeyEvent) -> HandlerOutcome>),
     KeyDownBubble(Box<dyn FnMut(&mut KeyEvent) -> HandlerOutcome>),
-    Focus(Box<dyn FnMut(FocusEvent)>),
-    Blur(Box<dyn FnMut(BlurEvent)>),
-    CompositionStart(Box<dyn FnMut(CompositionEvent)>),
-    CompositionUpdate(Box<dyn FnMut(CompositionEvent)>),
-    CompositionEnd(Box<dyn FnMut(CompositionEvent)>),
-    CompositionCancel(Box<dyn FnMut(CompositionEvent)>),
+    Focus(Box<dyn FnMut(&mut FocusEvent) -> HandlerOutcome>),
+    Blur(Box<dyn FnMut(&mut BlurEvent) -> HandlerOutcome>),
+    CompositionStart(Box<dyn FnMut(&mut CompositionEvent) -> HandlerOutcome>),
+    CompositionUpdate(Box<dyn FnMut(&mut CompositionEvent) -> HandlerOutcome>),
+    CompositionEnd(Box<dyn FnMut(&mut CompositionEvent) -> HandlerOutcome>),
+    CompositionCancel(Box<dyn FnMut(&mut CompositionEvent) -> HandlerOutcome>),
 }
 
 /// 文本数据位置：接受字面量、显式 once 与读句柄；裸 `String` 不再隐式成为 once。
@@ -1223,30 +1517,139 @@ pub fn for_each_windowed<R: Row, K: RowKey>(
         .into_node()
 }
 
-pub fn on_click<R>(mut handler: impl FnMut() -> R + 'static) -> Attr
+pub fn on_click<R>(mut handler: impl FnMut(&mut ClickEvent) -> R + 'static) -> Attr
 where
     R: IntoHandlerOutcome,
 {
-    Attr::Event(Event::Click(Box::new(move || {
+    Attr::Event(Event::Click(Box::new(move |event| {
+        handler(event).into_handler_outcome()
+    })))
+}
+
+/// 零参数 click 处理器：不接收 payload，因此不能控制传播或默认动作。
+pub fn on_click0<R>(mut handler: impl FnMut() -> R + 'static) -> Attr
+where
+    R: IntoHandlerOutcome,
+{
+    Attr::Event(Event::Click(Box::new(move |_event| {
         handler().into_handler_outcome()
     })))
 }
 
-pub fn on_input<R>(mut handler: impl FnMut(String) -> R + 'static) -> Attr
+pub fn on_click_capture<R>(mut handler: impl FnMut(&mut ClickEvent) -> R + 'static) -> Attr
 where
     R: IntoHandlerOutcome,
 {
-    Attr::Event(Event::Input(Box::new(move |value| {
-        handler(value).into_handler_outcome()
+    Attr::Event(Event::ClickCapture(Box::new(move |event| {
+        handler(event).into_handler_outcome()
     })))
 }
 
-pub fn on_change<R>(mut handler: impl FnMut(bool) -> R + 'static) -> Attr
+pub fn on_click_bubble<R>(mut handler: impl FnMut(&mut ClickEvent) -> R + 'static) -> Attr
 where
     R: IntoHandlerOutcome,
 {
-    Attr::Event(Event::Change(Box::new(move |value| {
-        handler(value).into_handler_outcome()
+    Attr::Event(Event::ClickBubble(Box::new(move |event| {
+        handler(event).into_handler_outcome()
+    })))
+}
+
+pub fn on_dblclick<R>(mut handler: impl FnMut(&mut ClickEvent) -> R + 'static) -> Attr
+where
+    R: IntoHandlerOutcome,
+{
+    Attr::Event(Event::DblClick(Box::new(move |event| {
+        handler(event).into_handler_outcome()
+    })))
+}
+
+pub fn on_input<R>(mut handler: impl FnMut(&mut InputEvent) -> R + 'static) -> Attr
+where
+    R: IntoHandlerOutcome,
+{
+    Attr::Event(Event::Input(Box::new(move |event| {
+        handler(event).into_handler_outcome()
+    })))
+}
+
+/// 兼容旧式的 `String` input 处理器；新代码应使用 [`InputEvent`]。
+pub fn on_input_string<R>(mut handler: impl FnMut(String) -> R + 'static) -> Attr
+where
+    R: IntoHandlerOutcome,
+{
+    Attr::Event(Event::Input(Box::new(move |event| {
+        handler(event.value().to_owned()).into_handler_outcome()
+    })))
+}
+
+/// 兼容旧式的 `bool` change 处理器；新代码应使用 [`ChangeEvent`]。
+pub fn on_change_bool<R>(mut handler: impl FnMut(bool) -> R + 'static) -> Attr
+where
+    R: IntoHandlerOutcome,
+{
+    Attr::Event(Event::Change(Box::new(move |event| {
+        handler(event.proposed()).into_handler_outcome()
+    })))
+}
+
+/// 兼容按值接收 payload 的 focus 处理器；新代码应使用 `&mut FocusEvent`。
+pub fn on_focus_value<R>(mut handler: impl FnMut(FocusEvent) -> R + 'static) -> Attr {
+    Attr::Event(Event::Focus(Box::new(move |event| {
+        let _ = handler(*event);
+        HandlerOutcome::Ok
+    })))
+}
+
+/// 兼容按值接收 payload 的 blur 处理器；新代码应使用 `&mut BlurEvent`。
+pub fn on_blur_value<R>(mut handler: impl FnMut(BlurEvent) -> R + 'static) -> Attr {
+    Attr::Event(Event::Blur(Box::new(move |event| {
+        let _ = handler(*event);
+        HandlerOutcome::Ok
+    })))
+}
+
+pub fn on_composition_start_value<R>(
+    mut handler: impl FnMut(CompositionEvent) -> R + 'static,
+) -> Attr {
+    Attr::Event(Event::CompositionStart(Box::new(move |event| {
+        let _ = handler(event.clone());
+        HandlerOutcome::Ok
+    })))
+}
+
+pub fn on_composition_update_value<R>(
+    mut handler: impl FnMut(CompositionEvent) -> R + 'static,
+) -> Attr {
+    Attr::Event(Event::CompositionUpdate(Box::new(move |event| {
+        let _ = handler(event.clone());
+        HandlerOutcome::Ok
+    })))
+}
+
+pub fn on_composition_end_value<R>(
+    mut handler: impl FnMut(CompositionEvent) -> R + 'static,
+) -> Attr {
+    Attr::Event(Event::CompositionEnd(Box::new(move |event| {
+        let _ = handler(event.clone());
+        HandlerOutcome::Ok
+    })))
+}
+
+pub fn on_composition_cancel_value<R>(
+    mut handler: impl FnMut(CompositionEvent) -> R + 'static,
+) -> Attr {
+    Attr::Event(Event::CompositionCancel(Box::new(move |event| {
+        let _ = handler(event.clone());
+        HandlerOutcome::Ok
+    })))
+}
+
+pub fn on_change<R>(mut handler: impl FnMut(&mut ChangeEvent) -> R + 'static) -> Attr
+where
+    R: IntoHandlerOutcome,
+{
+    Attr::Event(Event::Change(Box::new(move |event| {
+        handler(event).into_handler_outcome()
     })))
 }
 
@@ -1286,53 +1689,107 @@ where
     })))
 }
 
-pub fn on_focus(handler: impl FnMut(FocusEvent) + 'static) -> Attr {
-    Attr::Event(Event::Focus(Box::new(handler)))
+pub fn on_focus<R>(mut handler: impl FnMut(&mut FocusEvent) -> R + 'static) -> Attr
+where
+    R: IntoHandlerOutcome,
+{
+    Attr::Event(Event::Focus(Box::new(move |event| {
+        handler(event).into_handler_outcome()
+    })))
 }
 
-pub fn on_blur(handler: impl FnMut(BlurEvent) + 'static) -> Attr {
-    Attr::Event(Event::Blur(Box::new(handler)))
+pub fn on_blur<R>(mut handler: impl FnMut(&mut BlurEvent) -> R + 'static) -> Attr
+where
+    R: IntoHandlerOutcome,
+{
+    Attr::Event(Event::Blur(Box::new(move |event| {
+        handler(event).into_handler_outcome()
+    })))
 }
 
-pub fn on_composition_start(handler: impl FnMut(CompositionEvent) + 'static) -> Attr {
-    Attr::Event(Event::CompositionStart(Box::new(handler)))
+pub fn on_composition_start<R>(
+    mut handler: impl FnMut(&mut CompositionEvent) -> R + 'static,
+) -> Attr
+where
+    R: IntoHandlerOutcome,
+{
+    Attr::Event(Event::CompositionStart(Box::new(move |event| {
+        handler(event).into_handler_outcome()
+    })))
 }
 
-pub fn on_composition_update(handler: impl FnMut(CompositionEvent) + 'static) -> Attr {
-    Attr::Event(Event::CompositionUpdate(Box::new(handler)))
+pub fn on_composition_update<R>(
+    mut handler: impl FnMut(&mut CompositionEvent) -> R + 'static,
+) -> Attr
+where
+    R: IntoHandlerOutcome,
+{
+    Attr::Event(Event::CompositionUpdate(Box::new(move |event| {
+        handler(event).into_handler_outcome()
+    })))
 }
 
-pub fn on_composition_end(handler: impl FnMut(CompositionEvent) + 'static) -> Attr {
-    Attr::Event(Event::CompositionEnd(Box::new(handler)))
+pub fn on_composition_end<R>(mut handler: impl FnMut(&mut CompositionEvent) -> R + 'static) -> Attr
+where
+    R: IntoHandlerOutcome,
+{
+    Attr::Event(Event::CompositionEnd(Box::new(move |event| {
+        handler(event).into_handler_outcome()
+    })))
 }
 
-pub fn on_composition_cancel(handler: impl FnMut(CompositionEvent) + 'static) -> Attr {
-    Attr::Event(Event::CompositionCancel(Box::new(handler)))
+pub fn on_composition_cancel<R>(
+    mut handler: impl FnMut(&mut CompositionEvent) -> R + 'static,
+) -> Attr
+where
+    R: IntoHandlerOutcome,
+{
+    Attr::Event(Event::CompositionCancel(Box::new(move |event| {
+        handler(event).into_handler_outcome()
+    })))
 }
 
-#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct SubmitEvent {
-    consumed: bool,
-    prevented: bool,
+    form: NodeId,
+    source: EventSource,
+    flow: EventFlow,
 }
 
 impl SubmitEvent {
+    pub(crate) fn new(form: NodeId, source: EventSource) -> Self {
+        Self {
+            form,
+            source,
+            flow: EventFlow::NONE,
+        }
+    }
+
+    /// 最近的 form 祖先。
+    pub const fn form(&self) -> NodeId {
+        self.form
+    }
+
+    pub const fn source(&self) -> EventSource {
+        self.source
+    }
+
     /// 停止后续处理；submit 本身没有后续默认动作，consume 用于统一的 turn flow。
     pub fn consume(&mut self) {
-        self.consumed = true;
+        self.flow.consume();
     }
 
-    /// 文档化的 no-op：submit 没有可以被跳过的后续默认动作。
+    /// 统一 flow 方法；submit 没有可跳过的后续默认动作。
     pub fn prevent_default(&mut self) {
-        self.prevented = true;
+        self.flow.prevent_default();
     }
 
-    pub const fn is_consumed(self) -> bool {
-        self.consumed
+    pub const fn is_consumed(&self) -> bool {
+        self.flow.is_consumed()
     }
 
-    pub const fn is_prevented(self) -> bool {
-        self.prevented
+    pub const fn is_prevented(&self) -> bool {
+        self.flow.prevents_default()
     }
 }
 
@@ -1345,31 +1802,95 @@ pub enum FocusCause {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct FocusEvent {
+    target: NodeId,
+    current_target: NodeId,
     cause: FocusCause,
+    flow: EventFlow,
 }
 
 impl FocusEvent {
-    pub(crate) const fn new(cause: FocusCause) -> Self {
-        Self { cause }
+    pub(crate) const fn new(target: NodeId, cause: FocusCause) -> Self {
+        Self {
+            target,
+            current_target: target,
+            cause,
+            flow: EventFlow::NONE,
+        }
+    }
+
+    pub const fn target(self) -> NodeId {
+        self.target
+    }
+
+    pub const fn current_target(self) -> NodeId {
+        self.current_target
     }
 
     pub const fn cause(self) -> FocusCause {
         self.cause
+    }
+
+    pub fn consume(&mut self) {
+        self.flow.consume();
+    }
+
+    pub fn prevent_default(&mut self) {
+        self.flow.prevent_default();
+    }
+
+    pub const fn is_consumed(self) -> bool {
+        self.flow.is_consumed()
+    }
+
+    pub const fn prevents_default(self) -> bool {
+        self.flow.prevents_default()
     }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct BlurEvent {
+    target: NodeId,
+    current_target: NodeId,
     cause: FocusCause,
+    flow: EventFlow,
 }
 
 impl BlurEvent {
-    pub(crate) const fn new(cause: FocusCause) -> Self {
-        Self { cause }
+    pub(crate) const fn new(target: NodeId, cause: FocusCause) -> Self {
+        Self {
+            target,
+            current_target: target,
+            cause,
+            flow: EventFlow::NONE,
+        }
+    }
+
+    pub const fn target(self) -> NodeId {
+        self.target
+    }
+
+    pub const fn current_target(self) -> NodeId {
+        self.current_target
     }
 
     pub const fn cause(self) -> FocusCause {
         self.cause
+    }
+
+    pub fn consume(&mut self) {
+        self.flow.consume();
+    }
+
+    pub fn prevent_default(&mut self) {
+        self.flow.prevent_default();
+    }
+
+    pub const fn is_consumed(self) -> bool {
+        self.flow.is_consumed()
+    }
+
+    pub const fn prevents_default(self) -> bool {
+        self.flow.prevents_default()
     }
 }
 
@@ -1386,25 +1907,40 @@ pub enum CompositionPhase {
 /// 在 End 是确认的候选文本，在 Cancel 是被丢弃的 preedit。
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct CompositionEvent {
+    target: NodeId,
+    current_target: NodeId,
     phase: CompositionPhase,
     text: String,
     caret: usize,
     selection: Option<(usize, usize)>,
+    flow: EventFlow,
 }
 
 impl CompositionEvent {
     pub(crate) fn new(
+        target: NodeId,
         phase: CompositionPhase,
         text: String,
         caret: usize,
         selection: Option<(usize, usize)>,
     ) -> Self {
         Self {
+            target,
+            current_target: target,
             phase,
             text,
             caret,
             selection,
+            flow: EventFlow::NONE,
         }
+    }
+
+    pub const fn target(&self) -> NodeId {
+        self.target
+    }
+
+    pub const fn current_target(&self) -> NodeId {
+        self.current_target
     }
 
     pub const fn phase(&self) -> CompositionPhase {
@@ -1422,8 +1958,25 @@ impl CompositionEvent {
     pub const fn selection(&self) -> Option<(usize, usize)> {
         self.selection
     }
+
+    pub fn consume(&mut self) {
+        self.flow.consume();
+    }
+
+    pub fn prevent_default(&mut self) {
+        self.flow.prevent_default();
+    }
+
+    pub const fn is_consumed(&self) -> bool {
+        self.flow.is_consumed()
+    }
+
+    pub const fn prevents_default(&self) -> bool {
+        self.flow.prevents_default()
+    }
 }
 
+/// 逻辑键；字符与功能键可被节点处理器直接识别。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Key {
     Escape,
@@ -1432,6 +1985,7 @@ pub enum Key {
     Space,
     Backspace,
     Delete,
+    Insert,
     ArrowLeft,
     ArrowRight,
     ArrowUp,
@@ -1440,23 +1994,81 @@ pub enum Key {
     End,
     PageUp,
     PageDown,
+    /// 可打印字符（小写字母、数字或符号），由宿主布局解析。
+    Character(char),
+    /// F1–F24；越界值由宿主折算为 `Other`。
+    Function(u8),
     Other,
+}
+
+/// 物理键；与逻辑 `Key` 分开，供布局无关的快捷键使用。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Code {
+    Escape,
+    Enter,
+    Tab,
+    Space,
+    Backspace,
+    Delete,
+    Insert,
+    ArrowLeft,
+    ArrowRight,
+    ArrowUp,
+    ArrowDown,
+    Home,
+    End,
+    PageUp,
+    PageDown,
+    /// 字母键，统一小写。
+    Key(char),
+    /// 主键盘数字键。
+    Digit(u8),
+    /// F1–F24。
+    Function(u8),
+    /// 其它物理键以宿主虚拟键表示。
+    Other(u32),
 }
 
 /// 一次 keydown 的载荷；处理器可消费事件或只跳过默认动作。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct KeyEvent {
     key: Key,
-    consumed: bool,
-    prevent_default: bool,
+    code: Code,
+    modifiers: Modifiers,
+    repeat: bool,
+    target: EventTarget,
+    current_target: EventTarget,
+    flow: EventFlow,
 }
 
 impl KeyEvent {
     pub const fn new(key: Key) -> Self {
         Self {
             key,
-            consumed: false,
-            prevent_default: false,
+            code: Code::Other(0),
+            modifiers: Modifiers::new(false, false, false, false),
+            repeat: false,
+            target: EventTarget::App,
+            current_target: EventTarget::App,
+            flow: EventFlow::NONE,
+        }
+    }
+
+    pub(crate) const fn with_details(
+        key: Key,
+        code: Code,
+        modifiers: Modifiers,
+        repeat: bool,
+        target: EventTarget,
+    ) -> Self {
+        Self {
+            key,
+            code,
+            modifiers,
+            repeat,
+            target,
+            current_target: target,
+            flow: EventFlow::NONE,
         }
     }
 
@@ -1464,21 +2076,45 @@ impl KeyEvent {
         self.key
     }
 
+    pub const fn code(self) -> Code {
+        self.code
+    }
+
+    pub const fn modifiers(self) -> Modifiers {
+        self.modifiers
+    }
+
+    pub const fn repeat(self) -> bool {
+        self.repeat
+    }
+
+    pub const fn target(self) -> EventTarget {
+        self.target
+    }
+
+    pub const fn current_target(self) -> EventTarget {
+        self.current_target
+    }
+
+    pub(crate) fn set_current_target(&mut self, target: EventTarget) {
+        self.current_target = target;
+    }
+
     /// 停止后续捕获/冒泡阶段与全部默认动作。
     pub fn consume(&mut self) {
-        self.consumed = true;
+        self.flow.consume();
     }
 
     /// 只跳过默认动作，传播继续。
     pub fn prevent_default(&mut self) {
-        self.prevent_default = true;
+        self.flow.prevent_default();
     }
 
     pub const fn is_consumed(self) -> bool {
-        self.consumed
+        self.flow.is_consumed()
     }
 
     pub const fn prevents_default(self) -> bool {
-        self.prevent_default
+        self.flow.prevents_default()
     }
 }

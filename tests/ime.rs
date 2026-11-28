@@ -437,3 +437,37 @@ fn preedit_stays_local_until_commit() {
     assert_eq!(events[3].caret(), 2);
     assert_eq!(events[3].selection(), None);
 }
+
+#[test]
+fn a_panicking_composition_handler_enters_the_report_and_keeps_editing() {
+    #[component]
+    fn PanicComposition() -> MountResult<MountPlan> {
+        view! {
+            <view>
+                <text-input
+                    aria:label="editor"
+                    on:compositionstart={move |_event: CompositionEvent| -> () {
+                        panic!("composition boom")
+                    }}
+                />
+            </view>
+        }
+    }
+
+    let mut app = Runtime::new();
+    app.mount(|| view! { <PanicComposition /> }).expect("mount");
+
+    let report = app
+        .compose_start("editor")
+        .expect("the handler panic is contained in the report");
+    assert!(matches!(
+        report.errors(),
+        [TurnError::HandlerPanicked(panic)] if panic.message() == "composition boom"
+    ));
+    app.compose_update("editor", "ni")
+        .expect("the editor still updates after a contained panic");
+    assert_eq!(app.preedit("editor"), Some(String::from("ni")));
+    app.compose_cancel("editor")
+        .expect("the editor still cancels after a contained panic");
+    assert_eq!(app.preedit("editor"), None);
+}

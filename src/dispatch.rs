@@ -91,6 +91,10 @@ pub enum DispatchError {
     Panic(PanicInfo),
     /// 窗口/activation 目标已关闭或被新一代替换。
     TargetClosed,
+    /// 直接原语在 Event/Delivery/Binding/Memo 内被重入调用。
+    Reentrant,
+    /// 本 turn 的处理器预算已耗尽；已执行的写入保留。
+    BudgetExceeded(crate::runtime::TurnBudget),
 }
 
 impl fmt::Display for DispatchError {
@@ -116,6 +120,12 @@ impl fmt::Display for DispatchError {
             Self::Command(error) => write!(f, "{error}"),
             Self::Panic(panic) => write!(f, "{panic}"),
             Self::TargetClosed => f.write_str("target is closed"),
+            Self::Reentrant => f.write_str("a direct primitive cannot run inside an active turn"),
+            Self::BudgetExceeded(budget) => write!(
+                f,
+                "the turn budget was exceeded (handlers {}, window requests {}, structure rounds {})",
+                budget.handlers, budget.window_requests, budget.structure_rounds
+            ),
         }
     }
 }

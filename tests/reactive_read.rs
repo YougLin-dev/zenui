@@ -486,15 +486,15 @@ fn a_reported_context_fault_does_not_poison_the_next_refresh() {
     app.mount(|| view! { <Probe /> }).expect("mount");
     let _ = app.refresh().expect("drain the mount report");
 
-    let failure = app
+    let report = app
         .click_label("fault")
-        .expect_err("the illegal write is reported");
+        .expect("the illegal write is contained in the turn report");
     assert!(matches!(
-        failure,
-        MountError::Context {
+        report.errors(),
+        [TurnError::ActionFailed(MountError::Context {
             operation: "Signal::set",
             ..
-        }
+        })]
     ));
     assert_eq!(root_text(&app, "value"), "before");
 

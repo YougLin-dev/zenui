@@ -413,8 +413,8 @@ fn disabled_inputs_and_wrong_kinds_reject_edits_and_composition() {
         app.set_caret_node(off, 1).map(|_| ()),
         app.set_selection_node(off, 0, 1).map(|_| ()),
         app.select_all_node(off).map(|_| ()),
-        app.compose_start_node(off),
-        app.compose_update_node(off, "x"),
+        app.compose_start_node(off).map(|_| ()),
+        app.compose_update_node(off, "x").map(|_| ()),
         app.compose_commit_node(off, "x").map(|_| ()),
     ];
     for result in rejected {

@@ -36,10 +36,10 @@ use crate::task::{TaskRecord, WakeCallback};
 use crate::text_edit::{self, Edit, Movement};
 use crate::tray::{TrayError, TraySpec};
 use crate::view::{
-    Attr, AttrValue, BlurEvent, ChildrenFactory, CompositionEvent, CompositionPhase, ErasedRowView,
-    ErasedStore, Event, FocusCause, FocusEvent, ForDriver, ForRows, HandlerError, HandlerOutcome,
-    InlineStyle, Key, KeyEvent, MountError, MountPlan, MountResult, PlanNode, ReadFault, ReadValue,
-    StyleSlot, SubmitEvent,
+    Attr, AttrValue, BlurEvent, ChangeEvent, ChildrenFactory, ClickEvent, Code, CompositionEvent,
+    CompositionPhase, ErasedRowView, ErasedStore, Event, FocusCause, FocusEvent, ForDriver,
+    ForRows, HandlerError, HandlerOutcome, InlineStyle, InputEvent, Key, KeyEvent, MountError,
+    MountPlan, MountResult, PlanNode, ReadFault, ReadValue, StyleSlot, SubmitEvent,
 };
 use crate::window::{
     ActivationId, CatalogEntry, CatalogError, CloseError, CloseEvent, CloseHandler, CloseOutcome,
@@ -94,9 +94,13 @@ impl fmt::Debug for EventTarget {
 }
 
 /// 类型化载荷；后续切片的键盘、菜单等 intent 在此扩展。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum IntentPayload {
-    Click,
+    Click {
+        position: Option<crate::view::Point>,
+        button: Option<crate::view::MouseButton>,
+        click_count: u8,
+    },
     Activate,
     /// 指针按下；宿主已算好 text-input 的字符偏移。
     Press {
@@ -104,7 +108,9 @@ pub enum IntentPayload {
     },
     KeyDown {
         key: Key,
+        code: Code,
         modifiers: Modifiers,
+        repeat: bool,
     },
 }
 
@@ -145,7 +151,7 @@ impl Modifiers {
 }
 
 /// 一个路由型用户意图。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Intent {
     source: EventSource,
     target: EventTarget,
@@ -173,7 +179,11 @@ impl Intent {
         Self::new(
             EventSource::Pointer,
             EventTarget::Node(target),
-            IntentPayload::Click,
+            IntentPayload::Click {
+                position: None,
+                button: None,
+                click_count: 1,
+            },
             Modifiers::new(false, false, false, false),
         )
     }
@@ -197,6 +207,26 @@ impl Intent {
         )
     }
 
+    /// 带指针细节的点击；宿主在松开时构造，UIA 与测试使用默认细节。
+    pub const fn click_detailed(
+        target: NodeId,
+        position: Option<crate::view::Point>,
+        button: Option<crate::view::MouseButton>,
+        click_count: u8,
+        modifiers: Modifiers,
+    ) -> Self {
+        Self::new(
+            EventSource::Pointer,
+            EventTarget::Node(target),
+            IntentPayload::Click {
+                position,
+                button,
+                click_count,
+            },
+            modifiers,
+        )
+    }
+
     /// 指针按下；`caret` 是宿主从场景算出的字符偏移，runtime 不依赖 render。
     pub const fn press(target: NodeId, caret: Option<usize>) -> Self {
         Self::new(
@@ -209,20 +239,52 @@ impl Intent {
 
     /// 一个节点 keydown；target 通常是焦点节点。
     pub const fn keydown(target: NodeId, key: Key, modifiers: Modifiers) -> Self {
+        Self::keydown_with(target, key, Code::Other(0), modifiers, false)
+    }
+
+    /// 带物理键、修饰键与 repeat 状态的节点 keydown。
+    pub const fn keydown_with(
+        target: NodeId,
+        key: Key,
+        code: Code,
+        modifiers: Modifiers,
+        repeat: bool,
+    ) -> Self {
         Self::new(
             EventSource::Keyboard,
             EventTarget::Node(target),
-            IntentPayload::KeyDown { key, modifiers },
+            IntentPayload::KeyDown {
+                key,
+                code,
+                modifiers,
+                repeat,
+            },
             modifiers,
         )
     }
 
     /// 没有节点焦点时的窗口根 keydown。
     pub const fn keydown_window(window: WindowCtx, key: Key, modifiers: Modifiers) -> Self {
+        Self::keydown_window_with(window, key, Code::Other(0), modifiers, false)
+    }
+
+    /// 带物理键、修饰键与 repeat 状态的窗口根 keydown。
+    pub const fn keydown_window_with(
+        window: WindowCtx,
+        key: Key,
+        code: Code,
+        modifiers: Modifiers,
+        repeat: bool,
+    ) -> Self {
         Self::new(
             EventSource::Keyboard,
             EventTarget::Window(window),
-            IntentPayload::KeyDown { key, modifiers },
+            IntentPayload::KeyDown {
+                key,
+                code,
+                modifiers,
+                repeat,
+            },
             modifiers,
         )
     }
@@ -318,6 +380,25 @@ fn finish_reveal(report: &mut TurnReport, tree: Option<TreeSlot>, before: Option
     }
 }
 
+/// 窗口命令与拖放没有单一目标树；flush 可能结算任一树的焦点，因此取全部
+/// 树的指纹，结束时合并差异。
+fn all_reveal_probes(runtime: &Runtime) -> Vec<(TreeSlot, RevealProbe)> {
+    runtime
+        .tree_keys()
+        .into_iter()
+        .map(|key| (key, with_state(|state| state.reveal_probe(key))))
+        .collect()
+}
+
+fn finish_reveal_all(report: &mut TurnReport, before: &[(TreeSlot, RevealProbe)]) {
+    let mut reveal = RevealFlags::default();
+    for (key, probe) in before {
+        let after = with_state(|state| state.reveal_probe(*key));
+        reveal.merge(RevealProbe::diff(probe, &after));
+    }
+    report.set_reveal(reveal);
+}
+
 /// 一次 turn 的 flow 结果。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TurnOutcome {
@@ -335,11 +416,59 @@ impl TurnOutcome {
     }
 }
 
+/// 一个 turn 的处理器、窗口/会话请求与结构结算轮数上限。
+///
+/// 超限后不再运行用户处理器或接受请求，已执行写入保留；turn 收尾把
+/// [`TurnError::BudgetExceeded`] 并入报告。
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct TurnBudget {
+    pub handlers: u32,
+    pub window_requests: u32,
+    pub structure_rounds: u32,
+}
+
+impl TurnBudget {
+    pub const DEFAULT: Self = Self {
+        handlers: 1024,
+        window_requests: 64,
+        structure_rounds: 8,
+    };
+}
+
+/// 一个 turn 的运行时计数与暂存的处理器错误。
+///
+/// 处理器错误在事件槽或焦点结算内部产生，最终统一并入该 turn 的
+/// [`TurnReport::errors`]；计数从 Idle 进入 turn 时清零。
+#[derive(Default)]
+struct TurnState {
+    handlers: u32,
+    window_requests: u32,
+    structure_rounds: u32,
+    budget_exceeded: bool,
+    pending_errors: Vec<TurnError>,
+    /// 处理器内再次派发的 Intent；外层 turn flush 后按 FIFO 执行。
+    queued_intents: std::collections::VecDeque<Intent>,
+    /// 正在 drain 队列；嵌套 turn 不再递归 drain，保证 FIFO。
+    draining_intents: bool,
+}
+
 /// turn 内出现的用户错误；写入已保留，错误不静默丢弃。
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum TurnError {
     HandlerFailed(HandlerError),
     HandlerPanicked(PanicInfo),
+    FactoryFailed(MountError),
+    FactoryPanicked(PanicInfo),
+    CleanupPanicked(PanicInfo),
+    StructureWriteRejected,
+    FieldFault(crate::store::FieldError),
+    CloseConfirmationNotShown {
+        window: ActivationId,
+        key: String,
+    },
+    BudgetExceeded(TurnBudget),
+    /// flush 或 turn 收尾的其它 typed 失败；错误已从公开入口收敛到报告。
+    ActionFailed(MountError),
 }
 
 impl fmt::Display for TurnError {
@@ -347,6 +476,22 @@ impl fmt::Display for TurnError {
         match self {
             Self::HandlerFailed(error) => write!(f, "handler failed: {error}"),
             Self::HandlerPanicked(panic) => write!(f, "handler panicked: {panic}"),
+            Self::FactoryFailed(error) => write!(f, "factory failed: {error}"),
+            Self::FactoryPanicked(panic) => write!(f, "factory panicked: {panic}"),
+            Self::CleanupPanicked(panic) => write!(f, "cleanup panicked: {panic}"),
+            Self::StructureWriteRejected => f.write_str("a structure turn rejected a UI write"),
+            Self::FieldFault(error) => write!(f, "field read failed: {error}"),
+            Self::CloseConfirmationNotShown { window, key } => write!(
+                f,
+                "window {key} kept close request {:?} without a visible confirmation window",
+                window
+            ),
+            Self::BudgetExceeded(budget) => write!(
+                f,
+                "turn budget exceeded (handlers {}, window requests {}, structure rounds {})",
+                budget.handlers, budget.window_requests, budget.structure_rounds
+            ),
+            Self::ActionFailed(error) => write!(f, "turn action failed: {error}"),
         }
     }
 }
@@ -399,6 +544,12 @@ impl TurnReport {
         };
     }
 
+    /// 合并内层默认动作（submit/checkbox）已经写入的 flow。
+    fn extend_outcome(&mut self, consumed: bool, prevent_default: bool) {
+        self.outcome.consumed |= consumed;
+        self.outcome.prevent_default |= prevent_default;
+    }
+
     fn mark_changed(&mut self) {
         self.changed = true;
     }
@@ -415,6 +566,7 @@ impl TurnReport {
 
 const HIDDEN_TARGET: &str = "target window is hidden";
 const SUSPENDED_TARGET: &str = "target window input is suspended";
+const REENTRANT_TURN: &str = "a direct primitive cannot run inside an active turn";
 
 pub(crate) enum Resource {
     Signal(u32, u32),
@@ -1201,6 +1353,8 @@ pub(crate) struct State {
     pub(crate) diagnostics: Vec<RuntimeDiagnostic>,
     pub(crate) phase: Phase,
     pub(crate) fault: Option<ContextFault>,
+    /// 当前 turn 的预算计数与暂存错误；Idle → turn 时清零。
+    turn: TurnState,
     pub(crate) appearance: Appearance,
     pub(crate) signals: Vec<SignalCell>,
     pub(crate) memos: Vec<MemoCell>,
@@ -1790,6 +1944,7 @@ impl State {
             diagnostics: Vec::new(),
             phase: Phase::Idle,
             fault: None,
+            turn: TurnState::default(),
             appearance: Appearance::Light,
             signals: Vec::new(),
             memos: Vec::new(),
@@ -3194,6 +3349,16 @@ impl State {
         self.active_close_source
     }
 
+    /// 从 Idle 状态开始一个新 turn 的预算计数；暂存错误保留给收尾报告。
+    pub(crate) fn begin_turn(&mut self) {
+        self.turn.handlers = 0;
+        self.turn.window_requests = 0;
+        self.turn.structure_rounds = 0;
+        self.turn.budget_exceeded = false;
+        // 上一次 turn 的 drain 若因内部 panic 中断，下一 turn 仍必须能继续。
+        self.turn.draining_intents = false;
+    }
+
     pub(crate) fn queue_window_request(
         &mut self,
         request: WindowRequest,
@@ -3211,6 +3376,11 @@ impl State {
         {
             return Err(WindowError::UnknownWindow(key));
         }
+        if self.turn.window_requests >= TurnBudget::DEFAULT.window_requests {
+            self.turn.budget_exceeded = true;
+            return Err(WindowError::BudgetExceeded);
+        }
+        self.turn.window_requests += 1;
         self.window_requests.push(request);
         Ok(())
     }
@@ -3233,6 +3403,11 @@ impl State {
         {
             return Err(SessionError::UnknownWindow(key));
         }
+        if self.turn.window_requests >= TurnBudget::DEFAULT.window_requests {
+            self.turn.budget_exceeded = true;
+            return Err(SessionError::BudgetExceeded);
+        }
+        self.turn.window_requests += 1;
         self.session.requests.push(action);
         Ok(())
     }
@@ -4348,6 +4523,18 @@ impl TextEditing {
         TextTrace::ExternalReset { origin, revision }
     }
 
+    /// handler 拒绝一次 undo/redo 后恢复派发前的本地快照。
+    ///
+    /// 不能只丢弃谱系记录：本地文本若停在拒绝的目标值，flush 会把它当成
+    /// 外部替换并清空历史；恢复后模型值与本地值一致，历史与 caret 保留。
+    fn restore_dispatch(&mut self, snapshot: &TextSnapshot) {
+        self.adopt(&snapshot.value);
+        self.caret = snapshot.caret;
+        self.anchor = snapshot.anchor;
+        self.selection = snapshot.selection;
+        self.clamp_offsets();
+    }
+
     /// 采用模型值并把 caret/anchor/selection 夹回文本范围。
     fn settle_value(&mut self, value: &str) {
         self.adopt(value);
@@ -4879,6 +5066,9 @@ fn set_spacer_height(state: &mut State, spacer: usize, rows: usize, row_height: 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum EventKind {
     Click,
+    ClickCapture,
+    ClickBubble,
+    DblClick,
     Input,
     Change,
     Submit,
@@ -4896,6 +5086,9 @@ enum EventKind {
 fn event_kind(event: &Event) -> EventKind {
     match event {
         Event::Click(_) => EventKind::Click,
+        Event::ClickCapture(_) => EventKind::ClickCapture,
+        Event::ClickBubble(_) => EventKind::ClickBubble,
+        Event::DblClick(_) => EventKind::DblClick,
         Event::Input(_) => EventKind::Input,
         Event::Change(_) => EventKind::Change,
         Event::Submit(_) => EventKind::Submit,
@@ -4914,6 +5107,9 @@ fn event_kind(event: &Event) -> EventKind {
 fn event_kind_name(kind: EventKind) -> &'static str {
     match kind {
         EventKind::Click => "click",
+        EventKind::ClickCapture => "click_capture",
+        EventKind::ClickBubble => "click_bubble",
+        EventKind::DblClick => "dblclick",
         EventKind::Input => "input",
         EventKind::Change => "change",
         EventKind::Submit => "submit",
@@ -5226,22 +5422,98 @@ impl Drop for ChildrenGuard {
 }
 
 /// 事件槽的 `take → catch → put`：handler panic 时槽位也必须回到运行时。
-fn invoke_event<R>(
+///
+/// 事件槽是所有元素事件处理器的统一入口，handler 预算在这里计数；超限后
+/// 不再运行用户代码，turn 收尾报告 `BudgetExceeded`。
+fn invoke_event(
     event_id: usize,
     mut event: Event,
-    invoke: impl FnOnce(&mut Event) -> R,
-) -> Result<R, PanicInfo> {
+    invoke: impl FnOnce(&mut Event) -> HandlerOutcome,
+) -> Result<HandlerOutcome, PanicInfo> {
+    if charge_handler_slot() {
+        with_state(|state| state.put_event(event_id, event));
+        return Ok(HandlerOutcome::Ok);
+    }
     let outcome = catch_panic(|| invoke(&mut event));
     with_state(|state| state.put_event(event_id, event));
     outcome
 }
 
-/// click 槽返回 `HandlerOutcome`；event 槽在 panic 后也必须放回。
-fn invoke_click_event(event_id: usize, event: Event) -> Result<HandlerOutcome, PanicInfo> {
+/// 为一次事件槽调用计数；超过 `TurnBudget::DEFAULT.handlers` 时返回 true。
+fn charge_handler_slot() -> bool {
+    with_state(|state| {
+        if state.turn.handlers >= TurnBudget::DEFAULT.handlers {
+            state.turn.budget_exceeded = true;
+            return true;
+        }
+        state.turn.handlers += 1;
+        false
+    })
+}
+
+/// click 家族槽返回 `HandlerOutcome`；event 槽在 panic 后也必须放回。
+fn invoke_click_event(
+    event_id: usize,
+    event: Event,
+    click: &mut ClickEvent,
+) -> Result<HandlerOutcome, PanicInfo> {
     invoke_event(event_id, event, |event| match event {
-        Event::Click(handler) => handler(),
+        Event::Click(handler)
+        | Event::ClickCapture(handler)
+        | Event::ClickBubble(handler)
+        | Event::DblClick(handler) => handler(click),
         _ => HandlerOutcome::Ok,
     })
+}
+
+fn invoke_input_event(
+    event_id: usize,
+    event: Event,
+    input: &mut InputEvent,
+) -> Result<HandlerOutcome, PanicInfo> {
+    invoke_event(event_id, event, |event| match event {
+        Event::Input(handler) => handler(input),
+        _ => HandlerOutcome::Ok,
+    })
+}
+
+fn invoke_change_event(
+    event_id: usize,
+    event: Event,
+    change: &mut ChangeEvent,
+) -> Result<HandlerOutcome, PanicInfo> {
+    invoke_event(event_id, event, |event| match event {
+        Event::Change(handler) => handler(change),
+        _ => HandlerOutcome::Ok,
+    })
+}
+
+fn turn_error_from_mount(error: MountError) -> TurnError {
+    match error {
+        MountError::FactoryFailed(error) => TurnError::FactoryFailed(*error),
+        MountError::FactoryPanicked(panic) | MountError::Panic(panic) => {
+            TurnError::FactoryPanicked(panic)
+        }
+        error => TurnError::ActionFailed(error),
+    }
+}
+
+/// 记录 handler 结果；返回是否停止本事件后续阶段与默认动作。
+fn record_handler_stop(
+    outcome: Result<HandlerOutcome, PanicInfo>,
+    report: &mut TurnReport,
+) -> bool {
+    match outcome {
+        Ok(HandlerOutcome::Ok) => false,
+        Ok(HandlerOutcome::Err(error)) => {
+            report.push_error(TurnError::HandlerFailed(error));
+            true
+        }
+        Err(panic) => {
+            report.push_error(TurnError::HandlerPanicked(panic));
+            true
+        }
+    }
 }
 
 /// 把一次 handler 结果记入 turn 报告；返回是否发生了 panic。
@@ -5683,21 +5955,20 @@ impl Runtime {
                 state.read_only += 1;
                 state.phase
             });
-            let outcome =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(command)));
+            let outcome = catch_panic(|| handler(command));
             with_state(|state| {
                 state.phase = previous_phase;
                 state.read_only = state.read_only.saturating_sub(1);
             });
             let value = match outcome {
                 Ok(value) => value,
-                Err(_) => {
+                Err(panic) => {
                     // 展开前记录的部分 fault 不属于任何调用方，丢弃后再报告 panic。
                     with_state(|state| {
                         state.fault = None;
                         state.write_error = None;
                     });
-                    return Err(MenuStateError::HandlerPanicked);
+                    return Err(MenuStateError::HandlerPanicked(panic));
                 }
             };
             if let Some(fault) = with_state(|state| state.fault.take()) {
@@ -5801,8 +6072,14 @@ impl Runtime {
     /// 启动任务。重复路径与 Unicode 原样保留，不做去重或规范化。
     ///
     /// 外部 Runtime 的窗口、已关闭/过期的 activation、隐藏窗口、等待关闭确认的
-    /// 窗口、空路径与没有处理器的窗口都在进入事件阶段前拒绝。
-    pub fn drop_files(&mut self, window: WindowCtx, paths: Vec<PathBuf>) -> Result<(), DropError> {
+    /// 窗口、空路径与没有处理器的窗口都在进入事件阶段前拒绝。处理器返回的
+    /// `Err` 或 panic 不成为入口错误：它们和 flush 失败一起进入返回的
+    /// [`TurnReport::errors`]，已提交写入保留。
+    pub fn drop_files(
+        &mut self,
+        window: WindowCtx,
+        paths: Vec<PathBuf>,
+    ) -> Result<TurnReport, DropError> {
         let state = self.state.clone();
         if window.runtime != state.borrow().id {
             return Err(DropError::WrongRuntime);
@@ -5827,6 +6104,7 @@ impl Runtime {
             else {
                 return Err(DropError::NoHandler);
             };
+            with_state(State::begin_turn);
             let previous = with_state(|state| {
                 let previous = state.phase;
                 state.phase = Phase::Event;
@@ -5834,14 +6112,19 @@ impl Runtime {
                 state.write_error = None;
                 previous
             });
-            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                handler(DropEvent::new(window, paths));
-            }));
+            let before = all_reveal_probes(self);
+            let outcome = if self.charge_handler() {
+                Ok(HandlerOutcome::Ok)
+            } else {
+                let mut handler = handler.borrow_mut();
+                catch_panic(|| handler(DropEvent::new(window, paths)))
+            };
             with_state(|state| state.phase = previous);
-            if outcome.is_err() {
-                return Err(DropError::HandlerPanicked);
-            }
-            self.finish_command().map_err(DropError::Command)
+            let mut report = TurnReport::default();
+            record_handler_outcome(outcome, &mut report);
+            self.finish_turn(&mut report);
+            finish_reveal_all(&mut report, &before);
+            Ok(report)
         })
     }
 
@@ -6067,13 +6350,17 @@ impl Runtime {
     ///
     /// 应用级处理器不依赖 activation，窗口全部关闭后仍可派发。托盘与共享
     /// 动作使用 [`Runtime::dispatch_app_command`]；窗口目标派发只在窗口没有
-    /// 注册同一 id 时回退到这里。重复 id 与启动后注册都返回 typed error，
-    /// 不覆盖已有处理器。
-    pub fn on_app_command(
+    /// 注册同一 id 时回退到这里。返回 `()`、`Result<(), E>` 或
+    /// [`HandlerOutcome`]；`Err` 与 panic 进入派发返回的 `TurnReport::errors`。
+    /// 重复 id 与启动后注册都返回 typed error，不覆盖已有处理器。
+    pub fn on_app_command<R>(
         &mut self,
         id: &'static str,
-        handler: impl Fn(CommandEvent) + 'static,
-    ) -> Result<(), CommandError> {
+        mut handler: impl FnMut(&mut CommandEvent) -> R + 'static,
+    ) -> Result<(), CommandError>
+    where
+        R: crate::view::IntoHandlerOutcome,
+    {
         let mut state = self.state.borrow_mut();
         if state.runtime_started() {
             return Err(CommandError::RegistrationClosed);
@@ -6081,7 +6368,12 @@ impl Runtime {
         if state.app_command_handlers.contains_key(id) {
             return Err(CommandError::AlreadyRegistered(id));
         }
-        state.app_command_handlers.insert(id, Rc::new(handler));
+        state.app_command_handlers.insert(
+            id,
+            Rc::new(std::cell::RefCell::new(Box::new(
+                move |event: &mut CommandEvent| handler(event).into_handler_outcome(),
+            ))),
+        );
         Ok(())
     }
 
@@ -6161,7 +6453,8 @@ impl Runtime {
     /// 菜单栏、快捷键、上下文菜单与辅助技术共用这条路径。处理器在
     /// `Phase::Event` 中恰好运行一次，可以写 Store/Signals 并排队窗口请求；
     /// 窗口已关闭、隐藏、等待关闭确认或属于另一个 Runtime 时返回 typed
-    /// error。处理器 panic 被 contain，不向调用方展开。
+    /// error。处理器返回的 `Err` 与 panic 不成为入口错误：它们和 flush 失败
+    /// 一起进入返回的 [`TurnReport::errors`]，已提交写入保留。
     ///
     /// 窗口没有为 `id` 注册处理器时回退到应用级处理器，事件暴露目标窗口。
     /// `CommandSource::Tray` 从不运行窗口处理器，只查找应用级处理器。
@@ -6170,7 +6463,7 @@ impl Runtime {
         window: WindowCtx,
         id: &'static str,
         source: CommandSource,
-    ) -> Result<(), CommandError> {
+    ) -> Result<TurnReport, CommandError> {
         self.dispatch_command_on(window, id, source, None)
     }
 
@@ -6184,7 +6477,7 @@ impl Runtime {
         id: &'static str,
         source: CommandSource,
         target: Option<NodeId>,
-    ) -> Result<(), CommandError> {
+    ) -> Result<TurnReport, CommandError> {
         let state = self.state.clone();
         if window.runtime != state.borrow().id {
             return Err(CommandError::WrongRuntime);
@@ -6234,7 +6527,7 @@ impl Runtime {
             } else {
                 CommandEvent::new(source, target)
             };
-            self.run_command_handler(id, handler, event)
+            self.run_command_handler(handler, event)
         })
     }
 
@@ -6252,7 +6545,7 @@ impl Runtime {
         id: &'static str,
         source: CommandSource,
         target: Option<WindowCtx>,
-    ) -> Result<(), CommandError> {
+    ) -> Result<TurnReport, CommandError> {
         let state = self.state.clone();
         if target.is_some_and(|target| target.runtime != state.borrow().id) {
             return Err(CommandError::WrongRuntime);
@@ -6267,17 +6560,17 @@ impl Runtime {
             }
             let handler = with_state(|state| state.app_command_handler(id))
                 .ok_or(CommandError::MissingHandler(id))?;
-            self.run_command_handler(id, handler, CommandEvent::for_app(source, target))
+            self.run_command_handler(handler, CommandEvent::for_app(source, target))
         })
     }
 
-    /// 在 Event 阶段运行一个处理器并提交结果；panic 被 contain。
+    /// 在 Event 阶段运行一个处理器并提交结果；`Err` 与 panic 进入 turn 报告。
     fn run_command_handler(
         &mut self,
-        id: &'static str,
         handler: CommandHandler,
-        event: CommandEvent,
-    ) -> Result<(), CommandError> {
+        mut event: CommandEvent,
+    ) -> Result<TurnReport, CommandError> {
+        with_state(State::begin_turn);
         let previous = with_state(|state| {
             let previous = (state.phase, state.active_close_source);
             state.phase = Phase::Event;
@@ -6286,20 +6579,28 @@ impl Runtime {
             state.write_error = None;
             previous
         });
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(event)));
+        let before = all_reveal_probes(self);
+        let outcome = if self.charge_handler() {
+            Ok(HandlerOutcome::Ok)
+        } else {
+            let mut handler = handler.borrow_mut();
+            catch_panic(|| handler(&mut event))
+        };
         with_state(|state| {
             state.phase = previous.0;
             state.active_close_source = previous.1;
         });
-        if outcome.is_err() {
-            return Err(CommandError::HandlerPanicked(id));
-        }
+        let mut report = TurnReport::default();
+        record_handler_outcome(outcome, &mut report);
         if self.tree_keys().is_empty() {
-            return self
-                .finish_command_without_ui()
-                .map_err(CommandError::Mount);
+            if let Err(error) = self.finish_command_without_ui() {
+                report.push_error(turn_error_from_mount(error));
+            }
+        } else {
+            self.finish_turn(&mut report);
         }
-        self.finish_command().map_err(CommandError::Mount)
+        finish_reveal_all(&mut report, &before);
+        Ok(report)
     }
 
     /// 结算 UI 处理器排队的窗口请求与关闭回复，返回已应用的数量。
@@ -6588,13 +6889,16 @@ impl Runtime {
             state.phase = Phase::Event;
             previous
         });
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(event)));
+        let outcome = catch_panic(|| handler(event));
         with_state(|state| state.phase = previous_phase);
         match outcome {
             Ok(outcome) => Ok(outcome),
-            Err(_) => {
+            Err(panic) => {
                 self.abort_close_epoch(window.key, queued_before);
-                Err(WindowError::Close(CloseError::HandlerPanicked))
+                // panic 前已提交的写入仍要在关闭 turn 内 flush；错误只表达
+                // 关闭协议失败，窗口保持打开。
+                let _ = self.finish_command();
+                Err(WindowError::Close(CloseError::HandlerPanicked(panic)))
             }
         }
     }
@@ -7287,7 +7591,8 @@ impl Runtime {
 
         let state = self.state.clone();
         context::install(&state, || {
-            for _ in 0..MAX_SETTLEMENTS {
+            for round in 1..=MAX_SETTLEMENTS {
+                with_state(|state| state.turn.structure_rounds = round as u32);
                 if !self.settle_round(true)? {
                     return Ok(());
                 }
@@ -7297,6 +7602,10 @@ impl Runtime {
             }
             // 第 8 轮恰好收敛时焦点仍然有效；只有确实还有待结算的目标才做兜底清理。
             if self.settle_round(false)? {
+                with_state(|state| {
+                    state.turn.structure_rounds = MAX_SETTLEMENTS as u32 + 1;
+                    state.turn.budget_exceeded = true;
+                });
                 self.settle_quarantined_memos();
                 self.take_flush_faults()?;
                 self.refresh_all_once()?;
@@ -7329,29 +7638,21 @@ impl Runtime {
             state.fault = None;
             state.write_error = None;
         });
-        let mut panic = None;
+        let mut panicked = false;
         if settlement.blur_old {
             with_state(|state| state.set_focused_in(key, None));
-            if let Err(info) = self.fire_blur(settlement.old, FocusCause::Settlement) {
-                panic = Some(info);
-            }
+            panicked = self.fire_blur(settlement.old, FocusCause::Settlement);
         }
         match (keep_target, settlement.target) {
             (true, Some(target)) => {
                 with_state(|state| state.set_focused_in(key, Some(target)));
-                if panic.is_none()
-                    && let Err(info) = self.fire_focus(target, FocusCause::Settlement)
-                {
-                    panic = Some(info);
+                if !panicked {
+                    self.fire_focus(target, FocusCause::Settlement);
                 }
             }
             _ => with_state(|state| state.set_focused_in(key, None)),
         }
         with_state(|state| state.phase = Phase::Idle);
-        if let Some(panic) = panic {
-            let _ = self.finish_command();
-            return Err(MountError::Panic(panic));
-        }
         if let Some(fault) = with_state(|state| state.fault.take()) {
             return Err(State::context_error(fault));
         }
@@ -9031,8 +9332,12 @@ impl Runtime {
         )
     }
 
-    /// 已解析目标的直接 click：只运行该元素自己的 handler。
+    /// 已解析目标的直接 click：只运行该元素自己的 click handler 与节点默认。
+    ///
+    /// 不回溯祖先、不执行 capture/bubble、不触发表单提交；需要完整路由时用
+    /// [`Self::activate_node`] 或 `dispatch_intent`。
     pub fn click_node(&mut self, node: NodeId) -> Result<TurnReport, DispatchError> {
+        self.begin_direct_turn()?;
         let state = self.state.clone();
         context::install(&state, || {
             let element = with_state(|state| state.element_for_node(node))?;
@@ -9041,56 +9346,163 @@ impl Runtime {
             }
             let tree = with_state(|state| state.tree_for_element(element));
             let reveal_before = tree.map(|tree| with_state(|state| state.reveal_probe(tree)));
-            let (event_id, event) =
-                self.take_node_event(node, element, EventKind::Click, NodeOperation::Click)?;
-            let outcome = invoke_click_event(event_id, event);
-            with_state(|state| state.phase = Phase::Idle);
+            // 直接原语只接受自身有 click 处理器或节点内建默认的元素；
+            // 普通容器需要完整路由，回到 activate_node。
+            let handled = with_state(|state| {
+                state.has_click_handler(element) || state.element_tag(element) == "checkbox"
+            });
+            if !handled {
+                return Err(DispatchError::WrongKind {
+                    node,
+                    operation: NodeOperation::Click,
+                });
+            }
+            let mut click = ClickEvent::new(
+                EventSource::Accessibility,
+                node,
+                None,
+                None,
+                1,
+                Modifiers::default(),
+            );
+            self.enter_event_phase();
             let mut report = TurnReport::default();
-            match outcome {
-                Ok(HandlerOutcome::Ok) => {}
-                Ok(HandlerOutcome::Err(error)) => {
-                    report.push_error(TurnError::HandlerFailed(error));
-                }
-                Err(panic) => report.push_error(TurnError::HandlerPanicked(panic)),
+            let stop = self
+                .run_click_event(element, EventKind::Click, &mut click, &mut report)?
+                .unwrap_or(false);
+            if !stop && report.is_ok() {
+                self.apply_click_default(element, false, EventSource::Accessibility, &mut report)?;
             }
-            if self
-                .finish_command_changed()
-                .map_err(DispatchError::Command)?
-            {
-                report.mark_changed();
-            }
+            report.extend_outcome(click.is_consumed(), click.prevents_default());
+            with_state(|state| state.phase = Phase::Idle);
+            self.finish_turn(&mut report);
             finish_reveal(&mut report, tree, reveal_before.as_ref());
             Ok(report)
         })
     }
 
-    /// 路由后的激活：先运行最近 click handler，再执行 `type=submit` 表单默认。
-    fn activate_element(&mut self, element: usize) -> Result<TurnReport, DispatchError> {
+    /// 路由后的激活：capture → 最近普通 handler → bubble → 节点/表单默认。
+    fn activate_element(
+        &mut self,
+        element: usize,
+        source: EventSource,
+    ) -> Result<TurnReport, DispatchError> {
         if with_state(|state| state.element_effectively_disabled(element)) {
             return Ok(TurnReport::default());
         }
         let node = with_state(|state| state.elements[element].id);
-        let tree = with_state(|state| state.tree_for_element(element));
-        let before = tree.map(|tree| with_state(|state| state.reveal_probe(tree)));
-        let has_click = with_state(|state| state.has_click_handler(element));
-        let mut report = if has_click {
-            self.click_node(node)?
-        } else {
-            TurnReport::default()
-        };
-        if report.is_ok()
-            && let Some(element) = with_state(|state| state.element_for_node(node).ok())
-        {
-            self.apply_click_default(element, &mut report)?;
-        }
-        finish_reveal(&mut report, tree, before.as_ref());
-        Ok(report)
+        self.route_click(node, source, None, None, 1, Modifiers::default())
     }
 
-    /// 内建 click 默认：按钮提交最近 form，复选框切换一次。
+    /// 完整 click 路由；`hit` 是原始命中节点，普通处理器按 closest-wins 选择。
+    fn route_click(
+        &mut self,
+        hit: NodeId,
+        source: EventSource,
+        position: Option<crate::view::Point>,
+        button: Option<crate::view::MouseButton>,
+        click_count: u8,
+        modifiers: Modifiers,
+    ) -> Result<TurnReport, DispatchError> {
+        let state = self.state.clone();
+        context::install(&state, || {
+            let hit_element = with_state(|state| state.element_for_node(hit))?;
+            if with_state(|state| state.element_effectively_disabled(hit_element)) {
+                return Ok(TurnReport::default());
+            }
+            let tree = with_state(|state| state.tree_for_element(hit_element));
+            let reveal_before = tree.map(|tree| with_state(|state| state.reveal_probe(tree)));
+            let path = with_state(|state| state.element_path(hit_element));
+            let normal = with_state(|state| state.closest_click_target(hit))?;
+            let mut click = ClickEvent::new(source, hit, position, button, click_count, modifiers);
+            self.enter_event_phase();
+            let mut report = TurnReport::default();
+            let mut stopped = false;
+
+            for element in &path {
+                if self
+                    .run_click_event(*element, EventKind::ClickCapture, &mut click, &mut report)?
+                    .unwrap_or(false)
+                {
+                    stopped = true;
+                    break;
+                }
+            }
+            if !stopped
+                && let Some(element) = normal
+                && self
+                    .run_click_event(element, EventKind::Click, &mut click, &mut report)?
+                    .unwrap_or(false)
+            {
+                stopped = true;
+            }
+            if !stopped {
+                for element in path.iter().rev().skip(1) {
+                    if self
+                        .run_click_event(*element, EventKind::ClickBubble, &mut click, &mut report)?
+                        .unwrap_or(false)
+                    {
+                        stopped = true;
+                        break;
+                    }
+                }
+            }
+            if !stopped && click_count >= 2 {
+                let target = path.iter().rev().copied().find(|element| {
+                    with_state(|state| state.has_event(*element, EventKind::DblClick))
+                });
+                if let Some(element) = target
+                    && self
+                        .run_click_event(element, EventKind::DblClick, &mut click, &mut report)?
+                        .unwrap_or(false)
+                {
+                    stopped = true;
+                }
+            }
+            if !stopped
+                && !click.is_consumed()
+                && !click.prevents_default()
+                && report.is_ok()
+                && !self.turn_budget_exceeded()
+                && let Some(element) = normal
+            {
+                self.apply_click_default(element, true, source, &mut report)?;
+            }
+            report.extend_outcome(click.is_consumed(), click.prevents_default());
+            with_state(|state| state.phase = Phase::Idle);
+            self.finish_turn(&mut report);
+            finish_reveal(&mut report, tree, reveal_before.as_ref());
+            Ok(report)
+        })
+    }
+
+    /// 运行一个 click 家族槽；返回该阶段是否有处理器以及是否停止传播。
+    fn run_click_event(
+        &mut self,
+        element: usize,
+        kind: EventKind,
+        click: &mut ClickEvent,
+        report: &mut TurnReport,
+    ) -> Result<Option<bool>, DispatchError> {
+        let Some((event_id, event)) = with_state(|state| state.take_element_event(element, kind))
+        else {
+            return Ok(None);
+        };
+        let node = with_state(|state| state.elements[element].id);
+        click.set_current_target(node);
+        let outcome = invoke_click_event(event_id, event, click);
+        let stop = record_handler_stop(outcome, report)
+            || click.is_consumed()
+            || self.turn_budget_exceeded();
+        Ok(Some(stop))
+    }
+
+    /// 内建 click 默认：复选框切换；`allow_submit` 为 false 时不触发表单提交。
     fn apply_click_default(
         &mut self,
         element: usize,
+        allow_submit: bool,
+        source: EventSource,
         report: &mut TurnReport,
     ) -> Result<(), DispatchError> {
         if with_state(|state| state.element_tag(element) == "checkbox") {
@@ -9100,12 +9512,12 @@ impl Runtime {
             });
             if let Some(next) = next {
                 let id = with_state(|state| state.elements[element].id);
-                let changed = self.change_node(id, next)?;
+                let changed = self.change_node_inner(id, next, source)?;
                 report.absorb(changed);
             }
             return Ok(());
         }
-        if !with_state(|state| state.is_submit_button(element)) {
+        if !allow_submit || !with_state(|state| state.is_submit_button(element)) {
             return Ok(());
         }
         let Some(form) = with_state(|state| state.ancestor_form(element)) else {
@@ -9115,34 +9527,77 @@ impl Runtime {
             return Ok(());
         }
         let form = with_state(|state| state.elements[form].id);
-        let submitted = self.submit_node(form)?;
+        let submitted = self.submit_node_inner(form, source)?;
         report.absorb(submitted);
         Ok(())
     }
 
     /// 路由一个 typed Intent；窗口/activation 目标先校验再询问处理器。
+    ///
+    /// 在处理器内再次派发时进入本 turn 的 FIFO 队列，等外层 turn flush 后
+    /// 按入队顺序执行；不重入同一棵树的 flush。
     pub fn dispatch_intent(&mut self, intent: Intent) -> Result<TurnReport, DispatchError> {
+        {
+            let mut state = self.state.borrow_mut();
+            if state.phase != Phase::Idle {
+                if state.turn.queued_intents.len() >= TurnBudget::DEFAULT.handlers as usize {
+                    state.turn.budget_exceeded = true;
+                } else {
+                    state.turn.queued_intents.push_back(intent);
+                }
+                return Ok(TurnReport::default());
+            }
+        }
+        self.begin_direct_turn()?;
+        self.dispatch_intent_now(intent)
+    }
+
+    fn dispatch_intent_now(&mut self, intent: Intent) -> Result<TurnReport, DispatchError> {
         match intent.payload() {
-            IntentPayload::KeyDown { key, modifiers } => {
-                return self.dispatch_keydown_intent(intent.target(), key, modifiers);
+            IntentPayload::KeyDown {
+                key,
+                code,
+                modifiers,
+                repeat,
+            } => {
+                return self.dispatch_keydown_intent(intent.target(), key, code, modifiers, repeat);
             }
             IntentPayload::Press { caret } => {
                 return self.dispatch_press_intent(intent.target(), caret);
             }
-            IntentPayload::Click | IntentPayload::Activate => {}
+            IntentPayload::Click {
+                position,
+                button,
+                click_count,
+            } => {
+                return match intent.target() {
+                    EventTarget::Node(node) => {
+                        let state = self.state.clone();
+                        context::install(&state, || {
+                            with_state(|state| state.element_for_node(node))?;
+                            self.route_click(
+                                node,
+                                intent.source(),
+                                position,
+                                button,
+                                click_count,
+                                intent.modifiers(),
+                            )
+                        })
+                    }
+                    EventTarget::Window(window) => {
+                        if !self.state.borrow().intent_window_usable(window) {
+                            return Err(DispatchError::TargetClosed);
+                        }
+                        Ok(TurnReport::default())
+                    }
+                    EventTarget::App => Ok(TurnReport::default()),
+                };
+            }
+            IntentPayload::Activate => {}
         }
         match intent.target() {
-            EventTarget::Node(node) => {
-                let state = self.state.clone();
-                context::install(&state, || {
-                    with_state(|state| state.element_for_node(node))?;
-                    let target = with_state(|state| state.closest_click_target(node))?;
-                    match target {
-                        Some(element) => self.activate_element(element),
-                        None => Ok(TurnReport::default()),
-                    }
-                })
-            }
+            EventTarget::Node(_) => Ok(TurnReport::default()),
             EventTarget::Window(window) => {
                 if !self.state.borrow().intent_window_usable(window) {
                     return Err(DispatchError::TargetClosed);
@@ -9249,7 +9704,7 @@ impl Runtime {
                     report.mark_changed();
                 }
             }
-            self.finish_command().map_err(DispatchError::Command)?;
+            self.finish_turn_plain(&mut report);
             finish_reveal(&mut report, Some(tree), Some(&before));
             Ok(report)
         })
@@ -9260,7 +9715,9 @@ impl Runtime {
         &mut self,
         target: EventTarget,
         key: Key,
+        code: Code,
         modifiers: Modifiers,
+        repeat: bool,
     ) -> Result<TurnReport, DispatchError> {
         let state = self.state.clone();
         context::install(&state, || {
@@ -9279,7 +9736,7 @@ impl Runtime {
                 EventTarget::Node(node) => {
                     let element = with_state(|state| state.element_for_node(node))?;
                     if with_state(|state| state.element_local(element).is_composing()) {
-                        self.keydown_node(node, key)?
+                        self.keydown_node_inner(node, key)?
                     } else {
                         let window = with_state(|state| {
                             state.tree_for_element(element).and_then(|tree| match tree {
@@ -9287,7 +9744,15 @@ impl Runtime {
                                 TreeSlot::Root => None,
                             })
                         });
-                        self.route_keydown(Some(element), window, key, modifiers)?
+                        self.route_keydown(
+                            Some(element),
+                            window,
+                            key,
+                            code,
+                            modifiers,
+                            repeat,
+                            target,
+                        )?
                     }
                 }
                 EventTarget::Window(window) => {
@@ -9302,9 +9767,17 @@ impl Runtime {
                         && with_state(|state| state.element_local(element).is_composing())
                     {
                         let node = with_state(|state| state.elements[element].id);
-                        self.keydown_node(node, key)?
+                        self.keydown_node_inner(node, key)?
                     } else {
-                        self.route_keydown(focused, Some(window), key, modifiers)?
+                        self.route_keydown(
+                            focused,
+                            Some(window),
+                            key,
+                            code,
+                            modifiers,
+                            repeat,
+                            target,
+                        )?
                     }
                 }
                 EventTarget::App => TurnReport::default(),
@@ -9314,18 +9787,22 @@ impl Runtime {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn route_keydown(
         &mut self,
         hit: Option<usize>,
         window: Option<WindowCtx>,
         key: Key,
+        code: Code,
         modifiers: Modifiers,
+        repeat: bool,
+        target: EventTarget,
     ) -> Result<TurnReport, DispatchError> {
         let path = hit
             .map(|element| with_state(|state| state.element_path(element)))
             .unwrap_or_default();
         self.enter_event_phase();
-        let mut key_event = KeyEvent::new(key);
+        let mut key_event = KeyEvent::with_details(key, code, modifiers, repeat, target);
         let mut report = TurnReport::default();
         let mut stopped = false;
 
@@ -9374,17 +9851,16 @@ impl Runtime {
                 }
             }
         }
-        if !stopped && !key_event.is_consumed() && !key_event.prevents_default() {
+        if !stopped
+            && !key_event.is_consumed()
+            && !key_event.prevents_default()
+            && !self.turn_budget_exceeded()
+        {
             self.apply_key_default(hit, window, key, modifiers, &mut report)?;
         }
-        report.set_outcome(key_event.is_consumed(), key_event.prevents_default());
+        report.extend_outcome(key_event.is_consumed(), key_event.prevents_default());
         with_state(|state| state.phase = Phase::Idle);
-        if self
-            .finish_command_changed()
-            .map_err(DispatchError::Command)?
-        {
-            report.mark_changed();
-        }
+        self.finish_turn(&mut report);
         Ok(report)
     }
 
@@ -9400,6 +9876,8 @@ impl Runtime {
         else {
             return Ok(None);
         };
+        let node = with_state(|state| state.elements[element].id);
+        key_event.set_current_target(EventTarget::Node(node));
         let result = invoke_event(event_id, event, |event| match event {
             Event::KeyDown(handler)
             | Event::KeyDownCapture(handler)
@@ -9418,7 +9896,9 @@ impl Runtime {
                 stop = true;
             }
         }
-        Ok(Some(stop || key_event.is_consumed()))
+        Ok(Some(
+            stop || key_event.is_consumed() || self.turn_budget_exceeded(),
+        ))
     }
 
     fn run_window_key_event(
@@ -9436,6 +9916,10 @@ impl Runtime {
         let Some(handler) = handler else {
             return Ok(None);
         };
+        if self.charge_handler() {
+            return Ok(Some(true));
+        }
+        key_event.set_current_target(EventTarget::Window(window));
         let outcome = catch_panic(|| {
             let mut handler = handler.borrow_mut();
             handler(key_event)
@@ -9469,12 +9953,10 @@ impl Runtime {
                 let Some(window) = window else {
                     return Ok(());
                 };
-                let result = if modifiers.shift() {
-                    self.focus_previous_in(window)
-                } else {
-                    self.focus_next_in(window)
-                };
-                result.map_err(|_| DispatchError::TargetClosed)?;
+                let traversed = self
+                    .traverse_focus_in_inner(window, !modifiers.shift())
+                    .map_err(|_| DispatchError::TargetClosed)?;
+                report.absorb(traversed);
             }
             Key::Enter | Key::Space => {
                 let Some(element) = hit else {
@@ -9486,12 +9968,13 @@ impl Runtime {
                         if with_state(|state| {
                             state.has_click_handler(element) || state.is_submit_button(element)
                         }) {
-                            let activated = self.activate_element(element)?;
+                            let activated =
+                                self.activate_element(element, EventSource::Keyboard)?;
                             report.absorb(activated);
                         }
                     }
                     (Key::Enter | Key::Space, "checkbox") => {
-                        let activated = self.activate_element(element)?;
+                        let activated = self.activate_element(element, EventSource::Keyboard)?;
                         report.absorb(activated);
                     }
                     (Key::Enter, "text-input") => {
@@ -9501,7 +9984,8 @@ impl Runtime {
                             let has_submit =
                                 with_state(|state| state.has_event(form, EventKind::Submit));
                             if has_submit {
-                                let submitted = self.submit_node(form_id)?;
+                                let submitted =
+                                    self.submit_node_inner(form_id, EventSource::Keyboard)?;
                                 report.absorb(submitted);
                             }
                         }
@@ -9519,11 +10003,12 @@ impl Runtime {
                     return Ok(());
                 }
                 let id = with_state(|state| state.elements[element].id);
-                if key == Key::Backspace {
-                    self.backspace_node(id)?;
+                let edited = if key == Key::Backspace {
+                    self.backspace_node_inner(id)?
                 } else {
-                    self.delete_forward_node(id)?;
-                }
+                    self.delete_forward_node_inner(id)?
+                };
+                report.absorb(edited);
                 report.mark_changed();
             }
             Key::ArrowLeft
@@ -9593,6 +10078,12 @@ impl Runtime {
             DispatchError::Command(error) => error,
             DispatchError::Panic(panic) => MountError::Panic(panic),
             DispatchError::TargetClosed => MountError::Component("target is closed"),
+            DispatchError::Reentrant => {
+                MountError::Component("a direct primitive cannot run inside an active turn")
+            }
+            DispatchError::BudgetExceeded(_) => {
+                MountError::Component("the turn budget was exceeded")
+            }
         })
     }
 
@@ -9607,6 +10098,8 @@ impl Runtime {
     /// 它仍然派发一次 `on:input`，应用模型保持值的权威；handler 错误与 panic
     /// 进入返回的 turn 报告。
     pub fn input(&mut self, label: &str, value: &str) -> Result<TurnReport, MountError> {
+        self.begin_direct_turn()
+            .map_err(|_| MountError::Component(REENTRANT_TURN))?;
         let target = FindTarget::Label(label.to_owned());
         let state = self.state.clone();
         context::install(&state, || {
@@ -9636,19 +10129,20 @@ impl Runtime {
                 }
                 state.update_local(element, LocalUpdate::Input(value.to_owned()));
             });
-            let outcome = invoke_event(event_id, event, |event| match event {
-                Event::Input(handler) => handler(value.to_owned()),
-                _ => HandlerOutcome::Ok,
-            });
+            let node = with_state(|state| state.elements[element].id);
+            let mut input = InputEvent::new(EventSource::Accessibility, node, value.to_owned());
+            let outcome = invoke_input_event(event_id, event, &mut input);
             let mut report = TurnReport::default();
             let panicked = record_handler_outcome(outcome, &mut report);
+            report.set_outcome(input.is_consumed(), input.prevents_default());
             with_state(|state| state.phase = Phase::Idle);
             if panicked {
                 let _ = self.finish_command();
+                self.drain_turn_state(&mut report);
                 return Ok(report);
             }
-            self.finish_command()?;
             report.mark_changed();
+            self.finish_turn_plain(&mut report);
             Ok(report)
         })
     }
@@ -9674,10 +10168,17 @@ impl Runtime {
         node: NodeId,
         text: &str,
     ) -> Result<TurnReport, DispatchError> {
+        self.begin_direct_turn()?;
         let state = self.state.clone();
         context::install(&state, || {
             let element = with_state(|state| state.element_for_node(node))?;
-            self.apply_text_edit(node, element, NodeOperation::InsertText, Edit::Insert(text))
+            self.apply_text_edit(
+                node,
+                element,
+                NodeOperation::InsertText,
+                Edit::Insert(text),
+                EventSource::Keyboard,
+            )
         })
     }
 
@@ -9691,24 +10192,49 @@ impl Runtime {
         node: NodeId,
         value: &str,
     ) -> Result<TurnReport, DispatchError> {
+        self.begin_direct_turn()?;
         let state = self.state.clone();
         context::install(&state, || {
             let element = with_state(|state| state.element_for_node(node))?;
-            self.apply_text_edit(node, element, NodeOperation::SetValue, Edit::Replace(value))
+            self.apply_text_edit(
+                node,
+                element,
+                NodeOperation::SetValue,
+                Edit::Replace(value),
+                EventSource::Accessibility,
+            )
         })
     }
 
     /// 删除 selection，或 caret 前一个字符；没有可删除内容时是不派发事件的无操作。
     pub fn backspace_node(&mut self, node: NodeId) -> Result<TurnReport, DispatchError> {
+        self.begin_direct_turn()?;
+        self.backspace_node_inner(node)
+    }
+
+    /// Backspace 默认在 Event 阶段复用；重入门禁由外层原语负责。
+    fn backspace_node_inner(&mut self, node: NodeId) -> Result<TurnReport, DispatchError> {
         let state = self.state.clone();
         context::install(&state, || {
             let element = with_state(|state| state.element_for_node(node))?;
-            self.apply_text_edit(node, element, NodeOperation::Backspace, Edit::Backspace)
+            self.apply_text_edit(
+                node,
+                element,
+                NodeOperation::Backspace,
+                Edit::Backspace,
+                EventSource::Keyboard,
+            )
         })
     }
 
     /// 删除 selection，或 caret 后一个字符；没有可删除内容时是不派发事件的无操作。
     pub fn delete_forward_node(&mut self, node: NodeId) -> Result<TurnReport, DispatchError> {
+        self.begin_direct_turn()?;
+        self.delete_forward_node_inner(node)
+    }
+
+    /// Delete 默认在 Event 阶段复用；重入门禁由外层原语负责。
+    fn delete_forward_node_inner(&mut self, node: NodeId) -> Result<TurnReport, DispatchError> {
         let state = self.state.clone();
         context::install(&state, || {
             let element = with_state(|state| state.element_for_node(node))?;
@@ -9717,6 +10243,7 @@ impl Runtime {
                 element,
                 NodeOperation::DeleteForward,
                 Edit::DeleteForward,
+                EventSource::Keyboard,
             )
         })
     }
@@ -9755,6 +10282,7 @@ impl Runtime {
         operation: NodeOperation,
         movement: Movement,
     ) -> Result<TurnReport, DispatchError> {
+        self.begin_direct_turn()?;
         let mut state = self.state.borrow_mut();
         let element = state.element_for_node(node)?;
         state.require_editable_text_input(node, element, operation)?;
@@ -9802,6 +10330,7 @@ impl Runtime {
         element: usize,
         operation: NodeOperation,
         edit: Edit<'_>,
+        source: EventSource,
     ) -> Result<TurnReport, DispatchError> {
         with_state(|state| state.require_editable_text_input(node, element, operation))?;
         let tree = with_state(|state| state.tree_for_element(element));
@@ -9831,6 +10360,7 @@ impl Runtime {
         };
         let Some(outcome) = text_edit::apply(&before.value, caret, selection, edit) else {
             let mut report = TurnReport::default();
+            self.drain_turn_state(&mut report);
             finish_reveal(&mut report, tree, reveal_before.as_ref());
             return Ok(report);
         };
@@ -9849,22 +10379,25 @@ impl Runtime {
         });
         // 事件槽与 Event 阶段必须在 handler panic 时也恢复；panic 撤销这次
         // 尚未结算的本地编辑，handler `Err` 则保留已提交的编辑。
-        let outcome = invoke_event(event_id, event, |event| match event {
-            Event::Input(handler) => handler(new_value),
-            _ => HandlerOutcome::Ok,
-        });
+        let mut input = InputEvent::new(source, node, new_value.clone());
+        let outcome = invoke_input_event(event_id, event, &mut input);
         let mut report = TurnReport::default();
         let panicked = record_handler_outcome(outcome, &mut report);
+        report.set_outcome(input.is_consumed(), input.prevents_default());
         with_state(|state| state.phase = Phase::Idle);
         if panicked {
             with_state(|state| abort_text_dispatch_if_current(state, node, element));
             let _ = self.finish_command();
+            self.drain_turn_state(&mut report);
             finish_reveal(&mut report, tree, reveal_before.as_ref());
             return Ok(report);
         }
         if let Err(error) = self.finish_command() {
             with_state(|state| abort_text_dispatch_if_current(state, node, element));
-            return Err(DispatchError::Command(error));
+            report.push_error(turn_error_from_mount(error));
+            self.drain_turn_state(&mut report);
+            finish_reveal(&mut report, tree, reveal_before.as_ref());
+            return Ok(report);
         }
         // 结算可能卸载这个输入；只有同一个 NodeId 仍是占用者时才夹取偏移。
         with_state(|state| {
@@ -9874,6 +10407,7 @@ impl Runtime {
         });
         self.record_text_edit(node, element, before, kind);
         report.mark_changed();
+        self.drain_turn_state(&mut report);
         finish_reveal(&mut report, tree, reveal_before.as_ref());
         Ok(report)
     }
@@ -9926,6 +10460,7 @@ impl Runtime {
         operation: NodeOperation,
         direction: HistoryDirection,
     ) -> Result<TurnReport, DispatchError> {
+        self.begin_direct_turn()?;
         let state = self.state.clone();
         context::install(&state, || {
             let element = with_state(|state| state.element_for_node(node))?;
@@ -9951,12 +10486,19 @@ impl Runtime {
             });
             let Some(entry) = entry else {
                 let mut report = TurnReport::default();
+                self.drain_turn_state(&mut report);
                 finish_reveal(&mut report, tree, reveal_before.as_ref());
                 return Ok(report);
             };
             let target = match direction {
                 HistoryDirection::Undo => entry.before.clone(),
                 HistoryDirection::Redo => entry.after.clone(),
+            };
+            // 失败时必须恢复的“当前已提交”快照：undo 回到 entry.after，
+            // redo 回到 entry.before。
+            let restore = match direction {
+                HistoryDirection::Undo => entry.after.clone(),
+                HistoryDirection::Redo => entry.before.clone(),
             };
             let (event_id, event) =
                 self.take_node_event(node, element, EventKind::Input, operation)?;
@@ -9977,25 +10519,33 @@ impl Runtime {
                 }
                 state.dispatch_text_edit(element, &target.value, epoch);
             });
-            let panic = invoke_event(event_id, event, |event| {
-                if let Event::Input(handler) = event {
-                    handler(target.value);
-                }
-            })
-            .err();
+            let mut input = InputEvent::new(EventSource::Keyboard, node, target.value.clone());
+            let mut report = TurnReport::default();
+            let failed =
+                record_handler_stop(invoke_input_event(event_id, event, &mut input), &mut report)
+                    || self.turn_budget_exceeded();
+            report.set_outcome(input.is_consumed(), input.prevents_default());
             with_state(|state| state.phase = Phase::Idle);
-            if panic.is_some() {
-                with_state(|state| abort_text_dispatch_if_current(state, node, element));
+            if failed {
+                with_state(|state| {
+                    if state.element_is_current(element, node) {
+                        abort_text_dispatch(state, element);
+                        if let LocalState::TextInput(editor) = state.element_local_mut(element) {
+                            editor.restore_dispatch(&restore);
+                        }
+                    }
+                });
             }
-            if panic.is_none()
-                && let Err(error) = self.finish_command()
-            {
-                with_state(|state| abort_text_dispatch_if_current(state, node, element));
-                return Err(DispatchError::Command(error));
+            if let Err(error) = self.finish_command() {
+                report.push_error(turn_error_from_mount(error));
+                if !failed {
+                    with_state(|state| abort_text_dispatch_if_current(state, node, element));
+                }
             }
-            if let Some(panic) = panic {
-                let _ = self.finish_command();
-                return Err(DispatchError::Panic(panic));
+            if failed {
+                self.drain_turn_state(&mut report);
+                finish_reveal(&mut report, tree, reveal_before.as_ref());
+                return Ok(report);
             }
             with_state(|state| {
                 if !state.element_is_current(element, node) {
@@ -10018,15 +10568,15 @@ impl Runtime {
                     }
                 }
             });
-            let mut report = TurnReport::default();
             report.mark_changed();
+            self.drain_turn_state(&mut report);
             finish_reveal(&mut report, tree, reveal_before.as_ref());
             Ok(report)
         })
     }
 
     /// 开始一次本地 composition；preedit 只进入编辑器，不写入模型。
-    pub fn compose_start(&mut self, label: &str) -> Result<(), MountError> {
+    pub fn compose_start(&mut self, label: &str) -> Result<TurnReport, MountError> {
         self.dispatch_label(
             FindTarget::Label(label.to_owned()),
             "composition target not found",
@@ -10036,7 +10586,10 @@ impl Runtime {
     }
 
     /// 按 Node ID 开始组合；目标必须是文本输入且未在组合中。
-    pub fn compose_start_node(&mut self, node: NodeId) -> Result<(), DispatchError> {
+    ///
+    /// handler 的 `Err` 与 panic 进入返回的报告；本地组合状态已经建立。
+    pub fn compose_start_node(&mut self, node: NodeId) -> Result<TurnReport, DispatchError> {
+        self.begin_direct_turn()?;
         let state = self.state.clone();
         context::install(&state, || {
             let element = with_state(|state| state.element_for_node(node))?;
@@ -10065,24 +10618,33 @@ impl Runtime {
             })?;
             with_state(|state| state.mark_element_changed(element));
             self.enter_event_phase();
-            let panic = self
-                .dispatch_element_event(element, EventKind::CompositionStart, |event| {
-                    if let Event::CompositionStart(handler) = event {
-                        handler(CompositionEvent::new(
-                            CompositionPhase::Start,
-                            String::new(),
-                            caret,
-                            selection,
-                        ));
+            let mut payload = CompositionEvent::new(
+                node,
+                CompositionPhase::Start,
+                String::new(),
+                caret,
+                selection,
+            );
+            let mut report = TurnReport::default();
+            if let Some(outcome) =
+                self.invoke_element_outcome(element, EventKind::CompositionStart, |event| {
+                    match event {
+                        Event::CompositionStart(handler) => handler(&mut payload),
+                        _ => HandlerOutcome::Ok,
                     }
                 })
-                .err();
-            self.finish_event(panic)
+            {
+                record_handler_outcome(outcome, &mut report);
+            }
+            report.set_outcome(payload.is_consumed(), payload.prevents_default());
+            with_state(|state| state.phase = Phase::Idle);
+            self.finish_turn_plain(&mut report);
+            Ok(report)
         })
     }
 
     /// 更新编辑器本地的 preedit；caret 跟随 preedit 末尾，模型保持不变。
-    pub fn compose_update(&mut self, label: &str, preedit: &str) -> Result<(), MountError> {
+    pub fn compose_update(&mut self, label: &str, preedit: &str) -> Result<TurnReport, MountError> {
         self.dispatch_label(
             FindTarget::Label(label.to_owned()),
             "composition target not found",
@@ -10096,7 +10658,8 @@ impl Runtime {
         &mut self,
         node: NodeId,
         preedit: &str,
-    ) -> Result<(), DispatchError> {
+    ) -> Result<TurnReport, DispatchError> {
+        self.begin_direct_turn()?;
         let state = self.state.clone();
         context::install(&state, || {
             let element = with_state(|state| state.element_for_node(node))?;
@@ -10123,19 +10686,28 @@ impl Runtime {
             })?;
             with_state(|state| state.mark_element_changed(element));
             self.enter_event_phase();
-            let panic = self
-                .dispatch_element_event(element, EventKind::CompositionUpdate, |event| {
-                    if let Event::CompositionUpdate(handler) = event {
-                        handler(CompositionEvent::new(
-                            CompositionPhase::Update,
-                            preedit.to_owned(),
-                            caret,
-                            selection,
-                        ));
+            let mut payload = CompositionEvent::new(
+                node,
+                CompositionPhase::Update,
+                preedit.to_owned(),
+                caret,
+                selection,
+            );
+            let mut report = TurnReport::default();
+            if let Some(outcome) =
+                self.invoke_element_outcome(element, EventKind::CompositionUpdate, |event| {
+                    match event {
+                        Event::CompositionUpdate(handler) => handler(&mut payload),
+                        _ => HandlerOutcome::Ok,
                     }
                 })
-                .err();
-            self.finish_event(panic)
+            {
+                record_handler_outcome(outcome, &mut report);
+            }
+            report.set_outcome(payload.is_consumed(), payload.prevents_default());
+            with_state(|state| state.phase = Phase::Idle);
+            self.finish_turn_plain(&mut report);
+            Ok(report)
         })
     }
 
@@ -10155,6 +10727,7 @@ impl Runtime {
         node: NodeId,
         text: &str,
     ) -> Result<TurnReport, DispatchError> {
+        self.begin_direct_turn()?;
         let state = self.state.clone();
         context::install(&state, || {
             let element = with_state(|state| state.element_for_node(node))?;
@@ -10171,11 +10744,6 @@ impl Runtime {
             self.enter_event_phase();
             let (before, mut report) = match self.commit_composition(node, element, text) {
                 Ok(done) => done,
-                Err(DispatchError::Panic(panic)) => {
-                    with_state(|state| abort_text_dispatch_if_current(state, node, element));
-                    let _ = self.finish_command();
-                    return Err(DispatchError::Panic(panic));
-                }
                 Err(error) => {
                     with_state(|state| state.phase = Phase::Idle);
                     return Err(error);
@@ -10194,13 +10762,14 @@ impl Runtime {
                 self.record_text_edit(node, element, before, EditKind::Boundary);
             }
             report.mark_changed();
+            self.drain_turn_state(&mut report);
             finish_reveal(&mut report, tree, probe_before.as_ref());
             Ok(report)
         })
     }
 
     /// 取消组合：丢弃 preedit，恢复组合开始时的 caret/selection，不派发 `on:input`。
-    pub fn compose_cancel(&mut self, label: &str) -> Result<(), MountError> {
+    pub fn compose_cancel(&mut self, label: &str) -> Result<TurnReport, MountError> {
         self.dispatch_label(
             FindTarget::Label(label.to_owned()),
             "composition target not found",
@@ -10210,7 +10779,8 @@ impl Runtime {
     }
 
     /// 按 Node ID 取消组合；取消不写模型，因此组合期间被禁用的输入仍可取消。
-    pub fn compose_cancel_node(&mut self, node: NodeId) -> Result<(), DispatchError> {
+    pub fn compose_cancel_node(&mut self, node: NodeId) -> Result<TurnReport, DispatchError> {
+        self.begin_direct_turn()?;
         let state = self.state.clone();
         context::install(&state, || {
             // 取消组合是模态提示下的清理动作，不写入模型；挂起的父窗口也必须允许。
@@ -10220,14 +10790,14 @@ impl Runtime {
                 state.require_composing_text_input(node, element, NodeOperation::CompositionCancel)
             })?;
             self.enter_event_phase();
-            match self.cancel_composition(node, element) {
-                Ok(()) => self.finish_event(None),
-                Err(DispatchError::Panic(panic)) => self.finish_event(Some(panic)),
-                Err(error) => {
-                    with_state(|state| state.phase = Phase::Idle);
-                    Err(error)
-                }
+            if let Err(error) = self.cancel_composition(node, element) {
+                with_state(|state| state.phase = Phase::Idle);
+                return Err(error);
             }
+            let mut report = TurnReport::default();
+            with_state(|state| state.phase = Phase::Idle);
+            self.finish_turn_plain(&mut report);
+            Ok(report)
         })
     }
 
@@ -10277,39 +10847,31 @@ impl Runtime {
             Ok::<_, DispatchError>((before, new_text, next_caret))
         })?;
         with_state(|state| state.dispatch_text_edit(element, &new_text, epoch));
-        if let Err(panic) =
-            self.dispatch_element_event(element, EventKind::CompositionEnd, |event| {
-                if let Event::CompositionEnd(handler) = event {
-                    handler(CompositionEvent::new(
-                        CompositionPhase::End,
-                        text.to_owned(),
-                        caret,
-                        None,
-                    ));
-                }
-            })
-        {
-            with_state(|state| state.phase = Phase::Idle);
-            return Err(DispatchError::Panic(panic));
-        }
         let mut report = TurnReport::default();
+        let mut end_payload =
+            CompositionEvent::new(node, CompositionPhase::End, text.to_owned(), caret, None);
+        let end_stopped =
+            match self.invoke_element_outcome(element, EventKind::CompositionEnd, |event| {
+                match event {
+                    Event::CompositionEnd(handler) => handler(&mut end_payload),
+                    _ => HandlerOutcome::Ok,
+                }
+            }) {
+                Some(outcome) => record_handler_stop(outcome, &mut report),
+                None => false,
+            };
+        report.extend_outcome(end_payload.is_consumed(), end_payload.prevents_default());
+        if end_stopped {
+            return Ok((Some(before), report));
+        }
         if let Some((event_id, event)) =
             with_state(|state| state.take_element_event(element, EventKind::Input))
         {
-            let outcome = invoke_event(event_id, event, |event| match event {
-                Event::Input(handler) => handler(new_text),
-                _ => HandlerOutcome::Ok,
-            });
-            match outcome {
-                Ok(HandlerOutcome::Ok) => {}
-                Ok(HandlerOutcome::Err(error)) => {
-                    report.push_error(TurnError::HandlerFailed(error));
-                }
-                Err(panic) => {
-                    with_state(|state| state.phase = Phase::Idle);
-                    return Err(DispatchError::Panic(panic));
-                }
-            }
+            let mut input = InputEvent::new(EventSource::Keyboard, node, new_text.clone());
+            let stop =
+                record_handler_stop(invoke_input_event(event_id, event, &mut input), &mut report);
+            report.extend_outcome(input.is_consumed(), input.prevents_default());
+            let _ = stop;
         }
         Ok((Some(before), report))
     }
@@ -10335,17 +10897,24 @@ impl Runtime {
             Ok((composition.preedit, editor.caret, editor.selection))
         })?;
         with_state(|state| state.mark_element_changed(element));
-        self.dispatch_element_event(element, EventKind::CompositionCancel, |event| {
-            if let Event::CompositionCancel(handler) = event {
-                handler(CompositionEvent::new(
-                    CompositionPhase::Cancel,
-                    discarded.clone(),
-                    caret,
-                    selection,
-                ));
-            }
-        })
-        .map_err(DispatchError::Panic)
+        let mut payload = CompositionEvent::new(
+            node,
+            CompositionPhase::Cancel,
+            discarded.clone(),
+            caret,
+            selection,
+        );
+        if let Some(outcome) = self.invoke_element_outcome(
+            element,
+            EventKind::CompositionCancel,
+            |event| match event {
+                Event::CompositionCancel(handler) => handler(&mut payload),
+                _ => HandlerOutcome::Ok,
+            },
+        ) {
+            self.record_pending_handler(outcome);
+        }
+        Ok(())
     }
 
     pub fn change(&mut self, label: &str, value: bool) -> Result<TurnReport, MountError> {
@@ -10363,6 +10932,17 @@ impl Runtime {
     /// 在 flush 后按 `checked` 绑定对齐，非受控的本地值由呈现层继续报告。
     /// 自身或祖先禁用时整次派发为空操作。
     pub fn change_node(&mut self, node: NodeId, value: bool) -> Result<TurnReport, DispatchError> {
+        self.begin_direct_turn()?;
+        self.change_node_inner(node, value, EventSource::Accessibility)
+    }
+
+    /// 直接 change 的内部实现；click 默认在 Event 阶段复用，不再做重入门禁。
+    fn change_node_inner(
+        &mut self,
+        node: NodeId,
+        value: bool,
+        source: EventSource,
+    ) -> Result<TurnReport, DispatchError> {
         let state = self.state.clone();
         context::install(&state, || {
             let element = with_state(|state| state.element_for_node(node))?;
@@ -10382,37 +10962,28 @@ impl Runtime {
                 });
             };
             let event = with_state(|state| state.take_element_event(element, EventKind::Change));
+            let mut change = ChangeEvent::new(source, node, value);
             let mut report = TurnReport::default();
-            let mut apply = true;
             if let Some((event_id, event)) = event {
                 with_state(|state| {
                     state.phase = Phase::Event;
                     state.fault = None;
                     state.write_error = None;
                 });
-                let outcome = invoke_event(event_id, event, |event| match event {
-                    Event::Change(handler) => handler(value),
-                    _ => HandlerOutcome::Ok,
-                });
+                let outcome = invoke_change_event(event_id, event, &mut change);
+                let stop = record_handler_stop(outcome, &mut report) || self.turn_budget_exceeded();
                 with_state(|state| state.phase = Phase::Idle);
-                match outcome {
-                    Ok(HandlerOutcome::Ok) => {}
-                    Ok(HandlerOutcome::Err(error)) => {
-                        report.push_error(TurnError::HandlerFailed(error));
-                        apply = false;
-                    }
-                    Err(panic) => {
-                        // handler 失败时 proposed 值不落地；已提交的模型写入仍由
-                        // 收尾 flush 处理。
-                        let _ = self.finish_command();
-                        return Err(DispatchError::Panic(panic));
-                    }
+                if !stop && !change.is_consumed() && !change.prevents_default() {
+                    with_state(|state| state.update_local(element, LocalUpdate::Change(value)));
                 }
-            }
-            if apply {
+            } else if !change.is_consumed()
+                && !change.prevents_default()
+                && !self.turn_budget_exceeded()
+            {
                 with_state(|state| state.update_local(element, LocalUpdate::Change(value)));
             }
-            self.finish_command().map_err(DispatchError::Command)?;
+            report.set_outcome(change.is_consumed(), change.prevents_default());
+            self.finish_turn_plain(&mut report);
             // 结算可能把行移出当前过滤或卸载整棵子树；只有同一个 NodeId 仍
             // 挂载时才读取本地状态，否则槽位可能已被复用。
             let after = with_state(|state| {
@@ -10443,6 +11014,16 @@ impl Runtime {
 
     /// 按 Node ID 派发一次 submit；handler 的 `Err`/panic 进入 turn 报告。
     pub fn submit_node(&mut self, node: NodeId) -> Result<TurnReport, DispatchError> {
+        self.begin_direct_turn()?;
+        self.submit_node_inner(node, EventSource::Accessibility)
+    }
+
+    /// 直接 submit 的内部实现；click/keydown 默认在 Event 阶段复用。
+    fn submit_node_inner(
+        &mut self,
+        node: NodeId,
+        source: EventSource,
+    ) -> Result<TurnReport, DispatchError> {
         let state = self.state.clone();
         context::install(&state, || {
             let element = with_state(|state| state.element_for_node(node))?;
@@ -10453,7 +11034,7 @@ impl Runtime {
             let reveal_before = tree.map(|tree| with_state(|state| state.reveal_probe(tree)));
             let (event_id, event) =
                 self.take_node_event(node, element, EventKind::Submit, NodeOperation::Submit)?;
-            let mut submit_event = SubmitEvent::default();
+            let mut submit_event = SubmitEvent::new(node, source);
             let outcome = invoke_event(event_id, event, |event| match event {
                 Event::Submit(handler) => handler(&mut submit_event),
                 _ => HandlerOutcome::Ok,
@@ -10461,13 +11042,8 @@ impl Runtime {
             let mut report = TurnReport::default();
             record_handler_outcome(outcome, &mut report);
             with_state(|state| state.phase = Phase::Idle);
-            if self
-                .finish_command_changed()
-                .map_err(DispatchError::Command)?
-            {
-                report.mark_changed();
-            }
-            report.set_outcome(submit_event.is_consumed(), submit_event.is_prevented());
+            self.finish_turn(&mut report);
+            report.extend_outcome(submit_event.is_consumed(), submit_event.is_prevented());
             finish_reveal(&mut report, tree, reveal_before.as_ref());
             Ok(report)
         })
@@ -10488,6 +11064,12 @@ impl Runtime {
     /// 按 Node ID 派发 keydown；组合中的 Enter/Escape 仍然优先被编辑器消费。
     /// 已解析目标的直接 keydown：只运行节点自己的普通 handler，不回溯祖先。
     pub fn keydown_node(&mut self, node: NodeId, key: Key) -> Result<TurnReport, DispatchError> {
+        self.begin_direct_turn()?;
+        self.keydown_node_inner(node, key)
+    }
+
+    /// keydown 的本地处理；路由默认与排队 Intent 在 turn 内复用。
+    fn keydown_node_inner(&mut self, node: NodeId, key: Key) -> Result<TurnReport, DispatchError> {
         let state = self.state.clone();
         context::install(&state, || {
             let element = with_state(|state| state.element_for_node(node))?;
@@ -10500,20 +11082,14 @@ impl Runtime {
                 let mut report = TurnReport::default();
                 if key == Key::Escape {
                     self.enter_event_phase();
-                    match self.cancel_composition(node, element) {
-                        Ok(()) => {}
-                        Err(DispatchError::Panic(panic)) => {
-                            report.push_error(TurnError::HandlerPanicked(panic));
-                        }
-                        Err(error) => {
-                            with_state(|state| state.phase = Phase::Idle);
-                            return Err(error);
-                        }
+                    if let Err(error) = self.cancel_composition(node, element) {
+                        with_state(|state| state.phase = Phase::Idle);
+                        return Err(error);
                     }
                 }
                 report.set_outcome(true, false);
                 with_state(|state| state.phase = Phase::Idle);
-                self.finish_command().map_err(DispatchError::Command)?;
+                self.finish_turn_plain(&mut report);
                 finish_reveal(&mut report, tree, reveal_before.as_ref());
                 return Ok(report);
             }
@@ -10541,24 +11117,25 @@ impl Runtime {
                 key_event.prevents_default(),
             );
             with_state(|state| state.phase = Phase::Idle);
-            self.finish_command().map_err(DispatchError::Command)?;
+            self.finish_turn_plain(&mut report);
             finish_reveal(&mut report, tree, reveal_before.as_ref());
             Ok(report)
         })
     }
 
     /// headless 焦点命令：先对旧目标派发一次 blur，再对新目标派发一次 focus。
-    pub fn focus(&mut self, label: &str) -> Result<(), MountError> {
+    pub fn focus(&mut self, label: &str) -> Result<TurnReport, MountError> {
         self.dispatch_label(
             FindTarget::Label(label.to_owned()),
             "focus target not found",
             "focus target is not focusable",
-            move |runtime, node| runtime.focus_node(node).map(|_| ()),
+            Self::focus_node,
         )
     }
 
     /// 按 Node ID 移动焦点；不可聚焦的目标返回 `WrongKind`，焦点保持不变。
     pub fn focus_node(&mut self, node: NodeId) -> Result<TurnReport, DispatchError> {
+        self.begin_direct_turn()?;
         let state = self.state.clone();
         context::install(&state, || {
             let element = with_state(|state| state.element_for_node(node))?;
@@ -10574,6 +11151,7 @@ impl Runtime {
             self.move_focus(tree, Some(element))
                 .map_err(DispatchError::Command)?;
             let mut report = TurnReport::default();
+            self.finish_turn_plain(&mut report);
             finish_reveal(&mut report, Some(tree), Some(&before));
             // 目标已经是焦点时 move_focus 不派发 handler、不推进 revision；
             // 只有焦点真的换了才报告 changed。
@@ -10587,7 +11165,8 @@ impl Runtime {
     /// 按 Node ID 清除焦点：只有该元素仍是当前焦点时才清空，绝不改焦到其他元素。
     ///
     /// 已提交但未持有焦点的元素返回 `Rejected`；迟到的原生 blur 不会命中新的焦点。
-    pub fn blur_node(&mut self, node: NodeId) -> Result<(), DispatchError> {
+    pub fn blur_node(&mut self, node: NodeId) -> Result<TurnReport, DispatchError> {
+        self.begin_direct_turn()?;
         let state = self.state.clone();
         context::install(&state, || {
             let element = with_state(|state| state.element_for_node(node))?;
@@ -10601,47 +11180,58 @@ impl Runtime {
                     reason: "node is not focused",
                 });
             }
-            self.move_focus(tree, None).map_err(DispatchError::Command)
+            self.move_focus(tree, None)
+                .map_err(DispatchError::Command)?;
+            let mut report = TurnReport::default();
+            self.finish_turn_plain(&mut report);
+            Ok(report)
         })
     }
 
     /// 清空焦点窗口的焦点；没有当前目标时不派发事件。
-    pub fn blur(&mut self) -> Result<(), MountError> {
+    pub fn blur(&mut self) -> Result<TurnReport, MountError> {
+        self.begin_direct_turn()
+            .map_err(|_| MountError::Component(REENTRANT_TURN))?;
         let state = self.state.clone();
         context::install(&state, || {
+            let mut report = TurnReport::default();
             let Some(tree) = with_state(|state| state.active_tree_key()) else {
-                return Ok(());
+                return Ok(report);
             };
-            self.move_focus(tree, None)
+            self.move_focus(tree, None)?;
+            self.finish_turn_plain(&mut report);
+            Ok(report)
         })
     }
 
     /// Tab / 方向键的向前遍历；到末尾后回到第一个可聚焦控件。
-    pub fn focus_next(&mut self) -> Result<(), MountError> {
+    pub fn focus_next(&mut self) -> Result<TurnReport, MountError> {
         self.traverse_focus(true)
     }
 
     /// Tab / 方向键的向后遍历；到开头后回到最后一个可聚焦控件。
-    pub fn focus_previous(&mut self) -> Result<(), MountError> {
+    pub fn focus_previous(&mut self) -> Result<TurnReport, MountError> {
         self.traverse_focus(false)
     }
 
     /// 在指定窗口内向前遍历焦点；焦点不会越过窗口边界。
     ///
     /// 窗口没有可聚焦控件时什么也不做；原生输入不应因为一个空窗口而报错。
-    pub fn focus_next_in(&mut self, window: WindowCtx) -> Result<(), WindowError> {
+    pub fn focus_next_in(&mut self, window: WindowCtx) -> Result<TurnReport, WindowError> {
         self.traverse_focus_in(window, true)
     }
 
     /// 在指定窗口内向后遍历焦点；焦点不会越过窗口边界。
     ///
     /// 窗口没有可聚焦控件时什么也不做。
-    pub fn focus_previous_in(&mut self, window: WindowCtx) -> Result<(), WindowError> {
+    pub fn focus_previous_in(&mut self, window: WindowCtx) -> Result<TurnReport, WindowError> {
         self.traverse_focus_in(window, false)
     }
 
     /// 只清除指定窗口的焦点；其他窗口的焦点保持不变。
-    pub fn blur_in(&mut self, window: WindowCtx) -> Result<(), WindowError> {
+    pub fn blur_in(&mut self, window: WindowCtx) -> Result<TurnReport, WindowError> {
+        self.begin_direct_turn()
+            .map_err(|_| WindowError::State(REENTRANT_TURN))?;
         let state = self.state.clone();
         if window.runtime != state.borrow().id {
             return Err(WindowError::WrongRuntime);
@@ -10651,11 +11241,16 @@ impl Runtime {
                 return Err(WindowError::Stale);
             }
             self.move_focus(TreeSlot::Window(window.key), None)
-                .map_err(WindowError::Mount)
+                .map_err(WindowError::Mount)?;
+            let mut report = TurnReport::default();
+            self.finish_turn_plain(&mut report);
+            Ok(report)
         })
     }
 
-    fn traverse_focus(&mut self, forward: bool) -> Result<(), MountError> {
+    fn traverse_focus(&mut self, forward: bool) -> Result<TurnReport, MountError> {
+        self.begin_direct_turn()
+            .map_err(|_| MountError::Component(REENTRANT_TURN))?;
         let state = self.state.clone();
         context::install(&state, || {
             let tree = with_state(|state| state.active_tree_key())
@@ -10664,7 +11259,22 @@ impl Runtime {
         })
     }
 
-    fn traverse_focus_in(&mut self, window: WindowCtx, forward: bool) -> Result<(), WindowError> {
+    fn traverse_focus_in(
+        &mut self,
+        window: WindowCtx,
+        forward: bool,
+    ) -> Result<TurnReport, WindowError> {
+        self.begin_direct_turn()
+            .map_err(|_| WindowError::State(REENTRANT_TURN))?;
+        self.traverse_focus_in_inner(window, forward)
+    }
+
+    /// Tab 默认在 Event 阶段复用；重入门禁由外层原语负责。
+    fn traverse_focus_in_inner(
+        &mut self,
+        window: WindowCtx,
+        forward: bool,
+    ) -> Result<TurnReport, WindowError> {
         let state = self.state.clone();
         if window.runtime != state.borrow().id {
             return Err(WindowError::WrongRuntime);
@@ -10675,14 +11285,18 @@ impl Runtime {
             }
             let tree = TreeSlot::Window(window.key);
             if with_state(|state| state.focus_order(tree)).is_empty() {
-                return Ok(());
+                return Ok(TurnReport::default());
             }
             self.traverse_focus_for(tree, forward)
                 .map_err(WindowError::Mount)
         })
     }
 
-    fn traverse_focus_for(&mut self, tree: TreeSlot, forward: bool) -> Result<(), MountError> {
+    fn traverse_focus_for(
+        &mut self,
+        tree: TreeSlot,
+        forward: bool,
+    ) -> Result<TurnReport, MountError> {
         let order = with_state(|state| state.focus_order(tree));
         if order.is_empty() {
             return Err(MountError::Component("no focusable target"));
@@ -10696,7 +11310,10 @@ impl Runtime {
             (false, Some(index)) => index - 1,
             (false, None) => order.len() - 1,
         };
-        self.move_focus(tree, Some(order[index]))
+        self.move_focus(tree, Some(order[index]))?;
+        let mut report = TurnReport::default();
+        self.finish_turn_plain(&mut report);
+        Ok(report)
     }
 
     fn move_focus(&mut self, tree: TreeSlot, target: Option<usize>) -> Result<(), MountError> {
@@ -10712,57 +11329,84 @@ impl Runtime {
             state.fault = None;
             state.write_error = None;
         });
-        let mut panic = None;
+        let mut panicked = false;
         if let Some(old) = current {
             with_state(|state| state.set_focused_in(tree, None));
-            if with_state(|state| state.element_is_mounted(old))
-                && let Err(info) = self.fire_blur(old, FocusCause::Command)
-            {
-                panic = Some(info);
+            if with_state(|state| state.element_is_mounted(old)) {
+                panicked = self.fire_blur(old, FocusCause::Command);
             }
         }
         if let Some(target) = target {
             with_state(|state| state.set_focused_in(tree, Some(target)));
-            if panic.is_none()
-                && let Err(info) = self.fire_focus(target, FocusCause::Command)
-            {
-                panic = Some(info);
+            if !panicked {
+                self.fire_focus(target, FocusCause::Command);
             }
         }
         with_state(|state| state.phase = Phase::Idle);
-        self.finish_event_mount(panic)
+        self.finish_command()
     }
 
-    fn fire_blur(&mut self, element: usize, cause: FocusCause) -> Result<(), PanicInfo> {
-        self.dispatch_element_event(element, EventKind::Blur, |event| {
-            if let Event::Blur(handler) = event {
-                handler(BlurEvent::new(cause));
-            }
-        })
+    /// 运行 blur 处理器；`Err`/panic 暂存进当前 turn，返回是否 panic。
+    ///
+    /// 焦点结算发生在 flush 内，没有独立报告可写，因此结果由外层 turn 的
+    /// `finish_turn*` 统一并入 `TurnReport.errors`。
+    fn fire_blur(&mut self, element: usize, cause: FocusCause) -> bool {
+        let Some((id, mut event)) =
+            with_state(|state| state.take_element_event(element, EventKind::Blur))
+        else {
+            return false;
+        };
+        let node = with_state(|state| state.elements[element].id);
+        let mut payload = BlurEvent::new(node, cause);
+        let outcome = if self.charge_handler() {
+            Ok(HandlerOutcome::Ok)
+        } else {
+            catch_panic(|| match &mut event {
+                Event::Blur(handler) => handler(&mut payload),
+                _ => HandlerOutcome::Ok,
+            })
+        };
+        with_state(|state| state.put_event(id, event));
+        self.record_pending_handler(outcome)
     }
 
-    fn fire_focus(&mut self, element: usize, cause: FocusCause) -> Result<(), PanicInfo> {
-        self.dispatch_element_event(element, EventKind::Focus, |event| {
-            if let Event::Focus(handler) = event {
-                handler(FocusEvent::new(cause));
-            }
-        })
+    fn fire_focus(&mut self, element: usize, cause: FocusCause) -> bool {
+        let Some((id, mut event)) =
+            with_state(|state| state.take_element_event(element, EventKind::Focus))
+        else {
+            return false;
+        };
+        let node = with_state(|state| state.elements[element].id);
+        let mut payload = FocusEvent::new(node, cause);
+        let outcome = if self.charge_handler() {
+            Ok(HandlerOutcome::Ok)
+        } else {
+            catch_panic(|| match &mut event {
+                Event::Focus(handler) => handler(&mut payload),
+                _ => HandlerOutcome::Ok,
+            })
+        };
+        with_state(|state| state.put_event(id, event));
+        self.record_pending_handler(outcome)
     }
 
-    /// 取事件槽、运行 handler、无条件放回；panic 收敛为诊断。
-    fn dispatch_element_event(
+    /// 取事件槽、运行 handler、无条件放回；handler 结果与 panic 一起返回。
+    ///
+    /// 预算耗尽时跳过 handler，由 turn 收尾报告 `BudgetExceeded`。
+    fn invoke_element_outcome(
         &mut self,
         element: usize,
         kind: EventKind,
-        invoke: impl FnOnce(&mut Event),
-    ) -> Result<(), PanicInfo> {
-        let Some((id, mut event)) = with_state(|state| state.take_element_event(element, kind))
-        else {
-            return Ok(());
+        invoke: impl FnOnce(&mut Event) -> HandlerOutcome,
+    ) -> Option<Result<HandlerOutcome, PanicInfo>> {
+        let (id, mut event) = with_state(|state| state.take_element_event(element, kind))?;
+        let outcome = if self.charge_handler() {
+            Ok(HandlerOutcome::Ok)
+        } else {
+            catch_panic(|| invoke(&mut event))
         };
-        let outcome = catch_panic(|| invoke(&mut event));
         with_state(|state| state.put_event(id, event));
-        outcome
+        Some(outcome)
     }
 
     fn enter_event_phase(&self) {
@@ -10771,6 +11415,95 @@ impl Runtime {
             state.fault = None;
             state.write_error = None;
         });
+    }
+
+    /// 直接原语入口：turn 内重入返回 [`DispatchError::Reentrant`]，Idle 入口
+    /// 清零本 turn 的预算计数。条目错误在 turn 内由 `finish_turn*` 汇总。
+    fn begin_direct_turn(&self) -> Result<(), DispatchError> {
+        let mut state = self.state.borrow_mut();
+        if matches!(
+            state.phase,
+            Phase::Event | Phase::Delivery | Phase::Binding | Phase::Memo
+        ) {
+            return Err(DispatchError::Reentrant);
+        }
+        state.begin_turn();
+        Ok(())
+    }
+
+    /// 为一次处理器调用计数；超过 `TurnBudget::DEFAULT.handlers` 时返回 true，
+    /// 调用方停止本事件的后续处理器与默认动作。
+    fn charge_handler(&self) -> bool {
+        charge_handler_slot()
+    }
+
+    /// 暂存没有报告可写的处理器结果；返回是否发生 panic。
+    fn record_pending_handler(&self, outcome: Result<HandlerOutcome, PanicInfo>) -> bool {
+        with_state(|state| match outcome {
+            Ok(HandlerOutcome::Ok) => false,
+            Ok(HandlerOutcome::Err(error)) => {
+                state
+                    .turn
+                    .pending_errors
+                    .push(TurnError::HandlerFailed(error));
+                false
+            }
+            Err(panic) => {
+                state
+                    .turn
+                    .pending_errors
+                    .push(TurnError::HandlerPanicked(panic));
+                true
+            }
+        })
+    }
+
+    /// 本 turn 的处理器或请求预算是否已耗尽。
+    fn turn_budget_exceeded(&self) -> bool {
+        with_state(|state| state.turn.budget_exceeded)
+    }
+
+    /// 把本 turn 暂存的处理器错误与预算超限并入报告。
+    fn drain_turn_state(&self, report: &mut TurnReport) {
+        let (errors, exceeded) = with_state(|state| {
+            (
+                std::mem::take(&mut state.turn.pending_errors),
+                std::mem::take(&mut state.turn.budget_exceeded),
+            )
+        });
+        report.errors.extend(errors);
+        if exceeded {
+            report.push_error(TurnError::BudgetExceeded(TurnBudget::DEFAULT));
+        }
+    }
+
+    /// 按 FIFO 执行处理器内排队的 Intent；嵌套 turn 不再递归 drain，
+    /// 保证先排队的先运行。目标在排队后失效是正常竞态，不产生错误。
+    fn drain_queued_intents(&mut self, report: &mut TurnReport) {
+        let already = with_state(|state| {
+            let was = state.turn.draining_intents;
+            state.turn.draining_intents = true;
+            was
+        });
+        if already {
+            return;
+        }
+        while let Some(intent) = with_state(|state| state.turn.queued_intents.pop_front()) {
+            match self.dispatch_intent_now(intent) {
+                Ok(nested) => report.absorb(nested),
+                Err(
+                    DispatchError::UnknownNode(_)
+                    | DispatchError::StaleNode(_)
+                    | DispatchError::Hidden(_)
+                    | DispatchError::Suspended(_)
+                    | DispatchError::TargetClosed,
+                ) => {}
+                Err(error) => report.push_error(TurnError::HandlerFailed(HandlerError::new(
+                    format!("queued intent rejected: {error}"),
+                ))),
+            }
+        }
+        with_state(|state| state.turn.draining_intents = false);
     }
 
     fn leave_event_phase(&mut self) -> Result<(), MountError> {
@@ -10783,6 +11516,26 @@ impl Runtime {
         self.refresh_internal()
     }
 
+    /// 批次 flush 后把错误收进同一个 turn 报告；公开原语不再把它变成
+    /// 会话级 `DispatchError::Command`。
+    fn finish_turn(&mut self, report: &mut TurnReport) {
+        match self.finish_command_changed() {
+            Ok(true) => report.mark_changed(),
+            Ok(false) => {}
+            Err(error) => report.push_error(turn_error_from_mount(error)),
+        }
+        self.drain_turn_state(report);
+        self.drain_queued_intents(report);
+    }
+
+    fn finish_turn_plain(&mut self, report: &mut TurnReport) {
+        if let Err(error) = self.finish_command() {
+            report.push_error(turn_error_from_mount(error));
+        }
+        self.drain_turn_state(report);
+        self.drain_queued_intents(report);
+    }
+
     /// 收尾并报告本次 flush 是否推进了任一树的 revision。
     ///
     /// `changed` 必须来自实际提交，而不是命令类型：空 click、无移动的 Tab
@@ -10792,29 +11545,6 @@ impl Runtime {
         let before = with_state(|state| state.next_tree_revision);
         self.refresh_internal()?;
         Ok(with_state(|state| state.next_tree_revision) != before)
-    }
-
-    /// 事件 handler 结束后的统一收尾。
-    ///
-    /// panic 是主诊断：先把 phase 恢复为 Idle，并尽力刷新 panic 前已经提交的
-    /// 写入；次生刷新错误不覆盖 panic。事件槽已经由 `invoke_event` 放回。
-    fn finish_event(&mut self, panic: Option<PanicInfo>) -> Result<(), DispatchError> {
-        let Some(panic) = panic else {
-            return self.finish_command().map_err(DispatchError::Command);
-        };
-        with_state(|state| state.phase = Phase::Idle);
-        let _ = self.finish_command();
-        Err(DispatchError::Panic(panic))
-    }
-
-    /// [`Runtime::finish_event`] 的 `MountError` 版本；label 助手直接返回它。
-    fn finish_event_mount(&mut self, panic: Option<PanicInfo>) -> Result<(), MountError> {
-        let Some(panic) = panic else {
-            return self.finish_command();
-        };
-        with_state(|state| state.phase = Phase::Idle);
-        let _ = self.finish_command();
-        Err(MountError::Panic(panic))
     }
 
     /// 没有挂载界面时的命令收尾：只报告 handler 的 fault 与写错误。
@@ -13465,10 +14195,13 @@ mod binding_tests {
         let _ = app.refresh().expect("drain the mount turn");
         let revision = app.presentation_revision();
         let before = app.presentation().expect("snapshot");
-        let failure = app
+        let report = app
             .click_label("go")
-            .expect_err("the proposed branch panics during pre-refresh");
-        assert!(matches!(failure, MountError::Panic(_)));
+            .expect("the proposed branch panic is contained");
+        assert!(matches!(
+            report.errors(),
+            [TurnError::FactoryPanicked(panic)] if panic.message() == "branch setup boom"
+        ));
         assert_eq!(
             app.presentation_revision(),
             revision,
@@ -13771,9 +14504,15 @@ mod binding_tests {
         let _ = app.refresh().expect("drain the mount turn");
         let revision = app.presentation_revision();
         let before = app.presentation().expect("snapshot");
-        let _ = app
+        let report = app
             .click_label("seed")
-            .expect_err("the second fresh row fails");
+            .expect("the second fresh row failure is contained");
+        assert!(matches!(
+            report.errors(),
+            [TurnError::FactoryFailed(MountError::Component(
+                "row factory boom"
+            ))]
+        ));
         assert_eq!(
             app.presentation_revision(),
             revision,
@@ -13815,12 +14554,18 @@ mod binding_tests {
         let mut app = Runtime::new();
         app.mount(|| view! { <BrokenShowHost /> }).expect("mount");
         let _ = app.refresh().expect("drain the mount turn");
-        let failure = app
+        let report = app
             .click_label("go")
-            .expect_err("the first branch cannot mount");
+            .expect("the first branch failure is contained");
         assert!(
-            matches!(failure, MountError::Component("branch boom")),
-            "unexpected failure: {failure:?}"
+            matches!(
+                report.errors(),
+                [TurnError::ActionFailed(MountError::Component(
+                    "branch boom"
+                ))]
+            ),
+            "unexpected failure: {:?}",
+            report.errors()
         );
         assert!(
             app.texts().iter().any(|text| text == "second shown"),
@@ -13890,13 +14635,18 @@ mod binding_tests {
             .find_label("break")
             .expect("the break button")
             .id();
-        let error = app.click_node(node).expect_err("the a branch fails");
+        let report = app
+            .click_node(node)
+            .expect("the a branch failure is contained");
         assert!(
             matches!(
-                error,
-                DispatchError::Command(MountError::Component("branch boom"))
+                report.errors(),
+                [TurnError::ActionFailed(MountError::Component(
+                    "branch boom"
+                ))]
             ),
-            "unexpected failure: {error:?}"
+            "unexpected failure: {:?}",
+            report.errors()
         );
         assert_eq!(
             status_text(&app, b),
@@ -14047,10 +14797,18 @@ mod binding_tests {
 
         // 后续兄弟节点失败：整个批量结构 turn 失败，已经提交的新窗口也要
         // 搬回旧窗口，请求映射与已提交的 first_row/spacer 不能分叉。
-        let failure = app.click_label("break").expect_err("the show branch fails");
+        let report = app
+            .click_label("break")
+            .expect("the show branch failure is contained");
         assert!(
-            matches!(failure, MountError::Component("branch boom")),
-            "unexpected failure: {failure:?}"
+            matches!(
+                report.errors(),
+                [TurnError::ActionFailed(MountError::Component(
+                    "branch boom"
+                ))]
+            ),
+            "unexpected failure: {:?}",
+            report.errors()
         );
         let revision = app.presentation_revision_of(window).expect("revision");
         let failure = app
@@ -14157,10 +14915,16 @@ mod binding_tests {
         app.click_label("seed").expect("seed the retained rows");
 
         // 新插入的行挂载失败，但已提交行的嵌套 Show 仍要在这一帧求值。
-        let failure = app.click_label("go").expect_err("the fresh row fails");
+        let report = app
+            .click_label("go")
+            .expect("the fresh row failure is contained");
         assert!(
-            matches!(&failure, MountError::FactoryFailed(error) if **error == MountError::Component("row boom")),
-            "unexpected failure: {failure:?}"
+            matches!(
+                report.errors(),
+                [TurnError::FactoryFailed(MountError::Component("row boom"))]
+            ),
+            "unexpected failure: {:?}",
+            report.errors()
         );
         let inners = app
             .texts()
@@ -14219,12 +14983,18 @@ mod binding_tests {
             .expect("mount");
         let _ = app.refresh().expect("drain the mount turn");
 
-        let failure = app
+        let report = app
             .click_label("go")
-            .expect_err("the proposed branch cannot mount");
+            .expect("the proposed branch failure is contained");
         assert!(
-            matches!(failure, MountError::Component("branch boom")),
-            "unexpected failure: {failure:?}"
+            matches!(
+                report.errors(),
+                [TurnError::ActionFailed(MountError::Component(
+                    "branch boom"
+                ))]
+            ),
+            "unexpected failure: {:?}",
+            report.errors()
         );
         assert!(
             app.texts().iter().any(|text| text == "fallback-inner"),
@@ -14270,12 +15040,18 @@ mod binding_tests {
             .expect("mount");
         let _ = app.refresh().expect("drain the mount turn");
 
-        let failure = app
+        let report = app
             .click_label("go")
-            .expect_err("the proposed fallback cannot mount");
+            .expect("the proposed fallback failure is contained");
         assert!(
-            matches!(failure, MountError::Component("fallback boom")),
-            "unexpected failure: {failure:?}"
+            matches!(
+                report.errors(),
+                [TurnError::ActionFailed(MountError::Component(
+                    "fallback boom"
+                ))]
+            ),
+            "unexpected failure: {:?}",
+            report.errors()
         );
         assert!(
             app.texts().iter().any(|text| text == "then-inner"),
@@ -15940,10 +16716,13 @@ mod binding_tests {
         app.mount(|| view! { <FaultFallbackHost /> })
             .expect("mount");
         app.click_label("seed").expect("seed a");
-        let failure = app
+        let report = app
             .click_label("duplicate")
-            .expect_err("b collides with a by title length");
-        assert_eq!(failure, MountError::DuplicateKey);
+            .expect("the duplicate key failure is contained");
+        assert_eq!(
+            report.errors(),
+            [TurnError::ActionFailed(MountError::DuplicateKey)]
+        );
         assert_eq!(
             app.for_items().len(),
             1,
@@ -16001,5 +16780,173 @@ mod binding_tests {
             .filter(|text| text.starts_with("row "))
             .collect();
         assert_eq!(rows, vec!["row a"]);
+    }
+}
+
+#[cfg(test)]
+mod turn_budget_tests {
+    #![allow(unused_braces)]
+
+    use super::*;
+    use crate::prelude::*;
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    #[test]
+    fn direct_primitives_reject_reentry_during_an_event_turn() {
+        let mut app = Runtime::new();
+        app.mount(|| {
+            view! {
+                <view>
+                    <button aria:label="go" on:click={|| {}}>"Go"</button>
+                </view>
+            }
+        })
+        .expect("mount");
+        let node = app
+            .presentation()
+            .expect("snapshot")
+            .find_label("go")
+            .expect("the button")
+            .id();
+
+        app.state.borrow_mut().phase = Phase::Event;
+        assert_eq!(
+            app.click_node(node),
+            Err(DispatchError::Reentrant),
+            "a direct primitive cannot run inside an active turn"
+        );
+        assert_eq!(app.change_node(node, true), Err(DispatchError::Reentrant));
+        app.state.borrow_mut().phase = Phase::Idle;
+        app.click_node(node).expect("an Idle entry is legal");
+    }
+
+    #[test]
+    fn a_handler_loop_cannot_queue_more_than_the_request_budget() {
+        #[component]
+        fn Probe(
+            window: WindowCtx,
+            accepted: Rc<Cell<u32>>,
+            rejected: Rc<Cell<u32>>,
+        ) -> MountResult<MountPlan> {
+            let click_accepted = accepted.clone();
+            let click_rejected = rejected.clone();
+            view! {
+                <view>
+                    <button
+                        aria:label="shower"
+                        on:click={move || {
+                            for _ in 0..100 {
+                                match window.request_show("details") {
+                                    Ok(()) => {
+                                        click_accepted.set(click_accepted.get() + 1);
+                                    }
+                                    Err(WindowError::BudgetExceeded) => {
+                                        click_rejected.set(click_rejected.get() + 1);
+                                    }
+                                    Err(_) => {}
+                                }
+                            }
+                        }}
+                    >"Show"</button>
+                </view>
+            }
+        }
+
+        let accepted = Rc::new(Cell::new(0));
+        let rejected = Rc::new(Cell::new(0));
+        let mut app = Runtime::new();
+        app.declare_windows({
+            let accepted = accepted.clone();
+            let rejected = rejected.clone();
+            move |catalog| {
+                let accepted = accepted.clone();
+                let rejected = rejected.clone();
+                catalog.window(WindowSpec::new("main").primary(), move |window| {
+                    let accepted = accepted.clone();
+                    let rejected = rejected.clone();
+                    view! {
+                        <Probe window={window} accepted={accepted} rejected={rejected} />
+                    }
+                })?;
+                catalog.window(WindowSpec::new("details"), |_| view! { <view /> })
+            }
+        })
+        .expect("declare the windows");
+        let main = app.show("main").expect("show main");
+        let report = app.click_label("shower").expect("the click turn");
+        assert!(
+            report
+                .errors()
+                .iter()
+                .any(|error| matches!(error, TurnError::BudgetExceeded(_))),
+            "the overflow is a turn diagnostic: {:?}",
+            report.errors()
+        );
+        assert_eq!(report.errors().len(), 1, "one budget error per turn");
+        assert_eq!(accepted.get(), 64, "the first 64 requests are accepted");
+        assert_eq!(
+            rejected.get(),
+            36,
+            "the remaining requests are typed errors"
+        );
+        app.apply_window_requests()
+            .expect("settle the accepted requests");
+        assert!(app.window_alive(main));
+        assert!(
+            app.windows()
+                .iter()
+                .any(|info| info.spec.key() == "details"),
+            "the accepted requests still open the window"
+        );
+    }
+
+    #[test]
+    fn nested_intents_run_after_the_outer_turn_in_fifo_order() {
+        let log = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let root_log = log.clone();
+        let a_log = log.clone();
+        let b_log = log.clone();
+        let mut app = Runtime::new();
+        app.mount(move || {
+            let root_log = root_log.clone();
+            let a_log = a_log.clone();
+            let b_log = b_log.clone();
+            view! {
+                <view>
+                    <button
+                        aria:label="root"
+                        on:click={move || root_log.borrow_mut().push("root")}
+                    >"Root"</button>
+                    <button
+                        aria:label="a"
+                        on:click={move || a_log.borrow_mut().push("a")}
+                    >"A"</button>
+                    <button
+                        aria:label="b"
+                        on:click={move || b_log.borrow_mut().push("b")}
+                    >"B"</button>
+                </view>
+            }
+        })
+        .expect("mount");
+        let snapshot = app.presentation().expect("snapshot");
+        let a = snapshot.find_label("a").expect("a").id();
+        let b = snapshot.find_label("b").expect("b").id();
+
+        // 模拟处理器内再次派发：turn 不是 Idle 时 Intent 进入 FIFO 队列。
+        app.state.borrow_mut().phase = Phase::Event;
+        app.dispatch_intent(Intent::click(a))
+            .expect("queue the first intent");
+        app.dispatch_intent(Intent::click(b))
+            .expect("queue the second intent");
+        app.state.borrow_mut().phase = Phase::Idle;
+
+        app.click_label("root").expect("the outer click turn");
+        assert_eq!(
+            *log.borrow(),
+            ["root", "a", "b"],
+            "queued intents run after the outer turn in FIFO order"
+        );
     }
 }

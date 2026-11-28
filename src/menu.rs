@@ -5,14 +5,17 @@
 //! 派发入口；托盘与应用动作使用应用级命令表。每个命令项由调用方给出的
 //! `&'static str` id 标识，id 在一个窗口的菜单树内唯一。
 
+use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::fmt;
 use std::rc::Rc;
 
+use zenui_core::PanicInfo;
+
 use crate::context::Phase;
 use crate::presentation::NodeId;
 use crate::store::WriteError;
-use crate::view::MountError;
+use crate::view::HandlerOutcome;
 use crate::window::WindowCtx;
 
 /// 命令来源。
@@ -71,23 +74,23 @@ impl CommandEvent {
     }
 
     /// 触发这次命令的入口。
-    pub const fn source(self) -> CommandSource {
+    pub const fn source(&self) -> CommandSource {
         self.source
     }
 
     /// 命令作用的上下文节点；菜单栏和快捷键通常没有目标。
-    pub const fn target(self) -> Option<NodeId> {
+    pub const fn target(&self) -> Option<NodeId> {
         self.target
     }
 
     /// 这次派发暴露的目标 activation；由窗口自己的处理器运行时为 `None`，
     /// 应用级处理器收到调用方提供的目标窗口。
-    pub const fn window(self) -> Option<WindowCtx> {
+    pub const fn window(&self) -> Option<WindowCtx> {
         self.window
     }
 }
 
-pub(crate) type CommandHandler = Rc<dyn Fn(CommandEvent)>;
+pub(crate) type CommandHandler = Rc<RefCell<Box<dyn FnMut(&mut CommandEvent) -> HandlerOutcome>>>;
 
 /// 命令注册或派发失败的原因。
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -110,10 +113,6 @@ pub enum CommandError {
     RegistrationClosed,
     /// 上下文目标不属于这个窗口或已经失效。
     InvalidTarget(NodeId),
-    /// handler panic；错误被 contain，不向调用方展开。
-    HandlerPanicked(&'static str),
-    /// handler 之后的界面刷新失败。
-    Mount(MountError),
 }
 
 impl fmt::Display for CommandError {
@@ -139,22 +138,11 @@ impl fmt::Display for CommandError {
                     "command target {node:?} is not a live node of this window"
                 )
             }
-            Self::HandlerPanicked(id) => {
-                write!(f, "the command handler for {id} panicked")
-            }
-            Self::Mount(error) => write!(f, "{error}"),
         }
     }
 }
 
-impl std::error::Error for CommandError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Mount(error) => Some(error),
-            _ => None,
-        }
-    }
-}
+impl std::error::Error for CommandError {}
 
 /// 菜单状态回调的失败原因。
 ///
@@ -174,7 +162,7 @@ pub enum MenuStateError {
     /// 回调尝试提交 Store 事务。
     Write(WriteError),
     /// handler panic；错误被 contain，不向调用方展开。
-    HandlerPanicked,
+    HandlerPanicked(PanicInfo),
 }
 
 impl fmt::Display for MenuStateError {
@@ -191,7 +179,7 @@ impl fmt::Display for MenuStateError {
                 )
             }
             Self::Write(error) => write!(f, "{error}"),
-            Self::HandlerPanicked => f.write_str("the menu state handler panicked"),
+            Self::HandlerPanicked(panic) => write!(f, "the menu state handler panicked: {panic}"),
         }
     }
 }

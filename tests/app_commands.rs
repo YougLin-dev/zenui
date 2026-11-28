@@ -27,7 +27,7 @@ fn a_tray_app_command_runs_with_zero_windows_and_commits_state() {
         })
         .expect("application setup");
     app.on_app_command("app.seed", move |event| {
-        handler_seen.borrow_mut().push(event);
+        handler_seen.borrow_mut().push(*event);
         status.set(String::from("tray"));
         let mut transaction = Transaction::new();
         transaction = transaction.write(store.insert("from-tray"));
@@ -69,7 +69,7 @@ fn an_app_command_exposes_a_live_target_and_settles_requests() {
     let reveal_seen = seen.clone();
     let mut app = Runtime::new();
     app.on_app_command("app.reveal", move |event| {
-        reveal_seen.borrow_mut().push(event);
+        reveal_seen.borrow_mut().push(*event);
         event
             .window()
             .expect("a live target")
@@ -242,7 +242,7 @@ fn declared_window_menu_commands_may_be_served_by_app_handlers() {
     for (id, label) in [("shared.save", "save"), ("shared.copy", "copy")] {
         let seen = seen.clone();
         app.on_app_command(id, move |event| {
-            seen.borrow_mut().push((label, event));
+            seen.borrow_mut().push((label, *event));
         })
         .expect("register the shared app command");
     }
@@ -278,7 +278,7 @@ fn stale_targets_are_typed_errors_and_never_reach_a_reopened_activation() {
     let handler_seen = seen.clone();
     let mut app = Runtime::new();
     app.on_app_command("app.ping", move |event| {
-        handler_seen.borrow_mut().push(event);
+        handler_seen.borrow_mut().push(*event);
     })
     .expect("register ping");
     app.declare_windows(|catalog| {
@@ -330,13 +330,16 @@ fn registration_errors_and_panics_leave_the_app_usable() {
         app.on_app_command("app.ok", |_| {}),
         Err(CommandError::AlreadyRegistered("app.ok"))
     );
-    app.on_app_command("app.boom", |_| panic!("the app command failed"))
+    app.on_app_command("app.boom", |_| -> () { panic!("the app command failed") })
         .expect("register boom");
 
-    assert_eq!(
-        app.dispatch_app_command("app.boom", CommandSource::Tray, None),
-        Err(CommandError::HandlerPanicked("app.boom"))
-    );
+    let report = app
+        .dispatch_app_command("app.boom", CommandSource::Tray, None)
+        .expect("the panic is contained in the report");
+    assert!(matches!(
+        report.errors(),
+        [TurnError::HandlerPanicked(panic)] if panic.message() == "the app command failed"
+    ));
     app.dispatch_app_command("app.ok", CommandSource::Tray, None)
         .expect("the app is usable after a contained panic");
 

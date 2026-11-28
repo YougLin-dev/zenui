@@ -53,9 +53,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     TranslateMessage, WINDOW_EX_STYLE, WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE, WM_COMMAND,
     WM_CONTEXTMENU, WM_DESTROY, WM_DPICHANGED, WM_ENTERMENULOOP, WM_GETDPISCALEDSIZE, WM_GETOBJECT,
     WM_IME_CHAR, WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_STARTCOMPOSITION, WM_INITMENU,
-    WM_INITMENUPOPUP, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEHWHEEL,
-    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NULL, WM_PAINT, WM_SETTINGCHANGE, WM_SIZE, WM_SYSCOMMAND,
-    WM_SYSKEYDOWN, WM_TIMER, WNDCLASSEXW, WS_OVERLAPPEDWINDOW, WS_POPUP,
+    WM_INITMENUPOPUP, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NULL, WM_PAINT, WM_SETTINGCHANGE, WM_SIZE,
+    WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_TIMER, WNDCLASSEXW, WS_OVERLAPPEDWINDOW, WS_POPUP,
 };
 
 use windows::core::{HSTRING, w};
@@ -700,6 +700,10 @@ struct WindowHost {
     ctx: WindowCtx,
     scene: Option<Scene>,
     pointer: Option<Point>,
+    /// 本次按压的点击计数；双击消息置 2，松开激活读取后复位。
+    click_count: u8,
+    /// 本次按压的原始命中节点；capture/bubble 从它开始。
+    pressed_hit: Option<NodeId>,
     hovered: Option<NodeId>,
     pressed: Option<NodeId>,
     release_capture: bool,
@@ -1460,7 +1464,17 @@ impl Host {
             .runtime
             .dispatch_app_command(id, CommandSource::Tray, target)
         {
-            Ok(()) | Err(CommandError::Stale) => Ok(()),
+            Ok(report) => {
+                self.surface_report(&report);
+                if report.reveal().needs_reveal()
+                    && let Some(target) = target
+                    && let Some(entry) = self.windows.get_mut(target.key())
+                {
+                    entry.reveal_requested = true;
+                }
+                Ok(())
+            }
+            Err(CommandError::Stale) => Ok(()),
             Err(error) => Err(HostError::Command(error)),
         }
     }
@@ -1596,6 +1610,9 @@ impl Host {
         let mut first_error = None;
         match self.runtime.apply_window_requests() {
             Ok(count) => applied += count,
+            Err(WindowError::Close(CloseError::HandlerPanicked(panic))) => {
+                self.note_diagnostic(format!("close handler panicked: {panic}"));
+            }
             Err(error) => {
                 first_error.get_or_insert(HostError::WindowState(error));
             }
@@ -1781,7 +1798,7 @@ impl Host {
         // 任何输入都让 caret 立即可见，之后由闪烁定时器继续。
         if matches!(
             message,
-            WM_LBUTTONDOWN | WM_LBUTTONUP | WM_MOUSEMOVE | WM_CHAR | WM_KEYDOWN
+            WM_LBUTTONDOWN | WM_LBUTTONDBLCLK | WM_LBUTTONUP | WM_MOUSEMOVE | WM_CHAR | WM_KEYDOWN
         ) && !window.caret_visible
         {
             window.caret_visible = true;
@@ -1793,14 +1810,19 @@ impl Host {
                 window.paint_requested = true;
                 bump_env_generation(window);
             }
-        } else if message == WM_LBUTTONDOWN && window.keyboard_modality {
+        } else if matches!(message, WM_LBUTTONDOWN | WM_LBUTTONDBLCLK) && window.keyboard_modality {
             window.keyboard_modality = false;
             window.paint_requested = true;
             bump_env_generation(window);
         }
         if matches!(
             message,
-            WM_LBUTTONDOWN | WM_LBUTTONUP | WM_MOUSEMOVE | WM_MOUSEWHEEL | WM_KEYDOWN
+            WM_LBUTTONDOWN
+                | WM_LBUTTONDBLCLK
+                | WM_LBUTTONUP
+                | WM_MOUSEMOVE
+                | WM_MOUSEWHEEL
+                | WM_KEYDOWN
         ) {
             // 输入必须命中当前滚动偏移的场景；surface 被遮挡时渲染可能没有
             // 更新 `window.scene`，这里先补一次只重建、不呈现的同步。
@@ -1808,6 +1830,8 @@ impl Host {
         }
         if message == WM_LBUTTONDOWN {
             self.pointer_pressed(window, lparam)
+        } else if message == WM_LBUTTONDBLCLK {
+            self.pointer_pressed_count(window, lparam, 2)
         } else if message == WM_LBUTTONUP {
             self.pointer_released(window, lparam)
         } else if message == WM_MOUSEMOVE {
@@ -1903,6 +1927,9 @@ impl Host {
                     window.clear_pointer_transients();
                 }
                 self.focus_after_sync = true;
+            }
+            Err(WindowError::Close(CloseError::HandlerPanicked(panic))) => {
+                self.note_diagnostic(format!("close handler panicked: {panic}"));
             }
             Err(error) => {
                 self.deferred_error.get_or_insert(HostError::Close(error));
@@ -2350,6 +2377,34 @@ impl Host {
         self.diagnostics.push(message);
     }
 
+    /// 把 turn 报告里的用户错误转成可恢复诊断；DispatchError 仍由调用方分层。
+    fn surface_turn_report(&mut self, report: &Result<TurnReport, DispatchError>) {
+        if let Ok(report) = report {
+            self.surface_report(report);
+        }
+    }
+
+    /// 命令与拖放没有 `DispatchError` 包装，直接读取报告。
+    fn surface_report(&mut self, report: &TurnReport) {
+        for error in report.errors() {
+            self.note_diagnostic(format!("turn error: {error}"));
+        }
+    }
+
+    /// 运行一个直接原语并读取它的 turn 报告；target 级竞态按既有规则忽略。
+    /// 返回报告是否请求显露。
+    fn dispatch_report(
+        &mut self,
+        result: Result<TurnReport, DispatchError>,
+    ) -> Result<bool, HostError> {
+        self.surface_turn_report(&result);
+        let reveal = result
+            .as_ref()
+            .is_ok_and(|report| report.reveal().needs_reveal());
+        ignore_expected_dispatch(result)?;
+        Ok(reveal)
+    }
+
     /// 把一个窗口的新快照渲染到它自己的 surface；共享 renderer 按目标尺寸切换。
     fn render_window(
         &mut self,
@@ -2660,6 +2715,17 @@ impl Host {
         window: &mut WindowHost,
         lparam: LPARAM,
     ) -> Result<(), HostError> {
+        self.pointer_pressed_count(window, lparam, 1)
+    }
+
+    fn pointer_pressed_count(
+        &mut self,
+        window: &mut WindowHost,
+        lparam: LPARAM,
+        click_count: u8,
+    ) -> Result<(), HostError> {
+        window.click_count = click_count;
+        window.pressed_hit = None;
         // 一次指针按下只属于一个窗口；其它窗口的按压瞬态立即结束。
         self.clear_pressed_except(window.ctx.key());
         window.char_suppression = None;
@@ -2690,10 +2756,12 @@ impl Host {
         }) else {
             window.hovered = None;
             window.pressed = None;
-            return self
+            let report = self
                 .runtime
                 .blur_in(window.ctx)
-                .map_err(HostError::WindowState);
+                .map_err(HostError::WindowState)?;
+            self.surface_report(&report);
+            return Ok(());
         };
 
         // 禁用状态按整个元素路径判定；子元素不能因为自身没写 disabled 就激活。
@@ -2703,6 +2771,7 @@ impl Host {
             return Ok(());
         }
         window.hovered = Some(node);
+        window.pressed_hit = Some(node);
 
         // 按下与 headless 共用 Press Intent：最近可聚焦祖先获得焦点，text-input
         // 使用场景算出的字符偏移放置 caret；禁用目标不会走到这里。
@@ -2710,6 +2779,7 @@ impl Host {
         let reveal = press
             .as_ref()
             .is_ok_and(|report| report.reveal().needs_reveal());
+        self.surface_turn_report(&press);
         ignore_expected_dispatch(press)?;
 
         if visual == Visual::TextInput {
@@ -2954,6 +3024,7 @@ impl Host {
         // 先取走目标：松开后的捕获释放会同步送出 WM_CAPTURECHANGED，
         // 那条消息不能把这次松开要激活的目标一起清掉。
         let target = window.pressed.take();
+        let hit = window.pressed_hit.take();
         // 捕获释放在窗口过程借出宿主之后进行：`ReleaseCapture` 会同步送达
         // `WM_CAPTURECHANGED`，嵌套的 `with_host` 不能与外层 `&mut Host` 重叠。
         window.release_capture = true;
@@ -2970,13 +3041,22 @@ impl Host {
                 })
         });
         if activated && let Some(node) = target {
-            let report = self.runtime.activate_node(node);
+            let hit = hit.unwrap_or(node);
+            let report = self.runtime.dispatch_intent(Intent::click_detailed(
+                hit,
+                Some(zenui::Point::new(point.x, point.y)),
+                Some(MouseButton::Primary),
+                window.click_count,
+                pointer_modifiers(),
+            ));
             // 激活处理器可能卸载当前焦点并结算到新的可见目标；runtime 在
             // 这个 turn 里报告了焦点变化，宿主必须像其它输入一样申请显露。
             window.reveal_requested |= report
                 .as_ref()
                 .is_ok_and(|report| report.reveal().needs_reveal());
+            self.surface_turn_report(&report);
             ignore_expected_dispatch(report)?;
+            window.click_count = 1;
         }
 
         window.hovered = window
@@ -3105,9 +3185,16 @@ impl Host {
         source: CommandSource,
     ) -> Result<(), HostError> {
         match self.runtime.dispatch_command(window, id, source) {
-            Ok(()) | Err(CommandError::Stale | CommandError::Hidden | CommandError::Suspended) => {
+            Ok(report) => {
+                self.surface_report(&report);
+                if report.reveal().needs_reveal()
+                    && let Some(entry) = self.windows.get_mut(window.key())
+                {
+                    entry.reveal_requested = true;
+                }
                 Ok(())
             }
+            Err(CommandError::Stale | CommandError::Hidden | CommandError::Suspended) => Ok(()),
             Err(error) => Err(HostError::Command(error)),
         }
     }
@@ -3141,15 +3228,28 @@ impl Host {
         else {
             return Ok(());
         };
-        let state = self
-            .runtime
-            .menu_state(window.ctx, &command)
-            .map_err(HostError::MenuState)?
-            .unwrap_or_else(|| command.default_state());
+        let state = self.menu_state_or_default(window.ctx, &command)?;
         if !state.enabled() {
             return Ok(());
         }
         self.dispatch_menu_command(window.ctx, command.id(), source)
+    }
+
+    /// 求值一次菜单状态；回调 panic 用声明默认值继续，菜单保持原状。
+    fn menu_state_or_default(
+        &mut self,
+        window: WindowCtx,
+        command: &MenuCommand,
+    ) -> Result<MenuCommandState, HostError> {
+        match self.runtime.menu_state(window, command) {
+            Ok(Some(state)) => Ok(state),
+            Ok(None) => Ok(command.default_state()),
+            Err(MenuStateError::HandlerPanicked(panic)) => {
+                self.note_diagnostic(format!("menu state handler panicked: {panic}"));
+                Ok(command.default_state())
+            }
+            Err(error) => Err(HostError::MenuState(error)),
+        }
     }
 
     /// `WM_INITMENU`/`WM_INITMENUPOPUP`：按只读状态回调设置 enabled/checked。
@@ -3186,11 +3286,7 @@ impl Host {
             let Some(command) = native_menu.command(id) else {
                 continue;
             };
-            let state = self
-                .runtime
-                .menu_state(window.ctx, command)
-                .map_err(HostError::MenuState)?
-                .unwrap_or_else(|| command.default_state());
+            let state = self.menu_state_or_default(window.ctx, command)?;
             states.push((id, state));
         }
         for (id, state) in states {
@@ -3641,6 +3737,7 @@ impl Host {
         let reveal = report
             .as_ref()
             .is_ok_and(|report| report.reveal().needs_reveal());
+        self.surface_turn_report(&report);
         ignore_expected_dispatch(report)?;
         window.reveal_requested |= reveal;
         window.paint_requested = true;
@@ -3679,7 +3776,8 @@ impl Host {
             // Alt 组合留给系统菜单与加速键预译；AltGr 的字符仍由 WM_CHAR 输入。
             return Ok(());
         }
-        let report = self.key_down_with(window, key, shift, control)?;
+        let repeat = lparam.0 & (1 << 30) != 0;
+        let report = self.key_down_full(window, key, shift, control, repeat)?;
         if (report.outcome().consumed() || report.outcome().prevent_default())
             && let Ok(snapshot) = self.runtime.presentation_of(window.ctx)
             && let Some(focused) = focused_input(&snapshot)
@@ -3697,6 +3795,7 @@ impl Host {
 
     /// 键盘映射本体：runtime keydown turn 之前的宿主层（组合/IME、编辑快捷键）
     /// 与之后仅存的滚动/绘制；控件默认动作全部由 runtime 结算。
+    #[cfg(test)]
     fn key_down_with(
         &mut self,
         window: &mut WindowHost,
@@ -3704,10 +3803,22 @@ impl Host {
         shift: bool,
         control: bool,
     ) -> Result<TurnReport, HostError> {
+        self.key_down_full(window, key, shift, control, false)
+    }
+
+    fn key_down_full(
+        &mut self,
+        window: &mut WindowHost,
+        key: VIRTUAL_KEY,
+        shift: bool,
+        control: bool,
+        repeat: bool,
+    ) -> Result<TurnReport, HostError> {
         let modifiers = Modifiers::new(shift, control, false, false);
+        let code = host_code(key);
         if key == VK_TAB {
             self.cancel_compositions(window)?;
-            let report = self.dispatch_key_intent(window, Key::Tab, modifiers)?;
+            let report = self.dispatch_key_intent(window, Key::Tab, code, repeat, modifiers)?;
             window.reveal_requested |= report.reveal().needs_reveal();
             window.paint_requested = true;
             return Ok(report);
@@ -3723,9 +3834,14 @@ impl Host {
                 window.paint_requested = true;
                 return Ok(TurnReport::default());
             }
-            self.runtime
-                .request_close(window.ctx)
-                .map_err(HostError::Close)?;
+            if let Err(error) = self.runtime.request_close(window.ctx) {
+                match error {
+                    WindowError::Close(CloseError::HandlerPanicked(panic)) => {
+                        self.note_diagnostic(format!("close handler panicked: {panic}"));
+                    }
+                    error => return Err(HostError::Close(error)),
+                }
+            }
             self.focus_after_sync = true;
             window.paint_requested = true;
             return Ok(TurnReport::default());
@@ -3736,7 +3852,8 @@ impl Host {
             .presentation_of(window.ctx)
             .map_err(HostError::Snapshot)?;
         if matches!(key, VK_PRIOR | VK_NEXT) {
-            let report = self.dispatch_key_intent(window, host_key(key), modifiers)?;
+            let report =
+                self.dispatch_key_intent(window, host_key(key), code, repeat, modifiers)?;
             if focused_input(&snapshot).is_some_and(|node| is_composing(&snapshot, node))
                 || key_default_blocked(&report)
             {
@@ -3755,7 +3872,8 @@ impl Host {
         let Some(focused) = focused_input(&snapshot) else {
             // 没有文本输入焦点时仍把 keydown 交给 runtime：焦点控件、窗口
             // fallback handler 与 Tab/Enter/Space 默认都在那里结算。
-            let report = self.dispatch_key_intent(window, host_key(key), modifiers)?;
+            let report =
+                self.dispatch_key_intent(window, host_key(key), code, repeat, modifiers)?;
             if matches!(key, VK_HOME | VK_END) && !key_default_blocked(&report) {
                 // 显式滚动优先：丢弃本 turn 的显露请求与更早的 pending 显露。
                 window.reveal_requested = false;
@@ -3773,7 +3891,7 @@ impl Host {
                 window.paint_requested = true;
                 return Ok(TurnReport::default());
             }
-            let report = self.dispatch_key_intent(window, Key::Escape, modifiers)?;
+            let report = self.dispatch_key_intent(window, Key::Escape, code, repeat, modifiers)?;
             window.reveal_requested |= report.reveal().needs_reveal();
             window.paint_requested = true;
             return Ok(report);
@@ -3790,6 +3908,7 @@ impl Host {
                     window.reveal_requested |= report
                         .as_ref()
                         .is_ok_and(|report| report.reveal().needs_reveal());
+                    self.surface_turn_report(&report);
                     ignore_expected_dispatch(report)?;
                     window.paint_requested = true;
                 }
@@ -3798,6 +3917,7 @@ impl Host {
                     window.reveal_requested |= report
                         .as_ref()
                         .is_ok_and(|report| report.reveal().needs_reveal());
+                    self.surface_turn_report(&report);
                     ignore_expected_dispatch(report)?;
                     window.paint_requested = true;
                 }
@@ -3806,6 +3926,7 @@ impl Host {
                     window.reveal_requested |= report
                         .as_ref()
                         .is_ok_and(|report| report.reveal().needs_reveal());
+                    self.surface_turn_report(&report);
                     ignore_expected_dispatch(report)?;
                     window.paint_requested = true;
                 }
@@ -3817,7 +3938,7 @@ impl Host {
         }
         // L3 用户 keydown → L4 控件默认全部在 runtime 内完成；宿主只保留
         // L1 快捷键、IME 与 L5 滚动/绘制。
-        let report = self.dispatch_key_intent(window, host_key(key), modifiers)?;
+        let report = self.dispatch_key_intent(window, host_key(key), code, repeat, modifiers)?;
         window.reveal_requested |= report.reveal().needs_reveal();
         window.paint_requested = true;
         Ok(report)
@@ -3827,13 +3948,17 @@ impl Host {
         &mut self,
         window: &WindowHost,
         key: Key,
+        code: Code,
+        repeat: bool,
         modifiers: Modifiers,
     ) -> Result<TurnReport, HostError> {
-        match self
-            .runtime
-            .dispatch_intent(Intent::keydown_window(window.ctx, key, modifiers))
-        {
-            Ok(report) => Ok(report),
+        match self.runtime.dispatch_intent(Intent::keydown_window_with(
+            window.ctx, key, code, modifiers, repeat,
+        )) {
+            Ok(report) => {
+                self.surface_report(&report);
+                Ok(report)
+            }
             Err(
                 DispatchError::WrongKind { .. }
                 | DispatchError::Rejected { .. }
@@ -3900,6 +4025,7 @@ impl Host {
         window.reveal_requested |= report
             .as_ref()
             .is_ok_and(|report| report.reveal().needs_reveal());
+        self.surface_turn_report(&report);
         ignore_expected_dispatch(report)?;
         window.paint_requested = true;
         Ok(())
@@ -3928,6 +4054,7 @@ impl Host {
         let reveal = report
             .as_ref()
             .is_ok_and(|report| report.reveal().needs_reveal());
+        self.surface_turn_report(&report);
         ignore_expected_dispatch(report)?;
         window.reveal_requested |= reveal;
         window.paint_requested = true;
@@ -3944,7 +4071,9 @@ impl Host {
             return Ok(());
         };
         if !is_composing(&snapshot, node) {
-            ignore_expected_dispatch(self.runtime.compose_start_node(node))?;
+            let started = self.runtime.compose_start_node(node);
+            let reveal = self.dispatch_report(started)?;
+            window.reveal_requested |= reveal;
         }
         window.reveal_requested = true;
         window.paint_requested = true;
@@ -3998,12 +4127,18 @@ impl Host {
             match commit {
                 Some(text) => {
                     if !composing {
-                        ignore_expected_dispatch(self.runtime.compose_start_node(node))?;
+                        let started = self.runtime.compose_start_node(node);
+                        let reveal = self.dispatch_report(started)?;
+                        window.reveal_requested |= reveal;
                     }
-                    ignore_expected_dispatch(self.runtime.compose_commit_node(node, &text))?;
+                    let committed = self.runtime.compose_commit_node(node, &text);
+                    let reveal = self.dispatch_report(committed)?;
+                    window.reveal_requested |= reveal;
                 }
                 None if composing => {
-                    ignore_expected_dispatch(self.runtime.compose_cancel_node(node))?;
+                    let cancelled = self.runtime.compose_cancel_node(node);
+                    let reveal = self.dispatch_report(cancelled)?;
+                    window.reveal_requested |= reveal;
                 }
                 None => {}
             }
@@ -4012,9 +4147,13 @@ impl Host {
         if request.update {
             let text = update.unwrap_or_default();
             if !composing {
-                ignore_expected_dispatch(self.runtime.compose_start_node(node))?;
+                let started = self.runtime.compose_start_node(node);
+                let reveal = self.dispatch_report(started)?;
+                window.reveal_requested |= reveal;
             }
-            ignore_expected_dispatch(self.runtime.compose_update_node(node, &text))?;
+            let updated = self.runtime.compose_update_node(node, &text);
+            let reveal = self.dispatch_report(updated)?;
+            window.reveal_requested |= reveal;
         }
         Ok(())
     }
@@ -4035,7 +4174,10 @@ impl Host {
         let mut cancelled = false;
         for node in composing {
             match self.runtime.compose_cancel_node(node) {
-                Ok(()) => cancelled = true,
+                Ok(report) => {
+                    self.surface_report(&report);
+                    cancelled = true;
+                }
                 Err(error) => ignore_expected_dispatch::<()>(Err(error))?,
             }
         }
@@ -4923,8 +5065,11 @@ impl Host {
         // OLE 接受与这条消息的派发之间，窗口可能被隐藏、挂起或关闭；
         // 运行时拒绝这些已经无效的投递是正常的竞态结果，不是宿主失败。
         match self.runtime.drop_files(window.ctx, paths) {
-            Ok(())
-            | Err(
+            Ok(report) => {
+                self.surface_report(&report);
+                window.reveal_requested |= report.reveal().needs_reveal();
+            }
+            Err(
                 zenui::DropError::Stale
                 | zenui::DropError::Hidden
                 | zenui::DropError::Suspended
@@ -4933,7 +5078,6 @@ impl Host {
             ) => {}
             Err(error) => return Err(HostError::Drop(error)),
         }
-        window.reveal_requested = true;
         window.paint_requested = true;
         Ok(())
     }
@@ -5072,6 +5216,8 @@ impl WindowHost {
             ctx,
             scene: None,
             pointer: None,
+            click_count: 1,
+            pressed_hit: None,
             hovered: None,
             pressed: None,
             release_capture: false,
@@ -5119,6 +5265,8 @@ impl WindowHost {
     /// 指针瞬态在隐藏、禁用或销毁后不能残留。
     fn clear_pointer_transients(&mut self) {
         self.pointer = None;
+        self.click_count = 1;
+        self.pressed_hit = None;
         self.hovered = None;
         self.pressed = None;
         self.scrollbar_drag = None;
@@ -5772,6 +5920,15 @@ fn ignore_expected_dispatch<T>(result: Result<T, DispatchError>) -> Result<(), H
     }
 }
 
+/// 指针激活时的修饰键快照；与 keydown 使用同一份 `GetKeyState` 语义。
+fn pointer_modifiers() -> Modifiers {
+    // 安全：GetKeyState 只查询本线程最近一条消息的修饰键状态。
+    let shift = unsafe { GetKeyState(i32::from(VK_SHIFT.0)) } < 0;
+    let control = unsafe { GetKeyState(i32::from(VK_CONTROL.0)) } < 0;
+    let alt = unsafe { GetKeyState(i32::from(VK_MENU.0)) } < 0;
+    Modifiers::new(shift, control, alt, false)
+}
+
 fn pointer_point(lparam: LPARAM, scale: f32) -> Point {
     let x = (lparam.0 & 0xffff) as u16 as i16 as f32;
     let y = ((lparam.0 >> 16) & 0xffff) as u16 as i16 as f32;
@@ -5981,7 +6138,36 @@ const fn host_key(key: VIRTUAL_KEY) -> Key {
         k if k == VK_END.0 => Key::End,
         k if k == VK_PRIOR.0 => Key::PageUp,
         k if k == VK_NEXT.0 => Key::PageDown,
+        0x2D => Key::Insert,
+        0x30..=0x39 => Key::Character((b'0' + (key.0 - 0x30) as u8) as char),
+        0x41..=0x5A => Key::Character((key.0 as u8 as char).to_ascii_lowercase()),
+        0x70..=0x87 => Key::Function((key.0 - 0x6F) as u8),
         _ => Key::Other,
+    }
+}
+
+/// 宿主虚拟键到物理 `Code` 的映射；其它键保留虚拟键值。
+const fn host_code(key: VIRTUAL_KEY) -> Code {
+    match key.0 {
+        k if k == VK_ESCAPE.0 => Code::Escape,
+        k if k == VK_RETURN.0 => Code::Enter,
+        k if k == VK_TAB.0 => Code::Tab,
+        k if k == VK_SPACE.0 => Code::Space,
+        k if k == VK_BACK.0 => Code::Backspace,
+        k if k == VK_DELETE.0 => Code::Delete,
+        k if k == VK_LEFT.0 => Code::ArrowLeft,
+        k if k == VK_RIGHT.0 => Code::ArrowRight,
+        k if k == VK_UP.0 => Code::ArrowUp,
+        k if k == VK_DOWN.0 => Code::ArrowDown,
+        k if k == VK_HOME.0 => Code::Home,
+        k if k == VK_END.0 => Code::End,
+        k if k == VK_PRIOR.0 => Code::PageUp,
+        k if k == VK_NEXT.0 => Code::PageDown,
+        0x2D => Code::Insert,
+        0x30..=0x39 => Code::Digit((key.0 - 0x30) as u8),
+        0x41..=0x5A => Code::Key((key.0 as u8 as char).to_ascii_lowercase()),
+        0x70..=0x87 => Code::Function((key.0 - 0x6F) as u8),
+        other => Code::Other(other as u32),
     }
 }
 
@@ -12188,6 +12374,144 @@ mod tests {
         );
     }
 
+    #[component]
+    fn PanicOnShow() -> MountResult<MountPlan> {
+        panic!("show branch boom")
+    }
+
+    #[test]
+    fn a_factory_panic_during_input_is_a_diagnostic_and_the_loop_continues() {
+        let runs = Rc::new(Cell::new(0));
+        let breaks = Rc::new(Cell::new(0));
+        let handler_runs = runs.clone();
+        let break_runs = breaks.clone();
+        let mut runtime = Runtime::new();
+        runtime
+            .declare_windows(move |catalog| {
+                let handler_runs = handler_runs.clone();
+                let break_runs = break_runs.clone();
+                catalog.window(WindowSpec::new(MAIN).primary().sized(320, 200), move |_| {
+                    let handler_runs = handler_runs.clone();
+                    let break_runs = break_runs.clone();
+                    let open = signal(false);
+                    let when = memo(move || open.get());
+                    view! {
+                        <view>
+                            <button
+                                aria:label="break"
+                                on:click={move || {
+                                    break_runs.set(break_runs.get() + 1);
+                                    open.set(true);
+                                }}
+                            >"Break"</button>
+                            <button
+                                aria:label="ok"
+                                on:click={move || {
+                                    handler_runs.set(handler_runs.get() + 1);
+                                }}
+                            >"OK"</button>
+                            <Show when={when}>
+                                <PanicOnShow />
+                            </Show>
+                        </view>
+                    }
+                })?;
+                Ok(())
+            })
+            .expect("declare the failing branch window");
+        let mut host = Host::open(runtime, HostConfig::hidden()).expect("open the host");
+        host.render().expect("render the first frame");
+        host.runtime.focus("break").expect("focus the button");
+
+        let result = host.with_window(MAIN, |host, window| {
+            host.key_down(window, WPARAM(VK_RETURN.0 as usize), LPARAM(0x1C << 16))
+        });
+        assert!(
+            result.is_ok(),
+            "the factory panic cannot end the message loop: {result:?}"
+        );
+        assert_eq!(breaks.get(), 1, "the keydown activates the button");
+
+        let diagnostics = host.take_diagnostics();
+        assert!(
+            diagnostics
+                .iter()
+                .any(|message| message.contains("show branch boom")),
+            "the factory panic is surfaced: {diagnostics:?}"
+        );
+        assert!(host.hwnd(MAIN).is_some(), "the window stays alive");
+        host.runtime
+            .click_label("ok")
+            .expect("the runtime still dispatches");
+        assert_eq!(runs.get(), 1);
+    }
+
+    #[test]
+    fn a_double_click_message_carries_click_count_two_and_runs_dblclick() {
+        let clicks = Rc::new(Cell::new(0));
+        let doubles = Rc::new(Cell::new(0));
+        let observed = Rc::new(Cell::new(0_u8));
+        let mut runtime = Runtime::new();
+        runtime
+            .declare_windows({
+                let clicks = clicks.clone();
+                let doubles = doubles.clone();
+                let observed = observed.clone();
+                move |catalog| {
+                    let clicks = clicks.clone();
+                    let doubles = doubles.clone();
+                    let observed = observed.clone();
+                    catalog.window(WindowSpec::new(MAIN).primary().sized(320, 240), move |_| {
+                        let clicks = clicks.clone();
+                        let doubles = doubles.clone();
+                        let observed = observed.clone();
+                        view! {
+                            <view>
+                                <button
+                                    aria:label="twice"
+                                    on:click={move |event: &mut ClickEvent| {
+                                        clicks.set(clicks.get() + 1);
+                                        observed.set(event.click_count());
+                                    }}
+                                    on:dblclick={move |_event: &mut ClickEvent| {
+                                        doubles.set(doubles.get() + 1);
+                                    }}
+                                >"Twice"</button>
+                            </view>
+                        }
+                    })?;
+                    Ok(())
+                }
+            })
+            .expect("declare the double-click window");
+        let mut host = Host::open(runtime, HostConfig::hidden()).expect("open the hidden host");
+        host.render().expect("first frame");
+        let (point, scale) = {
+            let snapshot = host.runtime.presentation().expect("snapshot");
+            let scene = host.scene(MAIN).expect("scene");
+            let id = snapshot.find_label("twice").expect("the button").id();
+            let rect = scene.node(id).expect("scene node").rect();
+            (
+                Point::new(rect.x + rect.width / 2.0, rect.y + rect.height / 2.0),
+                scene.viewport().scale(),
+            )
+        };
+        let lparam = pointer_lparam(point, scale);
+        with_main(&mut host, |host, window| {
+            host.pointer_pressed_count(window, lparam, 2)
+        });
+        with_main(&mut host, |host, window| {
+            host.pointer_released(window, lparam)
+        });
+        assert_eq!(clicks.get(), 1);
+        assert_eq!(
+            observed.get(),
+            2,
+            "the click payload carries the message count"
+        );
+        assert_eq!(doubles.get(), 1, "the nearest dblclick handler runs once");
+    }
+
     #[test]
     fn a_pointer_click_reaches_a_clickable_view_and_blocks_disabled_subtrees() {
         let row_clicks = Rc::new(Cell::new(0));
@@ -14154,7 +14478,7 @@ mod tests {
                     value.set(next);
                 }}
                 on:keydown={move |event: &mut KeyEvent| {
-                    if event.key() == Key::Other {
+                    if matches!(event.key(), Key::Character(_) | Key::Other) {
                         event.consume();
                     }
                 }}
@@ -15265,6 +15589,58 @@ mod tests {
             "suspending the parent cancels the pending composition"
         );
         assert!(!host.windows[MAIN].enabled);
+    }
+
+    #[test]
+    fn a_panicking_close_handler_is_a_diagnostic_and_the_parent_stays_open() {
+        const CONFIRM: &str = "confirm";
+        let mut runtime = Runtime::new();
+        runtime
+            .declare_windows(|catalog| {
+                catalog.window(
+                    WindowSpec::new(MAIN)
+                        .primary()
+                        .close_policy(ClosePolicy::Confirm),
+                    |window| {
+                        window
+                            .on_close(|_| -> CloseOutcome { panic!("close boom") })
+                            .expect("register the close handler");
+                        view! { <view><text>"Ready"</text></view> }
+                    },
+                )?;
+                catalog.window(WindowSpec::new(CONFIRM).confirmation_for(MAIN), |_| {
+                    view! { <view><text>"Confirm"</text></view> }
+                })?;
+                Ok(())
+            })
+            .expect("declare the closing catalog");
+        let mut host = Host::open(runtime, HostConfig::hidden()).expect("open the host");
+        host.render().expect("render the primary window");
+
+        send_msg(
+            &mut host,
+            MSG {
+                message: WM_CLOSE,
+                ..Default::default()
+            },
+        );
+        assert!(
+            host.deferred_error.take().is_none(),
+            "a close handler panic cannot end the message loop"
+        );
+        let diagnostics = host.take_diagnostics();
+        assert!(
+            diagnostics
+                .iter()
+                .any(|message| message.contains("close boom")),
+            "the panic is surfaced: {diagnostics:?}"
+        );
+        assert!(host.hwnd(MAIN).is_some(), "the parent stays open");
+        assert!(host.windows[MAIN].enabled, "the parent is re-enabled");
+        assert!(
+            host.runtime.window_accepts_input(host.windows[MAIN].ctx),
+            "the close epoch is aborted"
+        );
     }
 
     #[test]
@@ -16456,6 +16832,60 @@ mod tests {
     }
 
     #[test]
+    fn a_panicking_menu_state_handler_keeps_the_declared_state_and_the_loop() {
+        let mut runtime = Runtime::new();
+        runtime
+            .declare_windows(move |catalog| {
+                catalog.window(WindowSpec::new(MAIN).primary(), move |window| {
+                    window
+                        .on_command("file.clear", |_| {})
+                        .expect("register file.clear");
+                    window
+                        .on_menu_state(|_| -> MenuCommandState { panic!("menu state boom") })
+                        .expect("register menu state");
+                    view! { <view /> }
+                })?;
+                catalog.menu(
+                    MAIN,
+                    MenuSpec::new().submenu(
+                        "File",
+                        MenuSpec::new().item(
+                            MenuCommand::new("file.clear", "Clear")
+                                .enabled(false)
+                                .checked(true),
+                        ),
+                    ),
+                )?;
+                Ok(())
+            })
+            .expect("declare the panicking menu state host");
+        let mut host = Host::open(runtime, HostConfig::hidden()).expect("open the host");
+        let hwnd = host.hwnd(MAIN).expect("a live window");
+        let menu = unsafe { GetMenu(hwnd) };
+        let file = unsafe { GetSubMenu(menu, 0) };
+        let clear = unsafe { GetMenuItemID(file, 0) };
+
+        host.handle_message(hwnd, WM_INITMENUPOPUP, WPARAM(file.0 as usize), LPARAM(0));
+        assert!(
+            host.deferred_error.take().is_none(),
+            "a menu state panic is a diagnostic, not a message-loop error"
+        );
+        let diagnostics = host.take_diagnostics();
+        assert!(
+            diagnostics
+                .iter()
+                .any(|message| message.contains("menu state boom")),
+            "the panic is surfaced: {diagnostics:?}"
+        );
+        assert_eq!(
+            menu_state_at(file, clear),
+            MF_GRAYED.0 | MF_CHECKED.0,
+            "the declared state stays in effect"
+        );
+        assert!(host.runtime.presentation().is_ok(), "the session survives");
+    }
+
+    #[test]
     fn reopening_rebuilds_the_menu_and_reregisters_state() {
         let (mut host, _runs) = menu_state_host();
         let old_hwnd = host.hwnd(MAIN).expect("a live window");
@@ -16722,6 +17152,49 @@ mod tests {
             1,
             "the second open reaches the restored presenter"
         );
+        assert_eq!(runs.get(), 1);
+    }
+
+    #[test]
+    fn a_panicking_command_handler_is_a_diagnostic_and_the_session_continues() {
+        let runs = Rc::new(Cell::new(0));
+        let handler_runs = runs.clone();
+        let mut runtime = Runtime::new();
+        runtime
+            .declare_windows(move |catalog| {
+                catalog.window(WindowSpec::new(MAIN).primary(), move |window| {
+                    let handler_runs = handler_runs.clone();
+                    window
+                        .on_command("boom", |_| -> () { panic!("command boom") })
+                        .expect("register boom");
+                    window
+                        .on_command("ok", move |_| {
+                            handler_runs.set(handler_runs.get() + 1);
+                        })
+                        .expect("register ok");
+                    view! { <view><text>"Ready"</text></view> }
+                })?;
+                catalog.menu(
+                    MAIN,
+                    MenuSpec::new().command("boom", "Boom").command("ok", "OK"),
+                )?;
+                Ok(())
+            })
+            .expect("declare the command window");
+        let window = runtime.show(MAIN).expect("show the command window");
+        let mut host = Host::open(runtime, HostConfig::hidden()).expect("open the command host");
+
+        host.dispatch_menu_command(window, "boom", CommandSource::MenuBar)
+            .expect("a handler panic cannot end the message loop");
+        let diagnostics = host.take_diagnostics();
+        assert!(
+            diagnostics
+                .iter()
+                .any(|message| message.contains("command boom")),
+            "the panic is surfaced: {diagnostics:?}"
+        );
+        host.dispatch_menu_command(window, "ok", CommandSource::MenuBar)
+            .expect("the session still dispatches commands");
         assert_eq!(runs.get(), 1);
     }
 

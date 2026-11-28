@@ -185,18 +185,19 @@ fn a_cleanup_write_is_a_typed_context_error() {
     })
     .expect("mount");
 
-    let error = app
+    let report = app
         .click_label("close")
-        .expect_err("a cleanup write is rejected");
+        .expect("the cleanup write is contained in the turn report");
     assert!(
         matches!(
-            error,
-            MountError::Context {
+            report.errors(),
+            [TurnError::ActionFailed(MountError::Context {
                 operation: "Signal::set",
                 ..
-            }
+            })]
         ),
-        "unexpected error: {error:?}"
+        "unexpected error: {:?}",
+        report.errors()
     );
 
     app.click_label("probe").expect("the runtime stays usable");

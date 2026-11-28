@@ -628,10 +628,14 @@ fn a_handler_can_allow_or_deny_without_showing_a_confirmation() {
 #[test]
 fn a_panicking_handler_leaves_the_parent_open() {
     let mut harness = open(HandlerMode::Panic);
-    assert_eq!(
-        harness.app.request_close(harness.main),
-        Err(WindowError::Close(CloseError::HandlerPanicked))
-    );
+    let error = harness
+        .app
+        .request_close(harness.main)
+        .expect_err("the close handler panic is a typed close failure");
+    let WindowError::Close(CloseError::HandlerPanicked(panic)) = &error else {
+        panic!("unexpected error: {error:?}");
+    };
+    assert_eq!(panic.message(), "the close handler failed");
     assert_eq!(harness.close_runs.get(), 1);
     assert!(harness.app.window_alive(harness.main));
     assert!(harness.app.window_accepts_input(harness.main));

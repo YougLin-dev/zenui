@@ -12,6 +12,15 @@ fn panic_message(error: MountError) -> String {
     }
 }
 
+fn report_panic_message(report: &TurnReport) -> String {
+    match report.errors() {
+        [TurnError::FactoryPanicked(panic) | TurnError::HandlerPanicked(panic)] => {
+            panic.message().to_owned()
+        }
+        other => panic!("expected a contained panic, got {other:?}"),
+    }
+}
+
 #[test]
 fn a_panicking_click_handler_leaves_the_event_slot_reusable() {
     #[component]
@@ -178,13 +187,10 @@ fn a_panicking_show_factory_keeps_the_old_branch_and_releases_the_owner() {
     let signals = app.live_signals();
     assert!(!app.texts().iter().any(|text| text == "open"));
 
-    assert_eq!(
-        panic_message(
-            app.click_text("Toggle")
-                .expect_err("the show factory panic is contained")
-        ),
-        "show factory boom"
-    );
+    let report = app
+        .click_text("Toggle")
+        .expect("the show factory panic is contained");
+    assert_eq!(report_panic_message(&report), "show factory boom");
     assert!(
         !app.texts().iter().any(|text| text == "open"),
         "the old branch stays mounted"
@@ -237,13 +243,10 @@ fn a_panicking_for_factory_keeps_old_rows_and_releases_the_proposed_owner() {
     .expect("mount");
     let signals = app.live_signals();
 
-    assert_eq!(
-        panic_message(
-            app.click_text("Seed")
-                .expect_err("the item factory panic is contained")
-        ),
-        "for factory boom"
-    );
+    let report = app
+        .click_text("Seed")
+        .expect("the item factory panic is contained");
+    assert_eq!(report_panic_message(&report), "for factory boom");
     assert!(app.for_items().is_empty(), "no partial row was mounted");
     assert_eq!(
         app.live_signals(),

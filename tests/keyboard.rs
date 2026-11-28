@@ -393,3 +393,71 @@ fn reopening_a_window_requires_fresh_keydown_registration() {
         "closing released the old activation's keydown handler"
     );
 }
+
+#[test]
+fn keydown_exposes_modifiers_physical_code_and_repeat() {
+    let control = Rc::new(Cell::new(false));
+    let physical = Rc::new(Cell::new(false));
+    let repeating = Rc::new(Cell::new(false));
+    let target = Rc::new(Cell::new(None));
+
+    #[component]
+    fn Probe(
+        control: Rc<Cell<bool>>,
+        physical: Rc<Cell<bool>>,
+        repeating: Rc<Cell<bool>>,
+        target: Rc<Cell<Option<NodeId>>>,
+    ) -> MountResult<MountPlan> {
+        view! {
+            <view>
+                <button
+                    aria:label="keys"
+                    on:keydown={move |event: &mut KeyEvent| {
+                        control.set(event.modifiers().control());
+                        physical.set(event.code() == Code::Key('k'));
+                        repeating.set(event.repeat());
+                        target.set(event.target().node());
+                    }}
+                >"Keys"</button>
+            </view>
+        }
+    }
+
+    let mut app = Runtime::new();
+    app.mount({
+        let control = control.clone();
+        let physical = physical.clone();
+        let repeating = repeating.clone();
+        let target = target.clone();
+        move || {
+            view! {
+                <Probe
+                    control={control.clone()}
+                    physical={physical.clone()}
+                    repeating={repeating.clone()}
+                    target={target.clone()}
+                />
+            }
+        }
+    })
+    .expect("mount");
+    let node = app
+        .presentation()
+        .expect("snapshot")
+        .find_label("keys")
+        .expect("the button")
+        .id();
+    app.dispatch_intent(Intent::keydown_with(
+        node,
+        Key::Character('k'),
+        Code::Key('k'),
+        Modifiers::new(false, true, false, false),
+        true,
+    ))
+    .expect("the keydown turn");
+
+    assert!(control.get(), "Ctrl is observable in the handler");
+    assert!(physical.get(), "the physical code is observable");
+    assert!(repeating.get(), "key repeat is observable");
+    assert_eq!(target.get(), Some(node), "target is the resolved node");
+}
