@@ -358,19 +358,52 @@ fn lower_attribute(attribute: &NodeAttribute) -> syn::Result<TokenStream> {
     let key = attribute.key.to_string();
     if let Some(event) = key.strip_prefix("on:") {
         let expression = expression(attribute)?;
+        let param = closure_param(expression);
         let constructor = match event {
+            "click" if closure_arity(expression) == Some(0) => quote! { on_click0 },
             "click" => quote! { on_click },
+            "click_capture" => quote! { on_click_capture },
+            "click_bubble" => quote! { on_click_bubble },
+            "dblclick" => quote! { on_dblclick },
+            "input" if matches!(&param, Some(Param::Value(name)) if name == "String") => {
+                quote! { on_input_string }
+            }
             "input" => quote! { on_input },
+            "change" if matches!(&param, Some(Param::Value(name)) if name == "bool") => {
+                quote! { on_change_bool }
+            }
             "change" => quote! { on_change },
             "submit" => quote! { on_submit },
             "keydown" => quote! { on_keydown },
             "keydown_capture" => quote! { on_keydown_capture },
             "keydown_bubble" => quote! { on_keydown_bubble },
+            "focus" if matches!(&param, Some(Param::Value(name)) if name == "FocusEvent") => {
+                quote! { on_focus_value }
+            }
             "focus" => quote! { on_focus },
+            "blur" if matches!(&param, Some(Param::Value(name)) if name == "BlurEvent") => {
+                quote! { on_blur_value }
+            }
             "blur" => quote! { on_blur },
+            "compositionstart" if matches!(&param, Some(Param::Value(name)) if name == "CompositionEvent") =>
+            {
+                quote! { on_composition_start_value }
+            }
             "compositionstart" => quote! { on_composition_start },
+            "compositionupdate" if matches!(&param, Some(Param::Value(name)) if name == "CompositionEvent") =>
+            {
+                quote! { on_composition_update_value }
+            }
             "compositionupdate" => quote! { on_composition_update },
+            "compositionend" if matches!(&param, Some(Param::Value(name)) if name == "CompositionEvent") =>
+            {
+                quote! { on_composition_end_value }
+            }
             "compositionend" => quote! { on_composition_end },
+            "compositioncancel" if matches!(&param, Some(Param::Value(name)) if name == "CompositionEvent") =>
+            {
+                quote! { on_composition_cancel_value }
+            }
             "compositioncancel" => quote! { on_composition_cancel },
             other => {
                 return Err(syn::Error::new_spanned(
@@ -398,6 +431,47 @@ fn lower_attribute(attribute: &NodeAttribute) -> syn::Result<TokenStream> {
                 ::zenui::view::attr(#key, #expression)
             })
         }
+    }
+}
+
+/// 闭包第一个参数的类型形状；用于兼容旧的按值 payload 与 `String`/`bool` 签名。
+enum Param {
+    Value(String),
+    Reference,
+}
+
+fn closure_param(expression: &Expr) -> Option<Param> {
+    let closure = closure_expression(expression)?;
+    let syn::Pat::Type(typed) = closure.inputs.first()? else {
+        return None;
+    };
+    match typed.ty.as_ref() {
+        syn::Type::Path(path) => path
+            .path
+            .segments
+            .last()
+            .map(|segment| Param::Value(segment.ident.to_string())),
+        syn::Type::Reference(reference) => match reference.elem.as_ref() {
+            syn::Type::Path(_) => Some(Param::Reference),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// 闭包字面量的参数个数；命名函数与其它表达式返回 `None`。
+fn closure_arity(expression: &Expr) -> Option<usize> {
+    closure_expression(expression).map(|closure| closure.inputs.len())
+}
+
+fn closure_expression(expression: &Expr) -> Option<&syn::ExprClosure> {
+    match unbraced(expression) {
+        Expr::Closure(closure) => Some(closure),
+        Expr::Block(block) => match block.block.stmts.last()? {
+            syn::Stmt::Expr(expr, _) => closure_expression(expr),
+            _ => None,
+        },
+        _ => None,
     }
 }
 

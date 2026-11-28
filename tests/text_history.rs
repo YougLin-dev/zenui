@@ -1202,3 +1202,72 @@ fn undo_rejects_a_window_awaiting_close_confirmation() {
     app.request_close(main).expect("begin the close epoch");
     assert_eq!(app.undo_node(draft), Err(DispatchError::Suspended(draft)));
 }
+
+#[test]
+fn rejecting_or_panicking_undo_keeps_the_history_and_the_committed_value() {
+    #[component]
+    fn GuardedCancellation(reject: Rc<Cell<bool>>, boom: Rc<Cell<bool>>) -> MountResult<MountPlan> {
+        let draft = signal(String::from("ab"));
+        view! {
+            <text-input
+                aria:label="guarded"
+                value={draft}
+                on:input={move |value: String| -> Result<(), HandlerError> {
+                    if reject.get() {
+                        return Err(HandlerError::new("undo refused"));
+                    }
+                    if boom.get() {
+                        panic!("undo boom");
+                    }
+                    draft.set(value);
+                    Ok(())
+                }}
+            />
+        }
+    }
+
+    let reject = Rc::new(Cell::new(false));
+    let boom = Rc::new(Cell::new(false));
+    let mut app = Runtime::new();
+    app.mount({
+        let reject = reject.clone();
+        let boom = boom.clone();
+        move || view! { <GuardedCancellation reject={reject} boom={boom} /> }
+    })
+    .expect("mount");
+    let editor = node(&app, "guarded");
+    app.set_caret_node(editor, 2).expect("caret at the end");
+    app.insert_text_node(editor, "c").expect("type c");
+    app.insert_text_node(editor, "d").expect("type d");
+    assert_eq!(value(&app, "guarded"), "abcd");
+
+    reject.set(true);
+    let report = app.undo_node(editor).expect("the refusal is contained");
+    assert!(matches!(
+        report.errors(),
+        [TurnError::HandlerFailed(error)] if error.message() == "undo refused"
+    ));
+    assert_eq!(value(&app, "guarded"), "abcd", "the undo did not commit");
+    reject.set(false);
+    let report = app
+        .undo_node(editor)
+        .expect("the preserved history still undoes");
+    assert!(
+        report.is_ok(),
+        "unexpected second undo: {:?}",
+        report.errors()
+    );
+    assert_eq!(value(&app, "guarded"), "ab");
+
+    boom.set(true);
+    let report = app.redo_node(editor).expect("the panic is contained");
+    assert!(matches!(
+        report.errors(),
+        [TurnError::HandlerPanicked(panic)] if panic.message() == "undo boom"
+    ));
+    assert_eq!(value(&app, "guarded"), "ab", "the redo did not commit");
+    boom.set(false);
+    app.redo_node(editor)
+        .expect("the preserved redo still applies");
+    assert_eq!(value(&app, "guarded"), "abcd");
+}

@@ -763,6 +763,7 @@ impl Runtime {
     pub fn drive_tasks(&mut self) -> Result<DeliveryReport, MountError> {
         let state = self.state.clone();
         crate::context::install(&state, || {
+            with_state(State::begin_turn);
             with_state(State::accept_ready_tasks);
             let mut report = DeliveryReport::default();
             let mut ran_step = false;

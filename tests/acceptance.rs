@@ -111,8 +111,13 @@ fn a_failing_component_keeps_committed_siblings_and_releases_setup_state() {
     let baseline_memos = app.live_memos();
     assert!(app.texts().iter().any(|text| text == "stable"));
 
-    let failure = app.click_text("Break").expect_err("the branch mount fails");
-    assert_eq!(failure, MountError::Component("bomb"));
+    let report = app
+        .click_text("Break")
+        .expect("the branch failure is contained in the turn report");
+    assert_eq!(
+        report.errors(),
+        [TurnError::ActionFailed(MountError::Component("bomb"))]
+    );
     assert_eq!(
         app.live_signals(),
         baseline_signals,
@@ -171,15 +176,15 @@ fn illegal_context_writes_fail_before_state_changes_and_recover() {
     assert!(app.texts().iter().any(|text| text == "v=0"));
     assert!(app.texts().iter().any(|text| text == "n=0"));
 
-    let failure = app
+    let report = app
         .click_text("BadSignal")
-        .expect_err("a memo write is rejected");
+        .expect("the rejected memo write is contained in the turn report");
     assert!(matches!(
-        failure,
-        MountError::Context {
+        report.errors(),
+        [TurnError::ActionFailed(MountError::Context {
             operation: "Signal::set",
             ..
-        }
+        })]
     ));
     assert!(
         app.texts().iter().any(|text| text == "v=0"),
@@ -189,15 +194,17 @@ fn illegal_context_writes_fail_before_state_changes_and_recover() {
     app.click_text("Good").expect("a legal event still runs");
     assert!(app.texts().iter().any(|text| text == "v=1"));
 
-    let failure = app
+    let report = app
         .click_text("BadModel")
-        .expect_err("the rejected model write reaches the command boundary");
+        .expect("the rejected model write is contained in the turn report");
     assert!(matches!(
-        failure,
-        MountError::Write(WriteError::Context {
-            operation: "Transaction::finish",
-            ..
-        })
+        report.errors(),
+        [TurnError::ActionFailed(MountError::Write(
+            WriteError::Context {
+                operation: "Transaction::finish",
+                ..
+            }
+        ))]
     ));
     assert!(
         app.texts().iter().any(|text| text == "n=0"),
@@ -243,10 +250,13 @@ fn duplicate_for_keys_fail_before_publication() {
     let mut app = mount(|| view! { <BadList /> });
     let before = app.texts();
 
-    let failure = app
+    let report = app
         .click_text("Seed")
-        .expect_err("duplicate keys reject the frame");
-    assert_eq!(failure, MountError::DuplicateKey);
+        .expect("duplicate keys are contained in the turn report");
+    assert_eq!(
+        report.errors(),
+        [TurnError::ActionFailed(MountError::DuplicateKey)]
+    );
     assert_eq!(app.texts(), before, "the committed interface is untouched");
     assert!(app.for_items().is_empty(), "no duplicate row was mounted");
 }
@@ -399,15 +409,15 @@ fn signal_with_rejects_writes_without_changing_state() {
     }
 
     let mut app = mount(|| view! { <Guarded /> });
-    let failure = app
+    let report = app
         .click_text("Write")
-        .expect_err("a write inside with is rejected");
+        .expect("a write inside with is contained in the turn report");
     assert!(matches!(
-        failure,
-        MountError::Context {
+        report.errors(),
+        [TurnError::ActionFailed(MountError::Context {
             operation: "Signal::set",
             ..
-        }
+        })]
     ));
     assert!(app.texts().iter().any(|text| text == "v=0"));
 
@@ -673,10 +683,15 @@ fn stale_field_and_write_errors_are_reported() {
         "a removed field reads as an invalid handle"
     );
 
-    let failure = app
+    let report = app
         .click_text("DeleteAgain")
-        .expect_err("a stale write is reported");
-    assert!(matches!(failure, MountError::Write(WriteError::Missing(_))));
+        .expect("a stale write is contained in the turn report");
+    assert!(matches!(
+        report.errors(),
+        [TurnError::ActionFailed(MountError::Write(
+            WriteError::Missing(_)
+        ))]
+    ));
 }
 
 #[test]
@@ -740,10 +755,16 @@ fn a_retained_mounted_row_keeps_its_mounted_identity() {
     assert_eq!(before.len(), 2);
     let texts = app.texts();
 
-    let failure = app.click_text("Swap").expect_err("the fresh C row fails");
+    let report = app
+        .click_text("Swap")
+        .expect("the fresh C row failure is contained in the turn report");
     assert!(
-        matches!(&failure, MountError::FactoryFailed(error) if **error == MountError::Component("C boom")),
-        "unexpected failure: {failure:?}"
+        matches!(
+            report.errors(),
+            [TurnError::FactoryFailed(MountError::Component("C boom"))]
+        ),
+        "unexpected failure: {:?}",
+        report.errors()
     );
     assert_eq!(app.texts(), texts, "the old mapping remains");
     let after = app.for_items();

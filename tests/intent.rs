@@ -161,3 +161,42 @@ fn window_and_app_intents_validate_the_activation() {
     app.dispatch_intent(Intent::activate_window(reopened))
         .expect("the replacement activation is accepted");
 }
+
+#[test]
+fn a_handler_may_return_a_write_op_and_it_runs_once() {
+    #[component]
+    fn Writes() -> MountResult<MountPlan> {
+        let store = Store::new();
+        let rows = memo(move || store.rows(Filter::All).len().to_string());
+        view! {
+            <view>
+                <text aria:label="rows">{rows}</text>
+                <button aria:label="add" on:click={move || store.insert("row")}>"Add"</button>
+            </view>
+        }
+    }
+
+    let mut app = Runtime::new();
+    app.mount(|| view! { <Writes /> }).expect("mount");
+    let report = app.click_label("add").expect("the write-op turn");
+    assert!(
+        report.is_ok(),
+        "the WriteOp commits without a handler error"
+    );
+    assert!(
+        report.changed(),
+        "the committed row changes the presentation"
+    );
+    assert_eq!(row_count(&app), "1", "the WriteOp runs exactly once");
+
+    app.click_label("add").expect("a second write");
+    assert_eq!(row_count(&app), "2");
+}
+
+fn row_count(app: &Runtime) -> String {
+    app.presentation()
+        .expect("snapshot")
+        .find_label("rows")
+        .expect("the row count")
+        .text()
+}

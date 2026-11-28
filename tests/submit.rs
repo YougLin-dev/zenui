@@ -168,3 +168,54 @@ fn the_headless_add_flow_submits_the_demo_form() {
     assert_eq!(app.for_items().len(), 1, "the Add button submits the form");
     assert!(app.texts().iter().any(|text| text == "Via submit"));
 }
+
+#[test]
+fn submit_reports_the_triggering_source() {
+    #[component]
+    fn SourceForm(seen: Rc<std::cell::RefCell<Vec<EventSource>>>) -> MountResult<MountPlan> {
+        let seen_handler = seen;
+        view! {
+            <form aria:label="form" on:submit={move |event: &mut SubmitEvent| {
+                seen_handler.borrow_mut().push(event.source());
+            }}>
+                <text-input aria:label="draft" />
+                <button aria:label="submit" type="submit">"Save"</button>
+            </form>
+        }
+    }
+
+    let seen = Rc::new(std::cell::RefCell::new(Vec::new()));
+    let mut app = Runtime::new();
+    app.mount({
+        let seen = seen.clone();
+        move || view! { <SourceForm seen={seen} /> }
+    })
+    .expect("mount");
+    let draft = app
+        .presentation()
+        .expect("snapshot")
+        .find_label("draft")
+        .expect("the input")
+        .id();
+    let form = app
+        .presentation()
+        .expect("snapshot")
+        .find_label("form")
+        .expect("the form")
+        .id();
+
+    app.click_label("submit").expect("a pointer submit");
+    app.focus("draft").expect("focus the input");
+    app.dispatch_intent(Intent::keydown(draft, Key::Enter, Modifiers::default()))
+        .expect("a keyboard submit");
+    app.submit_node(form).expect("a direct submit");
+
+    assert_eq!(
+        *seen.borrow(),
+        [
+            EventSource::Pointer,
+            EventSource::Keyboard,
+            EventSource::Accessibility
+        ]
+    );
+}

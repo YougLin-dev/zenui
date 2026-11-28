@@ -286,7 +286,8 @@ pub fn TodoItem(todo: TodoId, todos: Store) -> MountResult<MountPlan> {
             <checkbox
                 checked={completed}
                 aria:label={once(complete_label)}
-                on:change={move |done: bool| {
+                on:change={move |event: &mut ChangeEvent| {
+                    let done = event.proposed();
                     let _ = Transaction::new()
                         .write(todos.set_completed(todo, done))
                         .finish();
@@ -297,7 +298,8 @@ pub fn TodoItem(todo: TodoId, todos: Store) -> MountResult<MountPlan> {
                 class="focus-visible:border-accent"
                 value={editing}
                 aria:label={once(edit_label)}
-                on:input={move |value: String| {
+                on:input={move |event: &mut InputEvent| {
+                    let value = event.value().to_owned();
                     editing.set(value.clone());
                     let _ = Transaction::new().write(todos.set_title(todo, value)).finish();
                 }}
@@ -564,7 +566,7 @@ pub fn TodoApp(window: WindowCtx, state: TodoState) -> MountResult<MountPlan> {
                     class="focus-visible:border-accent"
                     value={draft}
                     aria:label="What needs to be done?"
-                    on:input={move |value: String| draft.set(value)}
+                    on:input={move |event: &mut InputEvent| draft.set(event.value().to_owned())}
                 />
                 <button
                     class="px-4 py-2 bg-accent text-inverse rounded-md font-semibold"
@@ -681,7 +683,7 @@ pub fn TodoDetails(window: WindowCtx, state: TodoState) -> MountResult<MountPlan
                 class="focus-visible:border-accent"
                 value={note}
                 aria:label="Details note"
-                on:input={move |value: String| note.set(value)}
+                on:input={move |event: &mut InputEvent| note.set(event.value().to_owned())}
             />
             <view role="list" aria:label="Details rows" class="gap-0">
                 <For each={visible} store={todos} key={|row: &TodoRow| row.id} row-height={em(2.5)}>

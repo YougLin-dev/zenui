@@ -6,7 +6,7 @@
 
 #![allow(unused_braces)]
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use zenui::prelude::*;
@@ -153,10 +153,13 @@ fn a_panicking_change_handler_does_not_apply_the_proposed_value() {
     app.mount(|| view! { <PanickingChange /> }).expect("mount");
     let box_id = node(&app, "boom");
 
-    let failure = app
+    let report = app
         .change_node(box_id, true)
-        .expect_err("the handler panic is returned");
-    assert!(matches!(failure, DispatchError::Panic(panic) if panic.message() == "change boom"));
+        .expect("the handler panic is contained in the report");
+    assert!(matches!(
+        report.errors(),
+        [TurnError::HandlerPanicked(panic)] if panic.message() == "change boom"
+    ));
     assert_eq!(
         app.checked("boom"),
         Some(false),
@@ -261,7 +264,7 @@ fn tab_with_no_other_focusable_control_does_not_report_a_change() {
 fn programmatic_duplicate_event_handlers_are_rejected_at_mount() {
     let plan = zenui::view::element(
         "button",
-        vec![zenui::view::on_click(|| {}), zenui::view::on_click(|| {})],
+        vec![zenui::view::on_click0(|| {}), zenui::view::on_click0(|| {})],
         Vec::new(),
     );
     let mut app = Runtime::new();
@@ -269,4 +272,196 @@ fn programmatic_duplicate_event_handlers_are_rejected_at_mount() {
         .mount(move || Ok(MountPlan::new(vec![plan])))
         .expect_err("the duplicate handler is rejected");
     assert_eq!(failure, MountError::DuplicateHandler("click"));
+}
+
+type Log = Rc<RefCell<Vec<&'static str>>>;
+
+fn record(log: &Log, entry: &'static str) {
+    log.borrow_mut().push(entry);
+}
+
+#[test]
+fn click_capture_and_bubble_use_the_fixed_anchor_order() {
+    let log: Log = Rc::new(RefCell::new(Vec::new()));
+    let mut app = Runtime::new();
+    app.mount({
+        let log = log.clone();
+        move || {
+            let root_capture = log.clone();
+            let root_bubble = log.clone();
+            let mid_capture = log.clone();
+            let mid_bubble = log.clone();
+            let target = log.clone();
+            view! {
+                <view
+                    aria:label="root"
+                    on:click_capture={move |_event: &mut ClickEvent| {
+                        record(&root_capture, "root-capture")
+                    }}
+                    on:click_bubble={move |_event: &mut ClickEvent| {
+                        record(&root_bubble, "root-bubble")
+                    }}
+                >
+                    <view
+                        aria:label="mid"
+                        on:click_capture={move |_event: &mut ClickEvent| {
+                            record(&mid_capture, "mid-capture")
+                        }}
+                        on:click_bubble={move |_event: &mut ClickEvent| {
+                            record(&mid_bubble, "mid-bubble")
+                        }}
+                    >
+                        <button
+                            aria:label="target"
+                            on:click={move |_event: &mut ClickEvent| {
+                                record(&target, "target")
+                            }}
+                        >"Go"</button>
+                    </view>
+                </view>
+            }
+        }
+    })
+    .expect("mount");
+
+    app.click_label("target").expect("the routed click");
+    assert_eq!(
+        *log.borrow(),
+        [
+            "root-capture",
+            "mid-capture",
+            "target",
+            "mid-bubble",
+            "root-bubble"
+        ],
+        "capture runs root→hit, then the closest handler, then bubble hit-parent→root"
+    );
+}
+
+#[test]
+fn a_double_click_runs_the_nearest_dblclick_handler_after_the_click_handler() {
+    let log: Log = Rc::new(RefCell::new(Vec::new()));
+    let counts = Rc::new(Cell::new(0_u8));
+    let mut app = Runtime::new();
+    app.mount({
+        let log = log.clone();
+        let counts = counts.clone();
+        move || {
+            let click = log.clone();
+            let dbl = log.clone();
+            let counts = counts.clone();
+            view! {
+                <view aria:label="row">
+                    <button
+                        aria:label="twice"
+                        on:click={move |event: &mut ClickEvent| {
+                            counts.set(event.click_count());
+                            record(&click, "click");
+                        }}
+                        on:dblclick={move |event: &mut ClickEvent| {
+                            assert_eq!(event.click_count(), 2);
+                            record(&dbl, "dbl");
+                        }}
+                    >"Twice"</button>
+                </view>
+            }
+        }
+    })
+    .expect("mount");
+    let node = node(&app, "twice");
+    app.dispatch_intent(Intent::click_detailed(
+        node,
+        None,
+        None,
+        2,
+        Modifiers::default(),
+    ))
+    .expect("the double-click intent");
+    assert_eq!(counts.get(), 2, "the click payload carries the count");
+    assert_eq!(*log.borrow(), ["click", "dbl"]);
+}
+
+#[test]
+fn a_click_handler_can_prevent_the_submit_default() {
+    #[component]
+    fn BlockedSubmit(submits: Rc<Cell<u32>>) -> MountResult<MountPlan> {
+        view! {
+            <form aria:label="form" on:submit={move |_event: &mut SubmitEvent| {
+                submits.set(submits.get() + 1);
+            }}>
+                <button
+                    aria:label="save"
+                    type="submit"
+                    on:click={move |event: &mut ClickEvent| {
+                        event.prevent_default();
+                    }}
+                >"Save"</button>
+            </form>
+        }
+    }
+
+    let submits = Rc::new(Cell::new(0));
+    let mut app = Runtime::new();
+    app.mount({
+        let submits = submits.clone();
+        move || view! { <BlockedSubmit submits={submits} /> }
+    })
+    .expect("mount");
+    let report = app.click_label("save").expect("the click turn");
+    assert!(report.outcome().prevent_default());
+    assert_eq!(submits.get(), 0, "prevent_default skips the submit default");
+}
+
+#[test]
+fn click_and_change_sources_distinguish_pointer_keyboard_and_uia() {
+    #[component]
+    fn Sources(seen: Rc<RefCell<Vec<EventSource>>>) -> MountResult<MountPlan> {
+        let clicked = seen.clone();
+        let changed = seen;
+        view! {
+            <view>
+                <button
+                    aria:label="source"
+                    on:click={move |event: &mut ClickEvent| {
+                        clicked.borrow_mut().push(event.source());
+                    }}
+                >"Source"</button>
+                <checkbox
+                    aria:label="check"
+                    on:change={move |event: &mut ChangeEvent| {
+                        changed.borrow_mut().push(event.source());
+                    }}
+                />
+            </view>
+        }
+    }
+
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let mut app = Runtime::new();
+    app.mount({
+        let seen = seen.clone();
+        move || view! { <Sources seen={seen} /> }
+    })
+    .expect("mount");
+    let source = node(&app, "source");
+    let check = node(&app, "check");
+
+    app.click_label("source").expect("a pointer click");
+    app.focus("source").expect("focus the button");
+    app.dispatch_intent(Intent::keydown(source, Key::Enter, Modifiers::default()))
+        .expect("a keyboard activation");
+    app.click_node(source).expect("a direct/UIA click");
+    app.focus("check").expect("focus the checkbox");
+    app.dispatch_intent(Intent::keydown(check, Key::Enter, Modifiers::default()))
+        .expect("a keyboard toggle");
+
+    assert_eq!(
+        *seen.borrow(),
+        [
+            EventSource::Pointer,
+            EventSource::Keyboard,
+            EventSource::Accessibility,
+            EventSource::Keyboard
+        ]
+    );
 }

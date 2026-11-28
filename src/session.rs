@@ -76,6 +76,8 @@ pub enum SessionError {
     RegistrationClosed,
     /// 当前生命周期状态不允许该会话动作。
     State(&'static str),
+    /// 本 turn 的会话请求预算已耗尽；后续请求被拒绝。
+    BudgetExceeded,
     /// 会话已显式结束，不再接受新的窗口或会话动作。
     Ended,
     /// 目录中没有这个窗口键。
@@ -96,6 +98,9 @@ impl fmt::Display for SessionError {
                 "the session policy must be declared before the first window or root mount",
             ),
             Self::State(message) => f.write_str(message),
+            Self::BudgetExceeded => {
+                f.write_str("this turn already queued the maximum number of session requests")
+            }
             Self::Ended => f.write_str("the application session has ended"),
             Self::UnknownWindow(key) => write!(f, "window key {key} is not in the catalog"),
             Self::TrayRequired => {

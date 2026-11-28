@@ -358,7 +358,14 @@ fn menu_state_reads_committed_state_and_rejects_writes() {
     let error = app
         .menu_state(main, &command_by_id(&menu, "state.panic"))
         .expect_err("a panicking callback is contained");
-    assert_eq!(error, MenuStateError::HandlerPanicked);
+    assert!(
+        matches!(
+            error,
+            MenuStateError::HandlerPanicked(ref panic)
+                if panic.message() == "the menu state callback failed"
+        ),
+        "{error:?}"
+    );
     assert_eq!(
         app.menu_state(main, &toggle),
         Ok(Some(MenuCommandState::new(true, true))),
@@ -689,7 +696,7 @@ fn command_app() -> CommandApp {
             window
                 .on_command("do.update", move |event| {
                     update_runs.set(update_runs.get() + 1);
-                    update_events.borrow_mut().push(event);
+                    update_events.borrow_mut().push(*event);
                     status.set(String::from("ran"));
                     let mut transaction = Transaction::new();
                     transaction = transaction.write(Store::new().insert("from-command"));
@@ -847,7 +854,7 @@ fn a_panicking_command_handler_is_contained() {
     app.declare_windows(move |catalog| {
         catalog.window(WindowSpec::new("main").primary(), move |window| {
             window
-                .on_command("boom", |_| panic!("the command handler failed"))
+                .on_command("boom", |_| -> () { panic!("the command handler failed") })
                 .expect("register boom");
             window
                 .on_command("ok", move |_| status.set(String::from("ok")))
@@ -863,12 +870,55 @@ fn a_panicking_command_handler_is_contained() {
     .expect("catalog");
     let main = app.show("main").expect("show main");
 
-    assert_eq!(
-        app.dispatch_command(main, "boom", CommandSource::MenuBar),
-        Err(CommandError::HandlerPanicked("boom"))
-    );
+    let report = app
+        .dispatch_command(main, "boom", CommandSource::MenuBar)
+        .expect("the panic is contained in the report");
+    assert!(matches!(
+        report.errors(),
+        [TurnError::HandlerPanicked(panic)] if panic.message() == "the command handler failed"
+    ));
     app.dispatch_command(main, "ok", CommandSource::MenuBar)
         .expect("the runtime is still usable after a contained panic");
+    assert_eq!(text_of(&app, main, "status"), "ok");
+}
+
+#[test]
+fn a_command_handler_error_enters_the_turn_report() {
+    let mut app = Runtime::new();
+    let status = app.setup(|| signal(String::from("idle"))).expect("setup");
+    app.declare_windows(move |catalog| {
+        catalog.window(WindowSpec::new("main").primary(), move |window| {
+            window
+                .on_command("refuse", |_| -> Result<(), HandlerError> {
+                    Err(HandlerError::new("save refused"))
+                })
+                .expect("register refuse");
+            window
+                .on_command("ok", move |_| status.set(String::from("ok")))
+                .expect("register ok");
+            view! { <view><text aria:label="status">{status}</text></view> }
+        })?;
+        catalog.menu(
+            "main",
+            MenuSpec::new()
+                .command("refuse", "Refuse")
+                .command("ok", "OK"),
+        )?;
+        Ok(())
+    })
+    .expect("catalog");
+    let main = app.show("main").expect("show main");
+
+    let report = app
+        .dispatch_command(main, "refuse", CommandSource::MenuBar)
+        .expect("the handler error is contained in the report");
+    assert!(matches!(
+        report.errors(),
+        [TurnError::HandlerFailed(error)] if error.message() == "save refused"
+    ));
+    assert_eq!(text_of(&app, main, "status"), "idle");
+    app.dispatch_command(main, "ok", CommandSource::MenuBar)
+        .expect("the session continues");
     assert_eq!(text_of(&app, main, "status"), "ok");
 }
 
@@ -881,7 +931,7 @@ fn dispatch_validates_context_targets() {
         catalog.window(WindowSpec::new("a").primary(), move |window| {
             let seen = a_seen.clone();
             window
-                .on_command("act", move |event| seen.borrow_mut().push(event))
+                .on_command("act", move |event| seen.borrow_mut().push(*event))
                 .expect("register act");
             view! { <view><button aria:label="a-button">"A"</button></view> }
         })?;

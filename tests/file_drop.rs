@@ -293,13 +293,51 @@ fn a_panicking_drop_handler_is_contained_and_the_runtime_stays_usable() {
     .expect("declare windows");
 
     let main = app.show("main").expect("show main");
-    assert_eq!(
-        app.drop_files(main, vec![path("panic.txt")]),
-        Err(DropError::HandlerPanicked)
-    );
+    let report = app
+        .drop_files(main, vec![path("panic.txt")])
+        .expect("the panic is contained in the report");
+    assert!(matches!(
+        report.errors(),
+        [TurnError::HandlerPanicked(panic)] if panic.message() == "the drop handler failed"
+    ));
     app.drop_files(main, vec![path("after.txt")])
         .expect("a later drop still runs");
     assert_eq!(*events.borrow(), [vec![path("after.txt")]]);
+}
+
+#[test]
+fn a_drop_handler_error_enters_the_turn_report() {
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let events_factory = events.clone();
+    let mut app = Runtime::new();
+    app.declare_windows(move |catalog| {
+        catalog.window(WindowSpec::new("main").primary(), move |window| {
+            let events = events_factory.clone();
+            window
+                .on_drop(move |drop| -> Result<(), HandlerError> {
+                    if drop.paths().iter().any(|path| path.ends_with("refuse.txt")) {
+                        return Err(HandlerError::new("drop refused"));
+                    }
+                    events.borrow_mut().push(drop.into_paths());
+                    Ok(())
+                })
+                .expect("register the drop handler");
+            view! { <view>"main"</view> }
+        })
+    })
+    .expect("declare windows");
+
+    let main = app.show("main").expect("show main");
+    let report = app
+        .drop_files(main, vec![path("refuse.txt")])
+        .expect("the handler error is contained in the report");
+    assert!(matches!(
+        report.errors(),
+        [TurnError::HandlerFailed(error)] if error.message() == "drop refused"
+    ));
+    app.drop_files(main, vec![path("accepted.txt")])
+        .expect("a later drop still runs");
+    assert_eq!(*events.borrow(), [vec![path("accepted.txt")]]);
 }
 
 #[test]

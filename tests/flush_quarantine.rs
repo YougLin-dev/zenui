@@ -162,12 +162,16 @@ fn a_failed_for_factory_releases_fresh_rows_and_keeps_retained_rows() {
     let memos = app.live_memos();
     assert_eq!(report_runs(&mut app), "runs 2");
 
-    let failure = app
+    let report = app
         .click_label("break")
-        .expect_err("the boom row factory fails");
+        .expect("the boom row factory failure is contained");
     assert!(
-        matches!(&failure, MountError::FactoryFailed(error) if **error == MountError::Component("row boom")),
-        "unexpected failure: {failure:?}"
+        matches!(
+            report.errors(),
+            [TurnError::FactoryFailed(MountError::Component("row boom"))]
+        ),
+        "unexpected failure: {:?}",
+        report.errors()
     );
     assert_eq!(
         app.live_signals(),
@@ -185,12 +189,16 @@ fn a_failed_for_factory_releases_fresh_rows_and_keeps_retained_rows() {
     );
     assert!(text_present(&app, "memo B"));
 
-    let failure = app
+    let report = app
         .click_label("rename-b")
-        .expect_err("the row set still contains boom");
+        .expect("the failing row factory result is contained");
     assert!(
-        matches!(&failure, MountError::FactoryFailed(error) if **error == MountError::Component("row boom")),
-        "unexpected failure: {failure:?}"
+        matches!(
+            report.errors(),
+            [TurnError::FactoryFailed(MountError::Component("row boom"))]
+        ),
+        "unexpected failure: {:?}",
+        report.errors()
     );
     assert!(
         text_present(&app, "memo B2"),
@@ -270,21 +278,20 @@ fn SettlementCommitHost() -> MountResult<MountPlan> {
                         }
                     });
                     let row_disabled = memo(move || is_a && disabled.get());
-                    let on_blur = move |_event: BlurEvent| {
-                        if let Some(key) = x_key.get()
-                            && store.row_id(key).is_some()
-                        {
-                            Transaction::new()
-                                .write(store.remove(key))
-                                .finish()
-                                .expect("delete X from the settlement blur");
-                        }
-                    };
                     view! {
                         <button
                             aria:label={once(format!("row {title}"))}
                             disabled={row_disabled}
-                            on:blur={on_blur}
+                            on:blur={move |_event: BlurEvent| {
+                                if let Some(key) = x_key.get()
+                                    && store.row_id(key).is_some()
+                                {
+                                    Transaction::new()
+                                        .write(store.remove(key))
+                                        .finish()
+                                        .expect("delete X from the settlement blur");
+                                }
+                            }}
                         >
                             <text>{label}</text>
                         </button>
@@ -882,10 +889,16 @@ fn an_error_flush_keeps_pending_changes_for_the_next_flush() {
     .expect("mount");
     assert_eq!(report_runs(&mut app), "runs 1");
 
-    let failure = app.click_label("break").expect_err("the boom row fails");
+    let report = app
+        .click_label("break")
+        .expect("the boom row failure is contained");
     assert!(
-        matches!(&failure, MountError::FactoryFailed(error) if **error == MountError::Component("row boom")),
-        "unexpected failure: {failure:?}"
+        matches!(
+            report.errors(),
+            [TurnError::FactoryFailed(MountError::Component("row boom"))]
+        ),
+        "unexpected failure: {:?}",
+        report.errors()
     );
 
     app.click_label("heal").expect("heal the row set");
