@@ -731,6 +731,11 @@ struct WindowHost {
     scrollbar_drag: Option<f32>,
     /// 下一次构建前把聚焦元素或 caret 显露到视口内；显式滚动会清除它。
     reveal_requested: bool,
+    /// 环境偏好驱动的重绘跳过行窗口同步，直到滚动、尺寸或结构变化。
+    ///
+    /// 文本缩放与 DPI 改变 `em` 行高，重新计算窗口会卸载窗口外行并丢失本地
+    /// 编辑状态；ADR-0022 要求这些偏好不推进树 revision。
+    defer_row_window_sync: bool,
     /// 指针、按压、模态或 caret 等瞬时状态变化需要重绘；它们不进入快照。
     ///
     /// 只有成功呈现才清除；`Timeout` / `Occluded` / `Lost` 与零尺寸保留它，
@@ -1138,7 +1143,9 @@ impl Host {
         for window in self.windows.values_mut() {
             window.paint_requested = true;
             // 文本缩放与高对比度不进入快照；环境代际推进让场景、布局与
-            // 无障碍几何在 revision 不变时也能失效。
+            // 无障碍几何在 revision 不变时也能失效。行高变化不重算挂载窗口，
+            // 否则会卸载窗口外行并推进树 revision。
+            window.defer_row_window_sync = true;
             bump_env_generation(window);
         }
         true
@@ -1692,7 +1699,8 @@ impl Host {
             Ok(()) | Err(FileDialogRequestError::Stale) => {}
             Err(error) => return Err(HostError::FileDialog(error)),
         }
-        self.runtime.drive_tasks().map_err(HostError::Runtime)?;
+        let report = self.runtime.drive_tasks().map_err(HostError::Runtime)?;
+        self.surface_delivery_errors(&report);
         self.settle_requests()?;
         self.sync_windows()?;
         if std::mem::take(&mut self.focus_after_sync) {
@@ -1909,12 +1917,20 @@ impl Host {
     fn deliver_tasks(&mut self) -> Result<(), HostError> {
         self.wake.observed();
         let report = self.runtime.drive_tasks().map_err(HostError::Runtime)?;
+        self.surface_delivery_errors(&report);
         // 交付期的 continuation 也可以打开、隐藏或关闭窗口。
         self.settle_requests()?;
-        if report.delivered == 0 {
+        if report.delivered == 0 && report.errors().is_empty() {
             return Ok(());
         }
         self.repaint_changed_windows()
+    }
+
+    /// 把 batch 内的 continuation 失败转成可恢复诊断；会话继续运行。
+    fn surface_delivery_errors(&mut self, report: &DeliveryReport) {
+        for error in report.errors() {
+            self.note_diagnostic(format!("task delivery failed: {error}"));
+        }
     }
 
     /// 闪烁 caret；只有聚焦输入、非组合且窗口在前台时才翻转。
@@ -2014,6 +2030,17 @@ impl Host {
             self.render_key(key)?;
         }
         Ok(())
+    }
+
+    /// 窗口尺寸或 DPI 改变后行窗口重新参与同步；与偏好驱动的重绘不同，
+    /// 视口高度已经变化，必须按新几何重新挂载。
+    fn note_window_geometry_changed(&mut self, hwnd: HWND) {
+        let Some(key) = self.key_for(hwnd) else {
+            return;
+        };
+        if let Some(window) = self.windows.get_mut(key) {
+            window.defer_row_window_sync = false;
+        }
     }
 
     fn render_key(&mut self, key: &'static str) -> Result<(), HostError> {
@@ -2401,7 +2428,14 @@ impl Host {
         // 行带几何来自第一遍；行窗口结构 turn 在场景构建之外应用，只有真的
         // 变化时才用运行时的新快照建第二遍。行带顶端锚定在内容起点，两遍
         // 场景的偏移一致且精确。
-        let row_windows = pending_row_windows(&scene);
+        let row_windows = if window.defer_row_window_sync && !snapshot_changed {
+            // 环境偏好只改变行高与几何；保持已挂载窗口，避免卸载窗口外行
+            // 并推进树 revision。下一次滚动、尺寸或结构变化再同步。
+            PendingRowWindows::default()
+        } else {
+            window.defer_row_window_sync = false;
+            pending_row_windows(&scene)
+        };
         let scene =
             self.apply_row_windows(window, snapshot, PendingScene { scene, row_windows })?;
         let target = target_config(self.format, width, height)?;
@@ -3252,125 +3286,150 @@ impl Host {
             .and_then(|window| window.accessibility.tree())
     }
 
-    /// 在窗口对应的 UI 线程上执行 provider 排队的动作，再结算请求与重绘。
+    /// 在窗口对应的 UI 线程上逐条执行 provider 排队的动作，并在每条之后结算请求。
+    ///
+    /// 每个动作都是独立 turn：处理器排队的窗口/会话请求先结算，下一条动作
+    /// 才能看到隐藏、关闭或新内容。动作失败保留为宿主错误，但已应答的动作
+    /// 不会被丢弃；报告内的 turn 错误转成可恢复诊断。
     fn run_queued_accessibility_actions(&mut self, hwnd: HWND) {
         let Some(key) = self.key_for(hwnd) else {
             return;
         };
-        let result = self.with_window(key, |host, window| host.run_accessibility_actions(window));
-        if let Err(error) = result {
-            self.deferred_error.get_or_insert(error);
-        }
-        if let Err(error) = self.settle_requests() {
-            self.deferred_error.get_or_insert(error);
+        while let Some(action) = self
+            .windows
+            .get_mut(key)
+            .and_then(|window| window.accessibility.take_next_action())
+        {
+            let result = self.with_window(key, |host, window| {
+                host.run_accessibility_action(window, action)
+            });
+            if let Err(error) = result {
+                self.deferred_error.get_or_insert(error);
+                break;
+            }
+            if let Err(error) = self.settle_requests() {
+                self.deferred_error.get_or_insert(error);
+                break;
+            }
         }
         if let Err(error) = self.repaint_changed_windows() {
             self.deferred_error.get_or_insert(error);
         }
     }
 
-    /// 按入队顺序执行辅助技术动作；每条都按最新快照重验。
+    /// 测试入口：按 FIFO 执行窗口队列，不结算窗口请求。
+    #[cfg(test)]
+    fn run_accessibility_actions(&mut self, window: &mut WindowHost) -> Result<(), HostError> {
+        while let Some(action) = window.accessibility.take_next_action() {
+            self.run_accessibility_action(window, action)?;
+        }
+        Ok(())
+    }
+
+    /// 执行一条辅助技术动作；Node 动作重验最新树，Scroll 先刷新输入场景。
     ///
     /// provider 已按调用时的树过滤过一次；这里重新读取运行时快照，覆盖排队期间
     /// 的卸载、禁用、隐藏与组合状态变化。被拒绝的动作是正常的竞态结果，不产生
     /// 宿主错误；Runtime 的命令路径还会再验证 Node ID 与窗口状态。
-    fn run_accessibility_actions(&mut self, window: &mut WindowHost) -> Result<(), HostError> {
-        let mut failure = None;
-        for action in window.accessibility.take_actions() {
-            match action {
-                ProviderAction::Scroll(request) => {
-                    if request.runtime != window.ctx.runtime_id()
-                        || request.activation != window.ctx.activation_id()
-                    {
-                        continue;
-                    }
-                    self.apply_accessibility_scroll(window, request.command);
-                    continue;
+    fn run_accessibility_action(
+        &mut self,
+        window: &mut WindowHost,
+        action: ProviderAction,
+    ) -> Result<(), HostError> {
+        match action {
+            ProviderAction::Scroll(request) => {
+                if request.runtime != window.ctx.runtime_id()
+                    || request.activation != window.ctx.activation_id()
+                {
+                    return Ok(());
                 }
-                ProviderAction::Node(request) => {
-                    if !Self::action_is_current(window, &request) {
-                        continue;
-                    }
-                    // 隐藏、等待关闭确认或原生禁用的窗口拒绝所有写动作。
-                    if !self.window_accepts_host_input(window) {
-                        continue;
-                    }
-                    let node = request.action.node();
-                    // NodeId 必须来自本 runtime；旧窗口或其它 runtime 的目标按竞态丢弃。
-                    if node.runtime_id() != window.ctx.runtime_id() {
-                        continue;
-                    }
-                    let Ok(snapshot) = self.runtime.presentation_of(window.ctx) else {
-                        continue;
-                    };
-                    let Some(element) = snapshot.node(node) else {
-                        continue;
-                    };
-                    if element.disabled() {
-                        continue;
-                    }
-                    let dispatched = match request.action {
-                        UiAction::Invoke { .. } => {
-                            if !element.semantics().has_action(SnapshotAction::Click) {
-                                continue;
-                            }
-                            self.runtime.click_node(node)
+                // 前一条动作可能已经提交了行或尺寸变化；先按最新快照与
+                // 行窗口重建输入场景，滚动才会使用新的内容范围。
+                self.refresh_input_scene(window)?;
+                self.apply_accessibility_scroll(window, request.command);
+            }
+            ProviderAction::Node(request) => {
+                if !Self::action_is_current(window, &request) {
+                    return Ok(());
+                }
+                // 隐藏、等待关闭确认或原生禁用的窗口拒绝所有写动作。
+                if !self.window_accepts_host_input(window) {
+                    return Ok(());
+                }
+                let node = request.action.node();
+                // NodeId 必须来自本 runtime；旧窗口或其它 runtime 的目标按竞态丢弃。
+                if node.runtime_id() != window.ctx.runtime_id() {
+                    return Ok(());
+                }
+                let Ok(snapshot) = self.runtime.presentation_of(window.ctx) else {
+                    return Ok(());
+                };
+                let Some(element) = snapshot.node(node) else {
+                    return Ok(());
+                };
+                if element.disabled() {
+                    return Ok(());
+                }
+                let dispatched = match request.action {
+                    UiAction::Invoke { .. } => {
+                        if !element.semantics().has_action(SnapshotAction::Click) {
+                            return Ok(());
                         }
-                        UiAction::Toggle { .. } => {
-                            let Some(checked) = element.toggle_state() else {
-                                continue;
-                            };
-                            if !element.semantics().has_action(SnapshotAction::Change) {
-                                continue;
-                            }
-                            self.runtime.change_node(node, !checked)
-                        }
-                        UiAction::ReplaceValue { text, .. } => {
-                            // 组合中的输入可读但拒绝整体替换，也不取消组合。
-                            let editable = element.semantics().has_action(SnapshotAction::Input)
-                                && element
-                                    .edit()
-                                    .is_some_and(|edit| edit.composition().is_none());
-                            if !editable {
-                                continue;
-                            }
-                            self.runtime.replace_text_node(node, &text)
-                        }
-                        UiAction::SetSelection { anchor, focus, .. } => {
-                            let editable = element.semantics().has_action(SnapshotAction::Input)
-                                && element
-                                    .edit()
-                                    .is_some_and(|edit| edit.composition().is_none());
-                            if !editable {
-                                continue;
-                            }
-                            self.runtime.set_selection_node(node, anchor, focus)
-                        }
-                        UiAction::SetFocus { .. } => {
-                            if !element.semantics().focusable()
-                                || !accessibility::window_is_foreground(window.hwnd())
-                            {
-                                continue;
-                            }
-                            self.runtime.focus_node(node)
-                        }
-                    };
-                    // 无障碍动作也是用户输入：处理器结算的焦点或 caret 与服务端点击
-                    // 同样需要显露。
-                    window.reveal_requested |= dispatched
-                        .as_ref()
-                        .is_ok_and(|report| report.reveal().needs_reveal());
-                    // 继续执行剩余动作；真正失败仍报告给宿主，但不丢弃已经应答的动作。
-                    if let Err(error) = ignore_expected_dispatch(dispatched) {
-                        failure.get_or_insert(error);
+                        self.runtime.click_node(node)
                     }
+                    UiAction::Toggle { .. } => {
+                        let Some(checked) = element.toggle_state() else {
+                            return Ok(());
+                        };
+                        if !element.semantics().has_action(SnapshotAction::Change) {
+                            return Ok(());
+                        }
+                        self.runtime.change_node(node, !checked)
+                    }
+                    UiAction::ReplaceValue { text, .. } => {
+                        // 组合中的输入可读但拒绝整体替换，也不取消组合。
+                        let editable = element.semantics().has_action(SnapshotAction::Input)
+                            && element
+                                .edit()
+                                .is_some_and(|edit| edit.composition().is_none());
+                        if !editable {
+                            return Ok(());
+                        }
+                        self.runtime.replace_text_node(node, &text)
+                    }
+                    UiAction::SetSelection { anchor, focus, .. } => {
+                        let editable = element.semantics().has_action(SnapshotAction::Input)
+                            && element
+                                .edit()
+                                .is_some_and(|edit| edit.composition().is_none());
+                        if !editable {
+                            return Ok(());
+                        }
+                        self.runtime.set_selection_node(node, anchor, focus)
+                    }
+                    UiAction::SetFocus { .. } => {
+                        if !element.semantics().focusable()
+                            || !accessibility::window_is_foreground(window.hwnd())
+                        {
+                            return Ok(());
+                        }
+                        self.runtime.focus_node(node)
+                    }
+                };
+                match dispatched {
+                    Ok(report) => {
+                        // 无障碍动作也是用户输入：处理器结算的焦点或 caret 与服务端点击
+                        // 同样需要显露。
+                        window.reveal_requested |= report.reveal().needs_reveal();
+                        for error in report.errors() {
+                            self.note_diagnostic(format!("accessibility action failed: {error}"));
+                        }
+                    }
+                    Err(error) => ignore_expected_dispatch::<()>(Err(error))?,
                 }
             }
         }
-        match failure {
-            Some(error) => Err(error),
-            None => Ok(()),
-        }
+        Ok(())
     }
 
     /// 队列动作必须属于当前窗口 activation；旧窗口遗留的请求直接丢弃。
@@ -5032,6 +5091,7 @@ impl WindowHost {
             preserve_press_on_next_rebuild: false,
             scrollbar_drag: None,
             reveal_requested: false,
+            defer_row_window_sync: false,
             paint_requested: true,
             last_snapshot: None,
             snapshot_revision: 0,
@@ -5190,6 +5250,7 @@ fn adopt_scroll_offset(window: &mut WindowHost, scene: &Scene, requested: i32) {
 fn set_scroll_offset(window: &mut WindowHost, offset: i32) {
     if window.scroll_offset != offset {
         window.scroll_offset = offset;
+        window.defer_row_window_sync = false;
         bump_env_generation(window);
     }
 }
@@ -5784,6 +5845,7 @@ fn row_containing(band: SceneRowBand, content_y: f32) -> Option<usize> {
 ///
 /// pending 是**按 band 的集合**而不是单个 `Option<RowWindow>`：同一屏可以
 /// 有多个窗口化 `For`，其中还可以有嵌套行带。
+#[derive(Default)]
 struct PendingRowWindows {
     bands: Vec<(u64, RowWindow)>,
 }
@@ -6421,7 +6483,12 @@ unsafe extern "system" fn wndproc(
             // 这样 DWM 在窗口缩放后拿到的是新帧，而不是被拉伸的上一帧。
             let result = unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
             // 安全：派发期间不持有宿主引用，窗口过程可以借出一次。
-            unsafe { with_host(hwnd, |host| host.paint(hwnd)) };
+            unsafe {
+                with_host(hwnd, |host| {
+                    host.note_window_geometry_changed(hwnd);
+                    host.paint(hwnd);
+                })
+            };
             // 帧已按当前尺寸呈现；清除同一尺寸的重复重绘区域。
             // 安全：只清除本窗口的更新区域。
             unsafe {
@@ -6585,7 +6652,12 @@ unsafe extern "system" fn wndproc(
             // 系统建议矩形为准。DPI 改变可能不改变窗口尺寸，因而没有 WM_SIZE；
             // 这里同步按新 scale 重绘。
             // 安全：派发期间不持有宿主引用，窗口过程可以借出一次。
-            unsafe { with_host(hwnd, |host| host.paint(hwnd)) };
+            unsafe {
+                with_host(hwnd, |host| {
+                    host.note_window_geometry_changed(hwnd);
+                    host.paint(hwnd);
+                })
+            };
             // 安全：只清除本窗口的更新区域。
             unsafe {
                 let _ = ValidateRect(Some(hwnd), None);
@@ -9217,6 +9289,246 @@ mod tests {
         assert_eq!(probe.clicks.load(Ordering::SeqCst), 1);
     }
 
+    #[component]
+    fn UiaRequestHost(window: WindowCtx, clicks: &'static AtomicUsize) -> MountResult<MountPlan> {
+        view! {
+            <view>
+                <button aria:label="Hide" on:click={move || {
+                    let _ = window.request_hide();
+                }}>"Hide"</button>
+                <button aria:label="Act" on:click={move || {
+                    clicks.fetch_add(1, Ordering::SeqCst);
+                }}>"Act"</button>
+                <button aria:label="Fail" on:click={move || -> Result<(), HandlerError> {
+                    Err(HandlerError::new("uia failed"))
+                }}>"Fail"</button>
+                <button aria:label="UiaPanic" on:click={move || -> () {
+                    panic!("uia panic");
+                }}>"Panic"</button>
+            </view>
+        }
+    }
+
+    fn open_uia_request_host() -> (Host, &'static AtomicUsize) {
+        let clicks = leak(AtomicUsize::new(0));
+        let mut runtime = Runtime::new();
+        runtime
+            .declare_windows(move |catalog| {
+                catalog.window(
+                    WindowSpec::new(MAIN).primary().sized(320, 200),
+                    move |window| {
+                        view! { <UiaRequestHost window={window} clicks={clicks} /> }
+                    },
+                )
+            })
+            .expect("declare the request window");
+        runtime.show(MAIN).expect("show the request window");
+        let mut host = Host::open(runtime, HostConfig::hidden()).expect("open the request host");
+        host.render().expect("render the request window");
+        (host, clicks)
+    }
+
+    fn enqueue_named_invoke(host: &mut Host, name: &str) {
+        let node = host
+            .accessibility_tree(MAIN)
+            .expect("published tree")
+            .find_name(name)
+            .and_then(|node| node.node_id())
+            .expect("the action node");
+        assert!(
+            host.windows[MAIN]
+                .accessibility
+                .enqueue_node(UiAction::Invoke { node })
+        );
+    }
+
+    #[test]
+    fn each_accessibility_action_settles_its_window_requests_first() {
+        let (mut host, clicks) = open_uia_request_host();
+        enqueue_named_invoke(&mut host, "Hide");
+        enqueue_named_invoke(&mut host, "Act");
+        let hwnd = host.hwnd(MAIN).expect("window handle");
+        host.run_queued_accessibility_actions(hwnd);
+
+        assert!(
+            host.presentation(MAIN).is_err(),
+            "the hide request is settled before the next action"
+        );
+        assert_eq!(
+            clicks.load(Ordering::SeqCst),
+            0,
+            "the action queued after Hide runs on a hidden window"
+        );
+    }
+
+    #[test]
+    fn accessibility_action_turn_errors_surface_as_diagnostics() {
+        let (mut host, _clicks) = open_uia_request_host();
+        enqueue_named_invoke(&mut host, "Fail");
+        enqueue_named_invoke(&mut host, "UiaPanic");
+        let hwnd = host.hwnd(MAIN).expect("window handle");
+        host.run_queued_accessibility_actions(hwnd);
+
+        let diagnostics = host.take_diagnostics();
+        assert!(
+            diagnostics
+                .iter()
+                .any(|message| message.contains("uia failed")),
+            "a handler Err is surfaced: {diagnostics:?}"
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|message| message.contains("uia panic")),
+            "a handler panic is surfaced: {diagnostics:?}"
+        );
+        assert!(
+            host.runtime.presentation().is_ok(),
+            "the session survives action errors"
+        );
+    }
+
+    #[component]
+    fn UiaScrollHost() -> MountResult<MountPlan> {
+        let store = Store::new();
+        let rows = memo(move || store.rows(Filter::All));
+        view! {
+            <view role="main">
+                <button aria:label="Seed" on:click={move || {
+                    let mut transaction = Transaction::new();
+                    for index in 0..10 {
+                        transaction = transaction.write(store.insert(format!("seed {index}")));
+                    }
+                    let _ = transaction.finish();
+                }}>"Seed"</button>
+                <button aria:label="Grow" on:click={move || {
+                    let mut transaction = Transaction::new();
+                    for index in 0..40 {
+                        transaction = transaction.write(store.insert(format!("grown {index}")));
+                    }
+                    let _ = transaction.finish();
+                }}>"Grow"</button>
+                <view class="gap-0">
+                    <For each={rows} store={store} key={|row: &TodoRow| row.id} row-height={px(20.0)}>
+                        {move |row: RowView<TodoRow>| view! {
+                            <view style:height={once(px(20.0))}>
+                                <text>{once(format!("row {}", row.key().raw()))}</text>
+                            </view>
+                        }}
+                    </For>
+                </view>
+            </view>
+        }
+    }
+
+    #[test]
+    fn an_accessibility_scroll_uses_the_scene_after_prior_actions() {
+        let mut runtime = Runtime::new();
+        runtime
+            .declare_windows(|catalog| {
+                catalog.window(WindowSpec::new(MAIN).primary().sized(320, 200), |_| {
+                    view! { <UiaScrollHost /> }
+                })
+            })
+            .expect("declare the scroll window");
+        runtime.show(MAIN).expect("show the scroll window");
+        let mut host = Host::open(runtime, HostConfig::hidden()).expect("open the scroll host");
+        host.runtime.click_text("Seed").expect("seed rows");
+        host.render().expect("render the seeded list");
+        let old_max = host.scene(MAIN).expect("scene").max_scroll_offset();
+        assert!(old_max > 0, "the seeded list is scrollable");
+
+        enqueue_named_invoke(&mut host, "Grow");
+        let (runtime, activation) = host.windows[MAIN].accessibility.identity();
+        assert!(
+            host.windows[MAIN]
+                .accessibility
+                .enqueue(ProviderAction::Scroll(ScrollRequest {
+                    runtime,
+                    activation,
+                    command: ScrollCommand::Percent(100.0),
+                }))
+        );
+        let hwnd = host.hwnd(MAIN).expect("window handle");
+        host.run_queued_accessibility_actions(hwnd);
+
+        let scene = host.scene(MAIN).expect("grown scene");
+        assert!(
+            scene.max_scroll_offset() > old_max,
+            "the invoke grew the scrollable content"
+        );
+        assert_eq!(
+            host.windows[MAIN].scroll_offset,
+            scene.max_scroll_offset(),
+            "the scroll clamps to the new content extent, not the stale maximum"
+        );
+    }
+
+    #[component]
+    fn LooseInputHost() -> MountResult<MountPlan> {
+        view! {
+            <view>
+                <text-input aria:label="Loose" on:input={move |_text: String| {}} />
+            </view>
+        }
+    }
+
+    #[test]
+    fn a_text_input_without_a_value_binding_reaches_scene_and_uia() {
+        let mut runtime = Runtime::new();
+        runtime
+            .declare_windows(|catalog| {
+                catalog.window(WindowSpec::new(MAIN).primary().sized(320, 200), |_| {
+                    view! { <LooseInputHost /> }
+                })
+            })
+            .expect("declare the loose input window");
+        runtime.show(MAIN).expect("show the loose input window");
+        let mut host = Host::open(runtime, HostConfig::hidden()).expect("open the loose host");
+        host.render().expect("render the empty input");
+        host.runtime.focus("Loose").expect("focus the input");
+        let node = host
+            .runtime
+            .presentation()
+            .expect("snapshot")
+            .find_label("Loose")
+            .expect("the input")
+            .id();
+        host.runtime
+            .set_caret_node(node, 0)
+            .expect("place the caret");
+        host.runtime
+            .type_text_node(node, "a")
+            .expect("type into the input");
+        host.render().expect("render the typed input");
+
+        assert_eq!(
+            host.presentation(MAIN)
+                .expect("snapshot")
+                .find_label("Loose")
+                .expect("the input")
+                .text_value(),
+            Some("a"),
+            "the snapshot carries the local edit"
+        );
+        let tree = host.accessibility_tree(MAIN).expect("published tree");
+        let edit = tree.find_name("Loose").expect("the edit node");
+        assert_eq!(
+            edit.value(),
+            Some("a"),
+            "UIA reads the committed input value"
+        );
+        let scene = host.scene(MAIN).expect("scene");
+        let glyphs = scene
+            .node(node)
+            .expect("the input in the scene")
+            .text()
+            .iter()
+            .map(|run| run.glyphs().len())
+            .sum::<usize>();
+        assert!(glyphs > 0, "the scene paints the typed glyph");
+    }
+
     #[test]
     fn an_accessibility_invoke_that_settles_focus_requests_reveal() {
         let (mut host, _probe) = open_uia_probe();
@@ -9731,6 +10043,50 @@ mod tests {
             Host::open(runtime, HostConfig::hidden()).expect("open the delivering task host");
         host.render().expect("render the delivering task window");
         (host, completed)
+    }
+
+    #[component]
+    fn PanickingContinuationHost(window: WindowCtx) -> MountResult<MountPlan> {
+        let start = move || {
+            let _ = window.task_scope().spawn(|_| ()).and_then(|task| {
+                task.on_done(|_| -> Result<(), MountError> { panic!("task continuation boom") })
+            });
+        };
+        view! {
+            <view role="main">
+                <button on:click={move || start()}>"Start task"</button>
+            </view>
+        }
+    }
+
+    #[test]
+    fn a_panicking_continuation_surfaces_a_diagnostic_and_keeps_the_host_running() {
+        let mut runtime = Runtime::new();
+        runtime
+            .declare_windows(|catalog| {
+                catalog.window(
+                    WindowSpec::new(MAIN).primary().sized(320, 240),
+                    |window| view! { <PanickingContinuationHost window={window} /> },
+                )
+            })
+            .expect("declare the panicking task window");
+        runtime.show(MAIN).expect("show the panicking task window");
+        let mut host =
+            Host::open(runtime, HostConfig::hidden()).expect("open the panicking task host");
+        host.render().expect("render the panicking task window");
+        host.runtime
+            .click_text("Start task")
+            .expect("spawn the task");
+        host.runtime.wait_for_tasks();
+        host.pump()
+            .expect("the host survives the continuation panic");
+        assert!(
+            host.take_diagnostics()
+                .iter()
+                .any(|message| message.contains("task continuation boom")),
+            "the batch error becomes a recoverable diagnostic"
+        );
+        host.render().expect("the session keeps rendering");
     }
 
     #[test]
@@ -10861,6 +11217,85 @@ mod tests {
     }
 
     #[test]
+    fn a_text_scale_repaint_keeps_the_mounted_row_window() {
+        let mut runtime = Runtime::new();
+        zenui_demo::open_todo_window(&mut runtime).expect("open the todo window");
+        for index in 0..40 {
+            runtime
+                .input("What needs to be done?", &format!("Task {index}"))
+                .expect("fill the draft");
+            runtime.submit("Add task").expect("add a row");
+        }
+        let mut host = Host::open(runtime, HostConfig::hidden()).expect("open a tall host");
+        host.render().expect("render at 100%");
+
+        let mounted_before: Vec<RowId> = host
+            .runtime
+            .for_items()
+            .iter()
+            .map(|item| item.row)
+            .collect();
+        assert!(mounted_before.len() < 40, "the list is windowed");
+        let last = mounted_before.len() - 1;
+        let label = format!("Edit Task {last}");
+        let node = host
+            .runtime
+            .presentation()
+            .expect("snapshot")
+            .find_label(&label)
+            .expect("the last mounted editor")
+            .id();
+        host.runtime.focus(&label).expect("focus the row editor");
+        host.runtime
+            .set_caret_node(node, 0)
+            .expect("place the caret");
+        host.runtime
+            .insert_text_node(node, "local ")
+            .expect("leave a local edit");
+        host.render().expect("render the local edit");
+
+        let revision = host.runtime.presentation_revision();
+        let row_height = host.scene(MAIN).expect("scene").row_bands()[0].row_height();
+        host.set_system_preferences(SystemPreferences::new(false, 225));
+        host.render().expect("render at 225%");
+
+        assert_eq!(
+            host.runtime.presentation_revision(),
+            revision,
+            "text scale must not resync the row window"
+        );
+        assert_eq!(
+            host.runtime
+                .for_items()
+                .iter()
+                .map(|item| item.row)
+                .collect::<Vec<_>>(),
+            mounted_before,
+            "the mounted rows and their local state survive the scale change"
+        );
+        let scene = host.scene(MAIN).expect("scaled scene");
+        assert!(
+            scene.row_bands()[0].row_height() > row_height,
+            "the scene really adopted the scaled row height"
+        );
+        assert_eq!(
+            scene.row_bands()[0].total_rows(),
+            40,
+            "the band still describes the full list"
+        );
+        assert_eq!(
+            host.runtime
+                .presentation()
+                .expect("snapshot")
+                .find_label(&label)
+                .expect("the edited row remains mounted")
+                .text_value(),
+            Some("local "),
+            "the local edit survives the preference repaint"
+        );
+    }
+
+    #[test]
     fn a_text_scale_change_reclamps_the_scroll_offset() {
         let mut runtime = Runtime::new();
         zenui_demo::open_todo_window(&mut runtime).expect("open the todo window");
@@ -11650,6 +12085,8 @@ mod tests {
                 ..Default::default()
             },
         );
+        // ADR-0010 的 reveal 预算与 ADR-0011 的行窗口 pass 2 相加；方案
+        // §15.5 已按这两个分账预算修正，不再要求全局两遍/顺延计数器。
         assert!(
             host.counters.scene_builds - reveal_builds <= 4,
             "a reveal frame is bounded: pass one, at most two reveal passes and one row-window build"

@@ -69,7 +69,7 @@ _Avoid_: host worker, UI task, dialog task, file drop
 _Avoid_: platform backend, shell
 
 **turn**:
-一次派发（用户输入、UIA 动作或任务交付）从 handler、模型/UI 写入、flush、快照发布到宿主动作结算的同步边界。一个 turn 可以包含多次提交，发布会累计这些变化；空 click、相等写入与纯 runtime 计数变化仍构成 turn，但不产生 effective change。
+一次派发（用户输入、UIA 动作或任务交付批次）从 handler、模型/UI 写入、flush、快照发布到宿主动作结算的同步边界。一个 turn 可以包含多次提交，发布会累计这些变化；空 click、相等写入与纯 runtime 计数变化仍构成 turn，但不产生 effective change。任务交付批次内的 continuation 只写状态，首个失败停止后续 step，批次末统一 flush 一次。
 _Avoid_: frame, event loop iteration
 
 **Intent**:
@@ -87,6 +87,10 @@ _Avoid_: event result, frame report
 **TurnOutcome**:
 turn 的 `consumed` 与 `prevent_default` 两个布尔结果；处理器、窗口根 keydown 与宿主默认动作共同决定。它不表示模型事务是否提交成功，后者由错误与模型结果表达。
 _Avoid_: handler result, default action flag
+
+**DeliveryReport**:
+一次 `Runtime::drive_tasks` 批次的报告：`delivered`、`discarded` 与 `errors`。continuation 的 `MountError`、上下文 fault、写入错误与批次末 flush 错误都留在报告里；批次在首个失败处停止后续 step，但已提交的写入仍按一次 flush 呈现。宿主把报告错误转成可恢复诊断，不结束会话。
+_Avoid_: task report, wake result
 
 **effective change**:
 会改变已发布呈现的提交：属性、文本、直接子序、焦点、外观或行带等。相等写入、空 click、只推进内部代数或计数的操作不是 effective change；它们不推进树 revision、不构建快照。

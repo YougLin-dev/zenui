@@ -8319,6 +8319,7 @@ impl Runtime {
             }),
             None => (String::new(), None),
         };
+        let has_value_binding = value_binding.is_some();
         with_state(|state| {
             let attrs = scratch.take_attrs();
             let styles = scratch.take_styles();
@@ -8343,7 +8344,11 @@ impl Runtime {
                 *state.element_attrs_mut(id) = attrs;
                 *state.element_inline_styles_mut(id) = styles;
                 match state.element_local_mut(id) {
-                    LocalState::TextInput(editor) => editor.observe(&committed, epoch),
+                    // 没有 `value` 源的输入是非受控控件：本地文本是唯一权威，
+                    // 不能按空绑定把它重置为空串。
+                    LocalState::TextInput(editor) if has_value_binding => {
+                        editor.observe(&committed, epoch)
+                    }
                     _ => None,
                 }
             };
@@ -11541,14 +11546,16 @@ fn snapshot_attrs(state: &State, element: usize) -> Vec<SnapshotAttr> {
             }),
         }
     }
-    // 文本输入呈现编辑器当前文本；`value` 绑定可能尚未追上本地编辑。
-    if let LocalState::TextInput(editor) = state.element_local(element)
-        && let Some(SnapshotValue::Text(value)) = attrs
-            .iter_mut()
-            .find(|attr| attr.name == "value")
-            .map(|attr| &mut attr.value)
-    {
-        *value = editor.value.clone();
+    // 文本输入无条件发布编辑器文本：没有 `value` 绑定的输入同样要呈现
+    // 已提交的本地编辑，Scene 与 UIA 都读取这个属性。
+    if let LocalState::TextInput(editor) = state.element_local(element) {
+        match attrs.iter_mut().find(|attr| attr.name == "value") {
+            Some(attr) => attr.value = SnapshotValue::Text(editor.value.clone()),
+            None => attrs.push(SnapshotAttr {
+                name: "value",
+                value: SnapshotValue::Text(editor.value.clone()),
+            }),
+        }
     }
     attrs
 }
@@ -13129,9 +13136,10 @@ mod binding_tests {
         let before_settle = app.presentation_revision_of(window).expect("revision");
         app.settle_tasks().expect("deliver both results");
         let after_settle = app.presentation_revision_of(window).expect("revision");
-        assert!(
-            after_settle >= before_settle + 2,
-            "each delivery commits its own revision"
+        assert_eq!(
+            after_settle,
+            before_settle + 1,
+            "one delivery batch flushes both commits once"
         );
 
         let update = app

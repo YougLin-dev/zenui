@@ -188,15 +188,15 @@ fn an_app_continuation_writing_a_disposed_window_signal_is_rejected() {
     app.click_text("Disposed app task").expect("spawn");
     app.close_window(window).expect("close");
 
-    let error = app
+    let report = app
         .settle_tasks()
-        .expect_err("writing a disposed signal is rejected");
+        .expect("a delivery error stays in the batch report");
     assert!(matches!(
-        error,
-        MountError::Context {
+        report.errors(),
+        [MountError::Context {
             operation: "Signal::set",
             ..
-        }
+        }]
     ));
     assert!(!app.texts().iter().any(|text| text == "too late"));
 }
@@ -208,10 +208,10 @@ fn a_panicking_read_scope_does_not_poison_later_delivery() {
 
     app.click_text("With disposed app task").expect("spawn");
     app.close_window(window).expect("close");
-    let error = app
+    let report = app
         .settle_tasks()
-        .expect_err("reading a disposed signal panics");
-    assert!(matches!(error, MountError::Delivery(_)));
+        .expect("a continuation panic stays in the batch report");
+    assert!(matches!(report.errors(), [MountError::Panic(_)]));
 
     let _second = open(&mut app);
     app.click_text("Window task").expect("window task");
@@ -247,10 +247,13 @@ fn a_panicking_continuation_is_reported_and_restores_the_context() {
     app.task_done(task, |_| panic!("continuation boom"))
         .expect("continuation");
 
-    let error = app
+    let report = app
         .settle_tasks()
-        .expect_err("a continuation panic is a delivery error");
-    assert!(matches!(error, MountError::Delivery(_)));
+        .expect("a continuation panic is a delivery report error");
+    assert!(matches!(
+        report.errors(),
+        [MountError::Panic(panic)] if panic.message() == "continuation boom"
+    ));
     assert_eq!(app.task_status(task), Some(TaskStatus::Panicked));
 
     app.click_text("Window task")
@@ -360,13 +363,16 @@ fn delivery_obeys_context_checks_and_later_delivery_recovers() {
     let _window = open(&mut app);
 
     app.click_text("Bad app task").expect("spawn");
-    let error = app
+    let report = app
         .settle_tasks()
-        .expect_err("a read-only delivery must be rejected");
-    assert!(matches!(
-        error,
-        MountError::Write(WriteError::Context { .. })
-    ));
+        .expect("a read-only delivery error stays in the batch report");
+    assert!(
+        report
+            .errors()
+            .iter()
+            .any(|error| matches!(error, MountError::Write(WriteError::Context { .. }))),
+        "unexpected report: {report:?}"
+    );
     assert!(
         app.texts().iter().any(|text| text == "n=0"),
         "the rejected delivery committed nothing"
@@ -580,4 +586,95 @@ fn a_failed_window_factory_cancels_tasks_started_in_its_setup() {
     app.settle_tasks()
         .expect("the cancelled setup task is discarded");
     assert_eq!(app.task_status(task), Some(TaskStatus::Stale));
+}
+
+#[component]
+fn BatchProbe(value: Signal<u32>) -> MountResult<MountPlan> {
+    let label = memo(move || format!("v={}", value.get()));
+    view! { <text>{label}</text> }
+}
+
+#[test]
+fn one_delivery_batch_flushes_once_after_all_continuations() {
+    let mut app = Runtime::new();
+    let value = app.setup(|| signal(0u32)).expect("application setup");
+    app.open_window("main", move |_| view! { <BatchProbe value={value} /> })
+        .expect("open the batch probe window");
+
+    let first = app.spawn_task(app.task_scope(), |_| ()).expect("first");
+    let second = app.spawn_task(app.task_scope(), |_| ()).expect("second");
+    app.task_done(first, move |_| {
+        value.set(1);
+        Ok(())
+    })
+    .expect("first continuation");
+    app.task_done(second, move |_| {
+        value.set(2);
+        Ok(())
+    })
+    .expect("second continuation");
+    app.wait_for_tasks();
+
+    let revision = app.presentation_revision();
+    let evaluations = app.binding_evaluations();
+    let report = app.drive_tasks().expect("one delivery batch");
+    assert_eq!(report.delivered, 2);
+    assert!(report.is_ok(), "unexpected report: {report:?}");
+    assert_eq!(
+        app.presentation_revision(),
+        revision + 1,
+        "two continuations share one batch-end flush"
+    );
+    assert_eq!(
+        app.binding_evaluations() - evaluations,
+        1,
+        "the label binding settles once after both writes"
+    );
+    assert_eq!(app.texts(), vec!["v=2"]);
+}
+
+#[test]
+fn a_panicking_continuation_flushes_prior_writes_and_stops_the_batch() {
+    let mut app = Runtime::new();
+    let value = app.setup(|| signal(0u32)).expect("application setup");
+    app.open_window("main", move |_| view! { <BatchProbe value={value} /> })
+        .expect("open the batch probe window");
+
+    let first = app.spawn_task(app.task_scope(), |_| ()).expect("first");
+    let second = app.spawn_task(app.task_scope(), |_| ()).expect("second");
+    app.task_done(first, move |_| {
+        value.set(1);
+        panic!("continuation boom");
+    })
+    .expect("first continuation");
+    app.task_done(second, move |_| {
+        value.set(2);
+        Ok(())
+    })
+    .expect("second continuation");
+    app.wait_for_tasks();
+
+    let revision = app.presentation_revision();
+    let report = app.drive_tasks().expect("delivery report");
+    assert!(matches!(
+        report.errors(),
+        [MountError::Panic(panic)] if panic.message() == "continuation boom"
+    ));
+    assert_eq!(report.delivered, 0);
+    assert_eq!(
+        app.presentation_revision(),
+        revision + 1,
+        "the batch still flushes the write committed before the panic"
+    );
+    assert_eq!(app.texts(), vec!["v=1"], "the retained write is presented");
+    assert_eq!(app.task_status(first), Some(TaskStatus::Panicked));
+    assert_ne!(app.task_status(second), Some(TaskStatus::Delivered));
+
+    let report = app.drive_tasks().expect("the next batch");
+    assert_eq!(
+        report.delivered, 1,
+        "the stopped step runs on a later batch"
+    );
+    assert!(report.is_ok());
+    assert_eq!(app.texts(), vec!["v=2"]);
 }

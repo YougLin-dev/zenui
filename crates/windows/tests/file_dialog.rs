@@ -4,6 +4,7 @@
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::VK_TAB;
@@ -21,7 +22,12 @@ type Outcomes = Rc<RefCell<Vec<FileDialogOutcome>>>;
 type Calls = Rc<RefCell<Vec<(isize, FileDialogOptions)>>>;
 
 #[component]
-fn PickerProbe(window: WindowCtx, picks: Picks, outcomes: Outcomes) -> MountResult<MountPlan> {
+fn PickerProbe(
+    window: WindowCtx,
+    picks: Picks,
+    outcomes: Outcomes,
+    delivered: Rc<Cell<u32>>,
+) -> MountResult<MountPlan> {
     let input = signal(String::new());
     let notice = signal(String::new());
 
@@ -77,7 +83,9 @@ fn PickerProbe(window: WindowCtx, picks: Picks, outcomes: Outcomes) -> MountResu
             let task = window
                 .app_task_scope()
                 .spawn(|_| String::from("task done"))?;
+            let delivered = delivered.clone();
             task.on_done(move |text| {
+                delivered.set(delivered.get() + 1);
                 notice.set(text);
                 Ok(())
             })
@@ -136,14 +144,17 @@ struct Harness {
     host: Host,
     picks: Picks,
     outcomes: Outcomes,
+    delivered: Rc<Cell<u32>>,
 }
 
 fn open() -> Harness {
     let mut runtime = Runtime::new();
     let picks: Picks = Rc::new(RefCell::new(Vec::new()));
     let outcomes: Outcomes = Rc::new(RefCell::new(Vec::new()));
+    let delivered: Rc<Cell<u32>> = Rc::new(Cell::new(0));
     let factory_picks = picks.clone();
     let factory_outcomes = outcomes.clone();
+    let factory_delivered = delivered.clone();
     runtime
         .declare_windows(move |catalog| {
             catalog.window(
@@ -151,7 +162,15 @@ fn open() -> Harness {
                 move |window| {
                     let picks = factory_picks.clone();
                     let outcomes = factory_outcomes.clone();
-                    view! { <PickerProbe window={window} picks={picks} outcomes={outcomes} /> }
+                    let delivered = factory_delivered.clone();
+                    view! {
+                        <PickerProbe
+                            window={window}
+                            picks={picks}
+                            outcomes={outcomes}
+                            delivered={delivered}
+                        />
+                    }
                 },
             )?;
             Ok(())
@@ -163,6 +182,7 @@ fn open() -> Harness {
         host,
         picks,
         outcomes,
+        delivered,
     }
 }
 
@@ -359,20 +379,25 @@ fn a_worker_wake_is_delivered_while_the_dialog_is_open() {
 
     let calls: Calls = Rc::new(RefCell::new(Vec::new()));
     let slot = calls.clone();
+    let delivered = Rc::clone(&harness.delivered);
     harness
         .host
         .set_file_dialog_presenter(move |anchor: HWND, options: &FileDialogOptions| {
             slot.borrow_mut().push((anchor.0 as isize, options.clone()));
-            std::thread::sleep(std::time::Duration::from_millis(50));
-            // 安全：派发本线程队列；不得持有 Host 引用。
-            unsafe {
-                let mut message = MSG::default();
-                for _ in 0..64 {
-                    if PeekMessageW(&mut message, None, 0, 0, PM_REMOVE).0 == 0 {
-                        break;
+            // 等待 worker 结果真正交付，而不是固定的 50 ms；阻塞期间仍泵送
+            // 本线程消息，嵌套循环才能把任务唤醒送达。
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while delivered.get() == 0 && Instant::now() < deadline {
+                // 安全：派发本线程队列；不得持有 Host 引用。
+                unsafe {
+                    let mut message = MSG::default();
+                    while PeekMessageW(&mut message, None, 0, 0, PM_REMOVE).0 != 0 {
+                        let _ = TranslateMessage(&message);
+                        DispatchMessageW(&message);
                     }
-                    let _ = TranslateMessage(&message);
-                    DispatchMessageW(&message);
+                }
+                if delivered.get() == 0 {
+                    std::thread::sleep(Duration::from_millis(1));
                 }
             }
             FileDialogOutcome::Cancelled
@@ -380,6 +405,11 @@ fn a_worker_wake_is_delivered_while_the_dialog_is_open() {
         .expect("install the waiting presenter");
 
     assert!(!harness.host.pump().expect("deliver both turns"));
+    assert_eq!(
+        harness.delivered.get(),
+        1,
+        "the worker result was delivered"
+    );
     assert_eq!(notice_text(&harness), "task done");
     assert_eq!(calls.borrow().len(), 1);
     assert_eq!(
