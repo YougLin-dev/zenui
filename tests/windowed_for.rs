@@ -1,5 +1,6 @@
 #![allow(unused_braces)]
 
+use zenui::RuntimeDiagnostic;
 use zenui::prelude::*;
 
 /// 一个窗口化列表夹具：固定 20 点行高的 `For`，每行一个带标签按钮。
@@ -84,6 +85,59 @@ fn label_order(app: &Runtime, window: WindowCtx, wanted: &[&str]) -> Vec<String>
         .filter(|label| wanted.contains(label))
         .map(str::to_owned)
         .collect()
+}
+
+#[component]
+fn NonWindowedList() -> MountResult<MountPlan> {
+    let store = Store::new();
+    let rows = memo(move || store.rows(Filter::All));
+    view! {
+        <view>
+            <button aria:label="Seed" on:click={move || -> Result<(), WriteError> {
+                let mut transaction = Transaction::new();
+                for index in 0..1_001 {
+                    transaction = transaction.write(store.insert(format!("r{index}")));
+                }
+                transaction.finish()
+            }}>"Seed"</button>
+            <For each={rows} store={store} key={|row: &TodoRow| row.id}>
+                {move |row: RowView<TodoRow>| view! {
+                    <text>{once(format!("Row {}", row.key().raw()))}</text>
+                }}
+            </For>
+        </view>
+    }
+}
+
+#[test]
+fn a_non_windowed_for_over_the_threshold_reports_one_diagnostic_and_mounts_all() {
+    let mut app = Runtime::new();
+    app.mount(|| view! { <NonWindowedList /> }).expect("mount");
+    app.click_label("Seed").expect("seed the full list");
+
+    let report = app.refresh().expect("refresh");
+    assert!(
+        report
+            .diagnostics()
+            .contains(&RuntimeDiagnostic::NonWindowedFor { total_rows: 1_001 }),
+        "the over-threshold For reports its full-mount cost: {:?}",
+        report.diagnostics()
+    );
+    assert_eq!(
+        app.texts()
+            .iter()
+            .filter(|text| text.starts_with("Row "))
+            .count(),
+        1_001,
+        "the diagnostic does not change the full-mount behavior"
+    );
+    assert!(
+        app.refresh()
+            .expect("second refresh")
+            .diagnostics()
+            .is_empty(),
+        "the diagnostic is reported once per For"
+    );
 }
 
 #[test]

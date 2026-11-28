@@ -974,6 +974,9 @@ struct RowWindowBatch {
 /// 没有宿主窗口时的默认挂载行数；ADR-0011 要求它远大于常见视口行数。
 const DEFAULT_WINDOW_ROWS: usize = 32;
 
+/// 未声明 `row-height` 的 For 超过该行数时给出一次诊断；全量挂载仍发生。
+pub const NON_WINDOWED_FOR_WARN_ROWS: usize = 1_000;
+
 /// 一个 Runtime 的应用会话状态。
 #[derive(Default)]
 struct SessionState {
@@ -1107,6 +1110,8 @@ pub(crate) struct State {
     pub(crate) binding_evaluations: u64,
     /// 成功完成的 memo compute 次数；只统计生产 memo 路径。
     pub(crate) memo_recomputes: u64,
+    /// 开发诊断；由下一次公开刷新报告取走。
+    pub(crate) diagnostics: Vec<RuntimeDiagnostic>,
     pub(crate) phase: Phase,
     pub(crate) fault: Option<ContextFault>,
     pub(crate) appearance: Appearance,
@@ -1245,6 +1250,14 @@ pub struct FocusInfo {
     pub label: Option<String>,
 }
 
+/// Runtime 开发诊断；由下一次公开刷新报告交付。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimeDiagnostic {
+    /// 未声明 `row-height` 的 `For` 超过 [`NON_WINDOWED_FOR_WARN_ROWS`]；
+    /// 仍会全量挂载，诊断只提示 O(总行数) 的挂载成本。
+    NonWindowedFor { total_rows: usize },
+}
+
 /// 自上次公开 [`Runtime::refresh`] 报告以来的有效呈现变化。
 ///
 /// 只统计会改变 presentation snapshot 的变化；空 click、相等写入与纯
@@ -1259,6 +1272,8 @@ pub struct RefreshReport {
     pub changed_windows: Vec<&'static str>,
     /// 本次刷新遇到的 typed 读取失败；值绑定保留最后已提交值。
     faults: Vec<ReadFault>,
+    /// 本次刷新增量产生的开发诊断。
+    diagnostics: Vec<RuntimeDiagnostic>,
 }
 
 impl RefreshReport {
@@ -1275,6 +1290,11 @@ impl RefreshReport {
     /// 本次刷新遇到的 typed 读取失败，按值去重。
     pub fn faults(&self) -> &[ReadFault] {
         &self.faults
+    }
+
+    /// 本次刷新增量产生的开发诊断。
+    pub fn diagnostics(&self) -> &[RuntimeDiagnostic] {
+        &self.diagnostics
     }
 }
 
@@ -1621,6 +1641,7 @@ impl State {
             store_counters: Counters::default(),
             binding_evaluations: 0,
             memo_recomputes: 0,
+            diagnostics: Vec::new(),
             phase: Phase::Idle,
             fault: None,
             appearance: Appearance::Light,
@@ -4269,6 +4290,8 @@ struct ForData {
     driver: Rc<dyn ForDriver>,
     /// 窗口化 For 的统一行高；`None` 挂载全部行（ADR-0010）。
     row_height: Option<Length>,
+    /// 未窗口化行数超过阈值时只报告一次。
+    non_windowed_warned: bool,
     /// 跨快照稳定的行带键；宿主按它声明行窗口。
     band: u64,
     total_rows: usize,
@@ -6306,6 +6329,14 @@ impl Runtime {
             if !with_state(|state| state.window_live_in_tree(window)) {
                 return Err(WindowError::Stale);
             }
+            // 隐藏窗口与关闭挂起窗口不接受结构输入：隐藏/挂起期间卸载焦点
+            // 行会销毁必须保留的本地编辑状态。
+            if !with_state(|state| state.window_is_visible(window.key)) {
+                return Err(WindowError::Hidden);
+            }
+            if with_state(|state| state.close_epochs.contains_key(window.key)) {
+                return Err(WindowError::Suspended);
+            }
             let key = TreeSlot::Window(window.key);
             // 1) 预校验全部行带：任何一条失败都不应用任何请求。活行带集合
             // 每次 turn 只遍历树一次，批量大小不影响校验成本。
@@ -6382,8 +6413,13 @@ impl Runtime {
                         // 结构阶段：新行必须挂到本窗口的树，而不是根树。
                         let (previous_phase, previous_tree) = with_state(|state| {
                             let previous = (state.phase, state.building_tree);
-                            state.refresh_focus = None;
-                            state.refresh_focus_id = None;
+                            // 修复刷新必须和完整刷新一样带上焦点身份：旧请求
+                            // 可能只靠一行 grace 保留焦点行，去掉 grace 会把
+                            // 它在回滚时卸载。
+                            let focused = state.tree(key).and_then(|tree| tree.focused);
+                            let focused_id = state.tree(key).and_then(|tree| tree.focused_id);
+                            state.refresh_focus = focused;
+                            state.refresh_focus_id = focused.zip(focused_id).map(|(_, id)| id);
                             state.phase = Phase::Binding;
                             state.building_tree = Some(key);
                             previous
@@ -6436,6 +6472,8 @@ impl Runtime {
                             // 修复是失败 turn 的恢复步骤；它产生的读失败与
                             // 焦点丢弃不留给下一次普通刷新重复报告。
                             state.fault = None;
+                            state.refresh_focus = None;
+                            state.refresh_focus_id = None;
                             state.window_focus_dropped = None;
                         });
                     }
@@ -6527,8 +6565,10 @@ impl Runtime {
         let mut state = self.state.borrow_mut();
         let keys = std::mem::take(&mut state.changed_trees);
         let faults = std::mem::take(&mut state.read_faults);
+        let diagnostics = std::mem::take(&mut state.diagnostics);
         let mut report = RefreshReport {
             faults,
+            diagnostics,
             ..RefreshReport::default()
         };
         for key in keys {
@@ -7164,6 +7204,7 @@ impl Runtime {
                         rows,
                         driver,
                         row_height,
+                        non_windowed_warned: false,
                         band,
                         total_rows: 0,
                         first_row: 0,
@@ -8011,6 +8052,17 @@ impl Runtime {
         // total 来自行集快照本身；静态快照里已删除的行不挂载，但仍计入声明范围，
         // 窗口因此保留一个空槽而不是报错或回退。
         let total = rows.as_ref().map_or(0, RowSet::len);
+        if for_node.row_height.is_none()
+            && total > NON_WINDOWED_FOR_WARN_ROWS
+            && !for_node.non_windowed_warned
+        {
+            for_node.non_windowed_warned = true;
+            with_state(|state| {
+                state
+                    .diagnostics
+                    .push(RuntimeDiagnostic::NonWindowedFor { total_rows: total });
+            });
+        }
         let previous_order = for_node.order.clone();
         let previous_first = for_node.first_row;
         let previous_total = for_node.total_rows;
@@ -13655,6 +13707,175 @@ mod binding_tests {
                 </For>
             </view>
         }
+    }
+
+    /// 第一条 band 的焦点行可通过一行 grace 保留，第二条 band 可注入工厂失败。
+    #[component]
+    fn GraceBandRows() -> MountResult<MountPlan> {
+        let store = Store::new();
+        let rows = memo(move || store.rows(Filter::All));
+        let armed = signal(false);
+        view! {
+            <view>
+                <button aria:label="seed" on:click={move || -> Result<(), WriteError> {
+                    let mut transaction = Transaction::new();
+                    for index in 0..40 {
+                        transaction = transaction.write(store.insert(format!("r{index}")));
+                    }
+                    transaction.finish()
+                }}>"seed"</button>
+                <button aria:label="arm" on:click={move || armed.set(true)}>"arm"</button>
+                <button aria:label="disarm" on:click={move || armed.set(false)}>"disarm"</button>
+                <view class="gap-0">
+                    <For each={rows} store={store} key={|row: &TodoRow| row.id} row-height={px(20.0)}>
+                        {move |row: RowView<TodoRow>| {
+                            let label = format!("a {}", row.key().raw());
+                            view! {
+                                <view style:height={once(px(20.0))}>
+                                    <text-input
+                                        aria:label={once(label)}
+                                        value={once(format!("v{}", row.key().raw()))}
+                                    />
+                                </view>
+                            }
+                        }}
+                    </For>
+                </view>
+                <view class="gap-0">
+                    <For each={rows} store={store} key={|row: &TodoRow| row.id} row-height={px(20.0)}>
+                        {move |row: RowView<TodoRow>| {
+                            if armed.get() {
+                                return Err(MountError::Component("b boom"));
+                            }
+                            view! {
+                                <view style:height={once(px(20.0))}>
+                                    <text>{once(format!("b {}", row.key().raw()))}</text>
+                                </view>
+                            }
+                        }}
+                    </For>
+                </view>
+            </view>
+        }
+    }
+
+    #[test]
+    fn a_failed_band_batch_keeps_the_focused_grace_row_and_its_caret() {
+        let mut app = Runtime::new();
+        app.declare_windows(|catalog| {
+            catalog.window(WindowSpec::new("main").primary(), |_| {
+                view! { <GraceBandRows /> }
+            })
+        })
+        .expect("declare the window");
+        let window = app.show("main").expect("show the window");
+        app.click_label("seed").expect("seed the rows");
+        let bands = {
+            let snapshot = app.presentation_of(window).expect("snapshot");
+            [snapshot.row_bands()[0].key(), snapshot.row_bands()[1].key()]
+        };
+
+        app.focus("a 5").expect("focus the grace row");
+        assert!(app.set_caret("a 5", 1), "place the caret in the row");
+        let focused = app
+            .presentation_of(window)
+            .expect("snapshot")
+            .find_label("a 5")
+            .expect("the focused row")
+            .id();
+        assert_eq!(
+            app.presentation_of(window).expect("snapshot").focus(),
+            Some(focused),
+            "the input holds the presented focus before the window move"
+        );
+
+        app.set_row_window(window, bands[0], 5, 10)
+            .expect("the focused row is kept by one-row grace");
+        let snapshot = app.presentation_of(window).expect("snapshot");
+        assert_eq!(
+            snapshot.row_bands()[0].first_row(),
+            4,
+            "the grace row expands the committed window"
+        );
+        assert_eq!(snapshot.focus(), Some(focused));
+
+        app.click_label("arm").expect("arm the second band");
+        let failure = app
+            .set_row_windows(
+                window,
+                &[
+                    (bands[0], RowWindow::new(4, 10)),
+                    (bands[1], RowWindow::new(35, 5)),
+                ],
+            )
+            .expect_err("the second band's factory fails");
+        assert!(
+            matches!(
+                &failure,
+                WindowError::Mount(MountError::FactoryFailed(error))
+                    if **error == MountError::Component("b boom")
+            ),
+            "unexpected failure: {failure:?}"
+        );
+
+        let snapshot = app.presentation_of(window).expect("snapshot");
+        assert_eq!(
+            snapshot.row_bands()[0].first_row(),
+            4,
+            "the repair restores the pre-turn grace window"
+        );
+        assert!(
+            snapshot.find_label("a 5").is_some(),
+            "the focused row stays mounted"
+        );
+        assert_eq!(snapshot.focus(), Some(focused));
+        assert_eq!(
+            app.caret("a 5"),
+            Some(1),
+            "the focused input keeps its caret"
+        );
+        assert_eq!(
+            app.state.borrow().row_windows.get(&bands[0]),
+            Some(&RowWindow::new(5, 10)),
+            "the request is rolled back to the pre-turn raw window"
+        );
+    }
+
+    #[test]
+    fn a_hidden_window_rejects_row_window_batches_before_any_structure_change() {
+        let (mut app, window, bands) = two_band_fixture();
+        app.hide(window).expect("hide the window");
+        let failure = app
+            .set_row_windows(window, &[(bands[0], RowWindow::new(5, 10))])
+            .expect_err("a hidden window rejects the batch");
+        assert!(matches!(failure, WindowError::Hidden));
+        assert!(
+            app.state.borrow().row_windows.is_empty(),
+            "the rejected batch installs no request"
+        );
+    }
+
+    #[test]
+    fn a_close_suspended_window_rejects_row_window_batches_before_any_factory() {
+        let (mut app, window, bands) = two_band_fixture();
+        app.state.borrow_mut().close_epochs.insert(
+            window.key,
+            CloseEpoch {
+                id: 0,
+                parent: window,
+                confirmation: "confirm",
+                focus: None,
+                reply: None,
+            },
+        );
+        let failure = app
+            .set_row_windows(window, &[(bands[0], RowWindow::new(5, 10))])
+            .expect_err("a close-suspended window rejects the batch");
+        assert!(matches!(failure, WindowError::Suspended));
+        assert!(
+            app.state.borrow().row_windows.is_empty(),
+            "the rejected batch installs no request"
+        );
     }
 
     fn count_labels(app: &Runtime, window: WindowCtx, prefix: &str) -> usize {

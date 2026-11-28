@@ -43,7 +43,8 @@ pub use presentation::{
 };
 pub use runtime::{
     EventSource, EventTarget, FocusInfo, Intent, IntentPayload, MemoryReport, Modifiers,
-    RefreshReport, RowWindow, Runtime, StorageReport, TurnError, TurnOutcome, TurnReport,
+    NON_WINDOWED_FOR_WARN_ROWS, RefreshReport, RowWindow, Runtime, RuntimeDiagnostic,
+    StorageReport, TurnError, TurnOutcome, TurnReport,
 };
 pub use session::{SessionCtx, SessionError, SessionPolicy};
 pub use signal::{Memo, MemoCompute, Once, ReactiveValue, Signal, memo, once, signal};
